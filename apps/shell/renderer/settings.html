@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+<title>语音助手 · 设置</title>
+<style>
+  :root {
+    --bg: #14161c; --panel: #1b1e26; --line: #2a2f3a; --text: #e8ebf2; --muted: #98a2b3;
+    --accent: #8a5cf6; --ok: #35c37d; --bad: #ef5b5b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); font: 13px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 14px 20px;
+    border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  #status { font-size: 12px; color: var(--muted); min-width: 120px; text-align: right; }
+  #status.ok { color: var(--ok); }
+  #status.bad { color: var(--bad); }
+  main { padding: 18px 20px 28px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  section > h2 { font-size: 13px; margin: 0 0 14px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .field { margin-bottom: 14px; }
+  .field:last-child { margin-bottom: 0; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  input, select {
+    width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid var(--line);
+    background: #0e1015; color: var(--text); font: inherit;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 12px; }
+  .row > .field { flex: 1; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 5px; }
+  button {
+    padding: 7px 14px; border-radius: 7px; border: 1px solid var(--line);
+    background: #232733; color: var(--text); font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 12px; }
+  th { color: var(--muted); font-weight: 500; }
+  td select { padding: 4px 6px; }
+  .checks { display: flex; flex-wrap: wrap; gap: 18px; }
+  .checks label { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--text); font-size: 13px; }
+  .checks input { width: auto; }
+  /* 星期小标签：选中才是实心，没选=当天不生效 */
+  .days { display: flex; gap: 3px; }
+  .days .chip {
+    width: 20px; height: 22px; padding: 0; border-radius: 5px; cursor: pointer;
+    border: 1px solid var(--line); background: #0e1015; color: var(--muted); font-size: 11px;
+  }
+  .days .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 4px; }
+  pre { background: #0e1015; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 11px;
+        color: var(--muted); max-height: 180px; overflow: auto; margin: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>语音助手 · 设置</h1>
+  <span class="spacer"></span>
+  <span id="status"></span>
+  <button class="primary" id="save">保存</button>
+</header>
+
+<main>
+  <section>
+    <h2>模型</h2>
+    <div class="row">
+      <div class="field">
+        <label for="provider">提供商</label>
+        <select id="provider"></select>
+      </div>
+      <div class="field">
+        <label for="model">模型</label>
+        <input id="model" spellcheck="false" list="modelList" />
+        <datalist id="modelList"></datalist>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="baseURL">接口地址</label>
+        <input id="baseURL" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label for="apiKey">API Key</label>
+        <input id="apiKey" type="password" spellcheck="false" />
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="maxSteps">最大步数</label>
+        <input id="maxSteps" type="number" min="1" max="30" step="1" />
+      </div>
+      <div class="field">
+        <label for="temperature">温度</label>
+        <input id="temperature" type="number" min="0" max="2" step="0.1" />
+      </div>
+    </div>
+    <div class="actions">
+      <button id="testModel">测试模型</button>
+      <span class="hint" id="modelHint"></span>
+    </div>
+
+    <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+      <div class="checks" style="margin-bottom:10px">
+        <label><input type="checkbox" id="scheduleEnabled" /> 按时间段切换模型</label>
+      </div>
+      <table>
+        <thead>
+          <tr><th style="width:88px">开始</th><th style="width:88px">结束</th><th>模型</th><th style="width:170px">星期（不选=每天）</th><th style="width:44px"></th></tr>
+        </thead>
+        <tbody id="scheduleRows"></tbody>
+      </table>
+      <div class="actions" style="margin-top:8px">
+        <button id="addSchedule">加一条</button>
+        <span class="hint" id="scheduleHint">先命中先用；结束时间不包含在该段内；开始=结束表示全天；跨午夜写成 22:00 → 06:00。</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>网易云音乐（可选）</h2>
+    <div class="field">
+      <label for="neteaseAppId">AppID</label>
+      <input id="neteaseAppId" spellcheck="false" placeholder="在开放平台「应用详情」里复制" />
+    </div>
+    <div class="field">
+      <label for="neteasePrivateKey">PrivateKey（RSA 私钥）</label>
+      <textarea id="neteasePrivateKey" rows="4" spellcheck="false" placeholder="粘贴私钥，留空表示不修改"></textarea>
+      <div class="hint">
+        这是你**本人**的开放平台凭据，只存在本机配置里，不会随安装包分发。
+        没配置时音乐工具只报错、不会自动去点客户端。
+      </div>
+    </div>
+    <div class="actions">
+      <button id="saveNetease">保存凭据</button>
+      <button id="clearNetease">清除</button>
+      <span class="hint" id="neteaseHint"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>联网搜索（Tavily）</h2>
+    <div class="field">
+      <label for="searchKey">API Key</label>
+      <input id="searchKey" type="password" spellcheck="false" />
+      <div class="hint">留空表示不修改；没配 key 时助手根本看不到 <code>web_search</code> 工具。</div>
+    </div>
+    <div class="actions">
+      <button id="testSearch">测试搜索</button>
+      <button id="clearSearch">清除</button>
+      <span class="hint" id="searchHint"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>语音</h2>
+    <div class="row">
+      <div class="field">
+        <label for="emotion">情绪（音色参考）</label>
+        <select id="emotion"></select>
+      </div>
+      <div class="field">
+        <label for="speed">语速</label>
+        <select id="speed">
+          <option value="0.85">0.85（慢）</option>
+          <option value="1">1.0（正常）</option>
+          <option value="1.15">1.15（快）</option>
+        </select>
+      </div>
+    </div>
+    <div class="checks" style="margin-top:6px">
+      <label><input type="checkbox" id="ttsEnabled" /> 语音播报</label>
+      <label><input type="checkbox" id="continuousMode" /> 连续对话（每轮说完继续待命 9 秒）</label>
+      <label><input type="checkbox" id="voiceConfirmEnabled" /> 语音确认</label>
+      <label><input type="checkbox" id="subtitles" /> 显示字幕</label>
+      <label><input type="checkbox" id="autoStart" /> 开机自启</label>
+      <label><input type="checkbox" id="releaseOnFullscreen" /> 全屏时让出显存</label>
+    </div>
+    <div class="hint" style="margin-top:6px">开机自启只在安装版生效；「全屏时让出显存」在打游戏时关掉语音（唤醒仍可用），退出全屏自动恢复。</div>
+    <div class="actions" style="margin-top:12px">
+      <button id="testVoice">试听这句</button>
+      <span class="hint" id="voiceHint">第一次试听要等模型加载（约 20 秒）</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>权限（R7）</h2>
+    <div class="field">
+      <label for="mode">档位</label>
+      <select id="mode">
+        <option value="conservative">保守：连点击也要问</option>
+        <option value="standard">标准：低风险放行、不可逆询问</option>
+        <option value="permissive">宽松：只挡破坏性系统操作</option>
+        <option value="unattended">免确认（全放行）：删除/命令都不再问你</option>
+      </select>
+      <div class="hint" style="color:#ef5b5b">「免确认」= 一切放行，包括删除文件与执行命令。审计仍会记录；「暂停操作」依然优先。</div>
+    </div>
+    <table>
+      <thead><tr><th>能力</th><th style="width:150px">级别</th></tr></thead>
+      <tbody id="capabilities"></tbody>
+    </table>
+    <div class="hint" style="margin-top:8px">级别留空 = 跟随档位；单独指定会覆盖档位。</div>
+  </section>
+
+  <section>
+    <h2>最近审计</h2>
+    <pre id="audit">加载中…</pre>
+    <div class="actions" style="margin-top:10px">
+      <button id="exportAudit">导出全部</button>
+      <span class="hint" id="auditHint">导出到数据目录的 exports/ 下</span>
+    </div>
+  </section>
+</main>
+
+<script type="module" src="settings.js"></script>
+</body>
+</html>

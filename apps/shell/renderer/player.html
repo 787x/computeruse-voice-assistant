@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';" />
+<title>正在播放</title>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  body {
+    font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+    color: #2b2340;
+    -webkit-user-select: none; user-select: none;
+  }
+  /* 独立浮窗：比字幕卡片更"实"，因为它是常驻的 */
+  .panel {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(255,255,255,.96);
+    border: 1px solid rgba(138, 92, 246, .22);
+    box-shadow: 0 10px 28px rgba(74, 46, 130, .22);
+    box-sizing: border-box;
+  }
+  .meta { flex: 1; min-width: 0; }
+  .title {
+    font-size: 13.5px; font-weight: 600; line-height: 1.25;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .artist {
+    font-size: 11.5px; color: #7b7391; margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .bar {
+    height: 3px; border-radius: 2px; margin-top: 8px;
+    background: rgba(138, 92, 246, .16); overflow: hidden;
+  }
+  .bar i { display: block; height: 100%; width: 0%; background: #8a5cf6; transition: width 900ms linear; }
+  .controls { display: flex; align-items: center; gap: 5px; flex: none; }
+  .btn {
+    width: 28px; height: 28px; border-radius: 8px; cursor: pointer;
+    border: 1px solid rgba(138, 92, 246, .22); background: #fff; color: #4b3f6b;
+    font-size: 13px; line-height: 1; display: flex; align-items: center; justify-content: center;
+  }
+  .btn:hover { background: #f3eeff; }
+  .btn.main { background: #8a5cf6; border-color: #8a5cf6; color: #fff; }
+  .btn.main:hover { background: #7a49e8; }
+  /* 关闭 = 停止播放（不是暂停），所以用 ✕ 而不是 ⏸ */
+  .btn.close { border-color: rgba(209, 52, 56, .28); color: #d13438; }
+  .btn.close:hover { background: #fdeaea; }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <div class="meta">
+      <div class="title" id="title">—</div>
+      <div class="artist" id="artist"></div>
+      <div class="bar"><i id="fill"></i></div>
+    </div>
+    <div class="controls">
+      <button class="btn" id="prev" title="上一首">⏮</button>
+      <button class="btn main" id="toggle" title="播放/暂停">⏸</button>
+      <button class="btn" id="next" title="下一首">⏭</button>
+      <button class="btn close" id="close" title="停止播放">✕</button>
+    </div>
+  </div>
+  <script type="module" src="player.js"></script>
+</body>
+</html>
