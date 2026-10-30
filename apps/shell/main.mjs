@@ -386,7 +386,13 @@ function dismiss() {
 async function shutdown() {
   cancelActiveTurn('shutdown')
   // Revoke initialization immediately, before waiting for microphone/TTS shutdown.
-  const agentCleanup = agentInitialization.close()
+  const agentCleanup = agentInitialization.close().then(result => {
+    log(`agent cleanup result: ${JSON.stringify(result)}`)
+    return result
+  }).catch(error => {
+    log(`agent cleanup failed: ${error.stack ?? error.message}`)
+    return { ok: false, errors: [error.message] }
+  })
   log('shutdown requested')
   // 兜底：任何一步卡住都不能让"退出"变成没反应（实测过一次等 worker 不返回）
   const hardStop = setTimeout(() => {
@@ -1843,23 +1849,31 @@ async function ensureAgent(signal) {
     checkpoint()
     if (!apiKey) throw new Error('还没配置模型 API Key')
 
-    // 等待初始化副作用结束；取消后不再启动后续同步或保存。
-    await (async () => {
-      try {
-        // 带上"上次同步过的哈希"：内容没变就不要写 CLI，否则会把登录态顶掉
-        const result = await syncCredentialsAsync(config.netease ?? {}, { syncedHash: config.netease?.syncedHash, signal: initSignal })
-        checkpoint()
-        const synced = result.synced ?? []
-        if (synced.length > 0) log(`netease credentials synced: ${synced.join(', ')}`)
-        if (result.hash !== undefined && result.hash !== config.netease?.syncedHash) {
-          await store.saveConfig({ netease: { ...(config.netease ?? {}), syncedHash: result.hash } })
-          config.netease = { ...(config.netease ?? {}), syncedHash: result.hash }
+    // Prepare credentials only for a music invocation, serially within this runtime.
+    let musicQueue = Promise.resolve()
+    function prepareMusic(signal) {
+      const pending = musicQueue.then(async () => {
+        signal?.throwIfAborted()
+        const fresh = await store.loadConfig()
+        signal?.throwIfAborted()
+        const credentials = fresh.netease ?? {}
+        const result = await syncCredentialsAsync(credentials, { syncedHash: credentials.syncedHash, signal })
+        signal?.throwIfAborted()
+        const current = await store.loadConfig()
+        signal?.throwIfAborted()
+        if (current.netease?.appId !== credentials.appId || current.netease?.privateKey !== credentials.privateKey) {
+          throw new Error('音乐凭据已更新，请重试')
         }
-      } catch (error) {
-        checkpoint()
-        log(`netease sync failed: ${error.message}`)
-      }
-    })()
+        // A settings save during synchronization owns its new credentials; never overwrite it.
+        if (current.netease?.appId === credentials.appId && current.netease?.privateKey === credentials.privateKey
+            && result.hash !== undefined && result.hash !== current.netease?.syncedHash) {
+          await store.saveConfig({ netease: { ...current.netease, syncedHash: result.hash } })
+        }
+        signal?.throwIfAborted()
+      })
+      musicQueue = pending.catch(() => {})
+      return pending
+    }
 
     checkpoint()
     const startedAt = Date.now()
@@ -1895,6 +1909,8 @@ async function ensureAgent(signal) {
         if (name === 'kill_app') return runKillApp(args)
         if (name === 'system_info') return runSystemInfo(args)
         if (name === 'netease_music') {
+          await prepareMusic(signal)
+          signal?.throwIfAborted()
           /*
            * 音乐一律走官方 CLI，不去操纵客户端界面。
            * 未登录时把登录链接一起带回去——模型没法替用户点授权，

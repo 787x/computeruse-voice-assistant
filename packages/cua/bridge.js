@@ -110,10 +110,14 @@ export class NativeBridge {
    * 确保后端进程已启动并就绪；并发调用共享同一次启动。
    * @returns 就绪横幅的 data 部分
    */
+  get terminationFailure() { return this.#terminationFailure }
+  #terminationFailure = null
+
   async ensureStarted() {
     if (this.#disposed) throw new BridgeUnavailableError('computer-use backend has been disposed')
     if (this.alive && this.#readyInfo !== null) return this.#readyInfo
     if (this.#ready !== null) return await this.#ready
+    if (this.#child) throw new BridgeUnavailableError(`previous backend has not exited: ${this.#terminationFailure?.message ?? "termination pending"}`)
     if (this.#restarts > this.#maxRestarts) {
       throw new BridgeUnavailableError(
         `computer-use backend crashed ${this.#restarts} times and will not be restarted automatically` +
@@ -128,6 +132,7 @@ export class NativeBridge {
 
   async #start() {
     if (this.#scriptPath === '') throw new BridgeUnavailableError('native script path is not configured')
+    this.#readyInfo = null
     this.#stdoutBuffer = ''
     this.#exitInfo = null
     this.#stderrLines = []
@@ -174,19 +179,28 @@ export class NativeBridge {
     // 复盘：docs/reverse-engineering.md「CI 抓到的第一个真 bug」。
 
     child.stdout?.setEncoding?.('utf8')
-    child.stdout?.on?.('data', (chunk) => this.#onStdout(chunk))
+    child.stdout?.on?.('data', (chunk) => { if (this.#child === child && !this.#terminationPending) this.#onStdout(chunk) })
     child.stderr?.setEncoding?.('utf8')
-    child.stderr?.on?.('data', (chunk) => this.#onStderr(chunk))
+    child.stderr?.on?.('data', (chunk) => { if (this.#child === child) this.#onStderr(chunk) })
     child.on?.('error', (error) => {
+      if (this.#child !== child) return
       this.#failStart(new BridgeUnavailableError(
         `computer-use backend process error: ${error instanceof Error ? error.message : String(error)}`,
         error,
       ))
     })
-    child.on?.('exit', (code, signal) => {
+    child.once?.('exit', (code, signal) => {
+      if (this.#child !== child) return
+      this.#child = undefined
+      this.#terminationPending = false
+      child.stdout?.removeAllListeners?.('data')
+      child.stderr?.removeAllListeners?.('data')
+      child.removeAllListeners?.('error')
+      child.on?.('error', () => {})
       this.#exitInfo = { code, signal }
       // 重启计数只统计「曾经就绪的进程意外死亡」，并且 dispose 期间不算。
       if (this.#disposed !== true && this.#readyInfo !== null) this.#restarts += 1
+      this.#readyInfo = null
       const reason = new BridgeUnavailableError(
         `computer-use backend exited (code=${code ?? 'null'}${signal ? `, signal=${signal}` : ''})` +
           (this.#stderrLines.length > 0 ? `\nlast diagnostics:\n${this.diagnostics}` : ''),
@@ -205,6 +219,7 @@ export class NativeBridge {
       const info = await banner
       if (this.#disposed) throw new BridgeUnavailableError('computer-use backend has been disposed')
       clearTimeout(timer)
+      if (this.#child !== child || this.#terminationPending) throw new BridgeUnavailableError("backend terminated during startup")
       this.#readyInfo = info
       return info
     } catch (error) {
@@ -292,20 +307,21 @@ export class NativeBridge {
     }
   }
 
-  #kill() {
+  #terminationPending = false
+  #kill(retry = false) {
+    if (this.#terminationPending && !retry) return
     const child = this.#child
-    this.#child = undefined
-    if (child === undefined || child === null) return
+    this.#readyInfo = null
+    if (!child) return
+    this.#terminationPending = true
+    try { child.stdin?.end?.() } catch { /* kill remains necessary */ }
     try {
-      child.stdin?.end?.()
-    } catch {
-      /* 已经关了 */
+      if (child.kill?.() === false) throw new Error('child.kill() returned false')
+      this.#terminationFailure = null
+    } catch (error) {
+      this.#terminationFailure = error
     }
-    try {
-      child.kill?.()
-    } catch {
-      /* 已经退了 */
-    }
+    // Only the matching exit callback releases ownership, even if kill returned true.
   }
 
   /**
@@ -420,13 +436,13 @@ export class NativeBridge {
       child.once('exit', onExit)
     })
     // No shutdown command through the request queue: warmup may still be waiting for ready.
-    this.#kill()
+    this.#kill(true)
     let timer
     try {
       await Promise.race([exit, new Promise(resolve => { timer = setTimeout(resolve, 1000) })])
       if (!exited && child.exitCode == null && child.signalCode == null) {
         this.#child = child // Retain the handle so a later cleanup can retry.
-        throw new BridgeUnavailableError('computer-use backend did not exit after disposal')
+        throw new BridgeUnavailableError(`computer-use backend did not exit after disposal: ${this.#terminationFailure?.message ?? 'exit event pending'}`)
       }
     } finally {
       clearTimeout(timer)

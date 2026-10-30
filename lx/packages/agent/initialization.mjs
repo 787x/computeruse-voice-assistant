@@ -88,10 +88,12 @@ export class AgentInitialization {
     if (!promise) {
       promise = Promise.resolve().then(() => resource.dispose()).then(() => {
         this.#resources.delete(resource)
+        return { resource }
       }).catch(error => {
         // Keep ownership on failure so close() can retry; never orphan it silently.
         this.#disposals.delete(resource)
         try { this.#diagnostic(error) } catch { /* diagnostics must not reject detached cleanup */ }
+        return { resource, error }
       })
       this.#disposals.set(resource, promise)
     }
@@ -109,7 +111,16 @@ export class AgentInitialization {
     this.#runtime = null
     this.#loading = null
     this.#publish(null)
-    await Promise.all([...resources].map(resource => this.#dispose(resource)))
+    let failures = []
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const results = await Promise.all([...resources].map(resource => this.#dispose(resource)))
+      failures = results.filter(result => result.error)
+      resources.clear()
+      for (const result of failures) resources.add(result.resource)
+      if (!failures.length) break
+    }
+    return { ok: failures.length === 0, remaining: failures.length,
+      errors: failures.map(result => `${result.resource.constructor?.name ?? "Resource"}: ${result.error.message ?? String(result.error)}`) }
   }
 }
 function aborted() { return new DOMException('Agent initialization cancelled', 'AbortError') }

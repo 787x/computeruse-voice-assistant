@@ -384,7 +384,13 @@ function dismiss() {
 async function shutdown() {
   cancelActiveTurn('shutdown')
   // Revoke initialization immediately, before waiting for microphone/TTS shutdown.
-  const agentCleanup = agentInitialization.close()
+  const agentCleanup = agentInitialization.close().then(result => {
+    log(`agent cleanup result: ${JSON.stringify(result)}`)
+    return result
+  }).catch(error => {
+    log(`agent cleanup failed: ${error.stack ?? error.message}`)
+    return { ok: false, errors: [error.message] }
+  })
   log('shutdown requested')
   // 兜底：任何一步卡住都不能让"退出"变成没反应（实测过一次等 worker 不返回）
   const hardStop = setTimeout(() => {
@@ -1697,18 +1703,7 @@ async function ensureAgent(signal) {
     checkpoint()
     if (!apiKey) throw new Error('还没配置模型 API Key')
 
-    /*
-     * 音乐不再需要凭据：音源和账号都由 LX 自己管。
-     * 这里只探一下它在不在，日志里能看出"这次的音乐工具能不能用"。
-     */
-    await lxAvailable().then((ok) => {
-      checkpoint()
-      log(ok ? 'LX Music 可用（音乐工具就绪）' : 'LX Music 没开（点歌时会提示先启动它）')
-    }).catch((error) => {
-      checkpoint()
-      log(`LX availability check failed: ${error.message}`)
-    })
-
+    // LX availability is checked by runLx on demand; it is not an Agent prerequisite.
     checkpoint()
     const startedAt = Date.now()
     const toolkit = own(new cuaModule.CuaToolkit({ frameDir: join(DATA_ROOT, 'frames') }))

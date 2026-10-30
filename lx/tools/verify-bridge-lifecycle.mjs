@@ -7,7 +7,7 @@ import { NativeBridge } from '../packages/cua/bridge.js'
 import { CuaToolkit } from '../packages/cua/adapter.mjs'
 import { AgentInitialization } from '../packages/agent/initialization.mjs'
 const tick=()=>new Promise(r=>setImmediate(r))
-function fake() {
+function fake(options = {}) {
  const children=[],commands=[];let kills=0,live=0
  const spawnImpl=()=>{
   const child=new EventEmitter();child.stdout=new EventEmitter();child.stderr=new EventEmitter()
@@ -16,7 +16,7 @@ function fake() {
   child.kill=()=>{kills++;queueMicrotask(()=>{live--;child.signalCode='SIGTERM';child.emit('exit',null,'SIGTERM')})}
   children.push(child);return child
  }
- return {bridge:new NativeBridge({scriptPath:'test.ps1',spawnImpl}),children,commands,
+ return {bridge:new NativeBridge({scriptPath:'test.ps1',spawnImpl,...options}),children,commands,
   ready(){children[0].stdout.emit('data',JSON.stringify({event:'ready',id:null,data:{protocol:1}})+'\n')},
   get live(){return live},get kills(){return kills}}
 }
@@ -50,6 +50,49 @@ for(const phase of ['starting','banner-race','pending-call']) {
  await f.bridge.dispose()
  assert.equal(f.live,0);assert.equal(f.kills,1)
 }
+// Startup/request failures retain the live child, refuse restart and allow a later cleanup.
+for(const phase of ['startup-false','startup-throw','request-timeout','request-abort']) {
+ const f=fake({startupTimeoutMs:10,defaultTimeoutMs:10})
+ const started=f.bridge.ensureStarted(),child=f.children[0],kill=child.kill
+ child.kill=()=>{if(phase==='startup-throw')throw Error('kill denied');return false}
+ if(phase.startsWith('startup'))await assert.rejects(started)
+ else {
+  f.ready();await started
+  const controller=new AbortController()
+  const call=f.bridge.call('ping',{}, {signal:controller.signal})
+  const rejected=assert.rejects(call)
+  await tick();if(phase==='request-abort')controller.abort()
+  await rejected
+ }
+ assert.equal(f.bridge.alive,true)
+ assert.ok(f.bridge.terminationFailure)
+ await assert.rejects(f.bridge.ensureStarted(),/previous backend/)
+ assert.equal(f.children.length,1)
+ const failed=await Promise.allSettled([f.bridge.dispose()])
+ assert.equal(failed[0].status,'rejected')
+ assert.equal(f.bridge.alive,true)
+ child.kill=kill;await f.bridge.dispose()
+ assert.equal(f.bridge.alive,false);assert.equal(f.live,0)
+}
+// A delayed callback from an exited child cannot corrupt a replacement process/request.
+{
+ const f=fake({defaultTimeoutMs:10})
+ const first=f.bridge.ensureStarted();f.ready();await first
+ const old=f.children[0],stdout=old.stdout.listeners('data')[0],error=old.listeners('error')[0]
+ await assert.rejects(f.bridge.call('ping'))
+ await tick()
+ const second=f.bridge.ensureStarted(),child=f.children[1]
+ child.stdout.emit('data',JSON.stringify({event:'ready',id:null,data:{generation:2}})+'\n')
+ await second
+ stdout(JSON.stringify({event:'ready',id:null,data:{generation:1}})+'\n');error(Error('late error'));old.emit('exit',1,null)
+ assert.equal(f.bridge.readyInfo.generation,2)
+ assert.equal(old.stdout.listenerCount('data'),0)
+ const call=f.bridge.call('ping');await tick()
+ child.stdout.emit('data',JSON.stringify({id:f.commands.at(-1).id,ok:true,data:{safe:true}})+'\n')
+ assert.equal((await call).safe,true)
+ await f.bridge.dispose();assert.equal(f.live,0)
+}
+console.log('Fault ownership / delayed old callbacks: 5 scenarios PASS')
 console.log('Bridge lifecycle: 5 scenarios PASS (mock children, exit/kill/command counts asserted)')
 if(process.argv.includes('--real')) {
  assert.equal(process.platform,'win32','real PowerShell verification requires Windows')
