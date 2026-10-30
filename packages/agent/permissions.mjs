@@ -326,19 +326,15 @@ export class PermissionGate {
   }
 }
 
-/**
- * 把用户的一句话读成"答不答应"。
- *
- * 否定词必须先判：中文里"不用了""不要"里也含"用/要"，
- * 先匹配肯定词会把拒绝读成同意——这类错误在删除确认上代价最大。
- */
+/** Match complete confirmation/refusal utterances; ambiguity stays undecided. */
 export function parseConfirmText(raw) {
-  const text = String(raw ?? '').trim()
-  if (text === '') return null
-  if (/(取消|不要|不用|不行|不对|别|停|算了|拒绝|错了)/u.test(text)) {
+  // Whole utterances only; never search for affirmative substrings.
+  const text = String(raw ?? '').normalize('NFKC').replace(/\s/gu, '').replace(/[。.!！,，、]+$/u, '')
+  // Complete commands only: questions, quotations and negated cancellation stay undecided.
+  if (/^(?:取消(?:吧)?|不用(?:了)?|不对|错了|停|别|不行|不要(?:了|执行(?:了)?|确认这个东西)?|别执行(?:了)?|不可以|不同意|不确认|不允许|不执行|拒绝|算了(?:吧)?|停止(?:操作)?)$/u.test(text)) {
     return { allow: false, channel: 'voice', reason: `用户说：${text}` }
   }
-  if (/(确认|确定|可以|好的|好|执行|是的|对|允许|同意|继续)/u.test(text)) {
+  if (/^(?:(?:可以|确认|确定|同意|允许|好的|好|是的|对|执行|继续)(?:吧|了)?|可以[，,]?执行吧|我(?:同意|确认)|可以的|好啊)$/u.test(text)) {
     return { allow: true, channel: 'voice' }
   }
   return null

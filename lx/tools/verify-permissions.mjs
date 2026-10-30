@@ -163,6 +163,17 @@ results.push({
   verdict: speech.map((row) => `${row.text}→${row.allow}`).join(' '),
 })
 
+// Exact decisions, including former negative-substring false positives.
+const utterances = [
+ ...['可以','确认','确定','同意','允许','好的','好','是的','对','执行','继续','我同意','我确认','可以的','好啊','可以，执行吧',' 可以 。'].map(text=>[text,true]),
+ ...['不可以','不同意','不确认','不允许','不执行','不要执行','取消','不行','不对','错了','停','不用','别','不要','别执行','不用了','不要了','别执行了','不要执行了','取消吧','算了吧','停止操作'].map(text=>[text,false]),
+ ...['可以吗？','可不可以？','不是不可以','不要取消','我说的是可以','我说的是不可以','如果安全就确认','“确认”','我同意吗','为什么要取消','嗯…','','   '].map(text=>[text,null]),
+]
+for (const [text,expected] of utterances) {
+ const parsed=parseConfirmText(text)
+ results.push({name:`完整语音 ${text}`,pass:(parsed===null?null:parsed.allow)===expected,verdict:String(expected)})
+}
+
 console.log('权限引擎验收\n' + '='.repeat(64))
 for (const row of results) {
   console.log(`${row.pass ? '✓' : '✗'} ${row.name.padEnd(36, ' ')} ${row.verdict}`)

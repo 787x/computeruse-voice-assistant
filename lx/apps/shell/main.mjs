@@ -238,7 +238,7 @@ function ensureWindow() {
     event.preventDefault()
     quitApp('hud close')
   })
-  win.on('closed', () => { win = null })
+  win.on('closed', () => { closeConfirmCard(); win = null })
   return win
 }
 
@@ -355,6 +355,7 @@ function hideHud() {
 
 /** 对话结束后的调用点：R14 里"隐藏 vs 销毁"的决策也在这里。 */
 function dismiss() {
+  closeConfirmCard()
   /*
    * 用户点 HUD 的 × 就是"别干了"，不是"先躲一下"。
    * 之前只隐藏窗口、麦克风还开着，随便一点动静又把它叫醒——这就是"关不掉还复活"。
@@ -524,6 +525,7 @@ async function stopListening() {  if (!listening) return { ok: true, already: tr
 
 /** 唤醒命中：弹出小窗并进入"说指令"阶段 */
 function onWake(keyword) {
+  if (confirmResolver !== null) return // Do not replace a pending confirmation with a wake.
   /*
    * 设置窗口在前台时不响应唤醒词。
    * 用户点"保存"、敲键盘时，KWS 很容易被点击声/人声误触发，
@@ -636,6 +638,7 @@ function startAsrLoad() {
     try {
       const { Asr } = await import('../../packages/voice/asr.mjs')
       asr = new Asr()
+      if (confirmResolver !== null) syncConfirmVoice()
       log(`asr ready in ${Date.now() - startedAt}ms`)
       return asr
     } catch (error) {
@@ -671,7 +674,8 @@ function maybePrewarmAsr() {
 }
 
 /** 一句说完了：把字幕定稿，进入思考态 */
-function finishCommand(reason) {
+function finishCommand(reason, voiceEpoch = confirmVoiceEpoch, endpointText = null, requestId = pendingConfirmId) {
+  if (!commandActive || (confirmResolver !== null && (voiceEpoch !== confirmVoiceEpoch || requestId !== pendingConfirmId))) return
   commandActive = false
   clearTimeout(commandTimer)
 
@@ -682,9 +686,11 @@ function finishCommand(reason) {
     followUpWindowStart = 0
   }
 
-  let text = asr === null ? '' : asr.flush()
+  const flushed = asr === null ? '' : asr.flush()
+  let text = endpointText !== null ? endpointText : flushed
+  if (confirmResolver !== null && (requestId !== pendingConfirmId || voiceEpoch !== confirmVoiceEpoch)) return
   if (reason === 'timeout') log(`command timeout, tail="${text}"`)
-  if (text === '' && lastCommandText !== '') {
+  if (confirmResolver === null && text === '' && lastCommandText !== '') {
     // 端点已判过：flush 可能是空的，用最后一次 partial 兜底
     text = lastCommandText
   }
@@ -692,10 +698,13 @@ function finishCommand(reason) {
 
   // 正在等确认：这句话是"答不答应"，不是新指令
   if (confirmResolver !== null) {
-    const answer = parseConfirmText(text)
+    const answer = voiceConfirmEnabled ? parseConfirmText(text) : null
     log(`confirm heard: "${text}" → ${answer === null ? '未表态' : (answer.allow ? '允许' : '拒绝')}`)
-    if (answer !== null) settleConfirm(answer)
-    else sendSubtitle({ hint: '说「确认」或「取消」' })
+    if (answer !== null) settleConfirm({ ...answer, epoch: voiceEpoch }, requestId, confirmVoiceSource)
+    else {
+      sendSubtitle({ hint: '可以说「确认」或「取消」，也可以点击按钮' })
+      syncConfirmVoice()
+    }
     return
   }
 
@@ -894,6 +903,8 @@ let userBargeInAt = 0
 let permissionGate = null
 /** 正在等确认的那个请求；null 表示没有待确认的事 */
 let confirmResolver = null
+let confirmSequence = 0
+let pendingConfirmId = null
 /** 待确认请求对应的能力（"允许 15 分钟"要按能力记授权） */
 let pendingConfirmCapability = null
 /**
@@ -907,6 +918,25 @@ const CONFIRM_TIMEOUT_MS = Number(process.env.CUA_VA_CONFIRM_TIMEOUT ?? 180000)
 let permissionMode = 'standard'
 /** 语音确认通道总开关（托盘可关，关了就只能点按钮） */
 let voiceConfirmEnabled = true
+let confirmVoiceEpoch = 0
+const confirmVoiceSource = Symbol('local ASR confirmation')
+function setVoiceConfirmEnabled(enabled) {
+  voiceConfirmEnabled = enabled
+  if (confirmResolver !== null) syncConfirmVoice()
+}
+function syncConfirmVoice() {
+  confirmVoiceEpoch += 1
+  clearTimeout(commandTimer)
+  commandActive = false
+  heardAny = false
+  lastCommandText = ''
+  lastSentPartial = ''
+  asr?.reset()
+  if (confirmResolver !== null && voiceConfirmEnabled && listening && asr !== null) {
+    commandActive = true
+    commandStartAt = Date.now() + 300
+  }
+}
 /** 连续对话：说完一轮继续待命，等用户接着讲（托盘可关 = 单次对话） */
 let continuousMode = process.env.CUA_VA_SINGLE_TURN === '1' ? false : true
 /** 合成用的情绪与语速（来自设置页，跟着音色包里的参考音频走） */
@@ -1764,7 +1794,15 @@ function summarizeArgsForCard(tool, args) {
 
 /** 等用户确认：语音或点击，谁先到算谁 */
 async function askUser(request) {
-  const card = describeRequest(request)
+  if (request.signal?.aborted) return { allow: false, channel: 'cancelled' }
+  closeConfirmCard()
+  const id = ++confirmSequence
+  pendingConfirmId = id
+  commandActive = false
+  clearTimeout(commandTimer)
+  asr?.reset()
+  lastCommandText = ''
+  const card = { ...describeRequest(request), id }
   pendingConfirmCapability = request.capability ?? null
   stopSpeaking()
   setState('confirm')
@@ -1774,45 +1812,44 @@ async function askUser(request) {
   if (win !== null && !win.isDestroyed()) win.webContents.send('hud:confirm', card)
   log(`confirm asked: ${card.text} (${card.detail})`)
 
-  // 语音通道：开一个短识别窗口，听"确认"或"取消"（托盘可关）
-  if (voiceConfirmEnabled) {
-    if (asr !== null) asr.reset()
-    commandActive = true
-    heardAny = false
-    lastCommandText = ''
-    lastSentPartial = ''
-    commandStartAt = Date.now() + 300
-  }
 
   return new Promise((resolve) => {
-    // 测试钩子：CUA_VA_AUTO_CONFIRM=allow|deny 时自动答复。
-    // 只在自动化里用，日志会明确标出，避免被当成"用户真的同意了"。
     const auto = process.env.CUA_VA_AUTO_CONFIRM
-    if (auto === 'allow' || auto === 'deny') {
-      setTimeout(() => {
-        log(`confirm auto-answer (test hook): ${auto}`)
-        settleConfirm(auto === 'allow'
-          ? { allow: true, channel: 'auto-test' }
-          : { allow: false, channel: 'auto-test', reason: '测试钩子：自动拒绝' })
-      }, 200)
-    }
-
+    const autoTimer = (auto === 'allow' || auto === 'deny') ? setTimeout(() => {
+      log(`confirm auto-answer (test hook): ${auto}`)
+      settleConfirm(auto === 'allow'
+        ? { allow: true, channel: 'auto-test' }
+        : { allow: false, channel: 'auto-test', reason: '测试钩子：自动拒绝' }, id)
+    }, 200) : null
     const timer = setTimeout(() => {
-      settleConfirm({ allow: false, channel: 'timeout', reason: `等了 ${Math.round(CONFIRM_TIMEOUT_MS / 1000)} 秒没有回应，按未同意处理` })
+      settleConfirm({ allow: false, channel: 'timeout', reason: `等了 ${Math.round(CONFIRM_TIMEOUT_MS / 1000)} 秒没有回应，按未同意处理` }, id)
     }, CONFIRM_TIMEOUT_MS)
 
     confirmResolver = (value) => {
       clearTimeout(timer)
+      clearTimeout(autoTimer)
+      request.signal?.removeEventListener('abort', onAbort)
       confirmResolver = null
+      pendingConfirmId = null
+      confirmVoiceEpoch += 1
+      clearTimeout(commandTimer)
+      asr?.reset()
+      lastCommandText = ''
       commandActive = false
       lastSentPartial = ''
       resolve(value)
     }
+    const onAbort = () => settleConfirm({ allow: false, channel: 'cancelled', reason: '回合已取消' }, id)
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+    if (request.signal?.aborted) onAbort()
+    else syncConfirmVoice()
   })
 }
 
 /** 决议一次确认（语音/点击/超时都走这里，只会生效一次） */
-function settleConfirm(value) {
+function settleConfirm(value, id = pendingConfirmId, trustedClick = false) {
+  if (id === null || id !== pendingConfirmId) return
+  if (value?.channel === 'voice' && (!voiceConfirmEnabled || value.epoch !== confirmVoiceEpoch || trustedClick !== confirmVoiceSource)) return
   const resolver = confirmResolver
   if (resolver === null) return
   // "允许 15 分钟"：记一次临时授权，避免同一个动作反复弹卡片
@@ -1998,7 +2035,10 @@ async function runCommand(text) {
  */
 function feedCommandAudio(chunk) {
   if (!commandActive || asr === null || Date.now() < commandStartAt) return null
+  const epoch = confirmVoiceEpoch
+  const requestId = pendingConfirmId
   const heard = asr.push(chunk)
+  if (confirmResolver !== null && (!voiceConfirmEnabled || epoch !== confirmVoiceEpoch || requestId !== pendingConfirmId)) return null
   if (heard.partial !== '') {
     heardAny = true
     lastCommandText = heard.partial
@@ -2010,7 +2050,7 @@ function feedCommandAudio(chunk) {
   }
   if (heard.final !== null) {
     lastCommandText = heard.final
-    finishCommand('endpoint')
+    finishCommand('endpoint', epoch, heard.final, requestId)
   }
   return heard
 }
@@ -2209,7 +2249,7 @@ async function loadUiPrefs() {
     const ui = config.ui ?? {}
     if (typeof ui.ttsEnabled === 'boolean') ttsEnabled = ui.ttsEnabled
     if (typeof ui.continuousMode === 'boolean') continuousMode = ui.continuousMode
-    if (typeof ui.voiceConfirmEnabled === 'boolean') voiceConfirmEnabled = ui.voiceConfirmEnabled
+    if (typeof ui.voiceConfirmEnabled === 'boolean') setVoiceConfirmEnabled(ui.voiceConfirmEnabled)
     if (typeof ui.subtitles === 'boolean') subtitlesEnabled = ui.subtitles
     if (typeof ui.releaseOnFullscreen === 'boolean') releaseOnFullscreen = ui.releaseOnFullscreen
     if (typeof ui.wakeEnabled === 'boolean') wakeOnLaunch = ui.wakeEnabled
@@ -2350,7 +2390,7 @@ function registerSettingsIpc() {
       // 立刻生效（不用重启）——这些都是内存里的开关与默认值
       if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled
       if (typeof payload?.ui?.continuousMode === 'boolean') continuousMode = payload.ui.continuousMode
-      if (typeof payload?.ui?.voiceConfirmEnabled === 'boolean') voiceConfirmEnabled = payload.ui.voiceConfirmEnabled
+      if (typeof payload?.ui?.voiceConfirmEnabled === 'boolean') setVoiceConfirmEnabled(payload.ui.voiceConfirmEnabled)
       if (typeof payload?.ui?.subtitles === 'boolean') subtitlesEnabled = payload.ui.subtitles
       if (typeof payload?.ui?.autoStart === 'boolean') {
         autoStartEnabled = payload.ui.autoStart
@@ -2612,7 +2652,7 @@ function buildTray() {
       log(`ttsEnabled=${ttsEnabled}`)
     } },
     { label: '语音确认', type: 'checkbox', checked: voiceConfirmEnabled, click: (item) => {
-      voiceConfirmEnabled = item.checked
+      setVoiceConfirmEnabled(item.checked)
       void saveUiPrefs()
       log(`voiceConfirmEnabled=${voiceConfirmEnabled}`)
     } },
@@ -2831,11 +2871,13 @@ if (!gotSingleInstanceLock) {
 
   // 播放浮窗上的按钮：prev / toggle / next
   // 确认卡片上的按钮：允许 / 允许 15 分钟 / 取消
-  ipcMain.on('hud:confirm', (_event, answer) => {
-    log(`hud:confirm received from renderer: ${JSON.stringify(answer)}`)
-    if (answer === true) settleConfirm({ allow: true, channel: 'click' })
-    else if (answer === 'once') settleConfirm({ allow: true, channel: 'click', once: true })
-    else settleConfirm({ allow: false, channel: 'click', reason: '用户点了取消' })
+  ipcMain.on('hud:confirm', (event, payload) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents
+        || event.senderFrame !== win.webContents.mainFrame) return
+    const { id, answer } = payload ?? {}
+    if (!Number.isInteger(id) || ![true, false, 'once'].includes(answer)) return
+    settleConfirm({ allow: answer === true || answer === 'once', channel: 'click',
+      once: answer === 'once', reason: answer === false ? '用户点了取消' : '' }, id, true)
   })
 
   // 麦克风权限：只放行 media，其余一律拒绝

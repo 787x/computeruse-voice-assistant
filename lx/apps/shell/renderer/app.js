@@ -268,9 +268,9 @@ window.hud.onSubtitle((payload) => {
 })
 
 $('close').addEventListener('click', () => window.hud.dismiss())
-$('allow').addEventListener('click', () => window.hud.answerConfirm(true))
-$('allowOnce').addEventListener('click', () => window.hud.answerConfirm('once'))
-$('deny').addEventListener('click', () => window.hud.answerConfirm(false))
+$('allow').addEventListener('click', () => { if (confirmData) window.hud.answerConfirm(confirmData.id, true) })
+$('allowOnce').addEventListener('click', () => { if (confirmData) window.hud.answerConfirm(confirmData.id, 'once') })
+$('deny').addEventListener('click', () => { if (confirmData) window.hud.answerConfirm(confirmData.id, false) })
 
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') window.hud.dismiss()
