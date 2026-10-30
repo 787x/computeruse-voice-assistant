@@ -552,9 +552,12 @@ $('save').addEventListener('click', async () => {
     if (payload.systemPrompt === null) restoredDefault = true
     if (result.warnings && result.warnings.length > 0) {
       // 磁盘已保存但部分运行时同步失败——明确告知用户哪些没生效
-      setStatus(`已保存，但有 ${result.warnings.length} 项未即时生效：${result.warnings.join('；')}`, 'warn')
+      const warningText = `已保存，但有 ${result.warnings.length} 项未即时生效：${result.warnings.join('；')}`
+      setStatus(warningText, 'warn')
+      $('status').title = warningText
     } else {
       setStatus('已保存', 'ok')
+      $('status').title = ''
     }
   } else {
     // 保存失败：loadedPrompt 不变（还是加载时的原值），

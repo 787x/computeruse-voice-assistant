@@ -16,25 +16,17 @@ import { normalizeSystemPromptForStorage } from '../agent/system-prompt.mjs'
 const CONFIG_DIR = process.env.CUA_VA_CONFIG_DIR ?? join(process.cwd(), '.config')
 const CONFIG_PATH = join(CONFIG_DIR, 'agent.json')
 
-/** 当前配置目录（可动态修改，供 --settings-test 隔离使用） */
-let currentConfigDir = CONFIG_DIR
-let currentConfigPath = CONFIG_PATH
-
-/** 设置配置目录（供测试隔离使用）。必须在任何 loadConfig/saveConfig 调用前设置。 */
-export function setConfigDir(dir) {
-  currentConfigDir = dir
-  currentConfigPath = join(dir, 'agent.json')
-}
-
-/** 获取当前配置路径（供日志/审计使用） */
-export function getConfigPath() {
-  return currentConfigPath
-}
+/**
+ * P2: 配置路径一致性——不再使用模块级可变变量。
+ * store 在 import 时读取 CUA_VA_CONFIG_DIR，之后不再改变。
+ * 这保证一次保存操作（loadConfig → 校验 → 临时写入 → rename）始终操作同一目录。
+ * --settings-test 在启动最早期设置环境变量，所有后续操作都走临时目录。
+ */
 
 /** 读取原始配置（含明文密钥），供内部调用。落盘的 `enc:` 密文在这里解回明文。 */
 export async function loadConfig() {
   try {
-    const raw = await readFile(currentConfigPath, 'utf8')
+    const raw = await readFile(CONFIG_PATH, 'utf8')
     const parsed = JSON.parse(raw)
     const merged = { ...defaultConfig(), ...parsed }
     merged.apiKey = decryptField(merged.apiKey)
@@ -252,12 +244,12 @@ async function saveConfigOnce(patch, { signal, expectedCredentials } = {}) {
   }
 
   signal?.throwIfAborted()
-  await mkdir(currentConfigDir, { recursive: true })
-  const tmp = `${currentConfigPath}.tmp`
+  await mkdir(CONFIG_DIR, { recursive: true })
+  const tmp = `${CONFIG_PATH}.tmp`
   signal?.throwIfAborted()
   await writeFile(tmp, JSON.stringify(next, null, 2), 'utf8')
   signal?.throwIfAborted()
-  await rename(tmp, currentConfigPath)
+  await rename(tmp, CONFIG_PATH)
   return loadPublicConfig()
 }
 
@@ -287,7 +279,7 @@ export function listProviders() {
 }
 
 export function getConfigFile() {
-  return currentConfigPath
+  return CONFIG_PATH
 }
 
 /** 兼容旧代码：动态获取当前配置文件路径 */

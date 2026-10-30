@@ -22,6 +22,7 @@
   #status { font-size: 12px; color: var(--muted); min-width: 120px; text-align: right; }
   #status.ok { color: var(--ok); }
   #status.bad { color: var(--bad); }
+  #status.warn { color: var(--warn, #f5a623); font-weight: 500; }
   main { padding: 18px 20px 28px; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
   section > h2 { font-size: 13px; margin: 0 0 14px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
@@ -72,7 +73,7 @@
 <header>
   <h1>语音助手 · 设置</h1>
   <span class="spacer"></span>
-  <span id="status"></span>
+  <span id="status" title=""></span>
   <button class="primary" id="save">保存</button>
 </header>
 
