@@ -685,7 +685,7 @@ function maybePrewarmAsr() {
 }
 
 /** 一句说完了：把字幕定稿，进入思考态 */
-function finishCommand(reason, voiceEpoch = confirmVoiceEpoch) {
+function finishCommand(reason, voiceEpoch = confirmVoiceEpoch, endpointText = null, requestId = pendingConfirmId) {
   if (!commandActive || (confirmResolver !== null && voiceEpoch !== confirmVoiceEpoch)) return
   commandActive = false
   clearTimeout(commandTimer)
@@ -697,9 +697,11 @@ function finishCommand(reason, voiceEpoch = confirmVoiceEpoch) {
     followUpWindowStart = 0
   }
 
-  let text = asr === null ? '' : asr.flush()
+  const flushed = asr === null ? '' : asr.flush()
+  let text = endpointText !== null ? endpointText : flushed
+  if (confirmResolver !== null && (requestId !== pendingConfirmId || voiceEpoch !== confirmVoiceEpoch)) return
   if (reason === 'timeout') log(`command timeout, tail="${text}"`)
-  if (text === '' && lastCommandText !== '') {
+  if (confirmResolver === null && text === '' && lastCommandText !== '') {
     // 端点已判过：flush 可能是空的，用最后一次 partial 兜底
     text = lastCommandText
   }
@@ -709,9 +711,9 @@ function finishCommand(reason, voiceEpoch = confirmVoiceEpoch) {
   if (confirmResolver !== null) {
     const answer = voiceConfirmEnabled ? parseConfirmText(text) : null
     log(`confirm heard: "${text}" → ${answer === null ? '未表态' : (answer.allow ? '允许' : '拒绝')}`)
-    if (answer?.allow === false) settleConfirm({ ...answer, epoch: voiceEpoch }, pendingConfirmId)
+    if (answer !== null) settleConfirm({ ...answer, epoch: voiceEpoch }, requestId, confirmVoiceSource)
     else {
-      sendSubtitle({ hint: '请点击按钮批准；语音仅可取消（需开启语音取消）' })
+      sendSubtitle({ hint: '可以说「确认」或「取消」，也可以点击按钮' })
       syncConfirmVoice()
     }
     return
@@ -956,6 +958,7 @@ let permissionMode = 'standard'
 /** 语音确认通道总开关（托盘可关，关了就只能点按钮） */
 let voiceConfirmEnabled = true
 let confirmVoiceEpoch = 0
+const confirmVoiceSource = Symbol('local ASR confirmation')
 function setVoiceConfirmEnabled(enabled) {
   voiceConfirmEnabled = enabled
   if (confirmResolver !== null) syncConfirmVoice()
@@ -1805,8 +1808,8 @@ async function ensureAgent(signal) {
 /**
  * 权限门。**所有工具调用都从这里过**（agent 的 gate 回调）。
  *
- * 确认通道仅允许可信卡片点击批准：
- *   HUD 弹卡片 + 同时开一个识别窗口，仅点击可以批准，语音只可取消；
+ * 确认通道支持本机语音和受保护的卡片点击：
+ *   HUD 弹卡片 + 同时开一个识别窗口，可以语音确认/取消，也可以点击按钮；
  *   不吭声 12 秒按拒绝处理——安全的那一侧永远是"不做"。
  */
 async function ensurePermissions() {
@@ -1841,7 +1844,7 @@ function summarizeArgsForCard(tool, args) {
   return parts.length === 0 ? `工具：${tool}` : `工具：${tool} · ${parts.join(' · ')}`
 }
 
-/** 等用户点击批准，或取消/超时拒绝 */
+/** 等用户语音或点击确认；取消/超时按拒绝处理 */
 async function askUser(request) {
   if (request.signal?.aborted) return { allow: false, channel: 'cancelled' }
   closeConfirmCard()
@@ -1890,8 +1893,9 @@ async function askUser(request) {
 /** 决议一次确认（语音/点击/超时都走这里，只会生效一次） */
 function settleConfirm(value, id = pendingConfirmId, trustedClick = false) {
   if (id === null || id !== pendingConfirmId) return
-  if (value?.channel === 'voice' && (!voiceConfirmEnabled || value.epoch !== confirmVoiceEpoch)) return
-  if (value?.allow === true && (!trustedClick || value?.channel !== 'click')) return
+  if (value?.channel === 'voice' && (!voiceConfirmEnabled || value.epoch !== confirmVoiceEpoch || trustedClick !== confirmVoiceSource)) return
+  if (value?.allow === true && !((value.channel === 'click' && trustedClick === true)
+      || (value.channel === 'voice' && trustedClick === confirmVoiceSource))) return
   const resolver = confirmResolver
   if (resolver === null) return
   // "允许 15 分钟"：记一次临时授权，避免同一个动作反复弹卡片
@@ -2096,8 +2100,9 @@ async function runCommand(text) {
 function feedCommandAudio(chunk) {
   if (!commandActive || asr === null || Date.now() < commandStartAt) return null
   const epoch = confirmVoiceEpoch
+  const requestId = pendingConfirmId
   const heard = asr.push(chunk)
-  if (confirmResolver !== null && (!voiceConfirmEnabled || epoch !== confirmVoiceEpoch)) return null
+  if (confirmResolver !== null && (!voiceConfirmEnabled || epoch !== confirmVoiceEpoch || requestId !== pendingConfirmId)) return null
   if (heard.partial !== '') {
     heardAny = true
     lastCommandText = heard.partial
@@ -2109,7 +2114,7 @@ function feedCommandAudio(chunk) {
   }
   if (heard.final !== null) {
     lastCommandText = heard.final
-    finishCommand('endpoint', epoch)
+    finishCommand('endpoint', epoch, heard.final, requestId)
   }
   return heard
 }
@@ -2710,7 +2715,7 @@ function buildTray() {
       void saveUiPrefs()
       log(`ttsEnabled=${ttsEnabled}`)
     } },
-    { label: '语音取消', type: 'checkbox', checked: voiceConfirmEnabled, click: (item) => {
+    { label: '语音确认', type: 'checkbox', checked: voiceConfirmEnabled, click: (item) => {
       setVoiceConfirmEnabled(item.checked)
       void saveUiPrefs()
       log(`voiceConfirmEnabled=${voiceConfirmEnabled}`)

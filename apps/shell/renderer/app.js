@@ -135,7 +135,7 @@ const RENDER = {
     clearAll()
     els.dot.classList.add('speak')
     els.title.textContent = '需要你确认'
-    els.sub.textContent = '请点击按钮批准；语音仅可取消（需开启语音取消）'
+    els.sub.textContent = '可以说「确认」或「取消」，也可以点击按钮'
     if (confirmData !== null) {
       els.subs.append(para(confirmData.text, 'current'))
       els.confirmWhat.textContent = confirmData.detail

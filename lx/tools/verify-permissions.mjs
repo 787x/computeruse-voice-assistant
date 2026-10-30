@@ -144,8 +144,8 @@ results.push({ name: '能力表非空且每项有级别', pass: missing.length =
 
 // 19. 语音确认的读法：否定优先，模糊话不表态
 const speech = [
-  { text: '确认', allow: null },
-  { text: '可以，执行吧', allow: null },
+  { text: '确认', allow: true },
+  { text: '可以，执行吧', allow: true },
   { text: '不用了', allow: false },
   { text: '不要确认这个东西', allow: false },
   { text: '取消', allow: false },
@@ -163,13 +163,13 @@ results.push({
   verdict: speech.map((row) => `${row.text}→${row.allow}`).join(' '),
 })
 
-// Even a faulty parser or injected confirmer must not approve through speech.
-for (const channel of ['voice', 'auto-test', 'unknown', undefined]) {
+// Unknown and test channels are not user confirmation channels.
+for (const channel of ['auto-test', 'unknown', undefined]) {
   const boundary = new PermissionGate({ confirm: async () => ({ allow: true, channel }) })
   const v = await boundary.check({ tool: 'read_clipboard' })
   results.push({ name: `批准边界 ${channel}`, pass: !v.allow, verdict: v.channel })
 }
-for (const text of ['不可以','不同意','不确认','不允许','不执行','确认吗？','确定？','如果安全就确认','好像可以','确认取消吗','可以但是先等等','确人','同意','yes']) {
+for (const text of ['不可以','不同意','不确认','不允许','不执行','确认吗？','确定？','如果安全就确认','好像可以','确认取消吗','可以但是先等等','确人','yes']) {
   results.push({ name: `语音不得批准 ${text}`, pass: parseConfirmText(text)?.allow !== true, verdict: text })
 }
 
@@ -180,6 +180,17 @@ for (const text of ['不要取消','你是说取消吗','为什么要取消','�
   results.push({ name: `歧义保持等待 ${text}`, pass: parseConfirmText(text) === null, verdict: text })
 }
 
+for (const text of ['可以','确认','确定','同意','允许','好的','好','是的','对','执行','继续','可以吧','可以，执行吧','  确 认 。']) {
+  results.push({name:`完整肯定 ${text}`,pass:parseConfirmText(text)?.allow===true,verdict:text})
+}
+for (const text of ['可以吗？','可不可以？','不是不可以','我说的是可以','我说的是不可以','如果安全就确认','"确认"','']) {
+  results.push({name:`歧义不决定 ${text}`,pass:parseConfirmText(text)===null,verdict:text})
+}
+{
+ const voiceGate=new PermissionGate({confirm:async()=>parseConfirmText('可以')})
+ const verdict=await voiceGate.check({tool:'read_clipboard'})
+ results.push({name:'真实解析同意通过权限门',pass:verdict.allow&&verdict.channel==='voice',verdict:verdict.channel})
+}
 console.log('权限引擎验收\n' + '='.repeat(64))
 for (const row of results) {
   console.log(`${row.pass ? '✓' : '✗'} ${row.name.padEnd(36, ' ')} ${row.verdict}`)

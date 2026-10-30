@@ -269,11 +269,11 @@ export class PermissionGate {
     })
 
     return this.#finish({
-      allow: answer?.allow === true && answer?.channel === 'click',
+      allow: answer?.allow === true && ['click', 'voice'].includes(answer?.channel),
       level: 'ask',
       capability: verdict.capability,
       channel: answer?.channel ?? 'unknown',
-      reason: answer?.allow === true && answer?.channel === 'click'
+      reason: answer?.allow === true && ['click', 'voice'].includes(answer?.channel)
         ? ''
         : (answer?.reason ?? '用户没有确认'),
       tool, args, utterance, started,
@@ -327,13 +327,16 @@ export class PermissionGate {
   }
 }
 
-/** 语音只能明确取消；所有肯定、疑问及不确定输入均不授权。 */
+/** 只接受完整的确认/拒绝表达；疑问、引用和歧义保持等待。 */
 export function parseConfirmText(raw) {
-  // Speech is cancellation-only. Match complete phrases, never affirmative substrings.
+  // Whole utterances only; never search for affirmative substrings.
   const text = String(raw ?? '').normalize('NFKC').replace(/\s/gu, '').replace(/[。.!！,，、]+$/u, '')
   // Complete commands only: questions, quotations and negated cancellation stay undecided.
   if (/^(?:取消(?:吧)?|不用了|不行|不要(?:了|执行(?:了)?|确认这个东西)?|别执行(?:了)?|不可以|不同意|不确认|不允许|不执行|拒绝|算了(?:吧)?|停止(?:操作)?)$/u.test(text)) {
     return { allow: false, channel: 'voice', reason: `用户说：${text}` }
+  }
+  if (/^(?:(?:可以|确认|确定|同意|允许|好的|好|是的|对|执行|继续)(?:吧|了)?|可以[，,]?执行吧)$/u.test(text)) {
+    return { allow: true, channel: 'voice' }
   }
   return null
 }

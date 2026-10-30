@@ -44,6 +44,14 @@ let confirmationId = null
 ipcRenderer.on('hud:confirm', (_event, card) => { confirmationId = card?.id ?? null })
 ipcRenderer.on('hud:confirmDone', () => { confirmationId = null })
 window.addEventListener('DOMContentLoaded', () => {
+  window.addEventListener('keydown', (event) => {
+    if (!event.isTrusted || event.repeat || event.key !== 'Enter' || confirmationId === null) return
+    if (event.target?.closest?.('button,input,textarea,select,[contenteditable]')) return
+    event.preventDefault()
+    const id = confirmationId
+    confirmationId = null
+    ipcRenderer.send('hud:confirm', { id, answer: true })
+  })
   for (const [name, answer] of [['allow', true], ['allowOnce', 'once'], ['deny', false]]) {
     const button = document.getElementById(name)
     button?.addEventListener('click', (event) => {

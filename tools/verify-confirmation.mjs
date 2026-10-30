@@ -1,32 +1,32 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import vm from 'node:vm'
+import {parseConfirmText,PermissionGate} from '../packages/agent/permissions.mjs'
 const source = await readFile(new URL('../apps/shell/main.mjs', import.meta.url), 'utf8').then(s => s.replace(/\r\n/g, '\n'))
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start))) }
 const timers = []
-const ctx = vm.createContext({ console, setTimeout: fn => (timers.push(fn), timers.length), clearTimeout() {} })
+const ctx = vm.createContext({ console, parseConfirmText, setTimeout: fn => (timers.push(fn), timers.length), clearTimeout() {} })
 vm.runInContext(`
 let confirmResolver=null, confirmSequence=0, pendingConfirmId=null, pendingConfirmCapability=null;
 let commandActive=false, commandTimer=null, asr={reset(){},flush(){return '确认吗？'}}, lastCommandText='',lastSentPartial='';
-let listening=true; let confirmVoiceEpoch=0; let voiceConfirmEnabled=true, heardAny=false, commandStartAt=0, hideTimer=null, activeTurn=null,currentState='hidden';
+let listening=true; let confirmVoiceEpoch=0; const confirmVoiceSource=Symbol('ASR'); let voiceConfirmEnabled=true, heardAny=false, commandStartAt=0, hideTimer=null, activeTurn=null,currentState='hidden';
 let followUpWindowStart=0, grants=0, permissionGate={grantOnce(){grants++;return Date.now()}};
 let win={isDestroyed:()=>false,webContents:{send(){}, mainFrame:{}}};
 const CONFIRM_TIMEOUT_MS=12000;
 function describeRequest(){return {text:'test',detail:'test'}}
 function stopSpeaking(){} function setState(s){currentState=s} function sendSubtitle(){} function log(){}
-function parseConfirmText(){return {allow:true,channel:'voice'}}
 ${section('function setVoiceConfirmEnabled(enabled)', '\n/**')}
 ${section('async function askUser(request)', '/**\n * 收掉卡片')}
 ${section('function closeConfirmCard()', '\n}').concat('\n}')}
 ${section('function onWake(keyword)', '\n}').concat('\n}')}
-${section('function finishCommand(reason, voiceEpoch = confirmVoiceEpoch)', '\n}').concat('\n}')}
+${section('function finishCommand(reason, voiceEpoch = confirmVoiceEpoch, endpointText = null, requestId = pendingConfirmId)', '\n}').concat('\n}')}
 let ipcHandler;
 const ipcMain={on(name,handler){ipcHandler=handler}};
 ${section("  ipcMain.on('hud:confirm',", '\n\n  // 麦克风')}
 `, ctx)
 const run = code => vm.runInContext(code,ctx)
 run("var p=askUser({capability:'clipboard.read'}); var first=pendingConfirmId")
-run("onWake('wake'); finishCommand('endpoint')") // injected affirmative parser must leave card usable
+run("onWake('wake'); finishCommand('endpoint')") // ambiguous real parser result must leave the card usable
 assert.equal(run('confirmResolver !== null && commandActive'),true)
 run("settleConfirm({allow:true,channel:'voice',once:true})")
 assert.equal(run('grants'),0)
@@ -47,9 +47,9 @@ run("var r=askUser({}); closeConfirmCard()")
 assert.equal((await run('r')).allow,false)
 run('var t=askUser({})'); timers.at(-1)()
 assert.equal((await run('t')).channel,'timeout')
-run("var u=askUser({}); voiceConfirmEnabled=true; settleConfirm({allow:false,channel:'voice',epoch:confirmVoiceEpoch})")
+run("var u=askUser({}); voiceConfirmEnabled=true; settleConfirm({allow:false,channel:'voice',epoch:confirmVoiceEpoch},pendingConfirmId,confirmVoiceSource)")
 assert.equal((await run('u')).allow,false)
-console.log('Confirmation lifecycle: PASS (faulty parser, disabled voice, wake, stale timeout/click, sender, repeat, grant, close, timeout, cancel)')
+console.log('Confirmation lifecycle: PASS (real parser, disabled voice, wake, stale timeout/click, sender, repeat, grant, close, timeout, cancel)')
 
 // Setting changes reset recognition without replacing the request or its deadline.
 run("var toggle=askUser({}); var toggleId=pendingConfirmId; var epoch=confirmVoiceEpoch; lastCommandText='取消'; lastSentPartial='取消'")
@@ -94,3 +94,42 @@ assert.equal((await run('noAsr')).allow,true,'ASR unavailable must not break cli
 run('asr=savedAsr')
 assert.ok(source.includes('setVoiceConfirmEnabled(payload.ui.voiceConfirmEnabled)'))
 assert.ok(source.includes('setVoiceConfirmEnabled(item.checked)'))
+
+vm.runInContext(section('function feedCommandAudio(chunk)', '\n}').concat('\n}'),ctx)
+for (const text of ['可以','确认','同意','好的','不可以','不同意','不确认','不允许']) {
+ run(`listening=true;voiceConfirmEnabled=true;asr={reset(){},flush(){return ''},push(){return {partial:'',final:${JSON.stringify(text)}}}}`)
+ const gate=new PermissionGate({confirm:request=>run('askUser({capability:"clipboard.read"})')})
+ const pending=gate.check({tool:'read_clipboard'})
+ run("commandStartAt=0;feedCommandAudio([])")
+ const verdict=await pending
+ assert.equal(verdict.allow,parseConfirmText(text).allow,text)
+ assert.equal(verdict.channel,'voice')
+}
+run("var partial=askUser({});asr.push=()=>({partial:'可以',final:null});commandStartAt=0;feedCommandAudio([])")
+assert.equal(run('confirmResolver!==null'),true,'partial must never approve')
+run("asr.push=()=>({partial:'',final:'不可以'});feedCommandAudio([])")
+assert.equal((await run('partial')).allow,false)
+run("var emptyFlush=askUser({});lastCommandText='可以';asr.flush=()=>'';finishCommand('timeout')")
+assert.equal(run('confirmResolver!==null'),true,'empty flush must not reuse partial')
+run("asr.flush=()=> '可以';finishCommand('timeout')")
+assert.equal((await run('emptyFlush')).allow,true,'valid flush must preserve voice approval')
+run("var oldRequest=askUser({});var oldId=pendingConfirmId,oldEpoch=confirmVoiceEpoch;var replacement=askUser({})")
+assert.equal((await run('oldRequest')).allow,false)
+run("finishCommand('endpoint',oldEpoch,'可以',oldId)")
+assert.equal(run('confirmResolver!==null'),true)
+run("settleConfirm({allow:true,channel:'voice',epoch:confirmVoiceEpoch},pendingConfirmId,true)")
+assert.equal(run('confirmResolver!==null'),true,'a claimed voice channel is not local ASR authority')
+run("closeConfirmCard();finishCommand('endpoint',oldEpoch,'可以',oldId)")
+assert.equal((await run('replacement')).allow,false)
+console.log('Real parser + ASR final/partial/flush + PermissionGate voice approval and stale-source isolation: PASS')
+
+run("var switched=askUser({});var switchId=pendingConfirmId;setVoiceConfirmEnabled(false)")
+const switchTimers=timers.length
+for(const text of ['可以','取消']) {
+ run(`asr.push=()=>({partial:'',final:${JSON.stringify(text)}});commandActive=true;commandStartAt=0;feedCommandAudio([])`)
+ assert.equal(run('confirmResolver!==null'),true,'disabled voice ignores both answers')
+}
+run("setVoiceConfirmEnabled(true);asr.push=()=>({partial:'',final:'可以'});commandStartAt=0;feedCommandAudio([])")
+assert.equal((await run('switched')).allow,true)
+assert.equal(timers.length,switchTimers)
+console.log('Off/on restores one-utterance voice approval without extending timeout: PASS')

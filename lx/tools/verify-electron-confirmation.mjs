@@ -69,13 +69,19 @@ try {
  assert.equal(run('grants'),1)
  await click('allowOnce');await sleep(80);assert.equal(run('grants'),1,'duplicate cannot grant again')
  const deny=run('askUser({})');await sleep(80);await click('deny');assert.equal((await deny).allow,false)
+ const keyboard=run('askUser({})');await sleep(80)
+ await win.webContents.executeJavaScript(`document.activeElement?.blur();window.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))`)
+ await sleep(40);assert.equal(run('confirmResolver!==null'),true,'synthetic keyboard must not approve')
+ win.webContents.sendInputEvent({type:'keyDown',keyCode:'Enter'})
+ win.webContents.sendInputEvent({type:'keyUp',keyCode:'Enter'})
+ assert.equal((await keyboard).allow,true,'trusted Enter must work without a mouse click')
  const timeout=run('askUser({})');assert.equal((await timeout).channel,'timeout')
  const controller=new AbortController();ctx.controller=controller
  const cancelled=run('askUser({signal:controller.signal})');controller.abort()
  assert.equal((await cancelled).channel,'cancelled')
  clearTimeout(watchdog)
  report({suite:'Electron isolated preload',electron:process.versions.electron,
-  pass:true,checks:['public approval API absent','synthetic clicks rejected','page callback mutation isolated','trusted input allowed','once','duplicate','deny','timeout','abort']})
+  pass:true,checks:['public approval API absent','synthetic clicks rejected','page callback mutation isolated','trusted input allowed','once','duplicate','deny','trusted Enter','synthetic Enter rejected','timeout','abort']})
  app.exit(0)
 } catch(error) {
  report({pass:false,error:error.stack})

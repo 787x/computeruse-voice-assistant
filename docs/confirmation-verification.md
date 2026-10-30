@@ -1,3 +1,5 @@
+> Current product contract: voice confirmation is bidirectional. Whole affirmative utterances approve, whole negative utterances reject; questions/quotes/conditions/ambiguity remain pending. The earlier cancellation-only/click-only conclusions below are historical and superseded by the final section.
+
 # Confirmation integration verification (2026-10-30)
 
 Runtime: existing Electron 43.4.0 from the local megawatt-flash-charge-simulator-ui project, Windows x64. The repository lockfile specifies Electron 45.0.0; that version remains unverified. No dependency declarations or lockfiles were changed.
@@ -127,3 +129,39 @@ Executed and passed:
 Development failures, then fixed: newly extracted shutdown tests initially lacked the new music owner mock and threw ReferenceError; fixtures were updated. The initial concurrency test exposed a stale-success-hash scenario where the simulated CLI was not restored after an intervening version; invalidating the old hash before mutation fixed this, and explicit B/A/B cases now cover it. Final suites have no remaining failures.
 
 Unverified: real网易云 accounts/private keys, real ncm-cli synchronization and account login retention, full Electron production startup/exit, packaged builds, real microphone and Electron 45.0.0. CLI/account conclusions above are controlled simulations. Existing external processes or writers outside this application are not coordinated by its in-process queue. Writes already started cannot be rolled back; cancellation prevents subsequent operations. OS-level termination denial remains a retained, observable cleanup failure.
+
+
+## Product compatibility correction: bidirectional voice confirmation (2026-10-30)
+
+Baseline checked: origin/main `06f097d` and PR HEAD `655ffdd`. This section supersedes earlier claims that speech can never approve. No history was rewritten and no force push or new PR was used.
+
+Restored both versions: complete affirmative phrases (可以、确认、确定、同意、允许、好的、好、是的、对、执行、继续 and limited direct variants), explicit voice refusal, original default-on voiceConfirmEnabled meaning and persisted field, setting/tray label 语音确认, HUD voice-or-button instructions, and approval through ASR → finishCommand → settleConfirm → PermissionGate. Default confirmation timeout is still 180000 ms. The UI remains one utterance/one decision, without a mandatory click or second confirmation. Mouse/15-minute/deny buttons remain protected; trusted Enter works and focused buttons retain native keyboard activation. Escape keeps main's actual behavior of dismissing the assistant, now labeled 关闭 accurately.
+
+Parser uses complete expressions with bounded normalization and no affirmative substring search. 不可以、不同意、不确认、不允许、不执行 and explicit cancellation refuse. 可以吗、可不可以、不是不可以、不要取消、我说的是可以、我说的是不可以, quotes, conditions and unrecognized text remain undecided. The quoted negative is conservatively undecided and cannot approve.
+
+Voice settlement requires a private main-process Symbol supplied only by the local ASR path, matching current request ID and ASR generation, and an enabled setting. PermissionGate accepts voice or click from its injected confirmation callback. The page has neither the ASR authority nor a public approval API. IPC still validates window/frame/payload/ID and builds click answers itself. A voice label or a boolean trusted flag does not grant ASR authority.
+
+Confirmation uses endpoint final directly, or the actual ASR flush result. An empty flush cannot fall back to lastCommandText/partial. Partial 可以 followed by final 不可以 never authorizes early. Invalid/ambiguous answers preserve the card and original deadline. Cancelling/replacing/timing out the request invalidates late voice results. Continuous/non-confirmation command fallback behavior remains intact.
+
+### Scope and convenience audit against main
+
+| Classification | Changes / disposition |
+|---|---|
+| Required original bug fix | Whole-expression affirmative/negative parsing and accurate ambiguity tests. Voice approval is preserved. |
+| Compatible protections with regression value | Request IDs, ASR generations, switch reset, timeout default deny, private ASR source, protected preload clicks/keyboard, per-turn cancellation and late-result UI isolation. Retained without extra user steps. Main already described dismiss as terminating work; the abort plumbing implements that intent. |
+| Independent technical fixes | Agent initialization owner, NativeBridge exit/close/retry, offline error cleanup, credential coordination and serialized saves. Kept in separate modules/test suites in existing commits; not necessary for the text parser and not expanded in this correction. Removing this intertwined work would be a substantial rollback; retained for review rather than rewriting/purging prior commits. Future separation can be done by selecting the isolated files/commits, but no new PR or branch was created here. |
+| Unnecessary product regressions | Removed click-only and cancellation-only policy, restored default-on bidirectional voice and UI wording, removed speech partial fallback while retaining real final/flush, aligned keyboard hint/behavior. Eager music blocking was already removed; ordinary instructions do not await unrelated music. |
+
+No permission tier, whitelist, unattended behavior, follow-up window duration, speech synthesis defaults, music implementation or launcher product setting was changed in this correction. Those module assertions are a source/diff audit, not a full real-device convenience test. Independent technical fixes remain visible in the cumulative PR and are explicitly not claimed as required for the original bug.
+
+### Executed verification
+
+Both versions:
+- `verify-permissions.mjs`: **86 cases passed**, including exact affirmative/negative/undecided assertions, real parseConfirmText→PermissionGate voice approval, original policy/deny/pause/grant/unattended cases and rejection of unknown/test channels.
+- `verify-confirmation.mjs`: actual production confirmation/audio functions and real parser, controlled ASR, real PermissionGate. 可以/确认/同意/好的 approve once without a click; negatives reject; partial-positive→negative-final, empty flush, valid flush, request replacement, stale ID/generation, switch off/on, forged internal voice claims, click/15-minute/repeat/timeout/abort all passed. No parser-return stub is used for these decisions.
+- Electron **43.4.0** production preload/renderer harness: **11 checks passed**, now including real trusted Chromium Enter and rejected synthetic Enter, alongside protected clicks, no page approval API, temporary grant, rejection, timeout and abort. This tests real Electron UI/IPC pieces, not a real microphone.
+- Existing initialization, Agent cancellation with local SSE abort, turn isolation, offline cleanup and P1 passed. Root credential synchronization suite passed. Node syntax and diff checks passed. NativeBridge suites (mock events plus real owned PowerShell PID scenarios) were also rerun as regression checks.
+
+Earlier tests that assumed all speech approval was forbidden were corrected; refusal, ambiguity, request-isolation and fake-source tests remain. Historical cancellation-only reports are not the current acceptance criteria. No final failing suite remains.
+
+Not verified: real microphone/ASR recognition quality, full production Electron session/continuous dialogue, packaged app, Electron 45.0.0, real music accounts/CLI login. ASR decisions in the Node suite are controlled finals/flushes, not microphone recordings. Broader convenience conclusions are limited to code comparison and the listed regressions.
