@@ -9,6 +9,10 @@
  * 为什么不能把旧录音的期望文字一改了事：旧录音里说的是「你好狼宝」，
  * 它只能作为**负向**用例。新唤醒词必须有新的音频输入，否则验证没有发生。
  *
+ * 判定是 fail-closed 的（PR #2 评审修复）：每个必需用例都有唯一 id 与预先
+ * 声明的期望；异常、缺文件、缺录音都记录为 pass=false 并参与最终判定，
+ * 不做任何"过滤后 every()"的空集合真值判断。
+ *
  * 用法：node tools/verify-keywords.mjs
  * 可选：把真人录音放到 assets/test/xiaoai-tongxue.wav，脚本会优先使用它。
  */
@@ -21,10 +25,22 @@ import { Kws } from '../packages/voice/kws.mjs'
 import { readWav } from '../packages/voice/wav.mjs'
 import {
   DEFAULT_WAKE_WORD,
+  LEGACY_DEFAULT_LINES,
   LEGACY_WAKE_WORDS,
   keywordLabel,
   readKeywordLines,
 } from '../packages/voice/keywords.mjs'
+
+/** 判定（同 verify-wake-runtime 的规则，见其 --selftest 回归）。 */
+function keywordsVerdict(rows, requiredIds) {
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  const checks = {}
+  for (const id of requiredIds) {
+    const r = byId.get(id)
+    checks[id] = r !== undefined && r.required === true && r.pass === true
+  }
+  return { checks, pass: requiredIds.every((id) => checks[id] === true) }
+}
 
 const require = createRequire(import.meta.url)
 const { LinearResampler } = require('sherpa-onnx-node/resampler.js')
@@ -33,14 +49,25 @@ const { LinearResampler } = require('sherpa-onnx-node/resampler.js')
 const dataDir = mkdtempSync(join(tmpdir(), 'cua-va-keywords-'))
 process.env.CUA_VA_DATA_DIR = dataDir
 
-const kws = new Kws()
-const keywordInfo = kws.keywordInfo
-const labels = keywordInfo.labels ?? []
-const lines = readKeywordLines(keywordInfo.file)
-const oldLabels = lines.map(keywordLabel).filter((label) => LEGACY_WAKE_WORDS.includes(label))
-const defaultOnlyNew = labels.length === 1
-  && labels[0] === DEFAULT_WAKE_WORD
-  && oldLabels.length === 0
+let kws = null
+let keywordInfo = null
+let defaultOnlyNew = false
+let linesLoaded = []
+try {
+  kws = new Kws()
+  keywordInfo = kws.keywordInfo
+  const labels = keywordInfo.labels ?? []
+  linesLoaded = readKeywordLines(keywordInfo.file)
+  const oldLabels = linesLoaded.map(keywordLabel).filter((label) => LEGACY_WAKE_WORDS.includes(label))
+  defaultOnlyNew = labels.length === 1
+    && labels[0] === DEFAULT_WAKE_WORD
+    && oldLabels.length === 0
+    // 不允许残留"整份旧默认"（迁移没生效的表征）
+    && !(linesLoaded.length === LEGACY_DEFAULT_LINES.length
+      && linesLoaded.every((line, i) => line === LEGACY_DEFAULT_LINES[i]))
+} catch (error) {
+  console.log(`✗ KWS 初始化失败: ${error.message}`)
+}
 
 function load16k(path) {
   const { samples, sampleRate } = readWav(path)
@@ -80,83 +107,79 @@ function detect(path) {
 const realRecording = 'assets/test/xiaoai-tongxue.wav'
 const syntheticRecording = 'assets/test/xiaoai-tongxue-synthetic.wav'
 const positive = existsSync(realRecording)
-  ? { file: realRecording, synthetic: false, note: '新唤醒词（真人录音）' }
+  ? { id: 'A', file: realRecording, synthetic: false, note: '新唤醒词（真人录音）' }
   : existsSync(syntheticRecording)
-    ? { file: syntheticRecording, synthetic: true, note: '新唤醒词（TTS 合成）' }
+    ? { id: 'A', file: syntheticRecording, synthetic: true, note: '新唤醒词（TTS 合成）' }
     : null
 
-const cases = []
-if (positive === null) {
-  cases.push({ note: '新唤醒词「小爱同学」', expect: DEFAULT_WAKE_WORD, status: 'incomplete', detail: '缺新录音（真人 xiaoai-tongxue.wav / 合成 xiaoai-tongxue-synthetic.wav）' })
-} else {
-  cases.push({ ...positive, expect: DEFAULT_WAKE_WORD, required: true })
-}
-cases.push(
-  { file: 'assets/test/nihao-langbao.wav', expect: null, note: '旧唤醒词「你好狼宝」不得触发', required: true },
-  { file: 'assets/test/wake-1.wav', expect: null, note: '更早唤醒词不得触发' },
-  { file: 'assets/test/dengyixia.wav', expect: null, note: '打断词「等一下」不得触发' },
-  { file: 'assets/test/other-speech.wav', expect: null, note: '无关语音' },
-  { file: 'assets/test/asr-zh.wav', expect: null, note: '无关语音（指令句）' },
-  { file: 'assets/test/not-wake-word.wav', expect: null, note: '普通语句' },
-)
+// 必需用例：正向 A + 默认词表 + 全部负向（缺任何一个 = 验收没发生 = 失败）
+const NEGATIVES = [
+  { id: 'N1', file: 'assets/test/nihao-langbao.wav', note: `旧唤醒词「${LEGACY_WAKE_WORDS.join('/')}」不得触发` },
+  { id: 'N2', file: 'assets/test/wake-1.wav', note: '更早唤醒词不得触发' },
+  { id: 'N3', file: 'assets/test/dengyixia.wav', note: '打断词「等一下」不得触发' },
+  { id: 'N4', file: 'assets/test/other-speech.wav', note: '无关语音' },
+  { id: 'N5', file: 'assets/test/asr-zh.wav', note: '无关语音（指令句）' },
+  { id: 'N6', file: 'assets/test/not-wake-word.wav', note: '普通语句' },
+]
+const REQUIRED_IDS = ['A', 'KWS', ...NEGATIVES.map((n) => n.id)]
 
 const rows = []
-for (const item of cases) {
-  if (item.status === 'incomplete') {
-    rows.push(item)
-    continue
+function pushCheck(id, note, fn) {
+  if (kws === null) {
+    rows.push({ id, note, required: true, pass: false, error: 'KWS 初始化失败' })
+    return
   }
-  if (!existsSync(item.file)) {
-    rows.push({ ...item, status: item.required ? 'fail' : 'skip', detail: '缺文件' })
-    continue
+  try {
+    rows.push({ id, note, required: true, ...fn() })
+  } catch (error) {
+    rows.push({ id, note, required: true, pass: false, error: error.message })
   }
-  const result = detect(item.file)
-  const pass = item.expect === null
-    ? result.hits.length === 0
-    : result.hits.includes(item.expect)
-  rows.push({
-    ...item,
-    status: pass ? 'pass' : 'fail',
-    hits: result.hits,
-    detail: result.hits.length === 0 ? '未命中' : `${result.hits.join(' + ')} @${result.firstAtMs}ms`,
+}
+
+// A) 新唤醒词必须命中（缺新录音 = 失败，不是跳过）
+if (positive === null) {
+  rows.push({ id: 'A', note: `新唤醒词「${DEFAULT_WAKE_WORD}」`, required: true, expect: DEFAULT_WAKE_WORD, pass: false, detail: '缺新录音（真人 xiaoai-tongxue.wav / 合成 xiaoai-tongxue-synthetic.wav）' })
+} else {
+  pushCheck('A', positive.note, () => {
+    const result = detect(positive.file)
+    return { expect: DEFAULT_WAKE_WORD, pass: result.hits.includes(DEFAULT_WAKE_WORD), detail: result.hits.length === 0 ? '未命中' : `${result.hits.join(' + ')} @${result.firstAtMs}ms` }
   })
 }
 
-const failed = rows.filter((row) => row.status === 'fail')
-const skipped = rows.filter((row) => row.status === 'skip')
-const incomplete = positive === null || positive.synthetic
-const requireReal = process.env.CUA_VA_REQUIRE_REAL_WAKE_RECORDING === '1'
+// KWS) 默认解析出的词表必须只含新词
+pushCheck('KWS', '生效关键词只含「小爱同学」', () => ({
+  pass: defaultOnlyNew,
+  detail: `labels=${(keywordInfo?.labels ?? []).join('/') || '(空)'} source=${keywordInfo?.source ?? 'n/a'}`,
+}))
 
-console.log('KWS 关键词验收\n' + '='.repeat(62))
-console.log(`关键词文件: ${keywordInfo.file}`)
-console.log(`来源: ${keywordInfo.source}${keywordInfo.migrated ? '（已从旧默认迁移）' : ''}`)
-console.log(`实际关键词: ${labels.join(' / ') || '(空)'}`)
-console.log(`仅含新默认词: ${defaultOnlyNew ? '是' : '否'}`)
+// 负向）全部必需；缺文件也算失败
+for (const neg of NEGATIVES) {
+  if (!existsSync(neg.file)) {
+    rows.push({ id: neg.id, note: neg.note, required: true, expect: null, pass: false, detail: '缺文件' })
+    continue
+  }
+  pushCheck(neg.id, neg.note, () => {
+    const result = detect(neg.file)
+    return { expect: null, pass: result.hits.length === 0, detail: result.hits.length === 0 ? '未命中' : `误触发: ${result.hits.join(' + ')} @${result.firstAtMs}ms` }
+  })
+}
+
+const verdict = keywordsVerdict(rows, REQUIRED_IDS)
+
+console.log('KWS 关键词验收（fail-closed）\n' + '='.repeat(62))
+if (keywordInfo !== null) {
+  console.log(`关键词文件: ${keywordInfo.file}`)
+  console.log(`来源: ${keywordInfo.source}${keywordInfo.migrated ? '（已从旧默认迁移）' : ''}${keywordInfo.warning ? `（warning: ${keywordInfo.warning}）` : ''}`)
+}
 console.log('-'.repeat(62))
 for (const row of rows) {
-  const mark = row.status === 'pass' ? '✓' : row.status === 'fail' ? '✗' : row.status === 'skip' ? '-' : '…'
-  console.log(`${mark} ${row.note.padEnd(28, ' ')} 期望 ${String(row.expect ?? '不触发').padEnd(6)} → ${row.detail}`)
+  console.log(`${row.pass ? '✓' : '✗'} ${row.note.padEnd(28, ' ')} 期望 ${String(row.expect ?? '不触发').padEnd(6)} → ${row.detail ?? row.error ?? ''}`)
 }
 console.log('='.repeat(62))
 if (positive?.synthetic === true) {
   console.log('⚠ 未提供真人「小爱同学」录音，当前正向用例使用项目 TTS 合成样本。')
   console.log('  真人正向验证尚未完成；将真人录音放到 assets/test/xiaoai-tongxue.wav 后重跑即可。')
 }
-if (skipped.length > 0) console.log(`- 跳过 ${skipped.length} 个可选用例（缺文件）`)
-if (failed.length > 0) console.log(`✗ 失败 ${failed.length} 个用例`)
-
-const verdict = {
-  defaultOnlyNew,
-  newWakeDetected: rows.find((row) => row.note?.startsWith('新唤醒词'))?.status === 'pass',
-  legacyNotDetected: rows.find((row) => row.note?.includes('旧唤醒词'))?.status === 'pass',
-  noFalseTrigger: rows.filter((row) => row.expect === null).every((row) => row.status === 'pass' || row.status === 'skip'),
-  realRecordingVerified: positive !== null && !positive.synthetic,
-  pass: defaultOnlyNew && failed.length === 0 && positive !== null,
-  incomplete,
-}
-console.log(JSON.stringify({ keywordFile: keywordInfo.file, labels, cases: rows.length, failed: failed.length, skipped: skipped.length, verdict }))
-
+console.log(JSON.stringify({ keywordFile: keywordInfo?.file ?? null, cases: rows.length, verdict, realRecordingVerified: positive !== null && !positive.synthetic }))
 rmSync(dataDir, { recursive: true, force: true })
-
-if (!verdict.pass) process.exitCode = failed.length > 0 ? 1 : 2
-else if (requireReal && !verdict.realRecordingVerified) process.exitCode = 2
+process.exitCode = verdict.pass ? 0 : 1

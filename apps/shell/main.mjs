@@ -479,8 +479,19 @@ async function doStartListening() {
       pipeline = new StreamingPipeline()
       const info = pipeline.keywordInfo
       if (info !== null) {
-        log(`kws keywords: ${info.file} (${info.source}, ${info.labels?.join('/') ?? ''}${info.migrated ? ', migrated' : ''})`)
+        log(`kws keywords: ${info.file} (${info.source}, ${info.labels?.join('/') ?? ''}${info.migrated ? ', migrated' : ''}${info.warning ? `, warning: ${info.warning}` : ''})`)
       }
+    } else if (pipeline.keywordsChanged()) {
+      /*
+       * 管线是缓存的：用户在数据目录里改了关键词文件后，
+       * 「关闭再开启语音唤醒」要能加载新配置，不必退出程序。
+       * 只在开麦边界比对一次签名（改过才重建，没改零开销）。
+       * 失败走 catch：明确报错，绝不把新配置当成已生效。
+       */
+      const reload = pipeline.reloadKws()
+      if (!reload.ok) throw new Error(`关键词文件无法加载: ${reload.error}`)
+      const info = reload.keywordInfo
+      log(`kws reloaded: ${info.file} (${info.source}, ${info.labels?.join('/') ?? ''})`)
     }
 
     const target = ensureCaptureWindow()

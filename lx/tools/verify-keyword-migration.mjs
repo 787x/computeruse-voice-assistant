@@ -1,16 +1,23 @@
 /**
- * 关键词解析/迁移单元测试（packages/voice/keywords.mjs）。
+ * 关键词解析/迁移回归（packages/voice/keywords.mjs）。
  *
- * 覆盖升级场景的四种关键行为：
+ * 覆盖 PR #2 评审修复后的语义：
  *   1. 全新安装：生成只含「小爱同学」的默认文件；
- *   2. 旧安装升级：默认「你好狼宝」文件被迁移为新默认词；
- *   3. 用户自定义：绝不覆盖，原样保留并迁移到用户数据目录；
- *   4. 显式指定：直接使用指定文件，不读写默认位置。
+ *   2. 旧默认升级：**逐行等于已知旧默认内容**才迁移；
+ *   3. 同标签但改过音素/顺序/行数的文件 = 用户自定义，绝不迁移；
+ *   4. 新位置有效配置永远优先：旧残留不得再次覆盖（二次启动、手动恢复默认）；
+ *   5. 从不原地改写旧文件；
+ *   6. 迁移写入失败/数据目录写不进 → 只读兜底 + warning，不丢配置；
+ *   7. 数据文件存在但读不动 → 明确报错，绝不静默覆盖；
+ *   8. 显式指定不读写默认位置；
+ *   9. 打包布局冒烟；
+ *  10. 签名（keywordFileSignature）可区分"改过/没改过"。
  *
  * 用法：node tools/verify-keyword-migration.mjs
  */
 import assert from 'node:assert/strict'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -24,6 +31,9 @@ import { join } from 'node:path'
 import {
   DEFAULT_KEYWORD_LINE,
   DEFAULT_WAKE_WORD,
+  LEGACY_DEFAULT_LINES,
+  isLegacyDefaultLines,
+  keywordFileSignature,
   resolveKeywordsFile,
 } from '../packages/voice/keywords.mjs'
 
@@ -39,6 +49,8 @@ function check(name, fn) {
   }
 }
 
+const LEGACY_DEFAULT_TEXT = `${LEGACY_DEFAULT_LINES.join('\n')}\n`
+
 function scenario() {
   const dir = mkdtempSync(join(tmpdir(), 'cua-va-kwtest-'))
   const dataFile = join(dir, 'data', 'kws-keywords.txt')
@@ -47,12 +59,18 @@ function scenario() {
   writeFileSync(bundledFile, `${DEFAULT_KEYWORD_LINE}\n`, 'utf8')
   return {
     dir,
-    resolve: (extra = {}) => resolveKeywordsFile({ dataFile, legacyFile, bundledFile, ...extra }),
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    dataFile,
+    legacyFile,
+    upgradeBackupFile: join(dir, 'data', 'kws-keywords.pre-upgrade.txt'),
+    resolve: (extra = {}) => resolveKeywordsFile({ dataFile, legacyFile, bundledFile, upgradeBackupFile: join(dir, 'data', 'kws-keywords.pre-upgrade.txt'), ...extra }),
+    writeBackup: (text) => { mkdirSync(join(dir, 'data'), { recursive: true }); writeFileSync(join(dir, 'data', 'kws-keywords.pre-upgrade.txt'), text, 'utf8') },
+    writeData: (text) => { mkdirSync(join(dir, 'data'), { recursive: true }); writeFileSync(dataFile, text, 'utf8') },
+    writeLegacy: (text) => { mkdirSync(join(dir, 'models'), { recursive: true }); writeFileSync(legacyFile, text, 'utf8') },
+    cleanup: () => { try { chmodSync(join(dir, 'models'), 0o755) } catch { /* */ } rmSync(dir, { recursive: true, force: true }) },
   }
 }
 
-// 1) 全新安装：无数据文件、无旧文件 → 生成新默认。
+// 1) 全新安装
 {
   const s = scenario()
   check('全新安装生成「小爱同学」默认文件', () => {
@@ -60,73 +78,146 @@ function scenario() {
     assert.ok(info.file.endsWith(join('data', 'kws-keywords.txt')), `应落在数据目录: ${info.file}`)
     assert.equal(info.source, 'default')
     assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
-    assert.equal(existsSync(info.file), true)
+    assert.equal(info.migrated, false)
     assert.equal(readFileSync(info.file, 'utf8').trim(), DEFAULT_KEYWORD_LINE)
   })
   s.cleanup()
 }
 
-// 2) 旧安装升级：models 下是旧默认词 → 迁移为新默认词，且不留旧词。
+// 2) 旧默认升级：迁移到新位置；旧文件保持原样（不再原地覆盖）
 {
   const s = scenario()
-  mkdirSync(join(s.dir, 'models'), { recursive: true })
-  writeFileSync(join(s.dir, 'models', 'kws-keywords.txt'),
-    'n ǐ h ǎo l áng b ǎo @你好狼宝\nn ǐ h ǎo n áng b ǎo @你好狼宝\n', 'utf8')
-  check('旧默认「你好狼宝」文件升级为「小爱同学」', () => {
+  s.writeLegacy(LEGACY_DEFAULT_TEXT)
+  check('旧默认逐行一致才迁移，且不改写旧文件', () => {
     const info = s.resolve()
     assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
     assert.equal(info.migrated, true)
-    const written = readFileSync(join(s.dir, 'models', 'kws-keywords.txt'), 'utf8')
-    assert.ok(!written.includes('你好狼宝'), '旧默认文件也应被更新')
+    assert.equal(info.file, s.dataFile)
+    assert.equal(readFileSync(s.legacyFile, 'utf8'), LEGACY_DEFAULT_TEXT, '旧文件必须原样保留')
+  })
+  check('迁移完成后，残留旧默认文件不得再次覆盖新配置', () => {
+    s.writeData(DEFAULT_KEYWORD_LINE + '\n') // 模拟用户手动恢复默认词后重启
+    const again = s.resolve()
+    assert.deepEqual(again.labels, [DEFAULT_WAKE_WORD])
+    assert.equal(again.migrated, false)
+    assert.equal(again.file, s.dataFile)
   })
   s.cleanup()
 }
 
-// 3) 用户自定义（数据目录）不被覆盖。
+// 3) 同标签但自定义：改音素 / 只留一行 / 调换顺序 / 加自造词，都不算旧默认
+{
+  const cases = [
+    ['同标签、改音素', ['n ǐ h ǎo l āng b ǎo @你好狼宝', LEGACY_DEFAULT_LINES[1]]],
+    ['同标签、只留一行', [LEGACY_DEFAULT_LINES[0]]],
+    ['同标签、调换顺序', [LEGACY_DEFAULT_LINES[1], LEGACY_DEFAULT_LINES[0]]],
+    ['同标签、加自造词', [...LEGACY_DEFAULT_LINES, DEFAULT_KEYWORD_LINE]],
+  ]
+  for (const [name, lines] of cases) {
+    const s = scenario()
+    s.writeLegacy(lines.join('\n') + '\n')
+    check(`旧位置「${name}」按用户自定义保留，不迁移成新默认`, () => {
+      assert.equal(isLegacyDefaultLines(lines), false, `${name} 不该被判定为旧默认`)
+      const info = s.resolve()
+      assert.equal(info.custom, true)
+      assert.deepEqual(info.labels, [...new Set(lines.map((l) => l.slice(l.lastIndexOf('@') + 1)))])
+      assert.equal(readFileSync(s.legacyFile, 'utf8'), lines.join('\n') + '\n', '旧文件原样保留')
+    })
+    s.cleanup()
+  }
+}
+
+// 4) 新位置有效配置优先（数据目录自定义 + 旧位置残留默认/自定义）
 {
   const s = scenario()
-  mkdirSync(join(s.dir, 'data'), { recursive: true })
-  writeFileSync(join(s.dir, 'data', 'kws-keywords.txt'), 'j iǎng y ǒu b ó @蒋友伯\n', 'utf8')
-  check('用户自定义关键词不被覆盖', () => {
+  s.writeData('j iǎng y ǒu b ó @蒋友伯\n')
+  s.writeLegacy(LEGACY_DEFAULT_TEXT)
+  check('数据目录自定义优先于旧残留', () => {
     const info = s.resolve()
     assert.equal(info.custom, true)
     assert.deepEqual(info.labels, ['蒋友伯'])
-    assert.equal(readFileSync(join(s.dir, 'data', 'kws-keywords.txt'), 'utf8').trim(), 'j iǎng y ǒu b ó @蒋友伯')
+    assert.equal(readFileSync(s.dataFile, 'utf8').trim(), 'j iǎng y ǒu b ó @蒋友伯')
   })
   s.cleanup()
 }
-
-// 3b) 用户自定义（旧 models 位置、数据目录仍是默认值）被保留并迁移。
 {
   const s = scenario()
-  mkdirSync(join(s.dir, 'data'), { recursive: true })
-  mkdirSync(join(s.dir, 'models'), { recursive: true })
-  writeFileSync(join(s.dir, 'data', 'kws-keywords.txt'), `${DEFAULT_KEYWORD_LINE}\n`, 'utf8')
-  writeFileSync(join(s.dir, 'models', 'kws-keywords.txt'), 'zh ōu w àng j ūn @周望军\n', 'utf8')
-  check('旧位置的自定义关键词被迁移保留', () => {
+  s.writeData(DEFAULT_KEYWORD_LINE + '\n')
+  s.writeLegacy('zh ōu w àng j ūn @周望军\n')
+  check('数据目录默认词优先（旧位置自定义不再夺权）', () => {
     const info = s.resolve()
-    assert.equal(info.custom, true)
+    assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
+    assert.equal(info.custom, false)
+  })
+  s.cleanup()
+}
+{
+  const s = scenario()
+  s.writeLegacy('zh ōu w àng j ūn @周望军\n')
+  check('旧位置自定义迁移到数据目录，二次启动不重复迁移', () => {
+    const info = s.resolve()
+    assert.equal(info.source, 'legacy-custom')
+    assert.equal(info.migrated, true)
     assert.deepEqual(info.labels, ['周望军'])
-    assert.ok(info.file.endsWith(join('data', 'kws-keywords.txt')))
+    assert.equal(readFileSync(s.legacyFile, 'utf8').trim(), 'zh ōu w àng j ūn @周望军')
+    const again = s.resolve()
+    assert.equal(again.source, 'data')
+    assert.equal(again.migrated, false)
+    assert.deepEqual(again.labels, ['周望军'])
   })
   s.cleanup()
 }
 
-// 3c) 混合文件（旧词 + 用户新增词）整体视为自定义，绝不改写。
+// 5) 数据目录写不进（Windows 上 chmod 目录挡不住建文件，用"路径被文件占用"确定性模拟）：
+//    旧自定义 → 只读使用 + warning；旧默认 → 只读内置默认，绝不使用旧词
 {
   const s = scenario()
-  mkdirSync(join(s.dir, 'models'), { recursive: true })
-  writeFileSync(join(s.dir, 'models', 'kws-keywords.txt'),
-    'n ǐ h ǎo l áng b ǎo @你好狼宝\nf ǎ g uó @法国\n', 'utf8')
-  check('含旧词但非纯默认的文件视为自定义并保留', () => {
+  s.writeLegacy('zh ōu w àng j ūn @周望军\n')
+  writeFileSync(join(s.dir, 'data'), 'blocker', 'utf8') // 用普通文件占住"数据目录"路径
+  check('数据目录不可写：自定义迁移退化为只读旧文件（配置不丢）', () => {
     const info = s.resolve()
-    assert.equal(info.custom, true)
-    assert.deepEqual(info.labels, ['你好狼宝', '法国'])
+    assert.deepEqual(info.labels, ['周望军'])
+    assert.equal(info.file, s.legacyFile)
+    assert.ok(info.warning !== '', '必须带 warning')
+  })
+  s.cleanup()
+}
+{
+  const s = scenario()
+  s.writeLegacy(LEGACY_DEFAULT_TEXT)
+  writeFileSync(join(s.dir, 'data'), 'blocker', 'utf8')
+  check('数据目录不可写 + 旧默认：退化为只读内置默认（新词，绝不回落旧默认）', () => {
+    const info = s.resolve()
+    assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
+    assert.equal(info.file, join(s.dir, 'bundled.txt'))
+    assert.ok(info.warning !== '')
   })
   s.cleanup()
 }
 
-// 4) 显式指定文件不读写默认位置。
+// 6) 数据文件读不动 → 明确报错，不静默覆盖
+{
+  const s = scenario()
+  mkdirSync(s.dataFile, { recursive: true }) // 目录冒充文件 → 读取抛 EISDIR/EPERM
+  check('数据位置损坏（目录冒充文件）：明确报错而非静默重写', () => {
+    assert.throws(() => s.resolve(), /无法读取|中止/)
+    assert.equal(existsSync(join(s.dataFile, 'kws-keywords.txt')), false)
+  })
+  s.cleanup()
+}
+{
+  const s = scenario()
+  s.writeData('   \n\n') // 空文件 = 无效配置
+  s.writeLegacy(LEGACY_DEFAULT_TEXT)
+  check('空的数据文件视为无效，重新生成默认', () => {
+    const info = s.resolve()
+    assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
+    assert.equal(readFileSync(s.dataFile, 'utf8').trim(), DEFAULT_KEYWORD_LINE)
+  })
+  s.cleanup()
+}
+
+// 7) 显式指定
 {
   const s = scenario()
   const explicit = join(s.dir, 'explicit.txt')
@@ -135,7 +226,7 @@ function scenario() {
     const info = s.resolve({ keywordsFile: explicit })
     assert.equal(info.file, explicit)
     assert.equal(info.source, 'explicit')
-    assert.equal(existsSync(join(s.dir, 'data', 'kws-keywords.txt')), false)
+    assert.equal(existsSync(s.dataFile), false)
   })
   check('显式文件不存在时报错', () => {
     assert.throws(() => s.resolve({ keywordsFile: join(s.dir, 'missing.txt') }), /关键词文件不存在/)
@@ -143,7 +234,7 @@ function scenario() {
   s.cleanup()
 }
 
-// 5) 内置默认文件的音素必须与官方「小爱同学」条目一致。
+// 8) 内置默认文件与官方音素一致
 {
   check('仓库内置默认文件与官方音素一致', () => {
     const file = new URL('../packages/voice/kws-keywords.default.txt', import.meta.url)
@@ -152,8 +243,7 @@ function scenario() {
   })
 }
 
-// 6) 打包布局冒烟：CUA_VA_ROOT 指向 resources 根，全新 userData，
-//    旧安装遗留 models/kws-keywords.txt（旧默认词）。对应 extraResources 布局。
+// 9) 打包布局冒烟：CUA_VA_ROOT=resources 根 + 全新 userData + 旧遗留默认
 {
   const s = scenario()
   const prevRoot = process.env.CUA_VA_ROOT
@@ -162,17 +252,18 @@ function scenario() {
     const resources = join(s.dir, 'resources')
     mkdirSync(join(resources, 'models'), { recursive: true })
     writeFileSync(join(resources, 'kws-keywords.default.txt'), `${DEFAULT_KEYWORD_LINE}\n`, 'utf8')
-    writeFileSync(join(resources, 'models', 'kws-keywords.txt'), 'n ǐ h ǎo l áng b ǎo @你好狼宝\n', 'utf8')
+    writeFileSync(join(resources, 'models', 'kws-keywords.txt'), LEGACY_DEFAULT_TEXT, 'utf8')
     process.env.CUA_VA_ROOT = resources
     process.env.CUA_VA_DATA_DIR = join(s.dir, 'userData', 'data')
-    check('打包根 + 旧遗留文件：首启即新默认词', () => {
-      const info = resolveKeywordsFile()
+    const { resolveKeywordsFile: resolveDefault } = await import('../packages/voice/keywords.mjs')
+    check('打包根 + 旧遗留默认：首启生成新默认词', () => {
+      const info = resolveDefault()
       assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
       assert.ok(info.file.endsWith(join('data', 'kws-keywords.txt')), info.file)
       assert.equal(info.migrated, true)
     })
-    check('二次解析幂等（不重复迁移）', () => {
-      const again = resolveKeywordsFile()
+    check('二次解析幂等、不重复迁移', () => {
+      const again = resolveDefault()
       assert.deepEqual(again.labels, [DEFAULT_WAKE_WORD])
       assert.equal(again.migrated, false)
     })
@@ -182,6 +273,63 @@ function scenario() {
     if (prevData === undefined) delete process.env.CUA_VA_DATA_DIR
     else process.env.CUA_VA_DATA_DIR = prevData
   }
+  s.cleanup()
+}
+
+// 10) 签名：关键词修改前后必须不同（重新开麦重载的判据）
+{
+  const s = scenario()
+  check('keywordFileSignature 能区分修改前后', () => {
+    const before = s.resolve().signature
+    s.writeData('j iǎng y ǒu b ó @蒋友伯\n')
+    const after = keywordFileSignature(s.dataFile)
+    assert.notEqual(before, after)
+    assert.equal(after, keywordFileSignature(s.dataFile))
+    assert.equal(keywordFileSignature(join(s.dir, 'nope.txt')), 'unreadable')
+  })
+  s.cleanup()
+}
+
+// 11) NSIS 升级前备份（installer.nsh customInit 写入 → 运行期消费一次）
+{
+  const s = scenario()
+  s.writeBackup('zh ōu w àng j ūn @周望军\n')
+  check('升级备份里的自定义词被消费为生效配置，备份删除', () => {
+    const info = s.resolve()
+    assert.equal(info.source, 'upgrade-backup')
+    assert.deepEqual(info.labels, ['周望军'])
+    assert.equal(info.custom, true)
+    assert.equal(existsSync(s.upgradeBackupFile), false, '备份必须一次性消费')
+    assert.equal(readFileSync(s.dataFile, 'utf8').trim(), 'zh ōu w àng j ūn @周望军')
+  })
+  check('备份消费后二次启动不再重复迁移', () => {
+    const again = s.resolve()
+    assert.equal(again.source, 'data')
+    assert.equal(again.migrated, false)
+    assert.deepEqual(again.labels, ['周望军'])
+  })
+  s.cleanup()
+}
+{
+  const s = scenario()
+  s.writeBackup(LEGACY_DEFAULT_TEXT) // 旧版默认词也被备份了
+  check('升级备份是旧默认词：丢弃并生成新默认，不留残留', () => {
+    const info = s.resolve()
+    assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
+    assert.equal(existsSync(s.upgradeBackupFile), false)
+  })
+  s.cleanup()
+}
+{
+  const s = scenario()
+  s.writeData('j iǎng y ǒu b ó @蒋友伯\n') // 数据目录已有有效配置
+  s.writeBackup(LEGACY_DEFAULT_TEXT)       // 上次中断升级留下的备份
+  check('数据目录有效配置优先于升级备份（备份不夺权、不误删数据配置）', () => {
+    const info = s.resolve()
+    assert.equal(info.source, 'data')
+    assert.deepEqual(info.labels, ['蒋友伯'])
+    assert.equal(readFileSync(s.dataFile, 'utf8').trim(), 'j iǎng y ǒu b ó @蒋友伯')
+  })
   s.cleanup()
 }
 

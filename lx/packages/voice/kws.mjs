@@ -9,7 +9,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { modelPath } from '../config/paths.mjs'
-import { resolveKeywordsFile } from './keywords.mjs'
+import { keywordFileSignature, readKeywordLabels, resolveKeywordsFile } from './keywords.mjs'
 
 const require = createRequire(import.meta.url)
 const sherpa = require('sherpa-onnx-node')
@@ -43,6 +43,10 @@ export class Kws {
         migrated: false,
         fallback: false,
       }
+      try {
+        this.keywordInfo.signature = keywordFileSignature(cfg.keywordsFile)
+        this.keywordInfo.labels = readKeywordLabels(cfg.keywordsFile)
+      } catch { /* 构造后的存在性检查会给出准确错误 */ }
     }
     if (!existsSync(cfg.modelDir)) throw new Error(`KWS 模型目录不存在: ${cfg.modelDir}`)
     if (!existsSync(cfg.keywordsFile)) throw new Error(`关键词文件不存在: ${cfg.keywordsFile}`)

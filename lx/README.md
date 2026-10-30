@@ -31,8 +31,12 @@
 3. 托盘勾上「语音唤醒」，说「小爱同学」。
 
 > 默认唤醒词文件随包分发（`packages/voice/kws-keywords.default.txt` → 安装后 `resources/kws-keywords.default.txt`），
-> 首次启动复制到用户数据目录 `…/data/kws-keywords.txt`。旧安装里的默认「你好狼宝」关键词会在升级后自动迁移为
-> 「小爱同学」；你自己改过的关键词文件会被原样保留，不会被覆盖。
+> 首次启动复制到用户数据目录 `…/data/kws-keywords.txt`。旧安装升级时：安装器会先把旧 `resources\models\kws-keywords.txt`
+> 备份到 `…/data/kws-keywords.pre-upgrade.txt`（`apps/shell/assets/installer.nsh`），应用首启一次性消费——只有**逐行等于
+> 旧版自动生成默认词**的文件才会被替换为「小爱同学」；改过音素/增删行的（哪怕标签仍是「你好狼宝」）都按自定义保留。
+> 你自己改过的生效配置永远不会被旧文件覆盖；改完关键词文件后，托盘**关开一次「语音唤醒」即可生效**，不必退出程序。
+> 例外：绕过安装器的手动搬目录升级不会被自动备份，此时旧词表还在旧目录
+> `resources\models\kws-keywords.txt`，手动复制到上面的 data 路径即可恢复。
 
 > 安装版**不含语音运行时**（venv + 音色包约 5GB）。需要发声就把 `.runtime/` 放到安装目录的
 > `resources/` 下，或直接用完整版压缩包（见下）。

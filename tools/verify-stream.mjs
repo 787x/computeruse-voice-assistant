@@ -66,25 +66,37 @@ const syntheticRecording = 'assets/test/xiaoai-tongxue-synthetic.wav'
 const wakeFile = existsSync(realRecording) ? realRecording : syntheticRecording
 const wakeIsSynthetic = wakeFile === syntheticRecording
 
+/*
+ * fail-closed：必需用例（正向/负向/旧词/弱信号）任何一个异常或缺输入
+ * 都记录为 pass:false 并参与判定——不允许"跑都没跑却被 every() 算过"。
+ */
 const report = { wakeFile, wakeIsSynthetic, cases: [] }
-report.cases.push(run(wakeFile))
-report.cases.push(run('assets/test/not-wake-word.wav'))
+function pushRun(id, note, path, db = 0) {
+  try {
+    if (!existsSync(path)) throw new Error(`缺文件 ${path}`)
+    report.cases.push({ id, note, required: true, ...run(path, db) })
+  } catch (error) {
+    report.cases.push({ id, note, required: true, file: path, error: error.message, wakes: [], gainMedianDb: null })
+  }
+}
+pushRun('W', '新唤醒词（流式管线）', wakeFile)
+pushRun('O', '普通语句', 'assets/test/not-wake-word.wav')
 // 旧唤醒词录音：默认关键词下必须不触发
-report.cases.push(run('assets/test/wake-1.wav'))
+pushRun('L', '旧唤醒词录音', 'assets/test/wake-1.wav')
 // 弱信号：把唤醒词衰减 24dB，模拟麦克风阵列那种 -45dBFS 输入
-report.cases.push({ ...run(wakeFile, -24), name: '弱信号 -24dB' })
+pushRun('Q', '弱信号 -24dB', wakeFile, -24)
 
-const wakeCase = report.cases[0]
-const otherCase = report.cases[1]
-const legacyCase = report.cases[2]
+const wakeCase = report.cases.find((c) => c.id === 'W')
+const otherCase = report.cases.find((c) => c.id === 'O')
+const legacyCase = report.cases.find((c) => c.id === 'L')
+const quietCase = report.cases.find((c) => c.id === 'Q')
 
-const quietCase = report.cases[3]
 report.verdict = {
   wakeDetected: wakeCase.wakes.includes(DEFAULT_WAKE_WORD),
   otherNotDetected: otherCase.wakes.length === 0,
   legacyNotDetected: legacyCase.wakes.length === 0,
-  // AGC 的正确行为：强信号不加热，弱信号才加
-  loudNoBoost: Math.abs(wakeCase.gainMedianDb) < 3,
+  // AGC 的正确行为：强信号不加热，弱信号才加（用例异常时 gainMedianDb=null，必须算失败）
+  loudNoBoost: wakeCase.gainMedianDb !== null && Math.abs(wakeCase.gainMedianDb) < 3,
   quietBoosted: quietCase.gainMedianDb > 5,
   quietStillDetected: quietCase.wakes.includes(DEFAULT_WAKE_WORD),
 }
