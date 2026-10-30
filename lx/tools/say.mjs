@@ -1,7 +1,7 @@
 /**
  * 用 TTS 合成一句话到 WAV（调试/造测试素材用）。
  *
- * 用法：node tools/say.mjs "你好狼宝" [输出路径] [语速] [情绪]
+ * 用法：node tools/say.mjs "小爱同学" [输出路径] [语速] [情绪]
  * 默认输出 assets/test/say.wav，末尾会补静音——流式 KWS/ASR 需要上下文。
  */
 import { Tts } from '../packages/voice/tts.mjs'

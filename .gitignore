@@ -7,6 +7,8 @@ build/
 .config/
 
 # 模型权重（体积大，按需下载）
+# 默认唤醒词不放在这里：唯一来源是 packages/voice/kws-keywords.default.txt，
+# 运行时复制到用户数据目录；models/kws-keywords.txt 只作为旧安装的迁移输入。
 models/
 
 # 运行期产物

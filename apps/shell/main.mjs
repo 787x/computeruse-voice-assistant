@@ -22,6 +22,7 @@ import { parseConfirmText } from '../../packages/agent/permissions.mjs'
 import { parseOfflineIntent, offlineUnsupported, formatTime, formatDate, isOfflineError } from '../../packages/agent/offline.mjs'
 import { judgeFollowUp, windowFor, heuristicFollowUp, FOLLOWUP_DEFAULTS } from '../../packages/agent/followup.mjs'
 import { cleanLine as cleanLineText } from '../../packages/agent/text.mjs'
+import { DEFAULT_WAKE_WORD } from '../../packages/voice/keywords.mjs'
 import { resolveModel } from '../../packages/config/schedule.mjs'
 import { LAUNCH_APP_TOOL } from '../../packages/tools/app-launch.mjs'
 import { SHELL_TOOL, runShell } from '../../packages/tools/shell.mjs'
@@ -83,7 +84,7 @@ const AUTO_HIDE_MS = 8000
  */
 const CONV_HEIGHT = 300
 
-/** 唤醒词说完后丢弃的一段音频（识别要跳过"你好狼宝"本身） */
+/** 唤醒词说完后丢弃的一段音频（识别要跳过「小爱同学」本身） */
 const WAKE_TAIL_MS = 300
 /** 说指令的最长等待：15 秒没说完就按已听到的收尾 */
 const COMMAND_TIMEOUT_MS = 15000
@@ -232,6 +233,10 @@ function ensureWindow() {
     if (win !== null && !win.isDestroyed()) win.webContents.send('hud:state', currentState)
     // 首帧先把内容高度报上来，否则窗口停在初始高度、内容被裁
     win?.webContents.send('hud:state', currentState)
+    // 窗口可能晚于 KWS 加载才建好：把已生效的唤醒提示补推一次
+    if (win !== null && !win.isDestroyed() && wakeHintLabels !== null) {
+      win.webContents.send('hud:wakeHint', wakeHintLabels)
+    }
   })
 
   // 失焦不隐藏：用户可能正在看字幕
@@ -266,7 +271,21 @@ function setState(state) {
   }
   if (win !== null && !win.isDestroyed()) {
     win.webContents.send('hud:state', state)
+    if (wakeHintLabels !== null) win.webContents.send('hud:wakeHint', wakeHintLabels)
   }
+}
+
+/**
+ * 唤醒提示跟着**实际生效**的关键词走（HUD 的 done/listening 文案）。
+ * 只在 KWS 首次加载或重载成功后推新值；失败路径不调用它，界面保持旧值——
+ * 绝不高亮一个没加载成功的词。
+ */
+let wakeHintLabels = null
+function pushWakeHint() {
+  const info = pipeline?.keywordInfo
+  if (!info || !Array.isArray(info.labels) || info.labels.length === 0) return
+  wakeHintLabels = info.labels
+  if (win !== null && !win.isDestroyed()) win.webContents.send('hud:wakeHint', wakeHintLabels)
 }
 
 /** 托盘点击：明确的用户意图，聚焦。 */
@@ -476,6 +495,23 @@ async function doStartListening() {
     if (pipeline === null) {
       const { StreamingPipeline } = await import('../../packages/voice/stream.mjs')
       pipeline = new StreamingPipeline()
+      const info = pipeline.keywordInfo
+      if (info !== null) {
+        log(`kws keywords: ${info.file} (${info.source}, ${info.labels?.join('/') ?? ''}${info.migrated ? ', migrated' : ''}${info.warning ? `, warning: ${info.warning}` : ''})`)
+      }
+      pushWakeHint()
+    } else if (pipeline.keywordsChanged()) {
+      /*
+       * 管线是缓存的：用户在数据目录里改了关键词文件后，
+       * 「关闭再开启语音唤醒」要能加载新配置，不必退出程序。
+       * 只在开麦边界比对一次签名（改过才重建，没改零开销）。
+       * 失败走 catch：明确报错，绝不把新配置当成已生效。
+       */
+      const reload = pipeline.reloadKws()
+      if (!reload.ok) throw new Error(`关键词文件无法加载: ${reload.error}`)
+      const info = reload.keywordInfo
+      log(`kws reloaded: ${info.file} (${info.source}, ${info.labels?.join('/') ?? ''})`)
+      pushWakeHint()
     }
 
     const target = ensureCaptureWindow()
@@ -575,8 +611,8 @@ if (!manual && ((settingsWin !== null && !settingsWin.isDestroyed() && settingsW
   heardAny = false
   lastCommandText = ''
   lastSentPartial = ''
-  // 唤醒词本身（"你好狼宝"）已经进了麦克风。识别从 300ms 后开始，
-  // 否则识别结果会带着"你好狼宝"四个字，指令就变成"你好狼宝打开浏览器"。
+  // 唤醒词本身（「小爱同学」）已经进了麦克风。识别从 300ms 后开始，
+  // 否则识别结果会带着「小爱同学」四个字，指令就变成「小爱同学打开浏览器」。
   commandStartAt = Date.now() + (manual ? 0 : WAKE_TAIL_MS)
   clearTimeout(commandTimer)
   commandTimer = setTimeout(() => finishCommand('timeout'), COMMAND_TIMEOUT_MS)
@@ -3256,7 +3292,7 @@ if (!gotSingleInstanceLock) {
     app.quit()
   } else if (process.argv.includes('--wake-demo')) {
     // 模拟一次唤醒：验证"命中 → 弹小窗"这条路径（不依赖扬声器/麦克风）
-    setTimeout(() => onWake('你好狼宝'), 1500)
+    setTimeout(() => onWake(DEFAULT_WAKE_WORD), 1500)
   } else if (isDemo) {
     // 演示模式：启动即弹出，便于截图/对齐视觉
     showForInteraction('speaking')
@@ -3362,7 +3398,7 @@ async function runAsrDemo(wavPath) {
 
   showForWake('listening')
   await sleep(500)
-  onWake('你好狼宝')
+  onWake(DEFAULT_WAKE_WORD)
   await sleep(WAKE_TAIL_MS)
 
   const timeline = []

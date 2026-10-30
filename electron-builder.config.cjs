@@ -12,7 +12,18 @@
 const bundleRuntime = process.env.CUA_VA_BUNDLE_RUNTIME === '1'
 
 const extraResources = [
-  { from: 'models', to: 'models' },
+  /*
+   * 关键词的唯一来源是仓库里的 packages/voice/kws-keywords.default.txt。
+   * 放进 resources 根目录是因为 sherpa-onnx 原生层读不到 asar，而且安装目录
+   * 里的 models/ 可能不可写；运行时会复制到 userData/data/kws-keywords.txt。
+   */
+  { from: 'packages/voice/kws-keywords.default.txt', to: 'kws-keywords.default.txt' },
+  /*
+   * 不把 models 下任何关键词文件打进包：那可能是开发机上的
+   * 「你好狼宝」遗留/本地测试文件。默认词只从上面的 default 文件分发，
+   * 旧安装升级时运行期仍会识别并迁移 models/kws-keywords.txt。
+   */
+  { from: 'models', to: 'models', filter: ['**/*', '!**/kws-keywords*.txt'] },
   { from: 'packages/voice/gsv_worker.py', to: 'gsv_worker.py' },
 ]
 if (bundleRuntime) extraResources.push({ from: '.runtime', to: '.runtime' })

@@ -9,6 +9,7 @@
  */
 import { Kws } from './kws.mjs'
 import { NoiseFloorTracker } from './agc.mjs'
+import { keywordFileSignature } from './keywords.mjs'
 
 export const STREAM_DEFAULTS = {
   targetDb: -22,
@@ -38,6 +39,45 @@ export class StreamingPipeline {
   #silentSeconds = 0
 
   get sampleRate() { return 16000 }
+
+  /** 当前 KWS 实际使用的关键词文件（含来源），用于启动日志与验收。 */
+  get keywordInfo() { return this.#kws?.keywordInfo ?? null }
+
+  /**
+   * 当前 KWS 加载时看到的关键词文件签名。
+   * 「关闭再开启语音唤醒」时由 ensureKeywordsFresh() 对比，判断是否要重建 KWS。
+   */
+  get keywordSignature() {
+    return this.#kws === null ? 'no-kws' : this.#kws.keywordInfo?.signature ?? 'unknown'
+  }
+
+  /**
+   * 关键词文件是否已变化（用户在数据目录里改了唤醒词）。
+   * 只在开麦边界检查一次——不在每个音频块上查文件。
+   */
+  keywordsChanged() {
+    if (this.#kws === null) return false
+    const file = this.#kws.keywordInfo?.file ?? ''
+    if (file === '') return false
+    return keywordFileSignature(file) !== this.keywordSignature
+  }
+
+  /**
+   * 重建 KWS 以加载当前关键词（代价约 1 秒）。
+   * new 失败时 this.#kws 的赋值不会发生，旧实例继续服务；
+   * 如实返回 ok:false，调用方绝不能把新配置当成已生效。
+   * @returns {{ok:boolean, error?:string, rebuilt:boolean, keywordInfo?:object}}
+   */
+  reloadKws() {
+    if (this.#kws === null) return { ok: true, rebuilt: false, keywordInfo: null }
+    try {
+      this.#kws = new Kws(this.#cfg.kwsOptions)
+      this.#silentSeconds = 0
+      return { ok: true, rebuilt: true, keywordInfo: this.#kws.keywordInfo }
+    } catch (error) {
+      return { ok: false, rebuilt: false, error: error.message }
+    }
+  }
 
   /**
    * @param {Float32Array} chunk 16k 单声道，建议 1600 采样/块
@@ -95,7 +135,7 @@ export class StreamingPipeline {
     /*
      * 唤醒用**原始**音频，不用 AGC 后的。
      *
-     * 实测（tools/verify-wake-runtime.mjs）：同一段「你好狼宝」，
+     * 实测（tools/verify-wake-runtime.mjs）：同一段「小爱同学」，
      * 直接喂给 Kws 能命中，经 AGC 放大后再喂就漏检——增益把波形削顶了，
      * 关键词模型的特征就乱了。KWS 本身有小模型自带的前端，不需要我们再帮它调音量。
      */
