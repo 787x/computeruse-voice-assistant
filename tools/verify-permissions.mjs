@@ -173,6 +173,13 @@ for (const text of ['不可以','不同意','不确认','不允许','不执行',
   results.push({ name: `语音不得批准 ${text}`, pass: parseConfirmText(text)?.allow !== true, verdict: text })
 }
 
+for (const text of ['不行','不用了','不要了','别执行','别执行了','不要执行','不要执行了','取消吧','算了吧','停止操作','  别 执行 了 。！ ','取消，']) {
+  results.push({ name: `明确取消 ${text}`, pass: parseConfirmText(text)?.allow === false, verdict: text })
+}
+for (const text of ['不要取消','你是说取消吗','为什么要取消','取消？','“取消”','「不要执行」','如果不安全就取消','不行吗','不要停止操作','取消不了','说取消','取消或确认']) {
+  results.push({ name: `歧义保持等待 ${text}`, pass: parseConfirmText(text) === null, verdict: text })
+}
+
 console.log('权限引擎验收\n' + '='.repeat(64))
 for (const row of results) {
   console.log(`${row.pass ? '✓' : '✗'} ${row.name.padEnd(36, ' ')} ${row.verdict}`)

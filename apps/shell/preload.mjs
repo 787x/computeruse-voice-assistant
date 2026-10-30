@@ -35,8 +35,22 @@ contextBridge.exposeInMainWorld('hud', {
   onConfirmDone: (handler) => {
     ipcRenderer.on('hud:confirmDone', () => handler())
   },
-  /** 用户点了"允许"(true) / "允许 15 分钟"('once') / "取消"(false) */
-  answerConfirm: (id, answer) => ipcRenderer.send('hud:confirm', { id, answer }),
   /** 用户主动收起 */
   dismiss: () => ipcRenderer.send('hud:dismiss'),
 })
+
+// Kept in the isolated world: page scripts cannot call the IPC sender or set this ID.
+let confirmationId = null
+ipcRenderer.on('hud:confirm', (_event, card) => { confirmationId = card?.id ?? null })
+ipcRenderer.on('hud:confirmDone', () => { confirmationId = null })
+window.addEventListener('DOMContentLoaded', () => {
+  for (const [name, answer] of [['allow', true], ['allowOnce', 'once'], ['deny', false]]) {
+    const button = document.getElementById(name)
+    button?.addEventListener('click', (event) => {
+      if (!event.isTrusted || event.currentTarget !== button || confirmationId === null) return
+      const id = confirmationId
+      confirmationId = null // One submission per displayed request.
+      ipcRenderer.send('hud:confirm', { id, answer })
+    })
+  }
+}, { once: true })

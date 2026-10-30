@@ -268,9 +268,6 @@ window.hud.onSubtitle((payload) => {
 })
 
 $('close').addEventListener('click', () => window.hud.dismiss())
-$('allow').addEventListener('click', (event) => { if (event.isTrusted && confirmData) window.hud.answerConfirm(confirmData.id, true) })
-$('allowOnce').addEventListener('click', (event) => { if (event.isTrusted && confirmData) window.hud.answerConfirm(confirmData.id, 'once') })
-$('deny').addEventListener('click', (event) => { if (event.isTrusted && confirmData) window.hud.answerConfirm(confirmData.id, false) })
 
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') window.hud.dismiss()

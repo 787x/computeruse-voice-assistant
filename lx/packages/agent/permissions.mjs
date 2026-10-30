@@ -208,7 +208,7 @@ export class PermissionGate {
    * @param {{tool:string, args?:object, utterance?:string, result?:{ok:boolean,ms:number}}} request
    * @returns {Promise<{allow:boolean, level:string, capability:string, reason?:string, channel?:string, needsConfirm?:boolean}>}
    */
-  async check({ tool, args = {}, utterance = '' }) {
+  async check({ tool, args = {}, utterance = '', signal }) {
     const started = this.#now()
 
     // 全局暂停优先于一切：用户说"暂停 10 分钟"就是想立刻静音
@@ -262,6 +262,7 @@ export class PermissionGate {
     const answer = await this.#confirm({
       tool,
       args,
+      signal,
       capability: verdict.capability,
       label: CAPABILITIES[verdict.capability]?.label ?? verdict.capability,
       why: verdict.reason,
@@ -329,8 +330,9 @@ export class PermissionGate {
 /** 语音只能明确取消；所有肯定、疑问及不确定输入均不授权。 */
 export function parseConfirmText(raw) {
   // Speech is cancellation-only. Match complete phrases, never affirmative substrings.
-  const text = String(raw ?? '').trim().replace(/[。！!，,\s]+$/u, '')
-  if (/^(取消|不用了|不要|不要确认这个东西|不可以|不同意|不确认|不允许|不执行|拒绝|算了|停止)$/u.test(text)) {
+  const text = String(raw ?? '').normalize('NFKC').replace(/\s/gu, '').replace(/[。.!！,，、]+$/u, '')
+  // Complete commands only: questions, quotations and negated cancellation stay undecided.
+  if (/^(?:取消(?:吧)?|不用了|不行|不要(?:了|执行(?:了)?|确认这个东西)?|别执行(?:了)?|不可以|不同意|不确认|不允许|不执行|拒绝|算了(?:吧)?|停止(?:操作)?)$/u.test(text)) {
     return { allow: false, channel: 'voice', reason: `用户说：${text}` }
   }
   return null
