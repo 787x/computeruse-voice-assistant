@@ -35,8 +35,30 @@ contextBridge.exposeInMainWorld('hud', {
   onConfirmDone: (handler) => {
     ipcRenderer.on('hud:confirmDone', () => handler())
   },
-  /** 用户点了"允许"(true) / "允许 15 分钟"('once') / "取消"(false) */
-  answerConfirm: (answer) => ipcRenderer.send('hud:confirm', answer),
   /** 用户主动收起 */
   dismiss: () => ipcRenderer.send('hud:dismiss'),
 })
+
+// Kept in the isolated world: page scripts cannot call the IPC sender or set this ID.
+let confirmationId = null
+ipcRenderer.on('hud:confirm', (_event, card) => { confirmationId = card?.id ?? null })
+ipcRenderer.on('hud:confirmDone', () => { confirmationId = null })
+window.addEventListener('DOMContentLoaded', () => {
+  window.addEventListener('keydown', (event) => {
+    if (!event.isTrusted || event.repeat || event.key !== 'Enter' || confirmationId === null) return
+    if (event.target?.closest?.('button,input,textarea,select,[contenteditable]')) return
+    event.preventDefault()
+    const id = confirmationId
+    confirmationId = null
+    ipcRenderer.send('hud:confirm', { id, answer: true })
+  })
+  for (const [name, answer] of [['allow', true], ['allowOnce', 'once'], ['deny', false]]) {
+    const button = document.getElementById(name)
+    button?.addEventListener('click', (event) => {
+      if (!event.isTrusted || event.currentTarget !== button || confirmationId === null) return
+      const id = confirmationId
+      confirmationId = null // One submission per displayed request.
+      ipcRenderer.send('hud:confirm', { id, answer })
+    })
+  }
+}, { once: true })

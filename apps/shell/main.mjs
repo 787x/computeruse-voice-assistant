@@ -16,6 +16,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { writeWav } from '../../packages/voice/wav.mjs'
 import { judgeBargeIn, stripBargeWords } from '../../packages/voice/bargein.mjs'
+import { CredentialSync } from '../../packages/tools/credential-sync.mjs'
+import { AgentInitialization } from '../../packages/agent/initialization.mjs'
 import { parseConfirmText } from '../../packages/agent/permissions.mjs'
 import { parseOfflineIntent, offlineUnsupported, formatTime, formatDate, isOfflineError } from '../../packages/agent/offline.mjs'
 import { judgeFollowUp, windowFor, heuristicFollowUp, FOLLOWUP_DEFAULTS } from '../../packages/agent/followup.mjs'
@@ -240,7 +242,7 @@ function ensureWindow() {
     event.preventDefault()
     quitApp('hud close')
   })
-  win.on('closed', () => { win = null })
+  win.on('closed', () => { cancelActiveTurn('window closed'); win = null })
   return win
 }
 
@@ -357,6 +359,7 @@ function hideHud() {
 
 /** 对话结束后的调用点：R14 里"隐藏 vs 销毁"的决策也在这里。 */
 function dismiss() {
+  cancelActiveTurn('dismiss')
   /*
    * 用户点 HUD 的 × 就是"别干了"，不是"先躲一下"。
    * 之前只隐藏窗口、麦克风还开着，随便一点动静又把它叫醒——这就是"关不掉还复活"。
@@ -364,7 +367,6 @@ function dismiss() {
    */
   userDismissedHud = true
   stopSpeaking()
-  activeTurn = null
   commandActive = false
   clearTimeout(commandTimer)
   if (listening) {
@@ -383,6 +385,16 @@ function dismiss() {
  * 该释放的（麦克风、子进程、音频）我们已经在上面前置做好了。
  */
 async function shutdown() {
+  cancelActiveTurn('shutdown')
+  // Revoke initialization immediately, before waiting for microphone/TTS shutdown.
+  const musicCleanup = musicCredentials.close().then(result => log(`music cleanup result: ${JSON.stringify(result)}`)).catch(error => log(`music cleanup failed: ${error.name}`))
+  const agentCleanup = agentInitialization.close().then(result => {
+    log(`agent cleanup result: ${JSON.stringify(result)}`)
+    return result
+  }).catch(error => {
+    log(`agent cleanup failed: ${error.stack ?? error.message}`)
+    return { ok: false, errors: [error.message] }
+  })
   log('shutdown requested')
   // 兜底：任何一步卡住都不能让"退出"变成没反应（实测过一次等 worker 不返回）
   const hardStop = setTimeout(() => {
@@ -393,7 +405,8 @@ async function shutdown() {
   try { stopSpeaking() } catch { /* 队列可能已空 */ }
   // TTS worker 常驻 1.5GB 显存，退出必须回收，否则下次启动会和残留进程抢显存
   try { if (ttsEngine !== null) await ttsEngine.dispose() } catch { /* 可能已经退出 */ }
-  try { if (agentRuntime !== null) await agentRuntime.toolkit.dispose() } catch { /* 桥接可能已退出 */ }
+  await agentCleanup
+  await musicCleanup
   clearTimeout(hardStop)
   log('shutdown done')
   app.exit(0)
@@ -403,6 +416,7 @@ async function shutdown() {
 let shuttingDown = false
 function quitApp(reason) {
   if (shuttingDown) return
+  cancelActiveTurn(reason)
   shuttingDown = true
   app.isQuitting = true
   log(`quit requested（${reason}）`)
@@ -471,7 +485,8 @@ async function doStartListening() {
     })
     const result = await target.webContents.executeJavaScript('window.captureControl.start()')
     listening = true
-    setState('listening')
+    if (confirmResolver !== null) syncConfirmVoice()
+    setState(confirmResolver !== null ? 'confirm' : 'listening')
     syncWakeTray(true)
     log(`listening started: ${JSON.stringify(result)}`)
     return result
@@ -524,21 +539,36 @@ async function stopListening() {  if (!listening) return { ok: true, already: tr
   return { ok: true }
 }
 
-/** 唤醒命中：弹出小窗并进入"说指令"阶段 */
-function onWake(keyword) {
+/** 显式手动开始：确保采集已开启，再进入真正的指令识别。 */
+async function startManualConversation() {
+  if (confirmResolver !== null) { showForInteraction('confirm'); return }
+  const generation = turnSeq
+  if (!listening) {
+    const result = await startListening()
+    if (!result.ok || generation !== turnSeq) return
+  }
+  if (confirmResolver !== null) { showForInteraction('confirm'); return }
+  stopSpeaking()
+  onWake('手动开始对话', true)
+}
+
+/** 唤醒命中或显式手动请求：显示小窗并开启指令识别。 */
+function onWake(keyword, manual = false) {
+  if (confirmResolver !== null) return // A wake must not replace a pending confirmation.
   /*
    * 设置窗口在前台时不响应唤醒词。
    * 用户点"保存"、敲键盘时，KWS 很容易被点击声/人声误触发，
    * 表现出来就是"一保存助手就醒了"——它是被声音叫醒的，不是被保存叫醒的。
    */
-if ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible())
-    || (wakeMutedUntil > 0 && Date.now() < wakeMutedUntil)) {
+if (!manual && ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible())
+    || (wakeMutedUntil > 0 && Date.now() < wakeMutedUntil))) {
     return
   }
   log(`wake: ${keyword}`)
   // 一次唤醒 = 一次会话：清掉上一件事的记忆，避免"新问题被老问题带偏"
   resetSession('wake')
-  showForWake('listening')
+  if (manual) showForInteraction('listening')
+  else showForWake('listening')
   sendSubtitle({ reset: true, hint: '我在听，请说' })
 
   commandActive = true
@@ -547,7 +577,7 @@ if ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible
   lastSentPartial = ''
   // 唤醒词本身（"你好狼宝"）已经进了麦克风。识别从 300ms 后开始，
   // 否则识别结果会带着"你好狼宝"四个字，指令就变成"你好狼宝打开浏览器"。
-  commandStartAt = Date.now() + WAKE_TAIL_MS
+  commandStartAt = Date.now() + (manual ? 0 : WAKE_TAIL_MS)
   clearTimeout(commandTimer)
   commandTimer = setTimeout(() => finishCommand('timeout'), COMMAND_TIMEOUT_MS)
 
@@ -638,6 +668,7 @@ function startAsrLoad() {
     try {
       const { Asr } = await import('../../packages/voice/asr.mjs')
       asr = new Asr()
+      if (confirmResolver !== null) syncConfirmVoice()
       log(`asr ready in ${Date.now() - startedAt}ms`)
       return asr
     } catch (error) {
@@ -673,7 +704,8 @@ function maybePrewarmAsr() {
 }
 
 /** 一句说完了：把字幕定稿，进入思考态 */
-function finishCommand(reason) {
+function finishCommand(reason, voiceEpoch = confirmVoiceEpoch, endpointText = null, requestId = pendingConfirmId) {
+  if (!commandActive || (confirmResolver !== null && voiceEpoch !== confirmVoiceEpoch)) return
   commandActive = false
   clearTimeout(commandTimer)
 
@@ -684,9 +716,11 @@ function finishCommand(reason) {
     followUpWindowStart = 0
   }
 
-  let text = asr === null ? '' : asr.flush()
+  const flushed = asr === null ? '' : asr.flush()
+  let text = endpointText !== null ? endpointText : flushed
+  if (confirmResolver !== null && (requestId !== pendingConfirmId || voiceEpoch !== confirmVoiceEpoch)) return
   if (reason === 'timeout') log(`command timeout, tail="${text}"`)
-  if (text === '' && lastCommandText !== '') {
+  if (confirmResolver === null && text === '' && lastCommandText !== '') {
     // 端点已判过：flush 可能是空的，用最后一次 partial 兜底
     text = lastCommandText
   }
@@ -694,10 +728,13 @@ function finishCommand(reason) {
 
   // 正在等确认：这句话是"答不答应"，不是新指令
   if (confirmResolver !== null) {
-    const answer = parseConfirmText(text)
+    const answer = voiceConfirmEnabled ? parseConfirmText(text) : null
     log(`confirm heard: "${text}" → ${answer === null ? '未表态' : (answer.allow ? '允许' : '拒绝')}`)
-    if (answer !== null) settleConfirm(answer)
-    else sendSubtitle({ hint: '说「确认」或「取消」' })
+    if (answer !== null) settleConfirm({ ...answer, epoch: voiceEpoch }, requestId, confirmVoiceSource)
+    else {
+      sendSubtitle({ hint: '可以说「确认」或「取消」，也可以点击按钮' })
+      syncConfirmVoice()
+    }
     return
   }
 
@@ -744,10 +781,40 @@ function finishCommand(reason) {
 /** 回合序号：晚到的旧回合不该覆盖新回合的字幕 */
 let turnSeq = 0
 /** @type {{agent:any, toolkit:any, config:any, readyMs:number}|null} */
+const musicCredentials = new CredentialSync({
+  loadConfig: async () => (await import('../../packages/config/store.mjs')).loadConfig(),
+  saveConfig: async (...args) => (await import('../../packages/config/store.mjs')).saveConfig(...args),
+}, syncCredentialsAsync)
 let agentRuntime = null
-let agentLoading = null
+const agentInitialization = new AgentInitialization({
+  publish: (runtime) => { agentRuntime = runtime },
+  diagnostic: (error) => log(`agent cleanup failed: ${error.message}`),
+})
 /** 当前回合；agent 的事件都倒进这里 */
 let activeTurn = null
+let latestTurn = null
+function cancelActiveTurn(reason) {
+  turnSeq += 1
+  clearTimeout(hideTimer)
+  const turn = latestTurn
+  activeTurn = null
+  latestTurn = null
+  turn?.controller.abort()
+  stopSpeaking()
+  log(`turn cancelled (${reason})`)
+  wantContinue = false
+  followUpJudgement = null
+  followUpJudgePromise = null
+  closeConfirmCard()
+  clearTimeout(commandTimer)
+  commandActive = false
+  asr?.reset()
+  lastCommandText = ''
+  lastSentPartial = ''
+}
+function isCurrentTurn(turn) {
+  return turnSeq === turn.id && !turn.controller.signal.aborted
+}
 
 /**
  * 把流式文本切成句：字幕和播报都以"句"为单位。
@@ -802,7 +869,7 @@ function isOfflineNow() {
  * 判断原则：宁可不认，也不要"以为听懂了其实办错"。
  * 所以这里只做规则匹配，不接本地小模型。
  */
-async function runOfflineCommand(text) {
+async function runOfflineCommand(text, turn) {
   const parsed = parseOfflineIntent(text)
   if (parsed === null) {
     replyOffline(offlineUnsupported(text))
@@ -823,8 +890,10 @@ async function runOfflineCommand(text) {
       replyOffline(lastAssistantText === '' ? '我刚才没说话。' : lastAssistantText)
       break
     case 'launch': {
-      const launcher = await ensureLauncher()
+      const launcher = await ensureLauncher(turn?.controller.signal)
+      if (turn && !isCurrentTurn(turn)) return
       const result = await launcher.launch(parsed.arg)
+      if (turn && !isCurrentTurn(turn)) return
       replyOffline(result.text.split('\n')[0])
       break
     }
@@ -896,6 +965,8 @@ let userBargeInAt = 0
 let permissionGate = null
 /** 正在等确认的那个请求；null 表示没有待确认的事 */
 let confirmResolver = null
+let confirmSequence = 0
+let pendingConfirmId = null
 /** 待确认请求对应的能力（"允许 15 分钟"要按能力记授权） */
 let pendingConfirmCapability = null
 /**
@@ -909,6 +980,25 @@ const CONFIRM_TIMEOUT_MS = Number(process.env.CUA_VA_CONFIRM_TIMEOUT ?? 180000)
 let permissionMode = 'standard'
 /** 语音确认通道总开关（托盘可关，关了就只能点按钮） */
 let voiceConfirmEnabled = true
+let confirmVoiceEpoch = 0
+const confirmVoiceSource = Symbol('local ASR confirmation')
+function setVoiceConfirmEnabled(enabled) {
+  voiceConfirmEnabled = enabled
+  if (confirmResolver !== null) syncConfirmVoice()
+}
+function syncConfirmVoice() {
+  confirmVoiceEpoch += 1
+  clearTimeout(commandTimer)
+  commandActive = false
+  heardAny = false
+  lastCommandText = ''
+  lastSentPartial = ''
+  asr?.reset()
+  if (confirmResolver !== null && voiceConfirmEnabled && listening && asr !== null) {
+    commandActive = true
+    commandStartAt = Date.now() + 300
+  }
+}
 /** 连续对话：说完一轮继续待命，等用户接着讲（托盘可关 = 单次对话） */
 let continuousMode = process.env.CUA_VA_SINGLE_TURN === '1' ? false : true
 /** 合成用的情绪与语速（来自设置页，跟着音色包里的参考音频走） */
@@ -1225,6 +1315,8 @@ async function pumpSpeech() {
  * 否则"模型说要继续、但没开待命窗口"这种 bug 只在长回答上出现。
  */
 async function afterTurnSpeechSettled() {
+  const generation = turnSeq
+  if (activeTurn !== null || userDismissedHud) return false
   if (ttsPumping || ttsQueue.length > 0 || playingAudio()) {
     pendingFollowUpCheck = true
     return false
@@ -1234,6 +1326,7 @@ async function afterTurnSpeechSettled() {
   closeConfirmCard()
   flushPendingUiAction()
   const followUp = await startFollowUpIfWanted()
+  if (generation !== turnSeq || userDismissedHud) return false
   log(`afterTurnSpeechSettled state=${currentState} followUp=${followUp}`)
   if (followUp) return true
   // 说完了就立刻换掉「正在说」，否则用户会以为它卡在播报里
@@ -1249,6 +1342,7 @@ async function afterTurnSpeechSettled() {
  * 拿不准就多等一会儿，判错也不至于把用户想说的话吞掉。
  */
 async function startFollowUpIfWanted() {
+  const generation = turnSeq
   if (!continuousMode) return false
   if (!listening) return false          // 麦克风都关了，待命没意义
   if (activeTurn !== null) return false  // 回合还没结束
@@ -1256,6 +1350,7 @@ async function startFollowUpIfWanted() {
   if (commandActive) return false        // 已经在听了
 
   const judgement = await resolveFollowUpJudgement()
+  if (generation !== turnSeq || userDismissedHud || !listening || activeTurn !== null || confirmResolver !== null) return false
   if (judgement.wait !== true && judgement.confidence < followUpConfig.thresholds.low) {
     log(`follow-up skipped: 判定不该继续等（conf=${judgement.confidence.toFixed(2)} ${judgement.why}）`)
     return false
@@ -1429,9 +1524,8 @@ function toolHint(name) {
   return hints[name] ?? '动手'
 }
 
-function handleAgentEvent(event) {
-  const turn = activeTurn
-  if (turn === null || turn.id !== turnSeq) return
+function handleAgentEvent(event, turn = activeTurn) {
+  if (turn === null || activeTurn !== turn || !isCurrentTurn(turn)) return
 
   if (event.type === 'text_delta') {
     if (turn.state !== 'speaking') {
@@ -1455,6 +1549,7 @@ function handleAgentEvent(event) {
      * 耳朵里还是上一句「我帮你看看」，两边完全错位。
      */
     applyUiWhenQuiet(() => {
+      if (!isCurrentTurn(turn)) return
       setState('thinking')
       sendSubtitle({ hint: `正在${toolHint(event.name)}` })
     })
@@ -1705,10 +1800,12 @@ async function handlePlayerAction(action) {
 
 
 /** 把已运行但没窗口的程序叫回前台；失败就返回一句模型能照做的话 */
-async function invokeCuaWithRecovery(toolkit, name, args, launcher) {
+async function invokeCuaWithRecovery(toolkit, name, args, launcher, signal) {
+  signal?.throwIfAborted()
   try {
     return await toolkit.invoke(name, args)
   } catch (error) {
+    signal?.throwIfAborted()
     const message = String(error?.message ?? '')
     if (!/No application with appKey|No such application/iu.test(message)) throw error
 
@@ -1727,6 +1824,7 @@ async function invokeCuaWithRecovery(toolkit, name, args, launcher) {
 
     if (woken) {
       await new Promise((resolve) => setTimeout(resolve, 1500))
+      signal?.throwIfAborted()
       try { return await toolkit.invoke(name, args) } catch { /* 落到软失败 */ }
     }
 
@@ -1745,9 +1843,12 @@ async function invokeCuaWithRecovery(toolkit, name, args, launcher) {
  * 单独一个实例：离线兜底要用它，而离线时 agent 根本起不来。
  */
 let appLauncher = null
-async function ensureLauncher() {
+async function ensureLauncher(signal) {
+  signal?.throwIfAborted()
   if (appLauncher !== null) return appLauncher
   const launchModule = await import('../../packages/tools/app-launch.mjs')
+  signal?.throwIfAborted()
+  if (appLauncher !== null) return appLauncher
   appLauncher = new launchModule.AppLauncher()
   void appLauncher.ensureIndex().then((list) => log(`app index ready: ${list.length} entries`)).catch((error) => log(`app index failed: ${error.message}`))
   return appLauncher
@@ -1757,47 +1858,37 @@ async function ensureLauncher() {
  * 模型 + 工具链初始化。LLM 客户端几乎零成本，但 CUA 桥接要起一个 PowerShell
  * （冷启动实测 1050ms），所以只做一次，第一次下指令时才付这个成本。
  */
-async function ensureAgent() {
-  if (agentRuntime !== null) return agentRuntime
-  if (agentLoading !== null) return agentLoading
-  agentLoading = (async () => {
+async function ensureAgent(signal) {
+  const runtime = await agentInitialization.ensure(signal, async ({ signal: initSignal, checkpoint, own }) => {
     const [store, llmModule, loopModule, cuaModule] = await Promise.all([
       import('../../packages/config/store.mjs'),
       import('../../packages/agent/llm.mjs'),
       import('../../packages/agent/loop.mjs'),
       import('../../packages/cua/adapter.mjs'),
     ])
+    checkpoint()
     const config = await store.loadConfig()
+    checkpoint()
     const apiKey = await store.resolveApiKey()
+    checkpoint()
     if (!apiKey) throw new Error('还没配置模型 API Key')
 
-    // 音乐工具的凭据同步给 ncm-cli；异步跑，别挡住这一轮对话
-    void (async () => {
-      try {
-        // 带上"上次同步过的哈希"：内容没变就不要写 CLI，否则会把登录态顶掉
-        const result = await syncCredentialsAsync(config.netease ?? {}, { syncedHash: config.netease?.syncedHash })
-        const synced = result.synced ?? []
-        if (synced.length > 0) log(`netease credentials synced: ${synced.join(', ')}`)
-        if (result.hash !== undefined && result.hash !== config.netease?.syncedHash) {
-          await store.saveConfig({ netease: { ...(config.netease ?? {}), syncedHash: result.hash } })
-          config.netease = { ...(config.netease ?? {}), syncedHash: result.hash }
-        }
-      } catch (error) {
-        log(`netease sync failed: ${error.message}`)
-      }
-    })()
-
+    checkpoint()
     const startedAt = Date.now()
-    const toolkit = new cuaModule.CuaToolkit({ frameDir: join(DATA_ROOT, 'frames') })
+    const toolkit = own(new cuaModule.CuaToolkit({ frameDir: join(DATA_ROOT, 'frames') }))
     await toolkit.warmup()
+    checkpoint()
 
     // 联网搜索：key 没配就当这个工具不存在（模型不会去调一个列表里没有的工具）
     const searchModule = await import('../../packages/tools/web-search.mjs')
+    checkpoint()
     const searchKey = await store.resolveSearchKey()
+    checkpoint()
     const webSearch = new searchModule.WebSearch({ apiKey: searchKey })
 
     // 按名字启动程序（Start 菜单级解析）：CUA 的 open_application 只吃真实路径
-    const launcher = await ensureLauncher()
+    const launcher = await ensureLauncher(initSignal)
+    checkpoint()
 
     const tools = {
       listTools: () => {
@@ -1806,7 +1897,8 @@ async function ensureAgent() {
         list.push(LAUNCH_APP_TOOL, SHELL_TOOL, FILES_TOOL, PROC_TOOL, KILL_TOOL, SYSINFO_TOOL, NETEASE_TOOL)
         return list
       },
-      invoke: async (name, args) => {
+      invoke: async (name, args, { signal } = {}) => {
+        signal?.throwIfAborted()
         if (name === 'web_search') return webSearch.invoke(args)
         if (name === 'launch_app') return launcher.launch(args?.query)
         if (name === 'run_shell') return runShell(args)
@@ -1815,6 +1907,8 @@ async function ensureAgent() {
         if (name === 'kill_app') return runKillApp(args)
         if (name === 'system_info') return runSystemInfo(args)
         if (name === 'netease_music') {
+          await musicCredentials.sync(signal)
+          signal?.throwIfAborted()
           /*
            * 音乐一律走官方 CLI，不去操纵客户端界面。
            * 未登录时把登录链接一起带回去——模型没法替用户点授权，
@@ -1825,6 +1919,7 @@ async function ensureAgent() {
            * 播放成功后把迷你播放器叫出来：用户要的是"像音乐 App 一样的浮窗"，
            * 播了歌却什么都不显示，会让人以为没生效。
            */
+          signal?.throwIfAborted()
           if (args?.action === 'play' && musicResult.data?.payload?.success !== false) {
             syncPlayerWindow()
           }
@@ -1836,7 +1931,8 @@ async function ensureAgent() {
         }
 
         const normalized = await normalizeCuaTarget(toolkit, name, args)
-        const result = await invokeCuaWithRecovery(toolkit, name, normalized, launcher)
+        signal?.throwIfAborted()
+        const result = await invokeCuaWithRecovery(toolkit, name, normalized, launcher, signal)
         // 截图要把图一起交给模型（它没有"打开文件"的能力），否则它对屏幕是瞎的
         if (name === 'screenshot') {
           const attached = await attachScreenshotImage(result)
@@ -1860,9 +1956,12 @@ async function ensureAgent() {
       maxSteps: config.maxSteps,
       onEvent: handleAgentEvent,
       // 所有工具调用都要过权限门，拒绝时把原因回填给模型（它会改用别的办法或告诉用户）
-      gate: async ({ tool, args }) => {
+      gate: async ({ tool, args, signal }) => {
+        signal?.throwIfAborted()
         const gateInstance = await ensurePermissions()
-        const verdict = await gateInstance.check({ tool, args, utterance: lastUtterance })
+        signal?.throwIfAborted()
+        const verdict = await gateInstance.check({ tool, args, utterance: lastUtterance, signal })
+        signal?.throwIfAborted()
         if (verdict.allow === true) return { allow: true }
 
         // 同一个回合里同一个工具被拒两次，就不再问：否则模型会把"没回应"当超时，
@@ -1880,23 +1979,21 @@ async function ensureAgent() {
       },
     })
 
-    agentRuntime = { agent, toolkit, config, webSearch, llm, apiKey, readyMs: Date.now() - startedAt }
-    applyModelSchedule('agent-ready')
-    log(`agent ready in ${agentRuntime.readyMs}ms model=${config.model}`)
-    return agentRuntime
-  })()
-  try {
-    return await agentLoading
-  } finally {
-    agentLoading = null
-  }
+    checkpoint()
+    return { agent, toolkit, config, webSearch, llm, apiKey, readyMs: Date.now() - startedAt }
+  })
+  signal?.throwIfAborted()
+  if (shuttingDown) throw new DOMException('Application exiting', 'AbortError')
+  applyModelSchedule('agent-ready')
+  log(`agent ready in ${runtime.readyMs}ms model=${runtime.config.model}`)
+  return runtime
 }
 
 /**
  * 权限门。**所有工具调用都从这里过**（agent 的 gate 回调）。
  *
- * 确认通道做成"语音优先、点击兜底"：
- *   HUD 弹卡片 + 同时开一个识别窗口，说"确认/取消"都行；
+ * 确认通道支持本机语音和受保护的卡片点击：
+ *   HUD 弹卡片 + 同时开一个识别窗口，可以语音确认/取消，也可以点击按钮；
  *   不吭声 12 秒按拒绝处理——安全的那一侧永远是"不做"。
  */
 async function ensurePermissions() {
@@ -1931,9 +2028,17 @@ function summarizeArgsForCard(tool, args) {
   return parts.length === 0 ? `工具：${tool}` : `工具：${tool} · ${parts.join(' · ')}`
 }
 
-/** 等用户确认：语音或点击，谁先到算谁 */
+/** 等用户语音或点击确认；取消/超时按拒绝处理 */
 async function askUser(request) {
-  const card = describeRequest(request)
+  if (request.signal?.aborted) return { allow: false, channel: 'cancelled' }
+  closeConfirmCard()
+  const id = ++confirmSequence
+  pendingConfirmId = id
+  commandActive = false
+  clearTimeout(commandTimer)
+  asr?.reset()
+  lastCommandText = ''
+  const card = { ...describeRequest(request), id }
   pendingConfirmCapability = request.capability ?? null
   stopSpeaking()
   setState('confirm')
@@ -1943,45 +2048,38 @@ async function askUser(request) {
   if (win !== null && !win.isDestroyed()) win.webContents.send('hud:confirm', card)
   log(`confirm asked: ${card.text} (${card.detail})`)
 
-  // 语音通道：开一个短识别窗口，听"确认"或"取消"（托盘可关）
-  if (voiceConfirmEnabled) {
-    if (asr !== null) asr.reset()
-    commandActive = true
-    heardAny = false
-    lastCommandText = ''
-    lastSentPartial = ''
-    commandStartAt = Date.now() + 300
-  }
 
   return new Promise((resolve) => {
-    // 测试钩子：CUA_VA_AUTO_CONFIRM=allow|deny 时自动答复。
-    // 只在自动化里用，日志会明确标出，避免被当成"用户真的同意了"。
-    const auto = process.env.CUA_VA_AUTO_CONFIRM
-    if (auto === 'allow' || auto === 'deny') {
-      setTimeout(() => {
-        log(`confirm auto-answer (test hook): ${auto}`)
-        settleConfirm(auto === 'allow'
-          ? { allow: true, channel: 'auto-test' }
-          : { allow: false, channel: 'auto-test', reason: '测试钩子：自动拒绝' })
-      }, 200)
-    }
-
     const timer = setTimeout(() => {
-      settleConfirm({ allow: false, channel: 'timeout', reason: `等了 ${Math.round(CONFIRM_TIMEOUT_MS / 1000)} 秒没有回应，按未同意处理` })
+      settleConfirm({ allow: false, channel: 'timeout', reason: `等了 ${Math.round(CONFIRM_TIMEOUT_MS / 1000)} 秒没有回应，按未同意处理` }, id)
     }, CONFIRM_TIMEOUT_MS)
 
     confirmResolver = (value) => {
       clearTimeout(timer)
+      request.signal?.removeEventListener('abort', onAbort)
       confirmResolver = null
+      pendingConfirmId = null
+      confirmVoiceEpoch += 1
+      clearTimeout(commandTimer)
+      asr?.reset()
+      lastCommandText = ''
       commandActive = false
       lastSentPartial = ''
       resolve(value)
     }
+    const onAbort = () => settleConfirm({ allow: false, channel: 'cancelled', reason: '回合已取消' }, id)
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+    if (request.signal?.aborted) onAbort()
+    else syncConfirmVoice()
   })
 }
 
 /** 决议一次确认（语音/点击/超时都走这里，只会生效一次） */
-function settleConfirm(value) {
+function settleConfirm(value, id = pendingConfirmId, trustedClick = false) {
+  if (id === null || id !== pendingConfirmId) return
+  if (value?.channel === 'voice' && (!voiceConfirmEnabled || value.epoch !== confirmVoiceEpoch || trustedClick !== confirmVoiceSource)) return
+  if (value?.allow === true && !((value.channel === 'click' && trustedClick === true)
+      || (value.channel === 'voice' && trustedClick === confirmVoiceSource))) return
   const resolver = confirmResolver
   if (resolver === null) return
   // "允许 15 分钟"：记一次临时授权，避免同一个动作反复弹卡片
@@ -2021,13 +2119,16 @@ let turnHistoryCounts = []
  * 设置页保存后，把搜索 key 同步到运行中的实例。
  * 每轮开始读一次配置（约 1ms），换来"改完立刻生效、不用重启"。
  */
-async function refreshSearchKey() {
-  if (agentRuntime === null) return
+async function refreshSearchKey(signal) {
+  const runtime = agentRuntime
+  if (runtime === null || signal?.aborted) return
   try {
     const store = await import('../../packages/config/store.mjs')
+    if (signal?.aborted || runtime !== agentRuntime) return
     const key = await store.resolveSearchKey()
-    if (agentRuntime.webSearch.setApiKey(key)) {
-      log(`web search key ${key === '' ? 'cleared' : 'updated'} → ${agentRuntime.webSearch.enabled ? 'enabled' : 'disabled'}`)
+    if (signal?.aborted || runtime !== agentRuntime) return
+    if (runtime.webSearch.setApiKey(key)) {
+      log(`web search key ${key === '' ? 'cleared' : 'updated'} → ${runtime.webSearch.enabled ? 'enabled' : 'disabled'}`)
     }
   } catch (error) {
     log(`refresh search key failed: ${error.message}`)
@@ -2041,10 +2142,10 @@ async function runCommand(text) {
   wantContinue = false
   turnHistoryCounts.push(sessionHistory.length)
   log(`turn start history=${sessionHistory.length} "${text.slice(0, 40)}"`)
-  // 设置页刚保存的搜索 key 要立刻生效，否则用户得重启才知道有没有配好
-  await refreshSearchKey()
-  const turn = { id: ++turnSeq, buffer: '', raw: '', state: 'thinking', tools: 0, startedAt: Date.now() }
+  cancelActiveTurn('new command')
+  const turn = { id: ++turnSeq, controller: new AbortController(), buffer: '', raw: '', state: 'thinking', tools: 0, startedAt: Date.now() }
   activeTurn = turn
+  latestTurn = turn
   clearTimeout(hideTimer)
   sendSubtitle({ hint: '我想一下…' })
 
@@ -2055,26 +2156,31 @@ async function runCommand(text) {
    * 而 system.shell 在标准档是"每次询问"——于是屏幕上弹出一张确认卡，
    * 用户没理它，等满 180 秒按拒绝处理，一轮对话白等三分钟（审计日志里有记录）。
    */
-  const trivial = parseOfflineIntent(text)
-  if (trivial !== null && (trivial.intent === 'time' || trivial.intent === 'date')) {
-    log(`local answer: ${trivial.intent}（不叫模型）`)
-    replyOffline(trivial.intent === 'time' ? `现在是${formatTime()}。` : `今天是${formatDate()}。`)
-    activeTurn = null
-    void afterTurnSpeechSettled()
-    return
-  }
-  // 断网时不必去撞一次 60 秒超时：本地能办的直接办，办不了的明说
-  if (isOfflineNow()) {
-    log('offline mode: 跳过模型，直接走本地兜底')
-    await runOfflineCommand(text)
-    activeTurn = null
-    void afterTurnSpeechSettled()
-    return
-  }
-
   try {
-    const { agent, llm } = await ensureAgent()
-    const result = await agent.run(text, { history: sessionHistory })
+    const trivial = parseOfflineIntent(text)
+    if (trivial !== null && (trivial.intent === 'time' || trivial.intent === 'date')) {
+      log(`local answer: ${trivial.intent}（不叫模型）`)
+      replyOffline(trivial.intent === 'time' ? `现在是${formatTime()}。` : `今天是${formatDate()}。`)
+      turn.completed = true
+      return
+    }
+    // 断网时不必去撞一次 60 秒超时：本地能办的直接办，办不了的明说
+    if (isOfflineNow()) {
+      log('offline mode: 跳过模型，直接走本地兜底')
+      turn.offlineAttempted = true
+      await runOfflineCommand(text, turn)
+      if (!isCurrentTurn(turn)) return
+      turn.completed = true
+      return
+    }
+
+    await refreshSearchKey(turn.controller.signal)
+    if (!isCurrentTurn(turn)) return
+    const { agent, llm } = await ensureAgent(turn.controller.signal)
+    if (!isCurrentTurn(turn)) return
+    const result = await agent.run(text, { history: sessionHistory, signal: turn.controller.signal,
+      onEvent: (event) => handleAgentEvent(event, turn) })
+    if (!isCurrentTurn(turn)) return
     flushTurn(turn)
     // 旧的文本标记只留作日志线索，真正决定要不要等的是下面的判定
     wantContinue = process.env.CUA_VA_FORCE_CONTINUE === '1' || /\[\[继续\]\]/u.test(turn.raw)
@@ -2090,11 +2196,12 @@ async function runCommand(text) {
     followUpJudgement = null
     const judgeStartedAt = Date.now()
     followUpJudgePromise = judgeFollowUp({
-      chat: (options) => llm.chat(options),
+      chat: (options) => llm.chat({ ...options, signal: turn.controller.signal }),
       userText: text,
       replyText: lastReplyText,
       timeoutMs: followUpConfig.judgeTimeoutMs,
     }).then((judgement) => {
+      if (!isCurrentTurn(turn)) return judgement
       followUpJudgement = judgement
       log(`follow-up judge: wait=${judgement.wait} conf=${judgement.confidence.toFixed(2)} src=${judgement.source} ${Date.now() - judgeStartedAt}ms ${judgement.why}`)
       // 判定回得晚（模型要 3~6 秒）：窗口可能已经按启发式开了，用真实置信度重算时长
@@ -2137,16 +2244,21 @@ async function runCommand(text) {
       return { ...heuristicFollowUp(lastReplyText), source: 'heuristic-error' }
     })
 
-    // 短回答可能在这一行之前就播完了，播报的 finally 不会再触发，所以这里补一次判定
-    void afterTurnSpeechSettled()
+    turn.completed = true
   } catch (error) {
-    // 网络类错误才走离线兜底；密钥错、参数错这类必须原样暴露，不能被兜底掩盖
-    if (isOfflineError(error)) {
-      log(`turn ${turn.id} offline (${error.message})，转本地兜底`)
-      activeTurn = null
-      await runOfflineCommand(text)
-      void afterTurnSpeechSettled()
-      return
+    if (!isCurrentTurn(turn) || error.name === 'AbortError') return
+    // A fallback failure is reported once; it must not escape this turn's cleanup.
+    if (isOfflineError(error) && !turn.offlineAttempted) {
+      try {
+        turn.offlineAttempted = true
+        await runOfflineCommand(text, turn)
+        if (!isCurrentTurn(turn)) return
+        turn.completed = true
+        return
+      } catch (fallbackError) {
+        if (!isCurrentTurn(turn) || fallbackError.name === 'AbortError') return
+        error = fallbackError
+      }
     }
     log(`turn ${turn.id} failed: ${error.message}`)
     wantContinue = false
@@ -2154,9 +2266,13 @@ async function runCommand(text) {
     setState('error')
     scheduleHide()
   } finally {
-    if (activeTurn === turn) activeTurn = null
-    // 回合结束了，还挂着的确认卡片要收掉（否则用户看到一张永远在等的卡片）
-    closeConfirmCard()
+    if (activeTurn === turn) {
+      activeTurn = null
+      clearTimeout(commandTimer)
+      commandActive = false
+      closeConfirmCard()
+      if (turn.completed) void afterTurnSpeechSettled()
+    }
   }
 }
 
@@ -2167,7 +2283,10 @@ async function runCommand(text) {
  */
 function feedCommandAudio(chunk) {
   if (!commandActive || asr === null || Date.now() < commandStartAt) return null
+  const epoch = confirmVoiceEpoch
+  const requestId = pendingConfirmId
   const heard = asr.push(chunk)
+  if (confirmResolver !== null && (!voiceConfirmEnabled || epoch !== confirmVoiceEpoch || requestId !== pendingConfirmId)) return null
   if (heard.partial !== '') {
     heardAny = true
     lastCommandText = heard.partial
@@ -2179,7 +2298,7 @@ function feedCommandAudio(chunk) {
   }
   if (heard.final !== null) {
     lastCommandText = heard.final
-    finishCommand('endpoint')
+    finishCommand('endpoint', epoch, heard.final, requestId)
   }
   return heard
 }
@@ -2378,7 +2497,7 @@ async function loadUiPrefs() {
     const ui = config.ui ?? {}
     if (typeof ui.ttsEnabled === 'boolean') ttsEnabled = ui.ttsEnabled
     if (typeof ui.continuousMode === 'boolean') continuousMode = ui.continuousMode
-    if (typeof ui.voiceConfirmEnabled === 'boolean') voiceConfirmEnabled = ui.voiceConfirmEnabled
+    if (typeof ui.voiceConfirmEnabled === 'boolean') setVoiceConfirmEnabled(ui.voiceConfirmEnabled)
     if (typeof ui.subtitles === 'boolean') subtitlesEnabled = ui.subtitles
     if (typeof ui.releaseOnFullscreen === 'boolean') releaseOnFullscreen = ui.releaseOnFullscreen
     if (typeof ui.wakeEnabled === 'boolean') wakeOnLaunch = ui.wakeEnabled
@@ -2526,26 +2645,15 @@ function registerSettingsIpc() {
        * 设置窗口就会一直"未响应"——用户看到的就是点了保存没反应。
        */
       if (credentialsChanged) {
-        void (async () => {
-          try {
-            const fresh = await store.loadConfig()
-            const current = await store.loadConfig()
-            const result = await syncCredentialsAsync(current.netease ?? {}, { syncedHash: current.netease?.syncedHash })
-            if (result.hash !== undefined && result.hash !== current.netease?.syncedHash) {
-              // 记下"同步过哪一版凭据"：下次内容没变就不动 CLI，避免把登录态顶掉
-              await store.saveConfig({ netease: { ...(current.netease ?? {}), syncedHash: result.hash } })
-            }
-            const synced = result.synced ?? []
-            log(`netease credentials ${synced.length > 0 ? `synced: ${synced.join(', ')}` : 'unchanged'}`)
-          } catch (error) {
-            log(`netease sync failed: ${error.message}`)
-          }
-        })()
+        // The application-wide owner tracks this promise; settings never wait for CLI latency.
+        musicCredentials.sync().catch(error => {
+          if (error.name !== 'AbortError') log(`netease sync failed: ${error.code ?? error.name}`)
+        })
       }
       // 立刻生效（不用重启）——这些都是内存里的开关与默认值
       if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled
       if (typeof payload?.ui?.continuousMode === 'boolean') continuousMode = payload.ui.continuousMode
-      if (typeof payload?.ui?.voiceConfirmEnabled === 'boolean') voiceConfirmEnabled = payload.ui.voiceConfirmEnabled
+      if (typeof payload?.ui?.voiceConfirmEnabled === 'boolean') setVoiceConfirmEnabled(payload.ui.voiceConfirmEnabled)
       if (typeof payload?.ui?.subtitles === 'boolean') subtitlesEnabled = payload.ui.subtitles
       if (typeof payload?.ui?.autoStart === 'boolean') {
         autoStartEnabled = payload.ui.autoStart
@@ -2812,7 +2920,7 @@ function buildTray() {
   tray.setToolTip('语音助手')
 
   const menu = Menu.buildFromTemplate([
-    { label: '唤醒 / 开始对话', click: () => showForInteraction('listening') },
+    { label: '唤醒 / 开始对话', click: () => { void startManualConversation() } },
     { type: 'separator' },
     { id: 'wake', label: '语音唤醒', type: 'checkbox', checked: false, click: (item) => {
       // 以"实际是否在听"为准：勾了但麦克风没开，比不勾更让人困惑
@@ -2834,7 +2942,7 @@ function buildTray() {
       log(`ttsEnabled=${ttsEnabled}`)
     } },
     { label: '语音确认', type: 'checkbox', checked: voiceConfirmEnabled, click: (item) => {
-      voiceConfirmEnabled = item.checked
+      setVoiceConfirmEnabled(item.checked)
       void saveUiPrefs()
       log(`voiceConfirmEnabled=${voiceConfirmEnabled}`)
     } },
@@ -2902,7 +3010,7 @@ function buildTray() {
   log(`tray 初始状态同步：state=${currentState} listening=${listening}`)
 
   // 左键点击图标 = 唤醒（Windows 上 click 与双击行为不同，两个都挂）
-  tray.on('click', () => showForInteraction('listening'))
+  tray.on('click', () => { void startManualConversation() })
 }
 
 /**
@@ -2981,9 +3089,8 @@ if (!gotSingleInstanceLock) {
    * 同时：有设置窗口开着就不弹，别打断改配置。
    */
   /*
-   * 第二个实例被拉起时，原来是直接 showForInteraction —— 窗口自己冒出来，
-   * 看起来就是"助手被唤醒了"。谁在拉起我们暂时不知道，所以先把父进程记下来。
-   * 另外：设置窗口开着就不弹，别打断改配置。
+   * 再次启动应用视为显式手动对话，而非只显示一个不收音的浮窗。
+   * 保留父进程日志；设置窗口开着时不抢焦点。
    */
   app.on('second-instance', () => {
     const parent = describeParentProcess()
@@ -2992,7 +3099,7 @@ if (!gotSingleInstanceLock) {
       log('second-instance：设置在开，不弹窗')
       return
     }
-    showForInteraction('listening')
+    void startManualConversation()
   })
   app.whenReady().then(async () => {
   log('whenReady')
@@ -3052,11 +3159,13 @@ if (!gotSingleInstanceLock) {
     void handlePlayerAction(action)
   })
   // 确认卡片上的按钮：允许 / 允许 15 分钟 / 取消
-  ipcMain.on('hud:confirm', (_event, answer) => {
-    log(`hud:confirm received from renderer: ${JSON.stringify(answer)}`)
-    if (answer === true) settleConfirm({ allow: true, channel: 'click' })
-    else if (answer === 'once') settleConfirm({ allow: true, channel: 'click', once: true })
-    else settleConfirm({ allow: false, channel: 'click', reason: '用户点了取消' })
+  ipcMain.on('hud:confirm', (event, payload) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents
+        || event.senderFrame !== win.webContents.mainFrame) return
+    const { id, answer } = payload ?? {}
+    if (!Number.isInteger(id) || ![true, false, 'once'].includes(answer)) return
+    settleConfirm({ allow: answer === true || answer === 'once', channel: 'click',
+      once: answer === 'once', reason: answer === false ? '用户点了取消' : '' }, id, true)
   })
 
   // 麦克风权限：只放行 media，其余一律拒绝
@@ -3490,13 +3599,9 @@ async function runGateTest(mode) {
   if (mode === 'timeout') {
     // 不答复，等超时（默认 12s，测试时用 CUA_VA_CONFIRM_TIMEOUT 缩短）
     report.timeoutMs = CONFIRM_TIMEOUT_MS
-  } else if (mode === 'deny') {
-    settleConfirm({ allow: false, channel: 'click', reason: '测试：用户点了取消' })
-  } else if (mode === 'once') {
-    // 点"15 分钟"：应当批准，并且把能力记成临时授权
-    settleConfirm({ allow: true, channel: 'click', once: true })
   } else {
-    settleConfirm({ allow: true, channel: 'click' })
+    // Interactive integration test: approval must traverse the real HUD click IPC.
+    log(`gate-test waiting for HUD ${mode} click`)
   }
 
   const askVerdict = await pending

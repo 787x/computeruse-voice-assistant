@@ -208,7 +208,7 @@ export class PermissionGate {
    * @param {{tool:string, args?:object, utterance?:string, result?:{ok:boolean,ms:number}}} request
    * @returns {Promise<{allow:boolean, level:string, capability:string, reason?:string, channel?:string, needsConfirm?:boolean}>}
    */
-  async check({ tool, args = {}, utterance = '' }) {
+  async check({ tool, args = {}, utterance = '', signal }) {
     const started = this.#now()
 
     // 全局暂停优先于一切：用户说"暂停 10 分钟"就是想立刻静音
@@ -262,17 +262,18 @@ export class PermissionGate {
     const answer = await this.#confirm({
       tool,
       args,
+      signal,
       capability: verdict.capability,
       label: CAPABILITIES[verdict.capability]?.label ?? verdict.capability,
       why: verdict.reason,
     })
 
     return this.#finish({
-      allow: answer?.allow === true,
+      allow: answer?.allow === true && ['click', 'voice'].includes(answer?.channel),
       level: 'ask',
       capability: verdict.capability,
       channel: answer?.channel ?? 'unknown',
-      reason: answer?.allow === true
+      reason: answer?.allow === true && ['click', 'voice'].includes(answer?.channel)
         ? ''
         : (answer?.reason ?? '用户没有确认'),
       tool, args, utterance, started,
@@ -326,19 +327,15 @@ export class PermissionGate {
   }
 }
 
-/**
- * 把用户的一句话读成"答不答应"。
- *
- * 否定词必须先判：中文里"不用了""不要"里也含"用/要"，
- * 先匹配肯定词会把拒绝读成同意——这类错误在删除确认上代价最大。
- */
+/** 只接受完整的确认/拒绝表达；疑问、引用和歧义保持等待。 */
 export function parseConfirmText(raw) {
-  const text = String(raw ?? '').trim()
-  if (text === '') return null
-  if (/(取消|不要|不用|不行|不对|别|停|算了|拒绝|错了)/u.test(text)) {
+  // Whole utterances only; never search for affirmative substrings.
+  const text = String(raw ?? '').normalize('NFKC').replace(/\s/gu, '').replace(/[。.!！,，、]+$/u, '')
+  // Complete commands only: questions, quotations and negated cancellation stay undecided.
+  if (/^(?:取消(?:吧)?|不用(?:了)?|不对|错了|停|别|不行|不要(?:了|执行(?:了)?|确认这个东西)?|别执行(?:了)?|不可以|不同意|不确认|不允许|不执行|拒绝|算了(?:吧)?|停止(?:操作)?)$/u.test(text)) {
     return { allow: false, channel: 'voice', reason: `用户说：${text}` }
   }
-  if (/(确认|确定|可以|好的|好|执行|是的|对|允许|同意|继续)/u.test(text)) {
+  if (/^(?:(?:可以|确认|确定|同意|允许|好的|好|是的|对|执行|继续)(?:吧|了)?|可以[，,]?执行吧|我(?:同意|确认)|可以的|好啊)$/u.test(text)) {
     return { allow: true, channel: 'voice' }
   }
   return null

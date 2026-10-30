@@ -57,6 +57,7 @@ export class CuaToolkit {
       defaultTimeoutMs: options.defaultTimeoutMs ?? 30000,
       startupTimeoutMs: options.startupTimeoutMs ?? 20000,
       maxRestarts: options.maxRestarts ?? 3,
+      spawnImpl: options.spawnImpl,
       onDiagnostic: options.onDiagnostic ?? (() => {}),
     })
 

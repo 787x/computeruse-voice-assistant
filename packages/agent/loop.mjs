@@ -113,7 +113,8 @@ export class Agent {
    *   history 是**同一个会话**里之前几轮的用户/助手发言（不含工具细节）。
    *   每次唤醒由调用方清空，于是"一次唤醒 = 一次会话"。
    */
-  async run(input, { signal, history = [] } = {}) {
+  async run(input, { signal, history = [], onEvent = this.#onEvent } = {}) {
+    const emit = (event) => { if (!signal?.aborted) onEvent(event) }
     const messages = [
       { role: 'system', content: this.#systemPrompt },
       ...trimHistory(history),
@@ -134,14 +135,14 @@ export class Agent {
         tools: availableTools,
         signal,
         stream: true, // 必须流式：首字和"先说话后动手"的白描都依赖它
-        onDelta: (text) => this.#onEvent({ type: 'text_delta', text }),
+        onDelta: (text) => emit({ type: 'text_delta', text }),
       })
       throwIfAborted(signal)
 
       if (result.text) finalText += result.text
 
       if (result.toolCalls.length === 0) {
-        this.#onEvent({ type: 'assistant', text: result.text, step })
+        emit({ type: 'assistant', text: result.text, step })
         break
       }
 
@@ -159,24 +160,27 @@ export class Agent {
         throwIfAborted(signal)
         const args = safeParseArgs(call.arguments)
 
-        this.#onEvent({ type: 'tool_start', name: call.name, args, step })
+        emit({ type: 'tool_start', name: call.name, args, step })
 
-        const verdict = await this.#gate({ tool: call.name, args })
+        throwIfAborted(signal)
+        const verdict = await this.#gate({ tool: call.name, args, signal })
+        throwIfAborted(signal)
         if (verdict?.allow !== true) {
           const denied = `已拒绝：${verdict?.reason ?? '权限不足'}`
           messages.push({ role: 'tool', tool_call_id: call.id, content: denied })
           steps.push({ step, tool: call.name, ok: false, text: denied })
-          this.#onEvent({ type: 'tool_end', name: call.name, ok: false, text: denied, step })
+          emit({ type: 'tool_end', name: call.name, ok: false, text: denied, step })
           continue
         }
 
         const started = Date.now()
         try {
-          const invoked = await this.#tools.invoke(call.name, args)
+          const invoked = await this.#tools.invoke(call.name, args, { signal })
+          throwIfAborted(signal)
           const text = clamp(invoked.text ?? '', TOOL_RESULT_MAX_CHARS)
           messages.push({ role: 'tool', tool_call_id: call.id, content: text })
           steps.push({ step, tool: call.name, ok: true, text, ms: Date.now() - started })
-          this.#onEvent({ type: 'tool_end', name: call.name, ok: true, text, step, ms: Date.now() - started })
+          emit({ type: 'tool_end', name: call.name, ok: true, text, step, ms: Date.now() - started })
 
           /*
            * 截图这类工具会带回一张图。**必须把图塞进对话**，否则模型只看到
@@ -195,10 +199,11 @@ export class Agent {
             })
           }
         } catch (error) {
+          throwIfAborted(signal)
           const message = `工具执行失败：${error instanceof Error ? error.message : String(error)}`
           messages.push({ role: 'tool', tool_call_id: call.id, content: message })
           steps.push({ step, tool: call.name, ok: false, text: message })
-          this.#onEvent({ type: 'tool_end', name: call.name, ok: false, text: message, step })
+          emit({ type: 'tool_end', name: call.name, ok: false, text: message, step })
         }
       }
 
@@ -214,6 +219,7 @@ export class Agent {
      * 然后循环直接结束——模型根本没机会说话，用户听到的就是"话说到一半停了"。
      * 现在多给一次不带工具的往返，让它用一句话说清楚做到哪、还差什么。
      */
+    throwIfAborted(signal)
     if (hitStepLimit && steps.length > 0) {
       try {
         const closing = await this.#llm.chat({
@@ -227,18 +233,20 @@ export class Agent {
           tools: [],
           signal,
           stream: true,
-          onDelta: (text) => this.#onEvent({ type: 'text_delta', text }),
+          onDelta: (text) => emit({ type: 'text_delta', text }),
         })
+        throwIfAborted(signal)
         if (closing.text) {
           finalText += closing.text
-          this.#onEvent({ type: 'assistant', text: closing.text, step: this.#maxSteps + 1, limited: true })
+          emit({ type: 'assistant', text: closing.text, step: this.#maxSteps + 1, limited: true })
         }
       } catch (error) {
-        this.#onEvent({ type: 'assistant', text: `（步数用完了，没能收尾：${error.message}）`, step: this.#maxSteps + 1, limited: true })
+        throwIfAborted(signal)
+        emit({ type: 'assistant', text: `（步数用完了，没能收尾：${error.message}）`, step: this.#maxSteps + 1, limited: true })
       }
     }
 
-    this.#onEvent({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit })
+    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit })
     return { text: finalText, steps, limited: hitStepLimit }
   }
 }

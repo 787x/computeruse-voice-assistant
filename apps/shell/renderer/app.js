@@ -135,7 +135,7 @@ const RENDER = {
     clearAll()
     els.dot.classList.add('speak')
     els.title.textContent = '需要你确认'
-    els.sub.textContent = '说「确认」或「取消」，也可以点按钮'
+    els.sub.textContent = '可以说「确认」或「取消」，也可以点击按钮'
     if (confirmData !== null) {
       els.subs.append(para(confirmData.text, 'current'))
       els.confirmWhat.textContent = confirmData.detail
@@ -268,9 +268,6 @@ window.hud.onSubtitle((payload) => {
 })
 
 $('close').addEventListener('click', () => window.hud.dismiss())
-$('allow').addEventListener('click', () => window.hud.answerConfirm(true))
-$('allowOnce').addEventListener('click', () => window.hud.answerConfirm('once'))
-$('deny').addEventListener('click', () => window.hud.answerConfirm(false))
 
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') window.hud.dismiss()

@@ -15,7 +15,7 @@ import { PermissionGate, classify, resolveLevel, CAPABILITIES, parseConfirmText 
 const dir = await mkdtemp(join(tmpdir(), 'perm-'))
 const auditPath = join(dir, 'audit.jsonl')
 
-let confirmAnswer = { allow: true, channel: 'voice' }
+let confirmAnswer = { allow: true, channel: 'click' }
 let confirmCalls = 0
 const gate = new PermissionGate({
   permissions: { mode: 'standard' },
@@ -39,12 +39,12 @@ await check('截图 → allow', (v) => v.allow && v.level === 'allow' && v.chann
 await check('左键点击 → allow', (v) => v.allow && v.level === 'allow', { tool: 'left_click', args: { x: 100, y: 200 } })
 
 // 3. 剪贴板：必须先问
-await check('读剪贴板 → ask → 用户确认', (v) => v.allow && v.level === 'ask' && v.channel === 'voice', { tool: 'read_clipboard' })
+await check('读剪贴板 → ask → 用户确认', (v) => v.allow && v.level === 'ask' && v.channel === 'click', { tool: 'read_clipboard' })
 
 // 4. 用户拒绝
-confirmAnswer = { allow: false, channel: 'voice' }
-await check('读剪贴板 → ask → 用户拒绝', (v) => !v.allow && v.channel === 'voice', { tool: 'read_clipboard' })
-confirmAnswer = { allow: true, channel: 'voice' }
+confirmAnswer = { allow: false, channel: 'click' }
+await check('读剪贴板 → ask → 用户拒绝', (v) => !v.allow && v.channel === 'click', { tool: 'read_clipboard' })
+confirmAnswer = { allow: true, channel: 'click' }
 
 // 5. 危险按键升级：Win+R 能打开任意命令执行
 await check('Win+R → 升级为 ask', (v) => v.level === 'ask' && v.capability === 'system.settings', { tool: 'key', args: { keys: 'WIN+R' } })
@@ -163,6 +163,38 @@ results.push({
   verdict: speech.map((row) => `${row.text}→${row.allow}`).join(' '),
 })
 
+// Unknown and test channels are not user confirmation channels.
+for (const channel of ['auto-test', 'unknown', undefined]) {
+  const boundary = new PermissionGate({ confirm: async () => ({ allow: true, channel }) })
+  const v = await boundary.check({ tool: 'read_clipboard' })
+  results.push({ name: `批准边界 ${channel}`, pass: !v.allow, verdict: v.channel })
+}
+for (const text of ['不可以','不同意','不确认','不允许','不执行','确认吗？','确定？','如果安全就确认','好像可以','确认取消吗','可以但是先等等','确人','yes']) {
+  results.push({ name: `语音不得批准 ${text}`, pass: parseConfirmText(text)?.allow !== true, verdict: text })
+}
+
+for (const text of ['不行','不用了','不要了','别执行','别执行了','不要执行','不要执行了','取消吧','算了吧','停止操作','  别 执行 了 。！ ','取消，']) {
+  results.push({ name: `明确取消 ${text}`, pass: parseConfirmText(text)?.allow === false, verdict: text })
+}
+for (const text of ['不要取消','你是说取消吗','为什么要取消','取消？','“取消”','「不要执行」','如果不安全就取消','不行吗','不要停止操作','取消不了','说取消','取消或确认']) {
+  results.push({ name: `歧义保持等待 ${text}`, pass: parseConfirmText(text) === null, verdict: text })
+}
+
+for (const text of ['可以','确认','确定','同意','允许','好的','好','是的','对','执行','继续','可以吧','可以，执行吧','  确 认 。']) {
+  results.push({name:`完整肯定 ${text}`,pass:parseConfirmText(text)?.allow===true,verdict:text})
+}
+for (const text of ['可以吗？','可不可以？','不是不可以','我说的是可以','我说的是不可以','如果安全就确认','"确认"','']) {
+  results.push({name:`歧义不决定 ${text}`,pass:parseConfirmText(text)===null,verdict:text})
+}
+{
+ const voiceGate=new PermissionGate({confirm:async()=>parseConfirmText('可以')})
+ const verdict=await voiceGate.check({tool:'read_clipboard'})
+ results.push({name:'真实解析同意通过权限门',pass:verdict.allow&&verdict.channel==='voice',verdict:verdict.channel})
+}
+for (const [text, expected] of [['我同意',true],['我确认',true],['可以的',true],['好啊',true],['不对',false],['错了',false],['停',false],['不用',false],['别',false],['我同意吗？',null],['我确认的话',null],['我说的是我同意',null],['不是我同意',null],['"好啊"',null],['我不同意',null]]) {
+  const result=parseConfirmText(text)
+  results.push({name:`自然口语 ${text}`,pass:(result===null?null:result.allow)===expected,verdict:String(expected)})
+}
 console.log('权限引擎验收\n' + '='.repeat(64))
 for (const row of results) {
   console.log(`${row.pass ? '✓' : '✗'} ${row.name.padEnd(36, ' ')} ${row.verdict}`)
