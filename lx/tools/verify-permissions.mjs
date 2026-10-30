@@ -15,7 +15,7 @@ import { PermissionGate, classify, resolveLevel, CAPABILITIES, parseConfirmText 
 const dir = await mkdtemp(join(tmpdir(), 'perm-'))
 const auditPath = join(dir, 'audit.jsonl')
 
-let confirmAnswer = { allow: true, channel: 'voice' }
+let confirmAnswer = { allow: true, channel: 'click' }
 let confirmCalls = 0
 const gate = new PermissionGate({
   permissions: { mode: 'standard' },
@@ -39,12 +39,12 @@ await check('截图 → allow', (v) => v.allow && v.level === 'allow' && v.chann
 await check('左键点击 → allow', (v) => v.allow && v.level === 'allow', { tool: 'left_click', args: { x: 100, y: 200 } })
 
 // 3. 剪贴板：必须先问
-await check('读剪贴板 → ask → 用户确认', (v) => v.allow && v.level === 'ask' && v.channel === 'voice', { tool: 'read_clipboard' })
+await check('读剪贴板 → ask → 用户确认', (v) => v.allow && v.level === 'ask' && v.channel === 'click', { tool: 'read_clipboard' })
 
 // 4. 用户拒绝
-confirmAnswer = { allow: false, channel: 'voice' }
-await check('读剪贴板 → ask → 用户拒绝', (v) => !v.allow && v.channel === 'voice', { tool: 'read_clipboard' })
-confirmAnswer = { allow: true, channel: 'voice' }
+confirmAnswer = { allow: false, channel: 'click' }
+await check('读剪贴板 → ask → 用户拒绝', (v) => !v.allow && v.channel === 'click', { tool: 'read_clipboard' })
+confirmAnswer = { allow: true, channel: 'click' }
 
 // 5. 危险按键升级：Win+R 能打开任意命令执行
 await check('Win+R → 升级为 ask', (v) => v.level === 'ask' && v.capability === 'system.settings', { tool: 'key', args: { keys: 'WIN+R' } })
@@ -144,8 +144,8 @@ results.push({ name: '能力表非空且每项有级别', pass: missing.length =
 
 // 19. 语音确认的读法：否定优先，模糊话不表态
 const speech = [
-  { text: '确认', allow: true },
-  { text: '可以，执行吧', allow: true },
+  { text: '确认', allow: null },
+  { text: '可以，执行吧', allow: null },
   { text: '不用了', allow: false },
   { text: '不要确认这个东西', allow: false },
   { text: '取消', allow: false },
@@ -162,6 +162,16 @@ results.push({
   pass: speechOk,
   verdict: speech.map((row) => `${row.text}→${row.allow}`).join(' '),
 })
+
+// Even a faulty parser or injected confirmer must not approve through speech.
+for (const channel of ['voice', 'auto-test', 'unknown', undefined]) {
+  const boundary = new PermissionGate({ confirm: async () => ({ allow: true, channel }) })
+  const v = await boundary.check({ tool: 'read_clipboard' })
+  results.push({ name: `批准边界 ${channel}`, pass: !v.allow, verdict: v.channel })
+}
+for (const text of ['不可以','不同意','不确认','不允许','不执行','确认吗？','确定？','如果安全就确认','好像可以','确认取消吗','可以但是先等等','确人','同意','yes']) {
+  results.push({ name: `语音不得批准 ${text}`, pass: parseConfirmText(text)?.allow !== true, verdict: text })
+}
 
 console.log('权限引擎验收\n' + '='.repeat(64))
 for (const row of results) {

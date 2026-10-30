@@ -238,7 +238,7 @@ function ensureWindow() {
     event.preventDefault()
     quitApp('hud close')
   })
-  win.on('closed', () => { win = null })
+  win.on('closed', () => { closeConfirmCard(); win = null })
   return win
 }
 
@@ -355,6 +355,7 @@ function hideHud() {
 
 /** 对话结束后的调用点：R14 里"隐藏 vs 销毁"的决策也在这里。 */
 function dismiss() {
+  closeConfirmCard()
   /*
    * 用户点 HUD 的 × 就是"别干了"，不是"先躲一下"。
    * 之前只隐藏窗口、麦克风还开着，随便一点动静又把它叫醒——这就是"关不掉还复活"。
@@ -524,6 +525,7 @@ async function stopListening() {  if (!listening) return { ok: true, already: tr
 
 /** 唤醒命中：弹出小窗并进入"说指令"阶段 */
 function onWake(keyword) {
+  if (confirmResolver !== null) return // A wake must not replace a pending confirmation.
   /*
    * 设置窗口在前台时不响应唤醒词。
    * 用户点"保存"、敲键盘时，KWS 很容易被点击声/人声误触发，
@@ -672,6 +674,7 @@ function maybePrewarmAsr() {
 
 /** 一句说完了：把字幕定稿，进入思考态 */
 function finishCommand(reason) {
+  if (!commandActive) return
   commandActive = false
   clearTimeout(commandTimer)
 
@@ -692,10 +695,19 @@ function finishCommand(reason) {
 
   // 正在等确认：这句话是"答不答应"，不是新指令
   if (confirmResolver !== null) {
-    const answer = parseConfirmText(text)
+    const answer = voiceConfirmEnabled ? parseConfirmText(text) : null
     log(`confirm heard: "${text}" → ${answer === null ? '未表态' : (answer.allow ? '允许' : '拒绝')}`)
-    if (answer !== null) settleConfirm(answer)
-    else sendSubtitle({ hint: '说「确认」或「取消」' })
+    if (answer?.allow === false) settleConfirm(answer, pendingConfirmId)
+    else {
+      sendSubtitle({ hint: '请点击按钮批准；语音仅可取消（需开启语音取消）' })
+      if (voiceConfirmEnabled) {
+        asr?.reset()
+        commandActive = true
+        heardAny = false
+        lastSentPartial = ''
+        commandStartAt = Date.now() + 300
+      }
+    }
     return
   }
 
@@ -894,6 +906,8 @@ let userBargeInAt = 0
 let permissionGate = null
 /** 正在等确认的那个请求；null 表示没有待确认的事 */
 let confirmResolver = null
+let confirmSequence = 0
+let pendingConfirmId = null
 /** 待确认请求对应的能力（"允许 15 分钟"要按能力记授权） */
 let pendingConfirmCapability = null
 /**
@@ -1726,8 +1740,8 @@ async function ensureAgent() {
 /**
  * 权限门。**所有工具调用都从这里过**（agent 的 gate 回调）。
  *
- * 确认通道做成"语音优先、点击兜底"：
- *   HUD 弹卡片 + 同时开一个识别窗口，说"确认/取消"都行；
+ * 确认通道仅允许可信卡片点击批准：
+ *   HUD 弹卡片 + 同时开一个识别窗口，仅点击可以批准，语音只可取消；
  *   不吭声 12 秒按拒绝处理——安全的那一侧永远是"不做"。
  */
 async function ensurePermissions() {
@@ -1762,9 +1776,16 @@ function summarizeArgsForCard(tool, args) {
   return parts.length === 0 ? `工具：${tool}` : `工具：${tool} · ${parts.join(' · ')}`
 }
 
-/** 等用户确认：语音或点击，谁先到算谁 */
+/** 等用户点击批准，或取消/超时拒绝 */
 async function askUser(request) {
-  const card = describeRequest(request)
+  closeConfirmCard()
+  const id = ++confirmSequence
+  pendingConfirmId = id
+  commandActive = false
+  clearTimeout(commandTimer)
+  asr?.reset()
+  lastCommandText = ''
+  const card = { ...describeRequest(request), id }
   pendingConfirmCapability = request.capability ?? null
   stopSpeaking()
   setState('confirm')
@@ -1774,7 +1795,7 @@ async function askUser(request) {
   if (win !== null && !win.isDestroyed()) win.webContents.send('hud:confirm', card)
   log(`confirm asked: ${card.text} (${card.detail})`)
 
-  // 语音通道：开一个短识别窗口，听"确认"或"取消"（托盘可关）
+  // 语音通道：开一个短识别窗口，只听明确取消（托盘可关）
   if (voiceConfirmEnabled) {
     if (asr !== null) asr.reset()
     commandActive = true
@@ -1785,25 +1806,17 @@ async function askUser(request) {
   }
 
   return new Promise((resolve) => {
-    // 测试钩子：CUA_VA_AUTO_CONFIRM=allow|deny 时自动答复。
-    // 只在自动化里用，日志会明确标出，避免被当成"用户真的同意了"。
-    const auto = process.env.CUA_VA_AUTO_CONFIRM
-    if (auto === 'allow' || auto === 'deny') {
-      setTimeout(() => {
-        log(`confirm auto-answer (test hook): ${auto}`)
-        settleConfirm(auto === 'allow'
-          ? { allow: true, channel: 'auto-test' }
-          : { allow: false, channel: 'auto-test', reason: '测试钩子：自动拒绝' })
-      }, 200)
-    }
-
     const timer = setTimeout(() => {
-      settleConfirm({ allow: false, channel: 'timeout', reason: `等了 ${Math.round(CONFIRM_TIMEOUT_MS / 1000)} 秒没有回应，按未同意处理` })
+      settleConfirm({ allow: false, channel: 'timeout', reason: `等了 ${Math.round(CONFIRM_TIMEOUT_MS / 1000)} 秒没有回应，按未同意处理` }, id)
     }, CONFIRM_TIMEOUT_MS)
 
     confirmResolver = (value) => {
       clearTimeout(timer)
       confirmResolver = null
+      pendingConfirmId = null
+      clearTimeout(commandTimer)
+      asr?.reset()
+      lastCommandText = ''
       commandActive = false
       lastSentPartial = ''
       resolve(value)
@@ -1812,7 +1825,10 @@ async function askUser(request) {
 }
 
 /** 决议一次确认（语音/点击/超时都走这里，只会生效一次） */
-function settleConfirm(value) {
+function settleConfirm(value, id = pendingConfirmId, trustedClick = false) {
+  if (id === null || id !== pendingConfirmId) return
+  if (value?.channel === 'voice' && !voiceConfirmEnabled) return
+  if (value?.allow === true && (!trustedClick || value?.channel !== 'click')) return
   const resolver = confirmResolver
   if (resolver === null) return
   // "允许 15 分钟"：记一次临时授权，避免同一个动作反复弹卡片
@@ -2611,7 +2627,7 @@ function buildTray() {
       void saveUiPrefs()
       log(`ttsEnabled=${ttsEnabled}`)
     } },
-    { label: '语音确认', type: 'checkbox', checked: voiceConfirmEnabled, click: (item) => {
+    { label: '语音取消', type: 'checkbox', checked: voiceConfirmEnabled, click: (item) => {
       voiceConfirmEnabled = item.checked
       void saveUiPrefs()
       log(`voiceConfirmEnabled=${voiceConfirmEnabled}`)
@@ -2831,11 +2847,13 @@ if (!gotSingleInstanceLock) {
 
   // 播放浮窗上的按钮：prev / toggle / next
   // 确认卡片上的按钮：允许 / 允许 15 分钟 / 取消
-  ipcMain.on('hud:confirm', (_event, answer) => {
-    log(`hud:confirm received from renderer: ${JSON.stringify(answer)}`)
-    if (answer === true) settleConfirm({ allow: true, channel: 'click' })
-    else if (answer === 'once') settleConfirm({ allow: true, channel: 'click', once: true })
-    else settleConfirm({ allow: false, channel: 'click', reason: '用户点了取消' })
+  ipcMain.on('hud:confirm', (event, payload) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents
+        || event.senderFrame !== win.webContents.mainFrame) return
+    const { id, answer } = payload ?? {}
+    if (!Number.isInteger(id) || ![true, false, 'once'].includes(answer)) return
+    settleConfirm({ allow: answer === true || answer === 'once', channel: 'click',
+      once: answer === 'once', reason: answer === false ? '用户点了取消' : '' }, id, true)
   })
 
   // 麦克风权限：只放行 media，其余一律拒绝

@@ -36,7 +36,7 @@ contextBridge.exposeInMainWorld('hud', {
     ipcRenderer.on('hud:confirmDone', () => handler())
   },
   /** 用户点了"允许"(true) / "允许 15 分钟"('once') / "取消"(false) */
-  answerConfirm: (answer) => ipcRenderer.send('hud:confirm', answer),
+  answerConfirm: (id, answer) => ipcRenderer.send('hud:confirm', { id, answer }),
   /** 用户主动收起 */
   dismiss: () => ipcRenderer.send('hud:dismiss'),
 })
