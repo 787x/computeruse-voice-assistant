@@ -13,11 +13,12 @@
  *   queue / state / login / logout / config / cloudupload / cloud / diag / tui
  * **没有 search**（官方文档写了但 CLI 还没实现），所以"放某首歌"需要 ID 或链接。
  */
-import { execFile, spawnSync } from 'node:child_process'
+import { execFile, spawn, spawnSync } from 'node:child_process'
 import { player } from './mpv-player.mjs'
-import { callApi, captureIdentity } from './netease-api.mjs'
+import { callApi, captureIdentity, makeSpyEnv, hasIdentity } from './netease-api.mjs'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 
 export const NETEASE_DEFAULTS = {
   timeoutMs: 30000,
@@ -60,7 +61,13 @@ function childEnv() {
     env.PATH = `${missing.join(';')};${existing}`
     delete env.Path
   }
-  return { ...env, NO_COLOR: '1' }
+  /*
+   * 关键：打包后 process.execPath 是「语音助手.exe」而不是 node。
+   * 不设 ELECTRON_RUN_AS_NODE，这些子进程会当成"又开了一次助手"启动，
+   * 撞上单实例锁 → 主实例收到 second-instance → 窗口自己弹出来（用户看到的就是"保存就唤醒"）。
+   * 实测日志：一次保存触发了 4 次这样的启动。
+   */
+  return { ...env, NO_COLOR: '1', ELECTRON_RUN_AS_NODE: '1' }
 }
 
 /** 执行一条 ncm-cli 命令（argv 数组，不经过 shell） */
@@ -270,7 +277,8 @@ export function describeResult(action, payload) {
     return `状态 ${state.status}${title}，进度 ${Math.round(Number(state.position) || 0)}s${duration}，队列 ${state.queueLength} 首`
   }
   if (action === 'login') {
-    return String(payload.url ?? payload.message ?? '').trim()
+    // CLI 给的是 qrCodeUrl / clickableUrl（不是 url）；优先可点链接
+    return String(payload.clickableUrl ?? payload.qrCodeUrl ?? payload.url ?? payload.message ?? '').trim()
   }
   if (payload.success === false) return `失败：${payload.message ?? '未知原因'}`
   if (action === 'play' && payload.message !== undefined) return String(payload.message)
@@ -357,7 +365,9 @@ async function resolveSong({ id, keyword, options }) {
 
   let songId = String(id ?? '').trim()
   if (songId === '' && typeof keyword === 'string' && keyword.trim() !== '') {
-    const payload = (await searchDirect(keyword.trim(), 5, options)) ?? searchCached(keyword.trim(), 5, options)
+    // 先看登录态：没登录就别浪费 11 秒去抓 token
+  if (loginStatus(options).loggedIn !== true) return { error: '还没登录网易云音乐（设置 → 网易云音乐 → 登录网易云）', needLogin: true }
+  const payload = (await searchDirect(keyword.trim(), 5, options)) ?? searchCached(keyword.trim(), 5, options)
     const pick = pickPlayable(payload)
     if (pick === null) return null
     songId = String(pick.id)
@@ -488,15 +498,124 @@ export async function runNetease(args = {}, options = {}) {
 }
 
 /** 登录状态（不抛错） */
+/**
+ * 前台登录会话：自己盯着 CLI 的 login 进程，链接一出来就交给回调。
+ *
+ * 为什么不用 `login --background`：那会把轮询丢给一个游离进程，
+ * 我们既看不到它是否还活着，也拿不到"扫码成功后 token 到底写没写进去"。
+ * 实测就出现过浏览器说登录成功、本地状态还是未登录（轮询进程早死了/链接是旧的）。
+ * 前台模式由我们自己持有子进程，退出码就是结论。
+ */
+export function startLoginSession(options = {}, handlers = {}) {
+  const entry = options.entry ?? resolveCliEntry()
+  if (entry === null) return { ok: false, error: '没找到 ncm-cli' }
+  /*
+   * 登录时顺便抓"设备身份"：login 成功后 CLI 会带新 token 请求一次 profile，
+   * 那条请求里就有 device + accessToken，正好是直连播放要的。
+   * 否则登录完还得再跑一次 play 探针——而 token 刚写入时探针可能还拿不到。
+   */
+  let spy = null
+  try { spy = makeSpyEnv('login') } catch { spy = null }
+  const child = spawn(process.execPath, [entry, 'login'], {
+    windowsHide: true,
+    env: spy === null ? childEnv() : spy.env,
+  })
+  let url = ''
+  let output = ''
+  const onChunk = (chunk) => {
+    const text = String(chunk)
+    output += text
+    if (url === '') {
+      const match = text.match(/https?:\/\/[^\s"'）)]+/u)
+      if (match !== null) {
+        url = match[0]
+        handlers.onUrl?.(url)
+      }
+    }
+  }
+  child.stdout?.on('data', onChunk)
+  child.stderr?.on('data', onChunk)
+  child.on('error', (error) => { handlers.onDone?.({ ok: false, error: error.message }) })
+  child.on('exit', (code) => {
+    const loggedIn = code === 0
+    let identity = null
+    if (loggedIn && spy !== null) {
+      try { identity = spy.read() } catch { identity = null }
+    }
+    clearLoginCache()
+    handlers.onDone?.({
+      ok: loggedIn,
+      url,
+      code,
+      identityCaptured: identity !== null,
+      error: loggedIn ? null : (output.trim().split('\n').at(-1) ?? '登录未完成').slice(0, 160),
+    })
+  })
+  return { ok: true, url, kill: () => { try { child.kill() } catch { /* 已退出 */ } } }
+}
+/** 登录态缓存 30 秒：每次查都要起一个 CLI 子进程，问太勤会把响应拖慢 */
+let loginCache = { at: 0, result: null }
+
 export function loginStatus(options = {}) {
+  if (loginCache.result !== null && Date.now() - loginCache.at < 30_000) return loginCache.result
+  /*
+   * 判定顺序很重要：
+   *   1. 手上有登录身份（device + accessToken）→ 直接算已登录。
+   *      这才是直连播放真正依赖的东西，比 CLI 自己的 --check 可信。
+   *   2. 没有身份才去问 CLI。
+   * 之前只信 CLI 的 --check：token 在本地被判过期时它一律报未登录，
+   * 而那时直连接口其实还能用——用户看到的就是"明明登录了却说没登录"。
+   */
+  if (hasIdentity()) {
+    const status = { loggedIn: true, text: '已登录（本机身份有效）', nickname: '' }
+    loginCache = { at: Date.now(), result: status }
+    return status
+  }
   const result = runCli(['login', '--check'], options)
   const payload = parseJson(result.raw)
-  return {
-    loggedIn: payload?.success === true,
+  const status = {
+    loggedIn: payload?.success === true && !/未登录/u.test(String(payload.message ?? '')),
     text: payload === null ? result.text : String(payload.message ?? ''),
+    nickname: String(payload?.nickname ?? payload?.data?.nickname ?? ''),
   }
+  loginCache = { at: Date.now(), result: status }
+  return status
 }
 
+/** 登录成功后清缓存，下一次查询立刻反映真实状态 */
+export function clearLoginCache() {
+  loginCache = { at: 0, result: null }
+}
+
+/**
+ * 异步版同步：给主进程的"保存设置"用。
+ *
+ * 为什么必须异步：spawnSync 会把主进程整个卡住——设置窗口随即变成"未响应"。
+ * 实测每次保存都要等 2~4 次 CLI 调用（0.5~11 秒），用户体感就是点保存后界面冻住。
+ */
+export async function syncCredentialsAsync(credentials = {}, options = {}) {
+  const appId = String(credentials.appId ?? '').trim()
+  const privateKey = String(credentials.privateKey ?? '').trim()
+  /*
+   * 关键：`config get privateKey` 返回的是打码值（MIIEvAIB***），
+   * 拿它跟真私钥比对永远不相等 → 每次保存设置都会重写私钥；
+   * 而重写凭据会把已有登录态顶掉（实测：登录成功 24 秒后 token 就 Expired）。
+   * 所以用"上次同步内容的哈希"判断要不要写。
+   */
+  const hash = createHash('sha256').update(`${appId}:${privateKey}`).digest('hex').slice(0, 16)
+  if (typeof options.syncedHash === 'string' && options.syncedHash === hash) {
+    return { synced: [], hash, skipped: true }
+  }
+  const synced = []
+  for (const [key, value] of [['appId', appId], ['privateKey', privateKey]]) {
+    if (value === '') continue
+    const current = await runCliAsync(['config', 'get', key], options)
+    if (current.raw.includes(value.slice(0, 24))) continue
+    const set = await runCliAsync(['config', 'set', key, value], options)
+    if (set.code === 0) synced.push(key)
+  }
+  return { synced, hash }
+}
 /** 把本地配置里的凭证同步给 CLI（不一致时才写） */
 export function syncCredentials(credentials = {}, options = {}) {
   const appId = String(credentials.appId ?? '').trim()

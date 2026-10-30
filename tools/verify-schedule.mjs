@@ -6,7 +6,7 @@
  *
  * 用法：node tools/verify-schedule.mjs
  */
-import { parseTime, minutesOf, matchRule, resolveModel, validateRules, parseDays, formatDays, isoWeekday } from '../packages/config/schedule.mjs'
+import { parseTime, minutesOf, matchRule, resolveModel, validateRules, parseDays, formatDays, isoWeekday, findProfile } from '../packages/config/schedule.mjs'
 
 const results = []
 function check(name, pass, detail) {
@@ -77,6 +77,33 @@ check('周末不命中', matchRule(weekdayRule, new Date(2026, 10, 1, 10, 0)) ==
 check('只选周三：周四不命中', matchRule([{ from: '00:00', to: '23:59', model: 'wed', days: [3] }], new Date(2026, 9, 29, 10, 0)) === null, '')
 check('全周写法等价每天', matchRule([{ from: '00:00', to: '23:59', model: 'all', days: [1, 2, 3, 4, 5, 6, 7] }], new Date(2026, 10, 1, 10, 0)) !== null, '')
 check('跨午夜+星期', matchRule([{ from: '22:00', to: '06:00', model: 'night', days: [4] }], new Date(2026, 9, 29, 23, 0)) !== null || true, '跨午夜跨天天然属于次日，规则按当天算')
+// ---- 供应商方案（定时切换连供应商一起换）
+const profiles = [
+  { id: 'p1', name: '白天', providerId: 'openai-compatible', baseURL: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.6-flash', apiKey: 'sk-day' },
+  { id: 'p2', name: '夜里', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', apiKey: 'sk-night' },
+]
+check('findProfile 命中', findProfile({ modelProfiles: profiles }, 'p2')?.name === '夜里', '')
+check('findProfile 未命中', findProfile({ modelProfiles: profiles }, 'nope') === null, '')
+
+const withProfile = resolveModel({
+  model: 'mimo-v2.6-flash',
+  modelProfiles: profiles,
+  modelSchedule: { enabled: true, rules: [{ from: '22:00', to: '06:00', profileId: 'p2', model: '' }] },
+}, at(23, 0))
+check('方案规则带出端点', withProfile.endpoint?.baseURL === 'https://api.deepseek.com/v1' && withProfile.endpoint.apiKey === 'sk-night',
+  JSON.stringify(withProfile.endpoint))
+check('方案规则带出模型', withProfile.model === 'deepseek-v4-pro', withProfile.model)
+check('方案规则带出 profile', withProfile.profile?.id === 'p2', '')
+
+const unknownProfile = resolveModel({
+  model: 'm1',
+  modelProfiles: profiles,
+  modelSchedule: { enabled: true, rules: [{ from: '00:00', to: '23:59', profileId: 'gone', model: 'only-model' }] },
+}, at(10, 0))
+check('方案找不到就退回模型名', unknownProfile.model === 'only-model' && unknownProfile.endpoint === null, JSON.stringify(unknownProfile.endpoint))
+
+check('有 profileId 就不需要 model', validateRules([{ from: '09:00', to: '18:00', profileId: 'p1', model: '' }]) === null, '')
+check('两者都没有要报错', typeof validateRules([{ from: '09:00', to: '18:00', model: '' }]) === 'string', '')
 check('minutesOf 正确', minutesOf(at(13, 7)) === 787, String(minutesOf(at(13, 7))))
 
 console.log('定时切换模型验收\n' + '='.repeat(64))

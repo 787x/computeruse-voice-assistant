@@ -41,12 +41,15 @@ export async function loadPublicConfig() {
     hasApiKey: Boolean(config.apiKey || process.env.CUA_VA_API_KEY),
     search: { ...(config.search ?? {}), apiKey: maskKey(searchKey), hasApiKey: Boolean(searchKey || process.env.TAVILY_API_KEY) },
     // 网易云：appId 可以明示，私钥只报长度（1600 字符塞进界面毫无意义）
+    modelProfiles: (config.modelProfiles ?? []).map((profile) => ({ ...profile, apiKey: maskKey(profile.apiKey), hasApiKey: Boolean(profile.apiKey) })),
     netease: {
       appId: config.netease?.appId ?? '',
       privateKey: config.netease?.privateKey === undefined || config.netease.privateKey === ''
         ? ''
         : `已保存（${String(config.netease.privateKey).length} 字符）`,
       hasPrivateKey: Boolean(config.netease?.privateKey),
+      // 界面要显示「已保存（N 字符）」；长度必须由这里给，掩码串自己的长度没有意义
+      privateKeyLength: String(config.netease?.privateKey ?? '').length,
     },
   }
 }
@@ -165,7 +168,32 @@ export async function saveConfig(patch) {
     else if (isRealSecret(incoming.appId)) merged.appId = incoming.appId.trim()
     if (incoming.privateKey === null) merged.privateKey = ''
     else if (isRealSecret(incoming.privateKey)) merged.privateKey = incoming.privateKey.trim()
+    /*
+     * 记下"同步过哪一版凭据"。这个字段丢了会导致每次启动都重写 CLI 凭据，
+     * 而重写会让已有的网易云登录态失效（token 变 Expired）。
+     */
+    if (typeof incoming.syncedHash === 'string' && incoming.syncedHash !== '') merged.syncedHash = incoming.syncedHash
     next.netease = merged
+  }
+  /*
+   * 模型方案：每条方案的 apiKey 单独打码；掩码值（含 * 或「已保存」）不覆盖原值。
+   */
+  if (Array.isArray(patch.modelProfiles)) {
+    const currentProfiles = Array.isArray(current.modelProfiles) ? current.modelProfiles : []
+    next.modelProfiles = patch.modelProfiles.map((profile) => {
+      const merged = {
+        id: typeof profile?.id === 'string' && profile.id !== '' ? profile.id : `p${Math.random().toString(36).slice(2, 8)}`,
+        name: String(profile?.name ?? '').trim(),
+        providerId: String(profile?.providerId ?? '').trim(),
+        baseURL: String(profile?.baseURL ?? '').trim(),
+        model: String(profile?.model ?? '').trim(),
+        apiKey: '',
+      }
+      const previous = currentProfiles.find((item) => item?.id === merged.id)
+      if (isRealSecret(profile?.apiKey)) merged.apiKey = String(profile.apiKey).trim()
+      else if (previous !== undefined) merged.apiKey = previous.apiKey ?? ''
+      return merged
+    })
   }
   // 落盘前加密（主进程注入了 safeStorage 才生效；工具脚本里就是明文）
   next.apiKey = encryptField(next.apiKey)

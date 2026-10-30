@@ -43,6 +43,23 @@ export class LLMClient {
     if (typeof model === 'string' && model.trim() !== '') this.#model = model.trim()
   }
 
+  /**
+   * 运行中换整套端点（定时切换"供应商"用）：地址、Key、模型一起换。
+   * 允许只传一部分——比如同一个供应商换模型时只给 model。
+   */
+  setEndpoint({ baseURL, apiKey, model } = {}) {
+    if (typeof baseURL === 'string' && /^https?:\/\//u.test(baseURL)) {
+      this.#baseURL = baseURL.replace(/\/+$/u, '')
+    }
+    if (typeof apiKey === 'string') this.#apiKey = apiKey
+    if (typeof model === 'string' && model.trim() !== '') this.#model = model.trim()
+  }
+
+  /** 当前端点摘要（日志用，不含 Key） */
+  get endpoint() {
+    return { baseURL: this.#baseURL, model: this.#model, hasKey: this.#apiKey !== '' }
+  }
+
   #headers() {
     const headers = { 'content-type': 'application/json' }
     if (this.#apiKey !== '') headers.authorization = `Bearer ${this.#apiKey}`

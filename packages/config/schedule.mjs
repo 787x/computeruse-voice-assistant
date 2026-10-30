@@ -87,7 +87,10 @@ export function matchRule(rules, now = new Date()) {
     const from = parseTime(rule.from)
     const to = parseTime(rule.to)
     if (from === null || to === null) continue
-    if (typeof rule.model !== 'string' || rule.model.trim() === '') continue
+    // 规则可以只给 profileId（连供应商一起换），也可以只给模型名
+    const hasProfile = typeof rule.profileId === 'string' && rule.profileId !== ''
+    const hasModel = typeof rule.model === 'string' && rule.model.trim() !== ''
+    if (!hasProfile && !hasModel) continue
     // days 为空 = 每天；填了就必须包含今天（ISO：1=周一 … 7=周日）
     const days = parseDays(rule.days)
     if (days.length > 0 && days.length < 7 && !days.includes(isoWeekday(now))) continue
@@ -107,14 +110,69 @@ export function matchRule(rules, now = new Date()) {
  * 算出"此刻应该用哪个模型"。
  * 没启用定时、或没有规则命中时，用配置里的默认模型。
  */
+/**
+ * 找到规则引用的方案。
+ * 规则优先用 profileId（能连供应商一起换）；没有就退回只换模型名。
+ */
+export function findProfile(config, profileId) {
+  if (typeof profileId !== 'string' || profileId === '') return null
+  const list = Array.isArray(config?.modelProfiles) ? config.modelProfiles : []
+  return list.find((profile) => profile?.id === profileId) ?? null
+}
+
+/**
+ * 算出"此刻应该用哪个模型/哪套端点"。
+ *
+ * 返回 endpoint 表示要**连供应商一起换**（地址 + Key）；
+ * 只有 model 时表示同一供应商内换模型。
+ */
 export function resolveModel(config, now = new Date()) {
   const schedule = config?.modelSchedule ?? {}
-  const fallback = typeof config?.model === 'string' ? config.model : ''
-  if (schedule.enabled !== true) return { model: fallback, rule: null, source: 'default' }
+  /*
+   * "默认"也可以是一套方案（换回默认供应商），但不必填：
+   *   - 配了 defaultProfileId → 落在时段外时切回那套方案（连供应商一起回）
+   *   - 没配 → 回到设置页顶部那套全局模型（model / baseURL / apiKey）
+   */
+  const defaultProfile = findProfile(config, schedule.defaultProfileId)
+  const defaultResult = defaultProfile !== null
+    ? {
+        model: String(defaultProfile.model ?? '').trim(),
+        rule: null,
+        source: 'default',
+        profile: defaultProfile,
+        endpoint: {
+          baseURL: String(defaultProfile.baseURL ?? '').trim(),
+          apiKey: String(defaultProfile.apiKey ?? ''),
+        },
+      }
+    : {
+        model: typeof config?.model === 'string' ? config.model : '',
+        rule: null,
+        source: 'default',
+        profile: null,
+        endpoint: null,
+      }
+  if (schedule.enabled !== true) return defaultResult
   const rule = matchRule(schedule.rules, now)
-  if (rule === null) return { model: fallback, rule: null, source: 'default' }
-  return { model: rule.model.trim(), rule, source: 'schedule' }
+  if (rule === null) return defaultResult
+
+  const profile = findProfile(config, rule.profileId)
+  if (profile !== null) {
+    return {
+      model: String(profile.model ?? '').trim(),
+      rule,
+      source: 'schedule',
+      profile,
+      endpoint: {
+        baseURL: String(profile.baseURL ?? '').trim(),
+        apiKey: String(profile.apiKey ?? ''),
+      },
+    }
+  }
+  return { model: String(rule.model ?? '').trim(), rule, source: 'schedule', profile: null, endpoint: null }
 }
+
+
 
 /** 校验规则数组（设置页保存前用；返回错误字符串或 null） */
 export function validateRules(rules) {
@@ -123,7 +181,9 @@ export function validateRules(rules) {
     const where = `第 ${index + 1} 条`
     if (parseTime(rule?.from) === null) return `${where}的开始时间格式不对（要 HH:mm）`
     if (parseTime(rule?.to) === null) return `${where}的结束时间格式不对（要 HH:mm）`
-    if (typeof rule?.model !== 'string' || rule.model.trim() === '') return `${where}没填模型名`
+    const hasProfile = typeof rule?.profileId === 'string' && rule.profileId !== ''
+    const hasModel = typeof rule?.model === 'string' && rule.model.trim() !== ''
+    if (!hasProfile && !hasModel) return `${where}既没选方案也没填模型名`
   }
   return null
 }

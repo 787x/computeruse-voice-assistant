@@ -109,18 +109,37 @@
     </div>
 
     <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
-      <div class="checks" style="margin-bottom:10px">
-        <label><input type="checkbox" id="scheduleEnabled" /> 按时间段切换模型</label>
+      <div class="hint" style="margin-bottom:8px">
+        模型方案：一套「供应商 + 地址 + Key + 模型」。定时切换引用方案时，<b>供应商会一起换</b>。
       </div>
       <table>
         <thead>
-          <tr><th style="width:88px">开始</th><th style="width:88px">结束</th><th>模型</th><th style="width:170px">星期（不选=每天）</th><th style="width:44px"></th></tr>
+          <tr><th style="width:110px">名称</th><th style="width:130px">提供商</th><th>接口地址</th><th style="width:150px">Key</th><th style="width:150px">模型</th><th style="width:44px"></th></tr>
+        </thead>
+        <tbody id="profileRows"></tbody>
+      </table>
+      <div class="actions" style="margin-top:8px">
+        <button id="addProfile">加一套方案</button>
+        <span class="hint" id="profileHint"></span>
+      </div>
+    </div>
+    <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+      <div class="checks" style="margin-bottom:10px">
+        <label><input type="checkbox" id="scheduleEnabled" /> 按时间段切换模型</label>
+      </div>
+      <div class="field" style="max-width:280px">
+        <label for="defaultProfile">其余时间用（默认）</label>
+        <select id="defaultProfile"></select>
+      </div>
+      <table>
+        <thead>
+          <tr><th style="width:84px">开始</th><th style="width:84px">结束</th><th>时段内用</th><th style="width:170px">星期（不选=每天）</th><th style="width:44px"></th></tr>
         </thead>
         <tbody id="scheduleRows"></tbody>
       </table>
       <div class="actions" style="margin-top:8px">
         <button id="addSchedule">加一条</button>
-        <span class="hint" id="scheduleHint">先命中先用；结束时间不包含在该段内；开始=结束表示全天；跨午夜写成 22:00 → 06:00。</span>
+        <span class="hint" id="scheduleHint">规则可以有多条，先命中先用；不在任何时段内就用上面的「默认」。结束时间不含在该段内；开始=结束表示全天；跨午夜写 22:00 → 06:00。</span>
       </div>
     </div>
   </section>
@@ -141,8 +160,13 @@
     </div>
     <div class="actions">
       <button id="saveNetease">保存凭据</button>
+      <button id="neteaseLogin" class="primary">登录网易云</button>
+      <button id="neteaseStatus">检查登录状态</button>
       <button id="clearNetease">清除</button>
       <span class="hint" id="neteaseHint"></span>
+    </div>
+    <div class="hint" style="margin-top:8px" id="neteaseLoginHint">
+      点「登录网易云」会打开授权页，用手机网易云 App 扫码即可；登录态存在本机，不随安装包分发。
     </div>
   </section>
 

@@ -74,6 +74,131 @@ function renderCapabilities() {
   }
 }
 
+/* ---------------- 模型方案（供应商 + Key + 模型） ---------------- */
+function profileRowId() {
+  return `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+}
+
+/** 默认方案下拉：空值 = 用顶部那套全局模型 */
+function renderDefaultProfileOptions(selectedId) {
+  const select = $('defaultProfile')
+  select.innerHTML = ''
+  const fallback = document.createElement('option')
+  fallback.value = ''
+  fallback.textContent = '（用顶部全局模型）'
+  select.append(fallback)
+  for (const profile of collectProfiles()) {
+    const option = document.createElement('option')
+    option.value = profile.id
+    option.textContent = profile.name !== '' ? profile.name : (profile.model !== '' ? profile.model : profile.id)
+    select.append(option)
+  }
+  select.value = typeof selectedId === 'string' ? selectedId : ''
+}
+function renderProfileRows(profiles) {
+  const body = $('profileRows')
+  body.innerHTML = ''
+  for (const [index, profile] of profiles.entries()) {
+    const row = document.createElement('tr')
+    row.dataset.id = profile.id ?? profileRowId()
+
+    const nameCell = document.createElement('td')
+    const name = document.createElement('input')
+    name.value = profile.name ?? ''
+    name.placeholder = '白天'
+    name.dataset.field = 'name'
+    nameCell.append(name)
+
+    const providerCell = document.createElement('td')
+    const provider = document.createElement('select')
+    provider.dataset.field = 'providerId'
+    for (const item of providerList) {
+      const option = document.createElement('option')
+      option.value = item.id
+      option.textContent = item.name
+      provider.append(option)
+    }
+    provider.value = profile.providerId ?? providerList[0]?.id ?? 'openai-compatible'
+    provider.addEventListener('change', () => {
+      const matched = providerList.find((item) => item.id === provider.value)
+      if (matched !== undefined) {
+        row.querySelector('[data-field="baseURL"]').value = matched.baseURL
+        const modelInput = row.querySelector('[data-field="model"]')
+        if (modelInput.value.trim() === '' && matched.models.length > 0) modelInput.value = matched.models[0]
+      }
+    })
+    providerCell.append(provider)
+
+    const urlCell = document.createElement('td')
+    const url = document.createElement('input')
+    url.value = profile.baseURL ?? ''
+    url.placeholder = 'https://…'
+    url.spellcheck = false
+    url.dataset.field = 'baseURL'
+    urlCell.append(url)
+
+    const keyCell = document.createElement('td')
+    const key = document.createElement('input')
+    key.type = 'password'
+    key.value = ''
+    key.placeholder = profile.hasApiKey === true ? `已保存（${profile.apiKey}）` : 'sk-…'
+    key.dataset.field = 'apiKey'
+    keyCell.append(key)
+
+    const modelCell = document.createElement('td')
+    const model = document.createElement('input')
+    model.value = profile.model ?? ''
+    model.placeholder = 'deepseek-flash'
+    model.spellcheck = false
+    model.dataset.field = 'model'
+    modelCell.append(model)
+
+    const delCell = document.createElement('td')
+    const del = document.createElement('button')
+    del.textContent = '删'
+    del.addEventListener('click', () => {
+      const current = collectProfiles()
+      current.splice(index, 1)
+      renderProfileRows(current)
+      renderScheduleRows(collectSchedule())
+    })
+    delCell.append(del)
+
+    row.append(nameCell, providerCell, urlCell, keyCell, modelCell, delCell)
+    body.append(row)
+  }
+}
+
+function collectProfiles() {
+  const rows = []
+  for (const row of $('profileRows').querySelectorAll('tr')) {
+    const pick = (name) => row.querySelector(`[data-field="${name}"]`)?.value ?? ''
+    rows.push({
+      id: row.dataset.id,
+      name: pick('name').trim(),
+      providerId: pick('providerId'),
+      baseURL: pick('baseURL').trim(),
+      model: pick('model').trim(),
+      // 空=不修改（主进程按掩码语义保留原 Key）
+      apiKey: pick('apiKey').trim(),
+    })
+  }
+  return rows
+}
+
+$('addProfile').addEventListener('click', () => {
+  const current = collectProfiles()
+  const provider = providerList[0]
+  current.push({
+    id: profileRowId(),
+    name: `方案 ${current.length + 1}`,
+    providerId: provider?.id ?? 'openai-compatible',
+    baseURL: provider?.baseURL ?? '',
+    model: provider?.models?.[0] ?? '',
+    apiKey: '',
+  })
+  renderProfileRows(current)
+})
 /* ---------------- 按时间段切换模型 ---------------- */
 /** "1-5" / "1,3" → 数字数组（老配置回显用） */
 function parseDaysText(value) {
@@ -107,13 +232,28 @@ function renderScheduleRows(rules) {
     to.placeholder = 'HH:mm'
     to.dataset.field = 'to'
     toCell.append(to)
+    // 时段内用哪套方案；一个方案都没有时退回"直接填模型名"
     const modelCell = document.createElement('td')
-    const model = document.createElement('input')
-    model.value = rule.model ?? ''
-    model.placeholder = 'deepseek-flash'
-    model.spellcheck = false
-    model.dataset.field = 'model'
-    modelCell.append(model)
+    const profileList = collectProfiles()
+    if (profileList.length > 0) {
+      const select = document.createElement('select')
+      select.dataset.field = 'profileId'
+      for (const profile of profileList) {
+        const option = document.createElement('option')
+        option.value = profile.id
+        option.textContent = profile.name !== '' ? profile.name : (profile.model !== '' ? profile.model : profile.id)
+        select.append(option)
+      }
+      select.value = typeof rule.profileId === 'string' && rule.profileId !== '' ? rule.profileId : profileList[0].id
+      modelCell.append(select)
+    } else {
+      const model = document.createElement('input')
+      model.value = rule.model ?? ''
+      model.placeholder = '先在上面加方案，或直接填模型名'
+      model.spellcheck = false
+      model.dataset.field = 'model'
+      modelCell.append(model)
+    }
     // 星期：七个可点的小标签，不选=每天
     const daysCell = document.createElement('td')
     const daysWrap = document.createElement('div')
@@ -155,7 +295,13 @@ function collectSchedule() {
   for (const row of $('scheduleRows').querySelectorAll('tr')) {
     const pick = (name) => row.querySelector(`[data-field="${name}"]`)?.value ?? ''
     const days = (row.querySelector('[data-days]')?.dataset.days ?? '').split(',').filter(Boolean).map(Number)
-    rows.push({ from: pick('from').trim(), to: pick('to').trim(), model: pick('model').trim(), days })
+    rows.push({
+      from: pick('from').trim(),
+      to: pick('to').trim(),
+      model: pick('model').trim(),
+      profileId: pick('profileId'),
+      days,
+    })
   }
   return rows
 }
@@ -184,7 +330,7 @@ function fillForm() {
   $('neteasePrivateKey').value = ''
   $('neteasePrivateKey').placeholder = netease.privateKey === undefined || netease.privateKey === ''
     ? '粘贴私钥（PKCS8，base64 那一长串）'
-    : `已保存（${String(netease.privateKey).length} 字符），留空不修改`
+    : `已保存（${netease.privateKeyLength ?? 0} 字符），留空不修改`
 
   $('emotion').value = config.tts?.emotion ?? '中立'
   $('speed').value = String(config.tts?.speed ?? 1)
@@ -198,6 +344,8 @@ function fillForm() {
   $('mode').value = config.permissions?.mode ?? 'standard'
   const schedule = config.modelSchedule ?? { enabled: false, rules: [] }
   scheduleEnabled.checked = schedule.enabled === true
+  renderProfileRows(Array.isArray(config.modelProfiles) ? config.modelProfiles : [])
+  renderDefaultProfileOptions(schedule.defaultProfileId)
   renderScheduleRows(Array.isArray(schedule.rules) ? schedule.rules : [])
 
   fillProviderNote()
@@ -227,6 +375,13 @@ function collect() {
       releaseOnFullscreen: $('releaseOnFullscreen').checked,
     },
     permissions: { mode: $('mode').value, overrides },
+    // 模型方案与定时规则：之前这两个字段压根没进 payload，所以用户"保存不下来"
+    modelProfiles: collectProfiles(),
+    modelSchedule: {
+      enabled: $('scheduleEnabled').checked,
+      defaultProfileId: $('defaultProfile').value,
+      rules: collectSchedule(),
+    },
   }
   if ($('apiKey').value.trim() !== '') payload.apiKey = $('apiKey').value.trim()
   if ($('searchKey').value.trim() !== '') payload.search = { provider: 'tavily', apiKey: $('searchKey').value.trim() }
@@ -304,6 +459,40 @@ $('saveNetease').addEventListener('click', async () => {
   const result = await window.settingsApi.save({ netease: payload })
   $('neteaseHint').textContent = result.ok === true ? '已保存（只在本机）' : `保存失败：${result.error}`
   if (result.ok === true) await load()
+})
+
+/**
+ * 登录网易云：拿一次性链接 → 系统浏览器打开。
+ * 登录态由 ncm-cli 保存，扫码后点「检查登录状态」就能看到昵称。
+ */
+$('neteaseLogin').addEventListener('click', async () => {
+  $('neteaseHint').textContent = '正在获取登录链接…'
+  const result = await window.settingsApi.neteaseLogin()
+  $('neteaseHint').textContent = result.ok === true
+    ? '等待扫码…登录成功会自动提示'
+    : `打不开登录页：${result.error}`
+})
+
+// 登录过程的两条推送：链接到了 / 扫完了
+window.settingsApi.onNeteaseLoginUrl((url) => {
+  $('neteaseHint').textContent = `已在浏览器打开 ${url}，用手机网易云扫码`
+})
+window.settingsApi.onNeteaseLoginDone((result) => {
+  $('neteaseHint').textContent = result.ok === true
+    ? '登录成功 ✓ 可以直接点歌了'
+    : `登录没完成：${result.error ?? '超时或取消'}（再点一次登录可重试）`
+})
+
+$('neteaseStatus').addEventListener('click', async () => {
+  $('neteaseHint').textContent = '正在查登录状态…'
+  const result = await window.settingsApi.neteaseStatus()
+  if (result.ok !== true) {
+    $('neteaseHint').textContent = `查询失败：${result.error}`
+    return
+  }
+  $('neteaseHint').textContent = result.loggedIn === true
+    ? `已登录${result.text === '' ? '' : `（${result.text}）`}`
+    : '还没登录（扫码后稍等几秒再查）'
 })
 
 $('clearNetease').addEventListener('click', async () => {

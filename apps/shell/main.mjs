@@ -8,7 +8,7 @@
  *
  * 语音、ASR、TTS、agent 都还没接，窗口状态由托盘"演示"菜单驱动。
  */
-import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, session, safeStorage, net } from 'electron'
+import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, session, safeStorage, net, shell } from 'electron'
 import { appendFileSync, existsSync, renameSync, statSync } from 'node:fs'
 import { freemem } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -26,7 +26,7 @@ import { SHELL_TOOL, runShell } from '../../packages/tools/shell.mjs'
 import { FILES_TOOL, runFiles } from '../../packages/tools/files.mjs'
 import { PROC_TOOL, KILL_TOOL, runAppControl, runKillApp } from '../../packages/tools/procs.mjs'
 import { SYSINFO_TOOL, runSystemInfo } from '../../packages/tools/sysinfo.mjs'
-import { NETEASE_TOOL, runNetease, runCliAsync, syncCredentials, loginStatus } from '../../packages/tools/netease.mjs'
+import { NETEASE_TOOL, runNetease, runCliAsync, syncCredentialsAsync, loginStatus, startLoginSession, clearLoginCache } from '../../packages/tools/netease.mjs'
 import { player as musicPlayer } from '../../packages/tools/mpv-player.mjs'
 import { externalPath } from '../../packages/config/paths.mjs'
 
@@ -131,6 +131,10 @@ let tray = null
 let hideTimer = null
 /** 用户是否亲手收起过小窗（决定"自动隐藏后要不要再弹出来"） */
 let userDismissedHud = false
+/** 保存设置后的短暂静默期：点击声容易被 KWS 当成唤醒词 */
+let wakeMutedUntil = 0
+/** 当前进行中的网易云登录会话（前台子进程，扫码成功即结束） */
+let loginSession = null
 let lastShowMode = null
 let currentState = 'hidden'
 let contentReady = false
@@ -303,6 +307,20 @@ function requestShow(mode, state, retry) {
 }
 
 function doShow(target, mode, state) {
+  // 诊断用：任何一次 HUD 显示都记下触发栈（CUA_VA_TRACE_SHOW=1 时更详细）
+  try {
+    const frames = String(new Error().stack ?? '').split('\n').slice(2, 6).map((line) => line.trim()).join(' <- ')
+    log(`doShow(state=${state}, mode=${mode}, settingsOpen=${settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible()}) <- ${frames}`)
+  } catch { /* 记录失败不影响显示 */ }
+  /*
+   * 改设置的时候一律不弹 HUD。
+   * 之前点"保存"会让助手从内部冒出来（不是唤醒词，是某条内部调用链触发的显示），
+   * 与其一条条追，不如在这里立一条规矩：设置窗口开着，谁也别想弹窗。
+   */
+  if (process.env.CUA_VA_SUPPRESS_SHOW !== '0' && settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible()) {
+    log(`show suppressed（设置在开，state=${state}）: ${new Error().stack?.split('\n').slice(2, 4).join(' | ') ?? ''}`)
+    return
+  }
   userDismissedHud = false
   positionBottomRight(target)
   if (mode === 'showInactive') target.showInactive()
@@ -339,9 +357,21 @@ function hideHud() {
 
 /** 对话结束后的调用点：R14 里"隐藏 vs 销毁"的决策也在这里。 */
 function dismiss() {
-  // 用户亲手关的窗口：后面再有播报别再把它弹出来打扰
+  /*
+   * 用户点 HUD 的 × 就是"别干了"，不是"先躲一下"。
+   * 之前只隐藏窗口、麦克风还开着，随便一点动静又把它叫醒——这就是"关不掉还复活"。
+   * 所以这里连监听一起停：要再用，从托盘点「唤醒 / 开始对话」。
+   */
   userDismissedHud = true
+  stopSpeaking()
+  activeTurn = null
+  commandActive = false
+  clearTimeout(commandTimer)
+  if (listening) {
+    void stopListening().then(() => { syncWakeTray(false) })
+  }
   hideHud()
+  log('dismiss: 窗口关闭，监听已停止')
 }
 
 /**
@@ -408,8 +438,24 @@ function ensureCaptureWindow() {
 }
 
 /** 打开采集 + 唤醒监听 */
+/**
+ * 开麦（幂等）。
+ *
+ * 开机自启时，"恢复上次唤醒"和 "--listen" 两条路径会在同一瞬间各调一次；
+ * 原来的 `if (listening)` 挡不住——因为 listening 要等 await 之后才置 true，
+ * 于是开了两个采集窗口：一个成功、一个报错，报错的把状态改成 error（托盘图标不对），
+ * KWS 也挂在那个半死的流上，喊唤醒词没反应。这里用"进行中的 Promise"做互斥。
+ */
+let listeningStartPromise = null
+
 async function startListening() {
   if (listening) return { ok: true, already: true }
+  if (listeningStartPromise !== null) return listeningStartPromise
+  listeningStartPromise = doStartListening().finally(() => { listeningStartPromise = null })
+  return listeningStartPromise
+}
+
+async function doStartListening() {
   try {
     // 延迟加载：sherpa-onnx 原生模块 + KWS 模型初始化约 1 秒，
     // 而且模型文件缺失时不应该影响应用启动
@@ -480,6 +526,15 @@ async function stopListening() {  if (!listening) return { ok: true, already: tr
 
 /** 唤醒命中：弹出小窗并进入"说指令"阶段 */
 function onWake(keyword) {
+  /*
+   * 设置窗口在前台时不响应唤醒词。
+   * 用户点"保存"、敲键盘时，KWS 很容易被点击声/人声误触发，
+   * 表现出来就是"一保存助手就醒了"——它是被声音叫醒的，不是被保存叫醒的。
+   */
+if ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible())
+    || (wakeMutedUntil > 0 && Date.now() < wakeMutedUntil)) {
+    return
+  }
   log(`wake: ${keyword}`)
   // 一次唤醒 = 一次会话：清掉上一件事的记忆，避免"新问题被老问题带偏"
   resetSession('wake')
@@ -1716,13 +1771,21 @@ async function ensureAgent() {
     const apiKey = await store.resolveApiKey()
     if (!apiKey) throw new Error('还没配置模型 API Key')
 
-    // 音乐工具的凭据同步给 ncm-cli（不一致才写，避免每次启动都碰配置）
-    try {
-      const synced = syncCredentials(config.netease ?? {})
-      if (synced.length > 0) log(`netease credentials synced: ${synced.join(', ')}`)
-    } catch (error) {
-      log(`netease sync failed: ${error.message}`)
-    }
+    // 音乐工具的凭据同步给 ncm-cli；异步跑，别挡住这一轮对话
+    void (async () => {
+      try {
+        // 带上"上次同步过的哈希"：内容没变就不要写 CLI，否则会把登录态顶掉
+        const result = await syncCredentialsAsync(config.netease ?? {}, { syncedHash: config.netease?.syncedHash })
+        const synced = result.synced ?? []
+        if (synced.length > 0) log(`netease credentials synced: ${synced.join(', ')}`)
+        if (result.hash !== undefined && result.hash !== config.netease?.syncedHash) {
+          await store.saveConfig({ netease: { ...(config.netease ?? {}), syncedHash: result.hash } })
+          config.netease = { ...(config.netease ?? {}), syncedHash: result.hash }
+        }
+      } catch (error) {
+        log(`netease sync failed: ${error.message}`)
+      }
+    })()
 
     const startedAt = Date.now()
     const toolkit = new cuaModule.CuaToolkit({ frameDir: join(DATA_ROOT, 'frames') })
@@ -1817,7 +1880,7 @@ async function ensureAgent() {
       },
     })
 
-    agentRuntime = { agent, toolkit, config, webSearch, llm, readyMs: Date.now() - startedAt }
+    agentRuntime = { agent, toolkit, config, webSearch, llm, apiKey, readyMs: Date.now() - startedAt }
     applyModelSchedule('agent-ready')
     log(`agent ready in ${agentRuntime.readyMs}ms model=${config.model}`)
     return agentRuntime
@@ -2265,6 +2328,8 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='powershell.exe
  * 轮询不会漏；30 秒精度对"几点用哪个模型"完全够。
  */
 let modelScheduleTimer = null
+/** 上一次落定的方案 id（default 表示默认）；用来判断要不要切 */
+let lastAppliedProfileId = null
 
 function startModelScheduleWatcher() {
   if (modelScheduleTimer !== null) return
@@ -2277,13 +2342,29 @@ function applyModelSchedule(reason) {
   try {
     const config = agentRuntime.config
     const decided = resolveModel(config, new Date())
-    const target = decided.source === 'schedule' ? decided.model : config.model
+    const target = decided.source === 'schedule' ? decided.model : (decided.model === '' ? config.model : decided.model)
     const llm = agentRuntime.llm
     if (llm === undefined) return
-    if (llm.model === target) return
-    llm.setModel(target)
+    /*
+     * 用"当前该落在哪个方案"作为决策标识：方案变了就整套端点换过去，
+     * 包含"回到默认"——默认方案的地址和 Key 也要跟着回去，
+     * 否则会拿上一个方案的 Key 去打默认供应商。
+     */
+    const decisionKey = decided.profile === null ? 'default' : String(decided.profile.id)
+    if (decisionKey === lastAppliedProfileId && llm.model === target) return
+
+    const endpoint = decided.endpoint ?? {
+      baseURL: config.baseURL,
+      apiKey: agentRuntime.apiKey ?? '',
+    }
+    llm.setEndpoint({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model: target })
+    lastAppliedProfileId = decisionKey
+
     const rule = decided.rule
-    log(`model switch (${reason}): → ${target}${rule === null ? '' : `（规则 ${rule.from}-${rule.to}）`}`)
+    const profile = decided.profile
+    log(`model switch (${reason}): → ${target} @ ${endpoint.baseURL}`
+      + `${profile === null ? '' : `（方案 ${profile.name ?? profile.id}）`}`
+      + `${rule === null ? '' : `（规则 ${rule.from}-${rule.to}）`}`)
   } catch (error) {
     log(`model schedule failed: ${error.message}`)
   }
@@ -2433,16 +2514,33 @@ function registerSettingsIpc() {
           overrides: payload.permissions.overrides ?? {},
         }
       }
+      const credentialsChanged = payload?.netease !== undefined
+        && (String(payload.netease.appId ?? '') !== ''
+          || String(payload.netease.privateKey ?? '') !== '')
       const saved = await store.saveConfig(next)
-      // 音乐凭据是"本人身份"，只落本机；保存后同步给 ncm-cli 并让直连客户端用上
-      if (payload?.netease !== undefined) {
-        try {
-          const fresh = await store.loadConfig()
-          const synced = syncCredentials(fresh.netease ?? {})
-          log(`netease credentials ${synced.length > 0 ? `synced: ${synced.join(', ')}` : 'unchanged'}`)
-        } catch (error) {
-          log(`netease sync failed: ${error.message}`)
-        }
+      // 保存动作本身带点击声，给它一段静默期，别让 KWS 把它当唤醒词
+      wakeMutedUntil = Date.now() + 1500
+      /*
+       * 音乐凭据变了才同步给 ncm-cli，而且**不 await**。
+       * 这个同步要跑 2~4 次 CLI 子进程（0.5~11 秒/次），一旦在保存路径上同步等待，
+       * 设置窗口就会一直"未响应"——用户看到的就是点了保存没反应。
+       */
+      if (credentialsChanged) {
+        void (async () => {
+          try {
+            const fresh = await store.loadConfig()
+            const current = await store.loadConfig()
+            const result = await syncCredentialsAsync(current.netease ?? {}, { syncedHash: current.netease?.syncedHash })
+            if (result.hash !== undefined && result.hash !== current.netease?.syncedHash) {
+              // 记下"同步过哪一版凭据"：下次内容没变就不动 CLI，避免把登录态顶掉
+              await store.saveConfig({ netease: { ...(current.netease ?? {}), syncedHash: result.hash } })
+            }
+            const synced = result.synced ?? []
+            log(`netease credentials ${synced.length > 0 ? `synced: ${synced.join(', ')}` : 'unchanged'}`)
+          } catch (error) {
+            log(`netease sync failed: ${error.message}`)
+          }
+        })()
       }
       // 立刻生效（不用重启）——这些都是内存里的开关与默认值
       if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled
@@ -2533,6 +2631,47 @@ function registerSettingsIpc() {
     }
   })
 
+  /*
+   * 网易云登录：CLI 会给出一个一次性登录链接（手机扫码/网页授权）。
+   * 用户点设置里的「登录网易云」→ 我们取链接并丢给系统浏览器打开。
+   */
+  /*
+   * 登录网易云：自己持有 login 子进程（前台模式），链接一出来就开浏览器。
+   * 不用 --background：那样轮询交给游离进程，扫完码本地可能还是未登录。
+   */
+  ipcMain.handle('settings:neteaseLogin', async () => {
+    try {
+      if (loginSession !== null) { try { loginSession.kill() } catch { /* 已退出 */ } loginSession = null }
+      let opened = false
+      loginSession = startLoginSession({}, {
+        onUrl: (url) => {
+          log(`netease login: 链接 ${url.slice(0, 50)}…`)
+          if (!opened) { opened = true; void shell.openExternal(url) }
+          if (settingsWin !== null && !settingsWin.isDestroyed()) settingsWin.webContents.send('settings:neteaseLoginUrl', url)
+        },
+        onDone: (result) => {
+          loginSession = null
+          clearLoginCache()
+          log(`netease login: done ok=${result.ok} code=${result.code}${result.error === null ? '' : ` err=${result.error}`}`)
+          if (settingsWin !== null && !settingsWin.isDestroyed()) settingsWin.webContents.send('settings:neteaseLoginDone', result)
+        },
+      })
+      if (loginSession.ok === false) return { ok: false, error: loginSession.error }
+      return { ok: true, waiting: true }
+    } catch (error) {
+      log(`netease login failed: ${error.message}`)
+      return { ok: false, error: error.message }
+    }
+  })
+
+  ipcMain.handle('settings:neteaseStatus', async () => {
+    try {
+      const status = loginStatus()
+      return { ok: true, loggedIn: status.loggedIn === true, text: status.text ?? '' }
+    } catch (error) {
+      return { ok: false, error: error.message }
+    }
+  })
   ipcMain.handle('settings:exportAudit', async () => exportAudit())
 
   ipcMain.handle('settings:testVoice', async (_event, options) => {
@@ -2617,7 +2756,14 @@ async function readAuditTail(lines) {
  * 于是读回来永远是 false（它按当前 app 名去找），用户会看到"勾了但不生效"。
  * 自己写 HKCU\...\Run 反而确定：值名固定、命令固定、读回来也一致。
  */
-const AUTOSTART_VALUE = '语音助手'
+/*
+ * 注册表值名用 ASCII。
+ * reg.exe 对中文值名不友好（按 OEM 代码页解析命令行），
+ * 用它 delete 中文值名会报"无效语法"删不掉；ASCII 名字两头都稳。
+ */
+const AUTOSTART_VALUE = 'ComputerUseVoiceAssistant'
+/** 旧版本用过的中文值名：启动时要清掉，否则开机同一程序会被启动两次 */
+const LEGACY_AUTOSTART_VALUE = '语音助手'
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
 
 function applyAutoStart(enabled) {
@@ -2632,6 +2778,29 @@ function applyAutoStart(enabled) {
   log(`autoStart=${enabled} reg exit=${result.status} ${String(result.stderr ?? '').trim().slice(0, 120)}`)
 }
 
+/**
+ * 清掉历史遗留的自启项。
+ * 早期版本用「语音助手」这个名字写过一次 Run 键，新版用 ComputerUseVoiceAssistant，
+ * 结果两份都在——开机时 Windows 会把同一个程序启动两次：
+ * 第二个实例拿不到单实例锁直接退出，但主实例会收到 second-instance 事件，
+ * 表现就是"托盘状态不对、唤醒时好时坏"。这个函数负责把重复项删掉。
+ */
+function cleanupLegacyAutoStart() {
+  if (!app.isPackaged) return
+  try {
+    /*
+     * 必须用 PowerShell 删，不能用 reg.exe：
+     * reg.exe 按 OEM 代码页解析命令行，中文值名「语音助手」传进去会变乱码，
+     * 结果是"无效语法"、删不掉（实测 exit=1）。PowerShell 走 Unicode 参数没这问题。
+     */
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+      `Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '${LEGACY_AUTOSTART_VALUE}' -ErrorAction SilentlyContinue`],
+      { windowsHide: true, encoding: 'utf8' })
+    log(result.status === 0 ? '已清理遗留自启项（若存在）' : '没有遗留自启项')
+  } catch (error) {
+    log(`cleanupLegacyAutoStart failed: ${error.message}`)
+  }
+}
 function isAutoStartRegistered() {
   const result = spawnSync('reg.exe', ['query', RUN_KEY, '/v', AUTOSTART_VALUE], { windowsHide: true, encoding: 'utf8' })
   return result.status === 0
@@ -2723,6 +2892,15 @@ function buildTray() {
   tray.setContextMenu(menu)
   wakeMenuItem = menu.getMenuItemById('wake')
 
+  /*
+   * 托盘建好之后，把"当前真实状态"补同步一次。
+   * 否则会出现：图标还是"未开麦"的样子，而菜单里的「语音唤醒」已经是勾选的
+   * （启动时 setState 可能早于 tray 创建，图标没落上）——用户看到的就是"状态对不上"。
+   */
+  setState(currentState)
+  wakeMenuItem.checked = listening
+  log(`tray 初始状态同步：state=${currentState} listening=${listening}`)
+
   // 左键点击图标 = 唤醒（Windows 上 click 与双击行为不同，两个都挂）
   tray.on('click', () => showForInteraction('listening'))
 }
@@ -2777,15 +2955,49 @@ async function saveWakePreference(enabled) {
 // ---------------------------------------------------------------- 生命周期
 
 // 单实例：托盘应用开两份会让用户看到两个图标、抢同一套热键
+/** 父进程是谁（把我们拉起来的那个）：用来查谁在偷偷启动第二个实例 */
+function describeParentProcess() {
+  try {
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${process.ppid}" | Select-Object -ExpandProperty Name)`],
+      { encoding: 'utf8', windowsHide: true, timeout: 4000 })
+    const name = String(result.stdout ?? '').trim()
+    return `${name === '' ? '?' : name}(ppid=${process.ppid})`
+  } catch {
+    return `?(ppid=${process.ppid})`
+  }
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 log(`singleInstanceLock=${gotSingleInstanceLock}`)
 if (!gotSingleInstanceLock) {
+  // 记下是谁把我们拉起来的：'second-instance' 的窗口是它弹的
+  log(`second-instance launch：parent=${describeParentProcess()} argv=${process.argv.slice(1).join(' ')}`)
   app.quit()
 } else {
-  app.on('second-instance', () => showForInteraction('listening'))
+  /*
+   * 第二个实例被拉起时，之前是直接 showForInteraction —— 也就是"窗口自己冒出来"、
+   * 看起来就是助手被唤醒了。谁在拉起我们目前不知道，所以先记下父进程，等证据。
+   * 同时：有设置窗口开着就不弹，别打断改配置。
+   */
+  /*
+   * 第二个实例被拉起时，原来是直接 showForInteraction —— 窗口自己冒出来，
+   * 看起来就是"助手被唤醒了"。谁在拉起我们暂时不知道，所以先把父进程记下来。
+   * 另外：设置窗口开着就不弹，别打断改配置。
+   */
+  app.on('second-instance', () => {
+    const parent = describeParentProcess()
+    log(`second-instance：又被拉起一次（parent=${parent}）`)
+    if (settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible()) {
+      log('second-instance：设置在开，不弹窗')
+      return
+    }
+    showForInteraction('listening')
+  })
   app.whenReady().then(async () => {
   log('whenReady')
   cleanupOrphans()
+  cleanupLegacyAutoStart()
   startPlayerWatcher()
   startModelScheduleWatcher()
   await registerCryptoHooks()
@@ -3070,7 +3282,7 @@ async function runAsrDemo(wavPath) {
   }
   if (finalText === '') finalText = latest
 
-  const report = {
+  Object.assign(report, {
     ok: true,
     wav: wavPath,
     inRate,
@@ -3080,7 +3292,7 @@ async function runAsrDemo(wavPath) {
     timeline,
     command: finalText,
     state: currentState,
-  }
+  })
   log(`asr-demo report ${JSON.stringify(report)}`)
   console.log('__ASRDEMO__' + JSON.stringify(report))
   // 留在屏幕上几秒，供人工/截图确认
@@ -3511,15 +3723,29 @@ async function runSettingsTest() {
   const store = await import('../../packages/config/store.mjs')
   const before = await store.loadConfig()
 
-  const target = openSettings()
-  await new Promise((resolve) => {
-    if (!target.webContents.isLoading()) { resolve(); return }
-    target.webContents.once('did-finish-load', () => resolve())
-  })
-  await sleep(1200)
+  const waitReady = async (target, ms = 5000) => {
+    if (!target.webContents.isLoading()) return
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      target.webContents.once('did-finish-load', () => { clearTimeout(timer); resolve() })
+    })
+  }
 
-  // 在页面里改：情绪 = 生气、语速 = 1.15、关掉连续对话、把键盘能力设为"每次询问"
-  const applied = await target.webContents.executeJavaScript(`(() => {
+  const report = { steps: [] }
+  /*
+   * 先等监听状态稳定：启动会恢复上次的唤醒开关，ASR 加载完才真正开麦。
+   * 不等的话，会把"启动时恢复唤醒"误算成"保存把助手叫醒了"。
+   */
+  for (let i = 0; i < 25 && !listening; i += 1) { await sleep(300) }
+  report.hudBefore = { visible: win !== null && !win.isDestroyed() && win.isVisible(), listening }
+  report.listeningBefore = listening
+
+  const settings = openSettings()
+  await waitReady(settings)
+  await sleep(600)
+
+  // 1) 改表单并保存，顺便量保存耗时（保存必须秒回，否则窗口会显示"未响应"）
+  const applied = await settings.webContents.executeJavaScript(`(async () => {
     const emotion = document.getElementById('emotion')
     const speed = document.getElementById('speed')
     const continuous = document.getElementById('continuousMode')
@@ -3529,72 +3755,131 @@ async function runSettingsTest() {
     speed.value = '1.15'
     if (continuous) continuous.checked = false
     if (keyboard) keyboard.value = 'ask'
+    const started = performance.now()
     document.getElementById('save').click()
+    await new Promise((r) => setTimeout(r, 600))
     return {
       ok: true,
-      emotion: emotion.value,
-      speed: speed.value,
-      options: Array.from(emotion.options).map(o => o.value),
+      saveMs: Math.round(performance.now() - started),
+      options: Array.from(emotion.options).map((o) => o.value),
       capabilityCount: document.querySelectorAll('#capabilities select').length,
-      keyboardFound: keyboard !== null,
     }
   })()`)
+  report.steps.push('form-saved')
 
-  await sleep(1500)
-  const after = await store.loadConfig()
-  const report = {
-    formApplied: applied.ok === true,
-    emotionOptions: applied.options,
-    capabilityCount: applied.capabilityCount,
-    savedEmotion: after.tts?.emotion,
-    savedSpeed: after.tts?.speed,
-    savedContinuous: after.ui?.continuousMode,
-    savedOverride: after.permissions?.overrides?.['input.keyboard'],
-    memoryEmotion: ttsEmotion,
-    memoryContinuous: continuousMode,
-  }
-
-  // 顺手验一下"导出审计"按钮真的能导出
-  // 网易云区块：字段在、且私钥不明文回显（只显示"已保存（N 字符）"占位）
-  report.neteaseUi = await target.webContents.executeJavaScript(`(async () => {
-    const appId = document.getElementById('neteaseAppId')
-    const key = document.getElementById('neteasePrivateKey')
-    return {
-      hasFields: Boolean(appId && key),
-      appIdValue: appId ? appId.value : '',
-      keyValue: key ? key.value : '',
-      keyPlaceholder: key ? key.placeholder : '',
-    }
+  // 2) 加一套模型方案并保存，然后关窗重开，看它有没有留下来
+  const added = await settings.webContents.executeJavaScript(`(async () => {
+    document.getElementById('addProfile').click()
+    const row = document.querySelector('#profileRows tr')
+    if (!row) return { ok: false }
+    row.querySelector('[data-field="name"]').value = '自检方案'
+    row.querySelector('[data-field="model"]').value = 'mimo-v2.6-flash'
+    row.querySelector('[data-field="apiKey"]').value = 'sk-selftest-not-real'
+    document.getElementById('save').click()
+    await new Promise((r) => setTimeout(r, 600))
+    return { ok: true, rows: document.querySelectorAll('#profileRows tr').length }
   })()`)
+  report.steps.push('profile-saved')
 
-  report.exportHint = await target.webContents.executeJavaScript(`(async () => {
+  const savedProfiles = (await store.loadConfig()).modelProfiles ?? []
+  settings.close()
+  await sleep(400)
+  const reopened = openSettings()
+  await waitReady(reopened)
+  await sleep(600)
+
+  const afterReopen = await reopened.webContents.executeJavaScript(`(() => ({
+    profileRows: document.querySelectorAll('#profileRows tr').length,
+    profileNames: Array.from(document.querySelectorAll('#profileRows [data-field="name"]')).map((input) => input.value),
+    defaultOptions: Array.from(document.getElementById('defaultProfile').options).map((option) => option.textContent),
+    neteaseAppId: document.getElementById('neteaseAppId').value,
+    neteaseKey: document.getElementById('neteasePrivateKey').value,
+    neteasePlaceholder: document.getElementById('neteasePrivateKey').placeholder,
+    defaultProfileValue: document.getElementById('defaultProfile').value,
+  }))()`)
+  report.steps.push('reopened')
+
+  // 3) 导出审计
+  report.exportHint = await reopened.webContents.executeJavaScript(`(async () => {
     document.getElementById('exportAudit').click()
-    await new Promise((r) => setTimeout(r, 800))
+    await new Promise((r) => setTimeout(r, 1500))
     return document.getElementById('auditHint').textContent
   })()`)
+
+  await sleep(400)
+  const after = await store.loadConfig()
+  report.hudAfter = { visible: win !== null && !win.isDestroyed() && win.isVisible(), listening }
+  report.listeningAfter = listening
+  report.formApplied = applied.ok === true
+  report.saveLatencyMs = applied.saveMs
+  report.emotionOptions = applied.options
+  report.capabilityCount = applied.capabilityCount
+  report.savedEmotion = after.tts?.emotion
+  report.savedSpeed = after.tts?.speed
+  report.savedContinuous = after.ui?.continuousMode
+  report.savedOverride = after.permissions?.overrides?.['input.keyboard']
+  report.memoryEmotion = ttsEmotion
+  report.memoryContinuous = continuousMode
+  report.profileRoundTrip = {
+    added: added.ok === true,
+    savedCount: savedProfiles.length,
+    reloadedRows: afterReopen.profileRows,
+    reloadedNames: afterReopen.profileNames,
+    defaultOptions: afterReopen.defaultOptions,
+  }
+  /*
+   * 登录入口检查：按钮在不在、状态查询通不通（不点登录，避免自检时弹浏览器）
+   */
+  const loginProbe = await reopened.webContents.executeJavaScript(`(async () => {
+    const button = document.getElementById('neteaseLogin')
+    let statusOk = false
+    let statusText = ''
+    try {
+      const status = await window.settingsApi.neteaseStatus()
+      statusOk = status.ok === true
+      statusText = status.loggedIn === true ? 'loggedIn' : 'notLoggedIn'
+    } catch (error) { statusText = String(error && error.message) }
+    return { hasButton: Boolean(button), statusOk, statusText }
+  })()`)
+  report.neteaseLogin = loginProbe
+
+  report.neteaseUi = {
+    hasFields: afterReopen.neteaseAppId !== undefined,
+    appIdValue: afterReopen.neteaseAppId,
+    keyValue: afterReopen.neteaseKey,
+    keyPlaceholder: afterReopen.neteasePlaceholder,
+  }
+
   report.verdict = {
-    formWorks: applied.ok === true && Array.isArray(applied.options) && applied.options.length >= 3,
-    capabilityTable: applied.capabilityCount >= 10 && applied.keyboardFound === true,
-    persisted: after.tts?.emotion === '生气' && Number(after.tts?.speed) === 1.15,
-    appliedToRuntime: ttsEmotion === '生气' && continuousMode === false,
-    uiTogglePersisted: after.ui?.continuousMode === false,
-    permissionOverrideSaved: after.permissions?.overrides?.['input.keyboard'] === 'ask',
+    formWorks: report.formApplied,
+    capabilityTable: Number(report.capabilityCount) >= 10,
+    persisted: report.savedEmotion === '生气' && Number(report.savedSpeed) === 1.15,
+    appliedToRuntime: report.memoryEmotion === '生气' && report.memoryContinuous === false,
+    uiTogglePersisted: report.savedContinuous === false,
+    permissionOverrideSaved: report.savedOverride === 'ask',
     auditExportWorks: typeof report.exportHint === 'string' && report.exportHint.includes('已导出'),
-    neteaseFields: report.neteaseUi?.hasFields === true,
-    neteaseKeyNotEchoed: report.neteaseUi?.keyValue === '',
+    neteaseFields: report.neteaseUi.appIdValue !== undefined,
+    neteaseKeyNotEchoed: report.neteaseUi.keyValue === '',
+    neteaseLoginButton: report.neteaseLogin?.hasButton === true,
+    neteaseStatusWorks: report.neteaseLogin?.statusOk === true,
+    settingsSaveFast: Number(report.saveLatencyMs) < 1500,
+    profileSaved: report.profileRoundTrip.savedCount >= 1,
+    profileReloaded: report.profileRoundTrip.reloadedRows >= 1,
+    saveDoesNotWake: report.hudAfter.visible === false && report.listeningAfter === report.listeningBefore,
   }
   report.pass = Object.values(report.verdict).every((value) => value === true)
 
-  // 还原成测试前的值，别把用户配置带偏
+  // 还原现场：把自检改过的配置写回去
   await store.saveConfig({
-    tts: { ...(before.tts ?? {}), emotion: before.tts?.emotion ?? '中立', speed: before.tts?.speed ?? 1 },
+    tts: { ...(before.tts ?? {}) },
     ui: { ...(before.ui ?? {}), continuousMode: before.ui?.continuousMode !== false },
     permissions: { ...(before.permissions ?? {}), overrides: before.permissions?.overrides ?? {} },
+    modelProfiles: before.modelProfiles ?? [],
   })
 
   log(`settings-test report ${JSON.stringify(report)}`)
   console.log('__SETTINGS__' + JSON.stringify(report))
-  setTimeout(() => { app.isQuitting = true; app.exit(0) }, 400)
+  setTimeout(() => { app.isQuitting = true; app.exit(0) }, 300)
 }
 
 /**

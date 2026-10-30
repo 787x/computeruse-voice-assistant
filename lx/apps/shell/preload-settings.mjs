@@ -1,0 +1,25 @@
+/**
+ * 设置窗口的 preload：只暴露设置页需要的那几个调用，不做通用桥。
+ *
+ * 渲染层拿不到 Node，也拿不到 ipcRenderer —— 所有规则（打码、合并、校验）都在主进程。
+ */
+import { contextBridge, ipcRenderer } from 'electron'
+
+contextBridge.exposeInMainWorld('settingsApi', {
+  /** 一次性拿全：配置（打码）+ 提供商 + 能力表 + 音色 + 最近审计 */
+  load: () => ipcRenderer.invoke('settings:load'),
+  /** 保存表单 */
+  save: (payload) => ipcRenderer.invoke('settings:save', payload),
+  /** 测模型连通性 */
+  testModel: (payload) => ipcRenderer.invoke('settings:testModel', payload),
+  /** 测搜索 */
+  testSearch: (apiKey) => ipcRenderer.invoke('settings:testSearch', apiKey),
+  /** 清除搜索 key */
+  clearSearch: () => ipcRenderer.invoke('settings:clearSearch'),
+  /** 用当前情绪/语速合成一句试听 */
+  testVoice: (options) => ipcRenderer.invoke('settings:testVoice', options),
+  /** 导出审计日志到数据目录的 exports/ */
+  exportAudit: () => ipcRenderer.invoke('settings:exportAudit'),
+  /** 音乐：查 LX Music 的开放 API 在不在 */
+  lxStatus: () => ipcRenderer.invoke('settings:lxStatus'),
+})

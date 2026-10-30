@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>语音助手 · 视觉稿</title>
+<link rel="stylesheet" href="hud.css" />
+<style>
+  html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg-canvas); }
+  body { font-family: var(--font); color: var(--text); }
+
+  /* 背景：假装用户正在编辑的文档 */
+  .work { position: fixed; inset: 0; padding: 48px 64px; }
+  .work h1 { font-size: 30px; font-weight: 400; margin: 0 0 8px; letter-spacing: -.2px; }
+  .work .meta { color: var(--text-2); font-size: 13px; margin-bottom: 32px; }
+  .work .doc { max-width: 720px; font-size: 14px; line-height: 1.9; color: #333; }
+  .work .doc p { margin: 0 0 16px; }
+  .work .bar { height: 12px; border-radius: 6px; background: #ececec; margin-bottom: 12px; }
+  .work .bar.w80 { width: 80%; } .work .bar.w60 { width: 60%; } .work .bar.w92 { width: 92%; }
+
+  /* 演示控制台：仅用于看状态，不属于产品 UI */
+  .dev {
+    position: fixed; left: 24px; bottom: 24px; z-index: 100;
+    background: #fff; border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px; display: flex; flex-wrap: wrap; gap: 8px; max-width: 420px;
+    box-shadow: var(--shadow);
+  }
+  .dev .label { width: 100%; font-size: 11px; color: var(--text-3); letter-spacing: .04em; text-transform: uppercase; }
+  .dev button {
+    font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 999px;
+    border: 1px solid var(--line); background: #fff; color: var(--text); cursor: pointer;
+  }
+  .dev button:hover { background: #f3f3f3; }
+  .dev button.on { background: #000; color: #fff; border-color: #000; }
+
+  .hud { position: fixed; right: 20px; bottom: 20px; z-index: 50; }
+  .hidden-note { position: fixed; right: 20px; bottom: 24px; font-size: 12px; color: var(--text-3); }
+</style>
+</head>
+<body>
+
+<!-- 背景：用户的工作内容 -->
+<div class="work">
+  <h1>季度技术方案评审</h1>
+  <div class="meta">最近编辑 · 14:22 · 与 李工、王工 共享</div>
+  <div class="doc">
+    <p>本季度重点解决三个问题：一是渲染路径的重复计算，二是设备指纹的稳定性，三是灰度发布的可回滚性。前两项已完成设计评审，第三项待补充回滚演练数据。</p>
+    <div class="bar w92"></div><div class="bar w80"></div><div class="bar w60"></div>
+    <p>回滚演练计划在下周三之前完成，覆盖三个典型场景：配置错误、依赖升级失败、数据迁移中断。</p>
+    <div class="bar w80"></div><div class="bar w92"></div>
+  </div>
+</div>
+
+<!-- 右下角小窗 -->
+<div class="hud" id="hud">
+  <div class="hud-head">
+    <span class="dot" id="dot"></span>
+    <span class="hud-title" id="title">聆听中</span>
+    <div class="wave" id="wave" style="display:none"><i></i><i></i><i></i><i></i><i></i></div>
+    <button class="hud-x" id="close">×</button>
+  </div>
+
+  <div class="subs" id="subs"></div>
+
+  <div class="think" id="think" style="display:none">
+    <i></i><i></i><i></i><span id="thinkText">正在想…</span>
+  </div>
+
+  <div class="confirm" id="confirm" style="display:none">
+    <div class="what">
+      <div id="confirmWhat"><b>删除 3 个文件</b>：报告.docx、预算.xlsx、草稿.md</div>
+      <div class="hint">Enter 允许 · Esc 拒绝</div>
+    </div>
+    <button class="btn primary" id="allow">允许</button>
+    <button class="btn" id="deny">拒绝</button>
+  </div>
+</div>
+
+<div class="hidden-note" id="hiddenNote" style="display:none">已隐藏（屏幕上不存在任何窗口）</div>
+
+<!-- 演示控制台 -->
+<div class="dev">
+  <div class="label">状态演示（非产品 UI）</div>
+  <button data-state="hidden">隐藏</button>
+  <button data-state="listening">聆听</button>
+  <button data-state="thinking">思考</button>
+  <button data-state="speaking">播报</button>
+  <button data-state="confirm">确认</button>
+  <button data-state="error">错误</button>
+</div>
+
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    hud: $('hud'), dot: $('dot'), title: $('title'), subs: $('subs'),
+    think: $('think'), thinkText: $('thinkText'), wave: $('wave'),
+    confirm: $('confirm'), confirmWhat: $('confirmWhat'), hiddenNote: $('hiddenNote'),
+  };
+
+  let highlightTimer = null;
+
+  function clearAll() {
+    els.subs.replaceChildren();
+    els.think.style.display = 'none';
+    els.wave.style.display = 'none';
+    els.confirm.style.display = 'none';
+    els.dot.className = 'dot';
+    clearInterval(highlightTimer);
+    highlightTimer = null;
+  }
+
+  /* 句内逐字高亮：按字数线性插值（真实实现按音频时长驱动） */
+  function typeSentence(text, durationMs) {
+    const p = document.createElement('p');
+    p.className = 'current';
+    const spoken = document.createElement('span');
+    spoken.className = 'spoken';
+    const pending = document.createElement('span');
+    pending.className = 'pending';
+    pending.textContent = text;
+    p.append(spoken, pending);
+    els.subs.append(p);
+
+    const chars = [...text];
+    const per = durationMs / chars.length;
+    let i = 0;
+
+    highlightTimer = setInterval(() => {
+      i += 1;
+      if (i > chars.length) { clearInterval(highlightTimer); highlightTimer = null; return; }
+      spoken.textContent = chars.slice(0, i).join('');
+      pending.textContent = chars.slice(i).join('');
+    }, per);
+  }
+
+  function para(text, className) {
+    const p = document.createElement('p');
+    if (className) p.className = className;
+    p.textContent = text;
+    return p;
+  }
+
+  const STATES = {
+    hidden() {
+      clearAll();
+      els.hud.classList.remove('show');
+      els.hiddenNote.style.display = 'block';
+    },
+
+    listening() {
+      clearAll();
+      els.hiddenNote.style.display = 'none';
+      els.hud.classList.add('show');
+      els.dot.classList.add('listen');
+      els.title.textContent = '聆听中';
+      els.subs.append(
+        para('帮我看看今天的日程。'),
+        para('然后把下午三点那个会议改到四点…', 'partial'),
+      );
+    },
+
+    thinking() {
+      clearAll();
+      els.hiddenNote.style.display = 'none';
+      els.hud.classList.add('show');
+      els.dot.classList.add('listen');
+      els.title.textContent = '思考中';
+      els.subs.append(para('帮我把下午三点的会议改到四点。', 'current'));
+      els.think.style.display = 'flex';
+      els.thinkText.textContent = '我看一下日程';
+    },
+
+    speaking() {
+      clearAll();
+      els.hiddenNote.style.display = 'none';
+      els.hud.classList.add('show');
+      els.dot.classList.add('speak');
+      els.title.textContent = '正在说';
+      els.wave.style.display = 'flex';
+      els.subs.append(
+        para('好的，我看一下你的日程。'),
+        para('下午三点是项目同步会，改到四点会撞上评审。'),
+      );
+      typeSentence('要我把项目同步会挪到四点十五吗？', 4200);
+    },
+
+    confirm() {
+      clearAll();
+      els.hiddenNote.style.display = 'none';
+      els.hud.classList.add('show');
+      els.dot.classList.add('speak');
+      els.title.textContent = '需要你确认';
+      els.subs.append(para('这三个文件要一起删掉吗？', 'current'));
+      els.confirmWhat.innerHTML = '<b>删除 3 个文件</b>：报告.docx、预算.xlsx、草稿.md';
+      els.confirm.style.display = 'flex';
+    },
+
+    error() {
+      clearAll();
+      els.hiddenNote.style.display = 'none';
+      els.hud.classList.add('show');
+      els.dot.classList.add('error');
+      els.title.textContent = '出错了';
+      els.subs.append(para('找不到「日程」应用，可能没有安装。', 'current'));
+    },
+  };
+
+  function apply(state) {
+    STATES[state]?.();
+    document.querySelectorAll('.dev button').forEach((btn) => {
+      btn.classList.toggle('on', btn.dataset.state === state);
+    });
+  }
+
+  document.querySelectorAll('.dev button').forEach((btn) => {
+    btn.addEventListener('click', () => apply(btn.dataset.state));
+  });
+  $('close').addEventListener('click', () => apply('hidden'));
+  $('allow').addEventListener('click', () => apply('speaking'));
+  $('deny').addEventListener('click', () => apply('hidden'));
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') apply('hidden'); });
+
+  apply('speaking');
+</script>
+</body>
+</html>

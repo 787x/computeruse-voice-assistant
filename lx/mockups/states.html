@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>语音助手 · 状态对照</title>
+<link rel="stylesheet" href="hud.css" />
+<style>
+  body {
+    margin: 0; padding: 40px;
+    background: #eceded;              /* 中性灰底，便于看清玻璃质感 */
+    font-family: var(--font); color: var(--text);
+  }
+  h1 { font-size: 22px; font-weight: 400; margin: 0 0 6px; }
+  .sub { color: var(--text-2); font-size: 13px; margin-bottom: 28px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 32px; align-items: flex-start; }
+  .cell { display: flex; flex-direction: column; gap: 10px; }
+  .cell .cap { font-size: 12px; color: var(--text-2); letter-spacing: .02em; }
+  .cell .cap b { color: var(--text); font-weight: 600; }
+  /* 对照表里让所有卡片直接可见，不要入场动画 */
+  .grid .hud { transform: none; opacity: 1; }
+</style>
+</head>
+<body>
+  <h1>语音助手 · 状态对照</h1>
+  <div class="sub">五态并排。宽度固定 380px，只长高不长宽。</div>
+
+  <div class="grid">
+
+    <!-- 聆听 -->
+    <div class="cell">
+      <div class="hud">
+        <div class="hud-head">
+          <span class="dot listen"></span>
+          <span class="hud-title">聆听中</span>
+          <button class="hud-x">×</button>
+        </div>
+        <div class="subs">
+          <p>帮我看看今天的日程。</p>
+          <p class="partial">然后把下午三点那个会议改到四点…</p>
+        </div>
+      </div>
+      <div class="cap"><b>1 / 聆听</b> · 用户的话实时上屏（灰斜体），助手不说话</div>
+    </div>
+
+    <!-- 思考 -->
+    <div class="cell">
+      <div class="hud">
+        <div class="hud-head">
+          <span class="dot listen"></span>
+          <span class="hud-title">思考中</span>
+          <button class="hud-x">×</button>
+        </div>
+        <div class="subs">
+          <p class="current">帮我把下午三点的会议改到四点。</p>
+        </div>
+        <div class="think">
+          <i></i><i></i><i></i><span>我看一下日程</span>
+        </div>
+      </div>
+      <div class="cap"><b>2 / 思考</b> · 三点 + 动作白描（约 0.7s 就到这一步）</div>
+    </div>
+
+    <!-- 播报 -->
+    <div class="cell">
+      <div class="hud">
+        <div class="hud-head">
+          <span class="dot speak"></span>
+          <span class="hud-title">正在说</span>
+          <div class="wave"><i></i><i></i><i></i><i></i><i></i></div>
+          <button class="hud-x">×</button>
+        </div>
+        <div class="subs">
+          <p>好的，我看一下你的日程。</p>
+          <p>下午三点是项目同步会，改到四点会撞上评审。</p>
+          <p class="current"><span class="spoken">要我把项目同步会挪到</span><span class="pending">四点十五吗？</span></p>
+        </div>
+      </div>
+      <div class="cap"><b>3 / 播报</b> · 已播句变灰，当前句逐字点亮（黑=已说，灰=未说）</div>
+    </div>
+
+    <!-- 确认 -->
+    <div class="cell">
+      <div class="hud">
+        <div class="hud-head">
+          <span class="dot speak"></span>
+          <span class="hud-title">需要你确认</span>
+          <button class="hud-x">×</button>
+        </div>
+        <div class="subs">
+          <p class="current">这三个文件要一起删掉吗？</p>
+        </div>
+        <div class="confirm">
+          <div class="what">
+            <div><b>删除 3 个文件</b>：报告.docx、预算.xlsx、草稿.md</div>
+            <div class="hint">Enter 允许 · Esc 拒绝</div>
+          </div>
+          <button class="btn primary">允许</button>
+          <button class="btn">拒绝</button>
+        </div>
+      </div>
+      <div class="cap"><b>4 / 确认</b> · 高风险动作，键盘可达</div>
+    </div>
+
+    <!-- 错误 -->
+    <div class="cell">
+      <div class="hud">
+        <div class="hud-head">
+          <span class="dot error"></span>
+          <span class="hud-title">出错了</span>
+          <button class="hud-x">×</button>
+        </div>
+        <div class="subs">
+          <p class="current">找不到「日程」应用，可能没有安装。</p>
+        </div>
+      </div>
+      <div class="cap"><b>5 / 错误</b> · 5 秒后自动隐藏</div>
+    </div>
+
+  </div>
+</body>
+</html>

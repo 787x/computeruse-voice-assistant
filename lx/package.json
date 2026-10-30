@@ -1,0 +1,36 @@
+{
+  "name": "computeruse-voice-assistant",
+  "productName": "语音助手",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Computer-Use 语音助手：独立桌面应用，自带 agent，复用 dsh-computer-use 的 computer-use 能力",
+  "main": "apps/shell/main.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "shell": "node tools/run-shell.mjs",
+    "shell:listen": "node tools/run-shell.mjs --listen",
+    "shell:demo": "node tools/run-shell.mjs --demo",
+    "shell:selftest": "node tools/run-shell.mjs --selftest",
+    "shell:mic": "node tools/run-shell.mjs --mic-test",
+    "agent": "node tools/try-agent.mjs",
+    "config-ui": "node tools/config-ui.mjs",
+    "verify:p0": "node tools/verify-p0.mjs",
+    "verify:p1": "node tools/verify-p1.mjs",
+    "verify:tts": "node tools/verify-tts.mjs",
+    "verify:vad": "node tools/verify-vad.mjs",
+    "verify:kws": "node tools/verify-kws.mjs",
+    "verify:stream": "node tools/verify-stream.mjs",
+    "build:dir": "electron-builder --config electron-builder.config.cjs --dir",
+    "build:win": "electron-builder --config electron-builder.config.cjs --win"
+  },
+  "devDependencies": {
+    "electron": "^45.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "sherpa-onnx-node": "^2.0.1"
+  }
+}

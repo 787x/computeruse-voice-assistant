@@ -3,7 +3,7 @@
  *
  * 三个用例：
  *   A 官方测试音频 + 官方关键词 —— 先证明 KWS 管线本身能工作
- *   B 用我们的 TTS 合成"你好小助手"，跑我们的关键词 —— 证明自定义唤醒词生效
+ *   B 用我们的 TTS 合成"你好狼宝"，跑我们的关键词 —— 证明自定义唤醒词生效
  *   C 合成一句不含唤醒词的话 —— 证明不会误触发
  */
 import { Kws } from '../packages/voice/kws.mjs'
@@ -60,7 +60,7 @@ function padSilence(x, seconds = 0.4, sampleRate = 16000) {
   return out
 }
 
-const wake = await tts.speak('你好小助手')
+const wake = await tts.speak('你好狼宝')
 // KWS 是流式模型：前后留静音让它有上下文，实测不加会漏检
 const wake16k = padSilence(resample(wake.samples, wake.sampleRate, 16000))
 writeWav('assets/test/wake-word.wav', wake16k, 16000)
@@ -73,7 +73,7 @@ writeWav('assets/test/not-wake-word.wav', other16k, 16000)
 const trials = []
 for (let i = 0; i < 3; i += 1) {
   try {
-    const a = await tts.speak('你好小助手', { speed: i === 1 ? 0.9 : 1.0 })
+    const a = await tts.speak('你好狼宝', { speed: i === 1 ? 0.9 : 1.0 })
     const x = padSilence(resample(a.samples, a.sampleRate, 16000))
     const spotter = new Kws()
     trials.push({ hit: feed(spotter, x) })
@@ -83,7 +83,7 @@ for (let i = 0; i < 3; i += 1) {
 }
 const bHits = trials.filter((t) => t.hit).length
 report.cases.push({
-  name: 'B 自定义「你好小助手」×3 次',
+  name: 'B 自定义「你好狼宝」×3 次',
   hits: bHits,
   of: trials.length,
   details: trials,

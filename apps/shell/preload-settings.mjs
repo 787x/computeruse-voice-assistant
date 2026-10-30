@@ -20,4 +20,11 @@ contextBridge.exposeInMainWorld('settingsApi', {
   testVoice: (options) => ipcRenderer.invoke('settings:testVoice', options),
   /** 导出审计日志到数据目录的 exports/ */
   exportAudit: () => ipcRenderer.invoke('settings:exportAudit'),
+  /** 网易云登录：主进程取一次性链接并用系统浏览器打开 */
+  neteaseLogin: () => ipcRenderer.invoke('settings:neteaseLogin'),
+  /** 查登录态（昵称/是否已登录） */
+  neteaseStatus: () => ipcRenderer.invoke('settings:neteaseStatus'),
+  /** 登录过程推送：拿到链接 / 登录结束 */
+  onNeteaseLoginUrl: (handler) => { ipcRenderer.on('settings:neteaseLoginUrl', (_e, url) => handler(url)) },
+  onNeteaseLoginDone: (handler) => { ipcRenderer.on('settings:neteaseLoginDone', (_e, result) => handler(result)) },
 })

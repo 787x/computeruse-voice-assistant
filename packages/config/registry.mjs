@@ -118,13 +118,19 @@ export function defaultConfig() {
      * 定时切换模型：不同时间段用不同模型（比如白天用便宜的、夜里用强的）。
      * 规则按数组顺序匹配，先命中先用；from == to 视为全天。
      */
-    modelSchedule: {
+    /**
+     * 模型方案：一套"供应商 + 地址 + Key + 模型"的组合，供定时切换直接引用。
+     * 不写方案也能用（规则里只填模型名），但那样换不了供应商。
+     */
+    modelProfiles: [],    modelSchedule: {
       enabled: false,
       rules: [],
     },    /** 网易云音乐：appId + RSA privateKey（ncm-cli 用它们做签名） */
     netease: {
       appId: '',
       privateKey: '',
+      // 上次同步给 ncm-cli 的凭据哈希：没变就不重写，避免把登录态顶掉
+      syncedHash: '',
     },
     followup: {
       thresholds: { high: 0.7, low: 0.3 },
