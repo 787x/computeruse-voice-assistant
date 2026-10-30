@@ -539,22 +539,36 @@ async function stopListening() {  if (!listening) return { ok: true, already: tr
   return { ok: true }
 }
 
-/** 唤醒命中：弹出小窗并进入"说指令"阶段 */
-function onWake(keyword) {
+/** 显式手动开始：确保采集已开启，再进入真正的指令识别。 */
+async function startManualConversation() {
+  if (confirmResolver !== null) { showForInteraction('confirm'); return }
+  const generation = turnSeq
+  if (!listening) {
+    const result = await startListening()
+    if (!result.ok || generation !== turnSeq) return
+  }
+  if (confirmResolver !== null) { showForInteraction('confirm'); return }
+  stopSpeaking()
+  onWake('手动开始对话', true)
+}
+
+/** 唤醒命中或显式手动请求：显示小窗并开启指令识别。 */
+function onWake(keyword, manual = false) {
   if (confirmResolver !== null) return // A wake must not replace a pending confirmation.
   /*
    * 设置窗口在前台时不响应唤醒词。
    * 用户点"保存"、敲键盘时，KWS 很容易被点击声/人声误触发，
    * 表现出来就是"一保存助手就醒了"——它是被声音叫醒的，不是被保存叫醒的。
    */
-if ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible())
-    || (wakeMutedUntil > 0 && Date.now() < wakeMutedUntil)) {
+if (!manual && ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible())
+    || (wakeMutedUntil > 0 && Date.now() < wakeMutedUntil))) {
     return
   }
   log(`wake: ${keyword}`)
   // 一次唤醒 = 一次会话：清掉上一件事的记忆，避免"新问题被老问题带偏"
   resetSession('wake')
-  showForWake('listening')
+  if (manual) showForInteraction('listening')
+  else showForWake('listening')
   sendSubtitle({ reset: true, hint: '我在听，请说' })
 
   commandActive = true
@@ -563,7 +577,7 @@ if ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible
   lastSentPartial = ''
   // 唤醒词本身（"你好狼宝"）已经进了麦克风。识别从 300ms 后开始，
   // 否则识别结果会带着"你好狼宝"四个字，指令就变成"你好狼宝打开浏览器"。
-  commandStartAt = Date.now() + WAKE_TAIL_MS
+  commandStartAt = Date.now() + (manual ? 0 : WAKE_TAIL_MS)
   clearTimeout(commandTimer)
   commandTimer = setTimeout(() => finishCommand('timeout'), COMMAND_TIMEOUT_MS)
 
@@ -2906,7 +2920,7 @@ function buildTray() {
   tray.setToolTip('语音助手')
 
   const menu = Menu.buildFromTemplate([
-    { label: '唤醒 / 开始对话', click: () => showForInteraction('listening') },
+    { label: '唤醒 / 开始对话', click: () => { void startManualConversation() } },
     { type: 'separator' },
     { id: 'wake', label: '语音唤醒', type: 'checkbox', checked: false, click: (item) => {
       // 以"实际是否在听"为准：勾了但麦克风没开，比不勾更让人困惑
@@ -2996,7 +3010,7 @@ function buildTray() {
   log(`tray 初始状态同步：state=${currentState} listening=${listening}`)
 
   // 左键点击图标 = 唤醒（Windows 上 click 与双击行为不同，两个都挂）
-  tray.on('click', () => showForInteraction('listening'))
+  tray.on('click', () => { void startManualConversation() })
 }
 
 /**
@@ -3075,9 +3089,8 @@ if (!gotSingleInstanceLock) {
    * 同时：有设置窗口开着就不弹，别打断改配置。
    */
   /*
-   * 第二个实例被拉起时，原来是直接 showForInteraction —— 窗口自己冒出来，
-   * 看起来就是"助手被唤醒了"。谁在拉起我们暂时不知道，所以先把父进程记下来。
-   * 另外：设置窗口开着就不弹，别打断改配置。
+   * 再次启动应用视为显式手动对话，而非只显示一个不收音的浮窗。
+   * 保留父进程日志；设置窗口开着时不抢焦点。
    */
   app.on('second-instance', () => {
     const parent = describeParentProcess()
@@ -3086,7 +3099,7 @@ if (!gotSingleInstanceLock) {
       log('second-instance：设置在开，不弹窗')
       return
     }
-    showForInteraction('listening')
+    void startManualConversation()
   })
   app.whenReady().then(async () => {
   log('whenReady')

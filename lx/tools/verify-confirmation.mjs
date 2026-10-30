@@ -18,7 +18,7 @@ function stopSpeaking(){} function setState(s){currentState=s} function sendSubt
 ${section('function setVoiceConfirmEnabled(enabled)', '\n/**')}
 ${section('async function askUser(request)', '/**\n * 收掉卡片')}
 ${section('function closeConfirmCard()', '\n}').concat('\n}')}
-${section('function onWake(keyword)', '\n}').concat('\n}')}
+${section('function onWake(keyword, manual = false)', '\n}').concat('\n}')}
 ${section('function finishCommand(reason, voiceEpoch = confirmVoiceEpoch, endpointText = null, requestId = pendingConfirmId)', '\n}').concat('\n}')}
 let ipcHandler;
 const ipcMain={on(name,handler){ipcHandler=handler}};
