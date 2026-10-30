@@ -3508,13 +3508,9 @@ async function runGateTest(mode) {
   if (mode === 'timeout') {
     // 不答复，等超时（默认 12s，测试时用 CUA_VA_CONFIRM_TIMEOUT 缩短）
     report.timeoutMs = CONFIRM_TIMEOUT_MS
-  } else if (mode === 'deny') {
-    settleConfirm({ allow: false, channel: 'click', reason: '测试：用户点了取消' })
-  } else if (mode === 'once') {
-    // 点"15 分钟"：应当批准，并且把能力记成临时授权
-    settleConfirm({ allow: true, channel: 'click', once: true })
   } else {
-    settleConfirm({ allow: true, channel: 'click' })
+    // Interactive integration test: approval must traverse the real HUD click IPC.
+    log(`gate-test waiting for HUD ${mode} click`)
   }
 
   const askVerdict = await pending
