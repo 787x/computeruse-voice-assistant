@@ -89,6 +89,21 @@ function reportHeight() {
   window.hud.setHeight(height)
 }
 
+/**
+ * 唤醒提示跟着**实际加载成功**的关键词走，不再硬写「小爱同学」。
+ * 标签由主进程在 KWS 首次加载/重载成功后推来（hud:wakeHint）；
+ * 重载失败时主进程不会推新值，这里也就不会显示没生效的词。
+ * @returns {string} 可直接拼进「喊X」的短语
+ */
+function wakeWordPhrase(labels) {
+  if (!Array.isArray(labels) || labels.length === 0) return '「小爱同学」' // 尚未加载：与安装包默认一致
+  if (labels.length === 1) return `「${labels[0]}」`
+  if (labels.length <= 3) return labels.map((l) => `「${l}」`).join('或')
+  return '唤醒词' // 词太多：给不会出错的通用提示
+}
+
+let wakeHintLabels = null
+
 const RENDER = {
   hidden() { clearAll() },
 
@@ -156,7 +171,7 @@ const RENDER = {
     clearAll()
     els.dot.classList.add('listen')
     els.title.textContent = '好了'
-    els.sub.textContent = '需要我做什么，喊「小爱同学」'
+    els.sub.textContent = `需要我做什么，喊${wakeWordPhrase(wakeHintLabels)}`
     if (live.finals.length > 0 || live.partial !== '') renderHeard()
   },
 
@@ -233,6 +248,15 @@ window.hud.onStopAudio(() => {
 })
 
 window.hud.onState(apply)
+
+/** 唤醒提示：主进程推来实际加载成功的关键词（重载失败不会推，这里保持旧值）。 */
+if (typeof window.hud.onWakeHint === 'function') {
+  window.hud.onWakeHint((labels) => {
+    wakeHintLabels = Array.isArray(labels) && labels.length > 0 ? labels : null
+    // done 态正挂在屏幕上时立即刷新文案
+    if (currentState === 'done') RENDER.done()
+  })
+}
 
 /** 确认卡片的内容由主进程给，渲染层不猜 */
 let confirmData = null

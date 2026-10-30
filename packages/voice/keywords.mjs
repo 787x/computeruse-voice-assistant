@@ -38,14 +38,26 @@ export const DEFAULT_KEYWORD_LINE = 'x iǎo ài t óng x ué @小爱同学'
 /** 历史上的默认唤醒词（展示名，只用于文案与验收，不作为迁移判据）。 */
 export const LEGACY_WAKE_WORDS = Object.freeze(['你好狼宝'])
 /**
- * 旧版本自动生成的默认关键词文件的**完整内容**（l/n 两个发音变体各一行）。
- * 迁移判据是"逐行一致"，不是"标签都是你好狼宝"——
- * 用户改过音素/顺序/增删行的文件必须视为自定义保留。
+ * 旧版本自动生成的默认关键词文件的**完整内容签名**（逐行一致才算旧默认）。
+ * 不是"标签都是你好狼宝"——用户改过音素/顺序/增删行的文件必须视为自定义保留。
+ *
+ * 来源核实（2026-10-30，解包真实 Release 产物比对字节）：
+ *   - v0.1.0 setup.exe → $PLUGINSDIR/app-64.7z → resources/models/kws-keywords.txt
+ *   - v0.2.0 setup.exe → 同路径
+ *   两者**字节一致**：单行 `n ǐ h ǎo l áng b ǎo @你好狼宝`（38 字节，LF 结尾）
+ *   → 签名 1，已证实的发布版默认。
+ *   - 签名 2（l/n 两个发音变体两行）来自仓库开发期本机 models/ 文件（未入库、
+ *     未随安装包发布过）；行集是签名 1 的超集且不含任何独有信息（都是旧唤醒词
+ *     本身），一并识别不会丢用户内容，只可能把开发者本机的旧默认迁对。
+ *   - 更早版本 / 其他渠道分发（如完整包的本地拷贝修改）无法核实：
+ *     按"来源不明优先视为自定义"原则保留、不迁移。
  */
-export const LEGACY_DEFAULT_LINES = Object.freeze([
-  'n ǐ h ǎo l áng b ǎo @你好狼宝',
-  'n ǐ h ǎo n áng b ǎo @你好狼宝',
+export const LEGACY_DEFAULT_SIGNATURES = Object.freeze([
+  Object.freeze(['n ǐ h ǎo l áng b ǎo @你好狼宝']),
+  Object.freeze(['n ǐ h ǎo l áng b ǎo @你好狼宝', 'n ǐ h ǎo n áng b ǎo @你好狼宝']),
 ])
+/** 主签名（真实安装包中逐字节一致的那份）。 */
+export const LEGACY_DEFAULT_LINES = LEGACY_DEFAULT_SIGNATURES[0]
 
 const BUNDLED_DEFAULT_FILE = join(dirname(fileURLToPath(import.meta.url)), 'kws-keywords.default.txt')
 
@@ -71,10 +83,11 @@ export function readKeywordLabels(file) {
   return [...new Set(readKeywordLines(file).map(keywordLabel).filter((label) => label !== ''))]
 }
 
-/** 可靠证据：整份文件逐行等于旧版自动生成的默认内容。 */
+/** 可靠证据：整份文件逐行等于某个已核实的旧默认签名。 */
 export function isLegacyDefaultLines(lines) {
-  return lines.length === LEGACY_DEFAULT_LINES.length
-    && lines.every((line, i) => line === LEGACY_DEFAULT_LINES[i])
+  return LEGACY_DEFAULT_SIGNATURES.some((signature) =>
+    lines.length === signature.length
+    && lines.every((line, i) => line === signature[i]))
 }
 
 /** 当前默认（小爱同学单行）内容。 */

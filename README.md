@@ -46,12 +46,14 @@
 3. 托盘勾上「语音唤醒」，说「小爱同学」。
 
 > 默认唤醒词文件随包分发（`packages/voice/kws-keywords.default.txt` → 安装后 `resources/kws-keywords.default.txt`），
-> 首次启动复制到用户数据目录 `…/data/kws-keywords.txt`。旧安装升级时：安装器会先把旧 `resources\models\kws-keywords.txt`
-> 备份到 `…/data/kws-keywords.pre-upgrade.txt`（`apps/shell/assets/installer.nsh`），应用首启一次性消费——只有**逐行等于
-> 旧版自动生成默认词**的文件才会被替换为「小爱同学」；改过音素/增删行的（哪怕标签仍是「你好狼宝」）都按自定义保留。
-> 你自己改过的生效配置永远不会被旧文件覆盖；改完关键词文件后，托盘**关开一次「语音唤醒」即可生效**，不必退出程序。
-> 例外：绕过安装器的手动搬目录升级不会被自动备份，此时旧词表还在旧目录
-> `resources\models\kws-keywords.txt`，手动复制到上面的 data 路径即可恢复。想换唤醒词，直接编辑 data 里的文件。
+> 首次启动复制到用户数据目录 `…/data/kws-keywords.txt`。旧安装升级时：安装器在删除旧目录前把旧
+> `resources\models\kws-keywords.txt` 备份到 `…/data/kws-keywords.pre-upgrade.txt`（`apps/shell/assets/installer.nsh`，
+> 备份失败会中止升级而不是静默丢配置），应用首启一次性消费——只有**逐行等于已核实的旧版默认词**
+> （v0.1.0/v0.2.0 安装包实测：单行 `n ǐ h ǎo l áng b ǎo @你好狼宝`）的文件才会被替换为「小爱同学」；
+> 改过音素/增删行的（哪怕标签仍是「你好狼宝」）都按自定义保留。
+> 你自己改过的生效配置永远不会被旧文件覆盖；改完关键词文件后，托盘**关开一次「语音唤醒」即可生效**，
+> HUD 的唤醒提示也会跟着实际生效的关键词走。想换唤醒词，直接编辑 data 里的文件。
+> 例外：绕过安装器的手动搬目录升级不会被自动备份，此时手动把旧词表复制到 data 路径即可。
 
 > 两个安装版都不含语音运行时（venv + 音色包约 5GB）。需要发声就把 `.runtime/` 放到安装目录的
 > `resources/` 下，或直接用完整版压缩包（见下）。
@@ -130,9 +132,11 @@ cd lx && npm install && node tools/run-shell.mjs --listen
 验收脚本（每个都只依赖本机，不需要网络）：
 
 ```bash
-node tools/verify-wake-runtime.mjs   # 唤醒链路（运行时同路径）
+node tools/verify-wake-runtime.mjs   # 唤醒链路（运行时同路径，--selftest 回归判定函数）
 node tools/verify-keywords.mjs       # 关键词命中/误触
 node tools/verify-keyword-migration.mjs  # 唤醒词默认值迁移/自定义保护
+node tools/verify-keyword-reload.mjs     # 关开唤醒重载 + HUD 提示接线
+node tools/run-verify.mjs tools/verify-electron-wake-hint.mjs  # 生产 preload/renderer 的唤醒提示
 node tools/verify-schedule.mjs       # 定时切换模型
 node tools/verify-permissions.mjs    # 权限门
 node tools/verify-offline.mjs        # 离线兜底

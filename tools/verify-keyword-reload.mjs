@@ -103,6 +103,23 @@ try {
     // 反例：不允许"失败后继续开麦"
     assert.doesNotMatch(src, /reloadKws\(\)[\s\S]{0,200}?if \(!reload\.ok\)[\s\S]{0,80}?return \{ ok: true/, '不能把重载失败吞掉')
   })
+
+  check('HUD 唤醒提示接线：只在加载成功后推 hud:wakeHint', () => {
+    const mainSrc = readFileSync(new URL('../apps/shell/main.mjs', import.meta.url), 'utf8')
+    const preloadSrc = readFileSync(new URL('../apps/shell/preload.mjs', import.meta.url), 'utf8')
+    const appSrc = readFileSync(new URL('../apps/shell/renderer/app.js', import.meta.url), 'utf8')
+    // 主进程：pushWakeHint 恰好在"首载成功"与"重载成功"两处被调用（不含定义处）
+    const calls = mainSrc.match(/(?<!function )\bpushWakeHint\(\)/g) ?? []
+    assert.equal(calls.length, 2, `pushWakeHint 应恰好调用两次（首载+重载成功），实际 ${calls.length}`)
+    assert.match(mainSrc, /win\.webContents\.send\('hud:wakeHint', wakeHintLabels\)/)
+    // 重载失败路径不得推新提示：throw 在 pushWakeHint 之前
+    assert.match(mainSrc, /if \(!reload\.ok\) throw[\s\S]{0,200}?pushWakeHint\(\)/, '失败必须先 throw，成功才推提示')
+    // preload 暴露 onWakeHint；renderer 用它渲染 done 文案，且 done 不再硬编码词
+    assert.match(preloadSrc, /onWakeHint/)
+    assert.match(appSrc, /window\.hud\.onWakeHint/)
+    assert.match(appSrc, /喊\$\{wakeWordPhrase\(wakeHintLabels\)\}/)
+    assert.doesNotMatch(appSrc, /需要我做什么，喊「[^$]/, 'done 文案不得再硬编码具体唤醒词')
+  })
 } finally {
   rmSync(dataDir, { recursive: true, force: true })
 }

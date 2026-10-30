@@ -25,8 +25,8 @@ import { Kws } from '../packages/voice/kws.mjs'
 import { readWav } from '../packages/voice/wav.mjs'
 import {
   DEFAULT_WAKE_WORD,
-  LEGACY_DEFAULT_LINES,
   LEGACY_WAKE_WORDS,
+  isLegacyDefaultLines,
   keywordLabel,
   readKeywordLines,
 } from '../packages/voice/keywords.mjs'
@@ -62,9 +62,8 @@ try {
   defaultOnlyNew = labels.length === 1
     && labels[0] === DEFAULT_WAKE_WORD
     && oldLabels.length === 0
-    // 不允许残留"整份旧默认"（迁移没生效的表征）
-    && !(linesLoaded.length === LEGACY_DEFAULT_LINES.length
-      && linesLoaded.every((line, i) => line === LEGACY_DEFAULT_LINES[i]))
+    // 不允许残留任何"已核实的旧默认文件内容"（迁移没生效的表征）
+    && !isLegacyDefaultLines(linesLoaded)
 } catch (error) {
   console.log(`✗ KWS 初始化失败: ${error.message}`)
 }

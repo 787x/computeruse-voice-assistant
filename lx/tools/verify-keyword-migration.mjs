@@ -50,6 +50,17 @@ function check(name, fn) {
 }
 
 const LEGACY_DEFAULT_TEXT = `${LEGACY_DEFAULT_LINES.join('\n')}\n`
+/** 两行历史形态（开发机本机版，签名 2）。 */
+const LEGACY_TWO_LINE_TEXT = 'n ǐ h ǎo l áng b ǎo @你好狼宝\nn ǐ h ǎo n áng b ǎo @你好狼宝\n'
+/**
+ * 真实历史安装包里的旧默认文件（v0.1.0/v0.2.0 setup.exe 解包后逐字节一致，
+ * 38 字节、LF 结尾的单行）。回归必须用这组字节，而不是测试自己构造的形态。
+ */
+const VERIFIED_RELEASE_BYTES = new Uint8Array([
+  0x6e, 0x20, 0xc7, 0x90, 0x20, 0x68, 0x20, 0xc7, 0x8e, 0x6f, 0x20, 0x6c, 0x20, 0xc3, 0xa1, 0x6e,
+  0x67, 0x20, 0x62, 0x20, 0xc7, 0x8e, 0x6f, 0x20, 0x40, 0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd, 0xe7,
+  0x8b, 0xbc, 0xe5, 0xae, 0x9d, 0x0a,
+])
 
 function scenario() {
   const dir = mkdtempSync(join(tmpdir(), 'cua-va-kwtest-'))
@@ -66,6 +77,7 @@ function scenario() {
     writeBackup: (text) => { mkdirSync(join(dir, 'data'), { recursive: true }); writeFileSync(join(dir, 'data', 'kws-keywords.pre-upgrade.txt'), text, 'utf8') },
     writeData: (text) => { mkdirSync(join(dir, 'data'), { recursive: true }); writeFileSync(dataFile, text, 'utf8') },
     writeLegacy: (text) => { mkdirSync(join(dir, 'models'), { recursive: true }); writeFileSync(legacyFile, text, 'utf8') },
+    writeLegacyBytes: (bytes) => { mkdirSync(join(dir, 'models'), { recursive: true }); writeFileSync(legacyFile, Buffer.from(bytes)) },
     cleanup: () => { try { chmodSync(join(dir, 'models'), 0o755) } catch { /* */ } rmSync(dir, { recursive: true, force: true }) },
   }
 }
@@ -87,13 +99,27 @@ function scenario() {
 // 2) 旧默认升级：迁移到新位置；旧文件保持原样（不再原地覆盖）
 {
   const s = scenario()
-  s.writeLegacy(LEGACY_DEFAULT_TEXT)
-  check('旧默认逐行一致才迁移，且不改写旧文件', () => {
+  // 用真实发布安装包里的字节（不是测试自己构造的形态）
+  s.writeLegacyBytes(VERIFIED_RELEASE_BYTES)
+  check('真实发布版旧默认（单行 38 字节）迁移为「小爱同学」', () => {
     const info = s.resolve()
     assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
     assert.equal(info.migrated, true)
     assert.equal(info.file, s.dataFile)
-    assert.equal(readFileSync(s.legacyFile, 'utf8'), LEGACY_DEFAULT_TEXT, '旧文件必须原样保留')
+  })
+  check('迁移保留旧文件原样', () => {
+    assert.deepEqual([...readFileSync(s.legacyFile)], [...VERIFIED_RELEASE_BYTES])
+  })
+  check('两行历史形态同样识别为旧默认', () => {
+    const t = scenario()
+    try {
+      t.writeLegacy(LEGACY_DEFAULT_TEXT)
+      const info = t.resolve()
+      assert.equal(info.migrated, true)
+      assert.deepEqual(info.labels, [DEFAULT_WAKE_WORD])
+    } finally {
+      t.cleanup()
+    }
   })
   check('迁移完成后，残留旧默认文件不得再次覆盖新配置', () => {
     s.writeData(DEFAULT_KEYWORD_LINE + '\n') // 模拟用户手动恢复默认词后重启
@@ -105,13 +131,15 @@ function scenario() {
   s.cleanup()
 }
 
-// 3) 同标签但自定义：改音素 / 只留一行 / 调换顺序 / 加自造词，都不算旧默认
+// 3) 同标签但自定义：改音素 / 只留 n 变体 / 调换顺序 / 加自造词，都不算旧默认。
+//    注意："只留 l 变体单行"恰恰是真实发布版的旧默认（见场景 2），不能列在这里。
 {
   const cases = [
-    ['同标签、改音素', ['n ǐ h ǎo l āng b ǎo @你好狼宝', LEGACY_DEFAULT_LINES[1]]],
-    ['同标签、只留一行', [LEGACY_DEFAULT_LINES[0]]],
-    ['同标签、调换顺序', [LEGACY_DEFAULT_LINES[1], LEGACY_DEFAULT_LINES[0]]],
-    ['同标签、加自造词', [...LEGACY_DEFAULT_LINES, DEFAULT_KEYWORD_LINE]],
+    ['同标签、改音素（声调不同）', ['n ǐ h ǎo l āng b ǎo @你好狼宝']],
+    ['同标签、只留 n 变体', ['n ǐ h ǎo n áng b ǎo @你好狼宝']],
+    ['两变体但调换顺序', ['n ǐ h ǎo n áng b ǎo @你好狼宝', 'n ǐ h ǎo l áng b ǎo @你好狼宝']],
+    ['旧默认 + 用户加词', ['n ǐ h ǎo l áng b ǎo @你好狼宝', 'f ǎ g uó @法国']],
+    ['用户把两个旧变体都改了音素', ['n ǐ h ǎo l áŋ b ǎo @你好狼宝', 'n ǐ h ǎo n áŋ b ǎo @你好狼宝']],
   ]
   for (const [name, lines] of cases) {
     const s = scenario()

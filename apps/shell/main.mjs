@@ -233,6 +233,10 @@ function ensureWindow() {
     if (win !== null && !win.isDestroyed()) win.webContents.send('hud:state', currentState)
     // 首帧先把内容高度报上来，否则窗口停在初始高度、内容被裁
     win?.webContents.send('hud:state', currentState)
+    // 窗口可能晚于 KWS 加载才建好：把已生效的唤醒提示补推一次
+    if (win !== null && !win.isDestroyed() && wakeHintLabels !== null) {
+      win.webContents.send('hud:wakeHint', wakeHintLabels)
+    }
   })
 
   // 失焦不隐藏：用户可能正在看字幕
@@ -267,7 +271,21 @@ function setState(state) {
   }
   if (win !== null && !win.isDestroyed()) {
     win.webContents.send('hud:state', state)
+    if (wakeHintLabels !== null) win.webContents.send('hud:wakeHint', wakeHintLabels)
   }
+}
+
+/**
+ * 唤醒提示跟着**实际生效**的关键词走（HUD 的 done/listening 文案）。
+ * 只在 KWS 首次加载或重载成功后推新值；失败路径不调用它，界面保持旧值——
+ * 绝不高亮一个没加载成功的词。
+ */
+let wakeHintLabels = null
+function pushWakeHint() {
+  const info = pipeline?.keywordInfo
+  if (!info || !Array.isArray(info.labels) || info.labels.length === 0) return
+  wakeHintLabels = info.labels
+  if (win !== null && !win.isDestroyed()) win.webContents.send('hud:wakeHint', wakeHintLabels)
 }
 
 /** 托盘点击：明确的用户意图，聚焦。 */
@@ -481,6 +499,7 @@ async function doStartListening() {
       if (info !== null) {
         log(`kws keywords: ${info.file} (${info.source}, ${info.labels?.join('/') ?? ''}${info.migrated ? ', migrated' : ''}${info.warning ? `, warning: ${info.warning}` : ''})`)
       }
+      pushWakeHint()
     } else if (pipeline.keywordsChanged()) {
       /*
        * 管线是缓存的：用户在数据目录里改了关键词文件后，
@@ -492,6 +511,7 @@ async function doStartListening() {
       if (!reload.ok) throw new Error(`关键词文件无法加载: ${reload.error}`)
       const info = reload.keywordInfo
       log(`kws reloaded: ${info.file} (${info.source}, ${info.labels?.join('/') ?? ''})`)
+      pushWakeHint()
     }
 
     const target = ensureCaptureWindow()

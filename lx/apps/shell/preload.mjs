@@ -25,6 +25,13 @@ contextBridge.exposeInMainWorld('hud', {
   onStopAudio: (handler) => {
     ipcRenderer.on('hud:stopAudio', () => handler())
   },
+  /**
+   * 唤醒提示：主进程推来**实际加载成功**的关键词标签数组（可能为 null=管线未就绪）。
+   * HUD 用它显示「喊『X』」，与真实生效的 KWS 配置一致；重载失败时主进程不会推新值。
+   */
+  onWakeHint: (handler) => {
+    ipcRenderer.on('hud:wakeHint', (_event, labels) => handler(labels))
+  },
   /** 播完回执：主进程据此播下一句 */
   spoken: (id) => ipcRenderer.send('hud:spoken', id),
   /** 确认卡片：主进程推来要确认的动作 */
