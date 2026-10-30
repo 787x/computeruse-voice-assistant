@@ -31,7 +31,7 @@ function fixture(stage, failure=false, initializer=code) {
  }
  const owner=new AgentInitialization()
  const ctx=vm.createContext({AgentInitialization,DOMException,Date,console,join:()=>'',DATA_ROOT:'test',
- agentInitialization:owner,shuttingDown:false,lastUtterance:'test',
+ musicCredentials:{close:async()=>({ok:true,remaining:0})},agentInitialization:owner,shuttingDown:false,lastUtterance:'test',
  loadModule:async path=>{await wait(path.includes('/config/')?'modules':'other-module');return modules[path]},
  runNetease:async()=>{counts.play=(counts.play??0)+1;return {text:'ok'}},
  syncCredentialsAsync:async(_credentials,options)=>{if(options.syncedHash==='new')return {synced:[],hash:'new'};counts.sync++;await wait('music');return {synced:[],hash:'new'}},

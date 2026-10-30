@@ -119,7 +119,7 @@ if(process.argv.includes('--real')) {
    const code=source.slice(start,source.indexOf('\n}',start)+2)
    let releaseMic,exitCode
    const mic=new Promise(r=>releaseMic=r)
-   const ctx=vm.createContext({agentInitialization:owner,setTimeout,clearTimeout,ttsEngine:null,
+   const ctx=vm.createContext({musicCredentials:{close:async()=>({ok:true,remaining:0})},agentInitialization:owner,setTimeout,clearTimeout,ttsEngine:null,
     cancelActiveTurn(){},log(){},stopListening:()=>mic,stopSpeaking(){},app:{exit(code){exitCode=code}}})
    vm.runInContext(code,ctx)
    const stopped=ctx.shutdown()
@@ -143,4 +143,39 @@ if(process.argv.includes('--real')) {
   }
   console.log(JSON.stringify({suite:'real PowerShell lifecycle',phase,pass:true,created:children.length,disposed:disposals,remainingOwnedPids:0}))
  }
+}
+
+// Node spawn failures can close without ever emitting exit.
+for (const order of [['error','close'],['error','exit','close'],['exit','close']]) {
+ const f=fake(),initial=f.bridge.ensureStarted(),rejected=assert.rejects(initial)
+ const child=f.children[0];child.kill=()=>false
+ for(const event of order)child.emit(event,event==='error'?Object.assign(Error('missing executable'),{code:'ENOENT'}):1,null)
+ await rejected
+ assert.equal(f.bridge.alive,false)
+ const retry=f.bridge.ensureStarted(),next=f.children[1]
+ next.stdout.emit('data',JSON.stringify({event:'ready',id:null,data:{generation:2}})+'\n')
+ await retry
+ child.emit('close',1,null);child.emit('error',Error('late'))
+ assert.equal(f.bridge.readyInfo.generation,2)
+ await f.bridge.dispose();assert.equal(f.bridge.alive,false)
+}
+{
+ let attempts=0
+ const bridge=new NativeBridge({scriptPath:'test.ps1',spawnImpl:()=>{attempts++;throw Error('spawn throws')}})
+ await assert.rejects(bridge.ensureStarted());await assert.rejects(bridge.ensureStarted())
+ assert.equal(attempts,2);assert.equal(bridge.alive,false);await bridge.dispose()
+}
+console.log('Spawn error/close event ordering and synchronous throw: 4 scenarios PASS')
+if(process.argv.includes('--real')) {
+ let count=0;const children=[]
+ const toolkit=new CuaToolkit({spawnImpl:(exe,args,options)=>{
+  const child=spawn(count++===0?'codex-intentionally-missing-executable.exe':exe,args,options);children.push(child);return child
+ }})
+ await assert.rejects(toolkit.warmup())
+ await new Promise(resolve=>setTimeout(resolve,50))
+ await toolkit.warmup();assert.ok(children[1].pid)
+ await toolkit.dispose()
+ assert.ok(children[1].exitCode!==null || children[1].signalCode!==null)
+ assert.throws(()=>process.kill(children[1].pid,0),e=>e.code==='ESRCH')
+ console.log('Real ENOENT error/close, retry with PowerShell and PID cleanup: PASS')
 }

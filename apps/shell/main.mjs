@@ -16,6 +16,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { writeWav } from '../../packages/voice/wav.mjs'
 import { judgeBargeIn, stripBargeWords } from '../../packages/voice/bargein.mjs'
+import { CredentialSync } from '../../packages/tools/credential-sync.mjs'
 import { AgentInitialization } from '../../packages/agent/initialization.mjs'
 import { parseConfirmText } from '../../packages/agent/permissions.mjs'
 import { parseOfflineIntent, offlineUnsupported, formatTime, formatDate, isOfflineError } from '../../packages/agent/offline.mjs'
@@ -358,6 +359,7 @@ function hideHud() {
 
 /** 对话结束后的调用点：R14 里"隐藏 vs 销毁"的决策也在这里。 */
 function dismiss() {
+  musicCredentials.cancelPending()
   cancelActiveTurn('dismiss')
   /*
    * 用户点 HUD 的 × 就是"别干了"，不是"先躲一下"。
@@ -386,6 +388,7 @@ function dismiss() {
 async function shutdown() {
   cancelActiveTurn('shutdown')
   // Revoke initialization immediately, before waiting for microphone/TTS shutdown.
+  const musicCleanup = musicCredentials.close().then(result => log(`music cleanup result: ${JSON.stringify(result)}`)).catch(error => log(`music cleanup failed: ${error.name}`))
   const agentCleanup = agentInitialization.close().then(result => {
     log(`agent cleanup result: ${JSON.stringify(result)}`)
     return result
@@ -404,6 +407,7 @@ async function shutdown() {
   // TTS worker 常驻 1.5GB 显存，退出必须回收，否则下次启动会和残留进程抢显存
   try { if (ttsEngine !== null) await ttsEngine.dispose() } catch { /* 可能已经退出 */ }
   await agentCleanup
+  await musicCleanup
   clearTimeout(hardStop)
   log('shutdown done')
   app.exit(0)
@@ -762,6 +766,10 @@ function finishCommand(reason, voiceEpoch = confirmVoiceEpoch) {
 /** 回合序号：晚到的旧回合不该覆盖新回合的字幕 */
 let turnSeq = 0
 /** @type {{agent:any, toolkit:any, config:any, readyMs:number}|null} */
+const musicCredentials = new CredentialSync({
+  loadConfig: async () => (await import('../../packages/config/store.mjs')).loadConfig(),
+  saveConfig: async (...args) => (await import('../../packages/config/store.mjs')).saveConfig(...args),
+}, syncCredentialsAsync)
 let agentRuntime = null
 const agentInitialization = new AgentInitialization({
   publish: (runtime) => { agentRuntime = runtime },
@@ -1849,32 +1857,6 @@ async function ensureAgent(signal) {
     checkpoint()
     if (!apiKey) throw new Error('还没配置模型 API Key')
 
-    // Prepare credentials only for a music invocation, serially within this runtime.
-    let musicQueue = Promise.resolve()
-    function prepareMusic(signal) {
-      const pending = musicQueue.then(async () => {
-        signal?.throwIfAborted()
-        const fresh = await store.loadConfig()
-        signal?.throwIfAborted()
-        const credentials = fresh.netease ?? {}
-        const result = await syncCredentialsAsync(credentials, { syncedHash: credentials.syncedHash, signal })
-        signal?.throwIfAborted()
-        const current = await store.loadConfig()
-        signal?.throwIfAborted()
-        if (current.netease?.appId !== credentials.appId || current.netease?.privateKey !== credentials.privateKey) {
-          throw new Error('音乐凭据已更新，请重试')
-        }
-        // A settings save during synchronization owns its new credentials; never overwrite it.
-        if (current.netease?.appId === credentials.appId && current.netease?.privateKey === credentials.privateKey
-            && result.hash !== undefined && result.hash !== current.netease?.syncedHash) {
-          await store.saveConfig({ netease: { ...current.netease, syncedHash: result.hash } })
-        }
-        signal?.throwIfAborted()
-      })
-      musicQueue = pending.catch(() => {})
-      return pending
-    }
-
     checkpoint()
     const startedAt = Date.now()
     const toolkit = own(new cuaModule.CuaToolkit({ frameDir: join(DATA_ROOT, 'frames') }))
@@ -1909,7 +1891,7 @@ async function ensureAgent(signal) {
         if (name === 'kill_app') return runKillApp(args)
         if (name === 'system_info') return runSystemInfo(args)
         if (name === 'netease_music') {
-          await prepareMusic(signal)
+          await musicCredentials.sync(signal)
           signal?.throwIfAborted()
           /*
            * 音乐一律走官方 CLI，不去操纵客户端界面。
@@ -2645,21 +2627,10 @@ function registerSettingsIpc() {
        * 设置窗口就会一直"未响应"——用户看到的就是点了保存没反应。
        */
       if (credentialsChanged) {
-        void (async () => {
-          try {
-            const fresh = await store.loadConfig()
-            const current = await store.loadConfig()
-            const result = await syncCredentialsAsync(current.netease ?? {}, { syncedHash: current.netease?.syncedHash })
-            if (result.hash !== undefined && result.hash !== current.netease?.syncedHash) {
-              // 记下"同步过哪一版凭据"：下次内容没变就不动 CLI，避免把登录态顶掉
-              await store.saveConfig({ netease: { ...(current.netease ?? {}), syncedHash: result.hash } })
-            }
-            const synced = result.synced ?? []
-            log(`netease credentials ${synced.length > 0 ? `synced: ${synced.join(', ')}` : 'unchanged'}`)
-          } catch (error) {
-            log(`netease sync failed: ${error.message}`)
-          }
-        })()
+        // The application-wide owner tracks this promise; settings never wait for CLI latency.
+        musicCredentials.sync().catch(error => {
+          if (error.name !== 'AbortError') log(`netease sync failed: ${error.code ?? error.name}`)
+        })
       }
       // 立刻生效（不用重启）——这些都是内存里的开关与默认值
       if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled

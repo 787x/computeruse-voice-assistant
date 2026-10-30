@@ -115,8 +115,20 @@ function decryptField(value) {
 /** 更新配置。
  * 空字符串或掩码值（含 *）表示"不修改密钥"，避免界面把打码值写回去。
  */
-export async function saveConfig(patch) {
+let saveQueue = Promise.resolve()
+export function saveConfig(patch, options = {}) {
+  const pending = saveQueue.then(() => saveConfigOnce(patch, options))
+  saveQueue = pending.catch(() => {})
+  return pending
+}
+async function saveConfigOnce(patch, { signal, expectedCredentials } = {}) {
+  signal?.throwIfAborted()
   const current = await loadConfig()
+  signal?.throwIfAborted()
+  if (expectedCredentials && (current.netease?.appId !== expectedCredentials.appId
+      || current.netease?.privateKey !== expectedCredentials.privateKey)) {
+    throw Object.assign(new Error('音乐配置版本已变化'), { code: 'STALE_CREDENTIALS' })
+  }
   const next = { ...current, ...patch }
 
   if (typeof patch.apiKey === 'string') {
@@ -172,7 +184,7 @@ export async function saveConfig(patch) {
      * 记下"同步过哪一版凭据"。这个字段丢了会导致每次启动都重写 CLI 凭据，
      * 而重写会让已有的网易云登录态失效（token 变 Expired）。
      */
-    if (typeof incoming.syncedHash === 'string' && incoming.syncedHash !== '') merged.syncedHash = incoming.syncedHash
+    if (typeof incoming.syncedHash === 'string') merged.syncedHash = incoming.syncedHash
     next.netease = merged
   }
   /*
@@ -201,9 +213,12 @@ export async function saveConfig(patch) {
     next.search = { ...next.search, apiKey: encryptField(next.search.apiKey) }
   }
 
+  signal?.throwIfAborted()
   await mkdir(CONFIG_DIR, { recursive: true })
   const tmp = `${CONFIG_PATH}.tmp`
+  signal?.throwIfAborted()
   await writeFile(tmp, JSON.stringify(next, null, 2), 'utf8')
+  signal?.throwIfAborted()
   await rename(tmp, CONFIG_PATH)
   return loadPublicConfig()
 }

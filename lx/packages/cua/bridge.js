@@ -189,12 +189,14 @@ export class NativeBridge {
         error,
       ))
     })
-    child.once?.('exit', (code, signal) => {
+    const finishChild = (code, signal) => {
       if (this.#child !== child) return
       this.#child = undefined
       this.#terminationPending = false
       child.stdout?.removeAllListeners?.('data')
       child.stderr?.removeAllListeners?.('data')
+      child.removeListener?.('exit', finishChild)
+      child.removeListener?.('close', finishChild)
       child.removeAllListeners?.('error')
       child.on?.('error', () => {})
       this.#exitInfo = { code, signal }
@@ -213,7 +215,9 @@ export class NativeBridge {
       if (this.#bannerReject !== undefined && this.#bannerResolve !== undefined && this.#readyInfo === null) {
         this.#failStart(reason)
       }
-    })
+    }
+    child.once?.('exit', finishChild)
+    child.once?.('close', finishChild)
 
     try {
       const info = await banner
@@ -434,6 +438,7 @@ export class NativeBridge {
     const exit = new Promise(resolve => {
       onExit = () => { exited = true; resolve() }
       child.once('exit', onExit)
+      child.once('close', onExit)
     })
     // No shutdown command through the request queue: warmup may still be waiting for ready.
     this.#kill(true)
@@ -447,6 +452,7 @@ export class NativeBridge {
     } finally {
       clearTimeout(timer)
       child.removeListener('exit', onExit)
+      child.removeListener('close', onExit)
     }
   }
 

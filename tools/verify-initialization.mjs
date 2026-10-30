@@ -31,7 +31,7 @@ function fixture(stage, failure=false, initializer=code) {
  }
  const owner=new AgentInitialization()
  const ctx=vm.createContext({AgentInitialization,DOMException,Date,console,join:()=>'',DATA_ROOT:'test',
- agentInitialization:owner,shuttingDown:false,lastUtterance:'test',
+ musicCredentials:{close:async()=>({ok:true,remaining:0})},agentInitialization:owner,shuttingDown:false,lastUtterance:'test',
  loadModule:async path=>{await wait(path.includes('/config/')?'modules':'other-module');return modules[path]},
  runNetease:async()=>{counts.play=(counts.play??0)+1;return {text:'ok'}},
  syncCredentialsAsync:async(_credentials,options)=>{if(options.syncedHash==='new')return {synced:[],hash:'new'};counts.sync++;await wait('music');return {synced:[],hash:'new'}},
@@ -200,7 +200,7 @@ for(const mode of ['partial','reject','hard-stop']) {
  const timers=[],logs=[],exits=[],release=deferred()
  const begin=source.indexOf('async function shutdown()')
  const code=source.slice(begin,source.indexOf('\n}',begin)+2)
- const ctx=vm.createContext({agentInitialization:{close:()=>mode==='reject'?Promise.reject(Error('cleanup exception')):mode==='hard-stop'?release.promise:Promise.resolve({ok:false,remaining:1,errors:['CuaToolkit: kill denied']})},
+ const ctx=vm.createContext({musicCredentials:{close:async()=>({ok:true})},agentInitialization:{close:()=>mode==='reject'?Promise.reject(Error('cleanup exception')):mode==='hard-stop'?release.promise:Promise.resolve({ok:false,remaining:1,errors:['CuaToolkit: kill denied']})},
  setTimeout:(fn,ms)=>(timers.push({fn,ms}),timers.length),clearTimeout(){},ttsEngine:null,cancelActiveTurn(){},log:message=>logs.push(message),
  stopListening:async()=>{},stopSpeaking(){},app:{exit:code=>exits.push(code)}})
  vm.runInContext(code,ctx)

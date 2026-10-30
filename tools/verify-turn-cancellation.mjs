@@ -12,7 +12,7 @@ for (const phase of ['refresh','init','model','model-error']) {
  runOptions=options;runCount++;entered.resolve();return await runDone.promise
  }}}}})
  vm.runInContext(`
- let turnSeq=0,activeTurn=null,latestTurn=null,hideTimer=null,commandTimer=null,commandActive=false;
+ const musicCredentials={cancelPending(){}};let turnSeq=0,activeTurn=null,latestTurn=null,hideTimer=null,commandTimer=null,commandActive=false;
  let wantContinue=false,followUpJudgement=null,followUpJudgePromise=null,asr=null,lastCommandText='',lastSentPartial='';
  let lastUtterance='',deniedInTurn={},turnHistoryCounts=[],sessionHistory=[],userDismissedHud=false,listening=false;
  let ui=[],closed=0;

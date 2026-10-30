@@ -22,7 +22,7 @@ for(const fallback of [false,true]) for(const phase of ['launcher-failure','laun
  refreshSearchKey:async()=>{},ensureAgent:async()=>{throw Object.assign(Error('network failure'),{network:true})},
  })
  vm.runInContext(`
- let turnSeq=0,activeTurn=null,latestTurn=null,hideTimer=null,commandTimer='timer',commandActive=false;
+ const musicCredentials={cancelPending(){}};let turnSeq=0,activeTurn=null,latestTurn=null,hideTimer=null,commandTimer='timer',commandActive=false;
  let wantContinue=false,followUpJudgement=null,followUpJudgePromise=null,asr=null,lastCommandText='',lastSentPartial='';
  let lastUtterance='',deniedInTurn={},turnHistoryCounts=[],sessionHistory=[],userDismissedHud=false,listening=false;
  let ui=[],closed=0,after=0;

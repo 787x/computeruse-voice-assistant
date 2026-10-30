@@ -614,10 +614,16 @@ export async function syncCredentialsAsync(credentials = {}, options = {}) {
     if (value === '') continue
     const current = await runCliAsync(['config', 'get', key], options)
     options.signal?.throwIfAborted()
-    if (current.raw.includes(value.slice(0, 24))) continue
+    if (key === 'appId' && current.code === 0 && current.raw.trim() === value) continue
     const set = await runCliAsync(['config', 'set', key, value], options)
     options.signal?.throwIfAborted()
-    if (set.code === 0) synced.push(key)
+    if (set.code !== 0) {
+      const error = new Error(`网易云凭据字段 ${key} 同步失败（CLI 非零退出）`)
+      error.code = 'CREDENTIAL_SYNC_FAILED'
+      error.synced = [...synced]
+      throw error
+    }
+    synced.push(key)
   }
   return { synced, hash }
 }
