@@ -156,7 +156,7 @@ const RENDER = {
     clearAll()
     els.dot.classList.add('listen')
     els.title.textContent = '好了'
-    els.sub.textContent = '需要我做什么，喊「你好狼宝」'
+    els.sub.textContent = '需要我做什么，喊「小爱同学」'
     if (live.finals.length > 0 || live.partial !== '') renderHeard()
   },
 

@@ -39,6 +39,9 @@ export class StreamingPipeline {
 
   get sampleRate() { return 16000 }
 
+  /** 当前 KWS 实际使用的关键词文件（含来源），用于启动日志与验收。 */
+  get keywordInfo() { return this.#kws?.keywordInfo ?? null }
+
   /**
    * @param {Float32Array} chunk 16k 单声道，建议 1600 采样/块
    * @returns {{levelDb:number, floorDb:number, speech:boolean, gainDb:number, wake:string|null}}
@@ -95,7 +98,7 @@ export class StreamingPipeline {
     /*
      * 唤醒用**原始**音频，不用 AGC 后的。
      *
-     * 实测（tools/verify-wake-runtime.mjs）：同一段「你好狼宝」，
+     * 实测（tools/verify-wake-runtime.mjs）：同一段「小爱同学」，
      * 直接喂给 Kws 能命中，经 AGC 放大后再喂就漏检——增益把波形削顶了，
      * 关键词模型的特征就乱了。KWS 本身有小模型自带的前端，不需要我们再帮它调音量。
      */

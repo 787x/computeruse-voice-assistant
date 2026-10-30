@@ -31,6 +31,7 @@ if (sampleRate !== 16000) {
 }
 
 const kws = new Kws()
+console.log(`关键词文件: ${kws.keywordInfo.file} (${kws.keywordInfo.source})`)
 let hit = null
 const chunk = 1600
 for (let i = 0; i < x.length; i += chunk) {

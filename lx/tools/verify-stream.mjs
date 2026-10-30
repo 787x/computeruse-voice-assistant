@@ -3,9 +3,15 @@
  *
  * 为什么单独测：实机"扬声器放唤醒词 → 麦克风收"受音量、AEC、房间影响，
  * 不适合作为管线正确性的判据。这里用固定音频验证管线行为是确定的。
+ *
+ * 唤醒词「小爱同学」：正向用例使用新唤醒词录音（真人优先，缺失时用合成样本），
+ * 旧唤醒词录音（wake-1.wav 等）只作为负向用例。
  */
+import { existsSync } from 'node:fs'
+
 import { StreamingPipeline } from '../packages/voice/stream.mjs'
 import { readWav } from '../packages/voice/wav.mjs'
+import { DEFAULT_WAKE_WORD } from '../packages/voice/keywords.mjs'
 
 function run(path, attenuateDb = 0) {
   const { samples, sampleRate } = readWav(path)
@@ -55,25 +61,38 @@ function run(path, attenuateDb = 0) {
   }
 }
 
-const report = { cases: [] }
-report.cases.push(run('assets/test/wake-1.wav'))
+const realRecording = 'assets/test/xiaoai-tongxue.wav'
+const syntheticRecording = 'assets/test/xiaoai-tongxue-synthetic.wav'
+const wakeFile = existsSync(realRecording) ? realRecording : syntheticRecording
+const wakeIsSynthetic = wakeFile === syntheticRecording
+
+const report = { wakeFile, wakeIsSynthetic, cases: [] }
+report.cases.push(run(wakeFile))
 report.cases.push(run('assets/test/not-wake-word.wav'))
+// 旧唤醒词录音：默认关键词下必须不触发
+report.cases.push(run('assets/test/wake-1.wav'))
 // 弱信号：把唤醒词衰减 24dB，模拟麦克风阵列那种 -45dBFS 输入
-report.cases.push({ ...run('assets/test/wake-1.wav', -24), name: '弱信号 -24dB' })
+report.cases.push({ ...run(wakeFile, -24), name: '弱信号 -24dB' })
 
 const wakeCase = report.cases[0]
 const otherCase = report.cases[1]
+const legacyCase = report.cases[2]
 
-const quietCase = report.cases[2]
+const quietCase = report.cases[3]
 report.verdict = {
-  wakeDetected: wakeCase.wakes.length > 0,
+  wakeDetected: wakeCase.wakes.includes(DEFAULT_WAKE_WORD),
   otherNotDetected: otherCase.wakes.length === 0,
+  legacyNotDetected: legacyCase.wakes.length === 0,
   // AGC 的正确行为：强信号不加热，弱信号才加
   loudNoBoost: Math.abs(wakeCase.gainMedianDb) < 3,
   quietBoosted: quietCase.gainMedianDb > 5,
-  quietStillDetected: quietCase.wakes.length > 0,
+  quietStillDetected: quietCase.wakes.includes(DEFAULT_WAKE_WORD),
 }
 report.verdict.pass = Object.values(report.verdict).every((v) => v === true)
 
 console.log(JSON.stringify(report, null, 1))
+if (wakeIsSynthetic && existsSync(syntheticRecording)) {
+  console.error('⚠ 正向用例使用 TTS 合成样本；真人「小爱同学」录音验证尚未完成。')
+}
+if (!existsSync(wakeFile)) console.error(`✗ 缺新唤醒词录音 ${wakeFile}：KWS 流式验收未执行`)
 process.exitCode = report.verdict.pass ? 0 : 1

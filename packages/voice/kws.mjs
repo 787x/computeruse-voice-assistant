@@ -9,13 +9,12 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { modelPath } from '../config/paths.mjs'
+import { resolveKeywordsFile } from './keywords.mjs'
 
 const require = createRequire(import.meta.url)
 const sherpa = require('sherpa-onnx-node')
 
 export const KWS_DEFAULTS = {
-  modelDir: modelPath('sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01'),
-  keywordsFile: modelPath('kws-keywords.txt'),
   keywordsScore: 1.0,
   keywordsThreshold: 0.25,
   numTrailingBlanks: 2,
@@ -28,6 +27,23 @@ export class Kws {
 
   constructor(options = {}) {
     const cfg = { ...KWS_DEFAULTS, ...options }
+    // 路径在构造时解析，而不是 import 时：主进程会先设置 CUA_VA_ROOT，
+    // 测试也会临时改数据目录，import 求值会把它们钉死在旧值上。
+    if (!cfg.modelDir) cfg.modelDir = modelPath('sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01')
+    if (!cfg.keywordsFile) {
+      const info = resolveKeywordsFile()
+      cfg.keywordsFile = info.file
+      this.keywordInfo = info
+    } else {
+      this.keywordInfo = {
+        file: cfg.keywordsFile,
+        source: 'explicit',
+        labels: [],
+        custom: true,
+        migrated: false,
+        fallback: false,
+      }
+    }
     if (!existsSync(cfg.modelDir)) throw new Error(`KWS 模型目录不存在: ${cfg.modelDir}`)
     if (!existsSync(cfg.keywordsFile)) throw new Error(`关键词文件不存在: ${cfg.keywordsFile}`)
 

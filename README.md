@@ -1,6 +1,6 @@
 # 银狼 · 语音助手（Computer-Use Voice Assistant）
 
-一个跑在 Windows 上的**桌面语音助手**：喊一声「你好狼宝」，它就能听懂、开口、动手操作这台电脑。
+一个跑在 Windows 上的**桌面语音助手**：喊一声「小爱同学」，它就能听懂、开口、动手操作这台电脑。
 
 不是插件，不是某个客户端的附加功能——就是一个独立的小软件，托盘常驻。
 
@@ -22,7 +22,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 语音唤醒 | 本地 KWS，说「你好狼宝」即进入对话，无需联网 |
+| 语音唤醒 | 本地 KWS，说「小爱同学」即进入对话，无需联网 |
 | 连续对话 | 说完一轮继续待命，要不要等你由模型判断（不是写死的 9 秒） |
 | 语音识别 | sherpa-onnx 流式中文/英文 ASR，本地跑 |
 | 语音合成 | GPT-SoVITS（银狼音色，6 种情绪），本地跑，支持打断词「等一下」 |
@@ -43,7 +43,11 @@
    - 模型 API Key（必需）
    - 联网搜索 Key（可选，Tavily）
    - v0.1.0 另需：网易云 AppID / PrivateKey，并扫码登录
-3. 托盘勾上「语音唤醒」，说「你好狼宝」。
+3. 托盘勾上「语音唤醒」，说「小爱同学」。
+
+> 默认唤醒词文件随包分发（`packages/voice/kws-keywords.default.txt` → 安装后 `resources/kws-keywords.default.txt`），
+> 首次启动复制到用户数据目录 `…/data/kws-keywords.txt`。旧安装里的默认「你好狼宝」关键词会在升级后自动迁移为
+> 「小爱同学」；你自己改过的关键词文件会被原样保留，不会被覆盖。想换唤醒词，直接编辑用户数据目录里那份文件。
 
 > 两个安装版都不含语音运行时（venv + 音色包约 5GB）。需要发声就把 `.runtime/` 放到安装目录的
 > `resources/` 下，或直接用完整版压缩包（见下）。
@@ -124,6 +128,7 @@ cd lx && npm install && node tools/run-shell.mjs --listen
 ```bash
 node tools/verify-wake-runtime.mjs   # 唤醒链路（运行时同路径）
 node tools/verify-keywords.mjs       # 关键词命中/误触
+node tools/verify-keyword-migration.mjs  # 唤醒词默认值迁移/自定义保护
 node tools/verify-schedule.mjs       # 定时切换模型
 node tools/verify-permissions.mjs    # 权限门
 node tools/verify-offline.mjs        # 离线兜底
