@@ -96,7 +96,7 @@ assert.ok(source.includes('setVoiceConfirmEnabled(payload.ui.voiceConfirmEnabled
 assert.ok(source.includes('setVoiceConfirmEnabled(item.checked)'))
 
 vm.runInContext(section('function feedCommandAudio(chunk)', '\n}').concat('\n}'),ctx)
-for (const text of ['可以','确认','同意','好的','不可以','不同意','不确认','不允许']) {
+for (const text of ['可以','确认','同意','好的','我同意','我确认','可以的','好啊','不可以','不同意','不确认','不允许','不对','错了','停','不用','别']) {
  run(`listening=true;voiceConfirmEnabled=true;asr={reset(){},flush(){return ''},push(){return {partial:'',final:${JSON.stringify(text)}}}}`)
  const gate=new PermissionGate({confirm:request=>run('askUser({capability:"clipboard.read"})')})
  const pending=gate.check({tool:'read_clipboard'})
@@ -133,3 +133,14 @@ run("setVoiceConfirmEnabled(true);asr.push=()=>({partial:'',final:'可以'});com
 assert.equal((await run('switched')).allow,true)
 assert.equal(timers.length,switchTimers)
 console.log('Off/on restores one-utterance voice approval without extending timeout: PASS')
+
+for(const text of ['我同意吗？','我说的是可以','我说的是不可以','不是不可以','不要取消','如果安全就可以','“我同意”','嗯']) {
+ run(`var ambiguous=askUser({});asr.push=()=>({partial:'',final:${JSON.stringify(text)}});commandStartAt=0`)
+ const before=timers.length
+ run('feedCommandAudio([])')
+ assert.equal(run('confirmResolver!==null'),true,text)
+ assert.equal(timers.length,before,'ambiguous speech must not extend timeout')
+ timers.at(-1)()
+ assert.equal((await run('ambiguous')).channel,'timeout')
+}
+console.log('Natural confirmations/refusals and ambiguous card/deadline preservation: PASS')

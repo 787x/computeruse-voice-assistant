@@ -332,10 +332,10 @@ export function parseConfirmText(raw) {
   // Whole utterances only; never search for affirmative substrings.
   const text = String(raw ?? '').normalize('NFKC').replace(/\s/gu, '').replace(/[。.!！,，、]+$/u, '')
   // Complete commands only: questions, quotations and negated cancellation stay undecided.
-  if (/^(?:取消(?:吧)?|不用了|不行|不要(?:了|执行(?:了)?|确认这个东西)?|别执行(?:了)?|不可以|不同意|不确认|不允许|不执行|拒绝|算了(?:吧)?|停止(?:操作)?)$/u.test(text)) {
+  if (/^(?:取消(?:吧)?|不用(?:了)?|不对|错了|停|别|不行|不要(?:了|执行(?:了)?|确认这个东西)?|别执行(?:了)?|不可以|不同意|不确认|不允许|不执行|拒绝|算了(?:吧)?|停止(?:操作)?)$/u.test(text)) {
     return { allow: false, channel: 'voice', reason: `用户说：${text}` }
   }
-  if (/^(?:(?:可以|确认|确定|同意|允许|好的|好|是的|对|执行|继续)(?:吧|了)?|可以[，,]?执行吧)$/u.test(text)) {
+  if (/^(?:(?:可以|确认|确定|同意|允许|好的|好|是的|对|执行|继续)(?:吧|了)?|可以[，,]?执行吧|我(?:同意|确认)|可以的|好啊)$/u.test(text)) {
     return { allow: true, channel: 'voice' }
   }
   return null

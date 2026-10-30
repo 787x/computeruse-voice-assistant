@@ -84,4 +84,69 @@ console.log(`Credential synchronization: ${cases} concurrent/failure scenarios +
  await owner.sync();assert.equal(calls,2,'new generation can synchronize without reviving cancelled queued work')
  await owner.close()
 }
-console.log('HUD cancellation invalidates old queue and permits a new generation: PASS')
+console.log('Explicit coordinator-wide cancellation invalidates its queue and permits a new generation: PASS')
+// Actual production dismiss/cancelActiveTurn, with a real coordinator + temporary store.
+const shellSource=(await readFile(new URL('../apps/shell/main.mjs',import.meta.url),'utf8')).replace(/\r\n/g,'\n')
+const shellFunction=name=>{const start=shellSource.indexOf(name);assert.ok(start>=0);return shellSource.slice(start,shellSource.indexOf('\n}',start)+2)}
+function hud(controller,owner) {
+ const ctx=vm.createContext({controller,musicCredentials:owner,clearTimeout(){}})
+ vm.runInContext(`
+ let turnSeq=1,latestTurn={id:1,controller},activeTurn=latestTurn,hideTimer=null,commandTimer=null;
+ let commandActive=true,asr=null,lastCommandText='',lastSentPartial='',wantContinue=false;
+ let followUpJudgement=null,followUpJudgePromise=null,userDismissedHud=false,listening=false;
+ function stopSpeaking(){} function log(){} function closeConfirmCard(){} function hideHud(){}
+ ${shellFunction('function cancelActiveTurn(reason)')}
+ ${shellFunction('function dismiss()')}
+ `,ctx)
+ return ()=>vm.runInContext('dismiss()',ctx)
+}
+for(const mode of ['settings-active','voice-active-settings-queued','settings-active-voice-queued']) {
+ const entered=deferred(),pause=deferred(),cli={},calls=[];let held=false
+ await store.saveConfig({netease:{...(mode==='voice-active-settings-queued'?A:B),syncedHash:''}})
+ const ctx=vm.createContext({createHash,runCliAsync:async argv=>{
+  const [,action,key,value]=argv;calls.push({action,key,value})
+  if(action==='set'&&!held){held=true;entered.resolve();await pause.promise}
+  if(action==='set'){cli[key]=value;return {code:0,raw:''}}
+  return {code:0,raw:cli[key]??''}
+ }})
+ vm.runInContext(code,ctx)
+ const owner=new CredentialSync(store,ctx.syncCredentialsAsync),controller=new AbortController()
+ const dismiss=hud(controller,owner)
+ let voice,setting,additional
+ if(mode==='voice-active-settings-queued') {
+  voice=owner.sync(controller.signal);const rejection=assert.rejects(voice,e=>e.name==='AbortError')
+  await entered.promise
+  await store.saveConfig({netease:{...B,syncedHash:''}})
+  setting=owner.sync()
+  dismiss();assert.equal(controller.signal.aborted,true)
+  pause.resolve();await rejection;await setting
+  assert.equal(calls.some(c=>c.action==='set'&&c.value===A.privateKey),false,'cancelled voice must not start its next CLI write')
+ } else {
+  setting=owner.sync();await entered.promise
+  let rejection
+  if(mode==='settings-active-voice-queued'){
+   voice=owner.sync(controller.signal);rejection=assert.rejects(voice,e=>e.name==='AbortError')
+   additional=owner.sync()
+  }
+  dismiss();assert.equal(controller.signal.aborted,true)
+  pause.resolve();await setting;if(rejection)await rejection;if(additional)await additional
+ }
+ const config=await store.loadConfig()
+ assert.deepEqual(cli,B,`${mode}: independent settings must leave CLI B`)
+ assert.equal(config.netease.appId,B.appId);assert.equal(config.netease.privateKey,B.privateKey)
+ assert.equal(config.netease.syncedHash,hash(B))
+ const next=new AbortController();await owner.sync(next.signal)
+ assert.deepEqual(cli,B,'new valid music work survives prior HUD dismissal')
+ assert.equal((await owner.close()).ok,true)
+}
+{
+ const entered=deferred(),pause=deferred()
+ const owner=new CredentialSync(store,async(_c,{signal})=>{entered.resolve();await pause.promise;signal.throwIfAborted();return {hash:'invalid'}})
+ const pending=owner.sync(),rejection=assert.rejects(pending,e=>e.name==='AbortError')
+ await entered.promise
+ const result=await owner.close()
+ assert.equal(result.ok,false);assert.equal(result.remaining,1,'uninterruptible mock must be reported, not called cleaned')
+ pause.resolve();await rejection
+ assert.equal((await owner.close()).ok,true)
+}
+console.log('HUD owner isolation: 3 real-dismiss/CLI-version scenarios + bounded application close PASS')

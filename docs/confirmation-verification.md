@@ -165,3 +165,18 @@ Both versions:
 Earlier tests that assumed all speech approval was forbidden were corrected; refusal, ambiguity, request-isolation and fake-source tests remain. Historical cancellation-only reports are not the current acceptance criteria. No final failing suite remains.
 
 Not verified: real microphone/ASR recognition quality, full production Electron session/continuous dialogue, packaged app, Electron 45.0.0, real music accounts/CLI login. ASR decisions in the Node suite are controlled finals/flushes, not microphone recordings. Broader convenience conclusions are limited to code comparison and the listed regressions.
+
+
+## Natural phrasing and HUD cancellation ownership (2026-10-30)
+
+Reviewed baseline `afc01b3`. This correction changes only two behaviors:
+- Both parsers retain whole-expression matching and add 我同意、我确认、可以的、好啊 as affirmative; 不对、错了、停、不用、别 as refusal. Existing direct affirmative/negative expressions remain. No substring approval, model call or extra confirmation step was added.
+- Root dismiss no longer invokes coordinator-wide cancelPending. It still calls cancelActiveTurn, whose AbortController is passed to Agent tools and voice-owned credential sync. Independent settings sync has no turn signal and survives HUD closure. Application shutdown still calls CredentialSync.close to cancel all managed work with a bounded result. The coordinator architecture and LX Music implementation are unchanged. Earlier historical claims that HUD invalidates the entire credential queue are superseded by this owner-scoped behavior.
+
+Executed and passed:
+- Both verify-permissions suites: **101 cases each**, including all requested natural phrases and undecided question/quotation/conditional/double-negative cases.
+- Both verify-confirmation suites: real parser, actual confirmation/audio functions and real PermissionGate with controlled ASR. Added phrases approve/refuse directly. Ambiguous speech preserves the card and existing deadline. Existing partial-positive→negative-final, valid/empty flush, off/on, request ID/generation, timeout/cancellation, click/temporary-grant and forged-source assertions passed.
+- Root verify-credential-sync: prior 9 concurrency/failure scenarios and CAS/shutdown tests passed; added **3 production dismiss/cancelActiveTurn scenarios** with actual coordinator, real temporary config and mock CLI: settings sync executing; voice A executing with saved settings B queued; settings executing with voice + independent settings queued. Each asserts the turn signal is aborted while independent sync completes, final config/private key/hash and simulated CLI correspond to B, cancelled A does not start its next CLI write, and a subsequent valid request succeeds. Also passed a bounded-close test reporting an uninterruptible mock as remaining until released. The explicit coordinator-wide cancelPending test is retained and correctly labeled; HUD does not call that operation.
+- Both initialization, Agent cancellation/local SSE, turn isolation, offline cleanup and P1 regressions passed. Both Electron **43.4.0** production preload/renderer confirmation harnesses passed **11 checks**, including mouse, temporary grant, Enter and synthetic-event rejection. Relevant syntax and diff checks passed.
+
+No final failing suite. All CLI credentials/config in the new tests are synthetic and stored in a temporary directory. Settings-save responsiveness is preserved by the unchanged non-awaiting enqueue path (source inspection), not measured through a real settings UI. Real microphone/ASR recognition, real music accounts/CLI, full production Electron session, packaged builds and Electron 45.0.0 remain unverified. No NativeBridge/login/clear behavior was changed or broadened in this correction.

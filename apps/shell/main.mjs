@@ -359,7 +359,6 @@ function hideHud() {
 
 /** 对话结束后的调用点：R14 里"隐藏 vs 销毁"的决策也在这里。 */
 function dismiss() {
-  musicCredentials.cancelPending()
   cancelActiveTurn('dismiss')
   /*
    * 用户点 HUD 的 × 就是"别干了"，不是"先躲一下"。

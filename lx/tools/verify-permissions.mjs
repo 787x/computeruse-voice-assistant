@@ -191,6 +191,10 @@ for (const text of ['可以吗？','可不可以？','不是不可以','我说�
  const verdict=await voiceGate.check({tool:'read_clipboard'})
  results.push({name:'真实解析同意通过权限门',pass:verdict.allow&&verdict.channel==='voice',verdict:verdict.channel})
 }
+for (const [text, expected] of [['我同意',true],['我确认',true],['可以的',true],['好啊',true],['不对',false],['错了',false],['停',false],['不用',false],['别',false],['我同意吗？',null],['我确认的话',null],['我说的是我同意',null],['不是我同意',null],['"好啊"',null],['我不同意',null]]) {
+  const result=parseConfirmText(text)
+  results.push({name:`自然口语 ${text}`,pass:(result===null?null:result.allow)===expected,verdict:String(expected)})
+}
 console.log('权限引擎验收\n' + '='.repeat(64))
 for (const row of results) {
   console.log(`${row.pass ? '✓' : '✗'} ${row.name.padEnd(36, ' ')} ${row.verdict}`)
