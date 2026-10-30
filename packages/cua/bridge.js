@@ -203,6 +203,7 @@ export class NativeBridge {
 
     try {
       const info = await banner
+      if (this.#disposed) throw new BridgeUnavailableError('computer-use backend has been disposed')
       clearTimeout(timer)
       this.#readyInfo = info
       return info
@@ -392,38 +393,45 @@ export class NativeBridge {
 
   /** 关闭后端并释放资源（幂等）。 */
   async dispose() {
-    if (this.#disposePromise === undefined) this.#disposePromise = this.#disposeOnce()
+    if (this.#disposePromise === undefined) {
+      this.#disposePromise = this.#disposeOnce().catch(error => {
+        this.#disposePromise = undefined
+        throw error
+      })
+    }
     return await this.#disposePromise
   }
 
   async #disposeOnce() {
-    const child = this.#child
-    if (child !== undefined && child !== null && this.#exitInfo === null) {
-      // 先礼貌关闭（这必须在 #disposed 置位之前，否则 ensureStarted 会拒绝这次请求）。
-      // 预算刻意收紧：dispose 是同步生命周期回调里 fire-and-forget 出去的，
-      // 等太久会让「调用方进程先退出」变成「后端进程被遗留」。
-      try {
-        await this.call('shutdown', {}, { timeoutMs: 1500 })
-      } catch {
-        /* 关不掉就直接 kill */
-      }
-      await new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(undefined), 600)
-        // 同上：这 600ms 是 dispose 的兜底上限，不能被 unref 掉，
-        // 否则进程可能在等它的过程中就直接退出了。
-        if (this.#exitInfo !== null) {
-          clearTimeout(timer)
-          resolve(undefined)
-          return
-        }
-        child.once?.('exit', () => {
-          clearTimeout(timer)
-          resolve(undefined)
-        })
-      })
-    }
+    // Revoke before awaiting anything: queued calls must never restart a closing bridge.
     this.#disposed = true
+    const child = this.#child
+    const error = new BridgeUnavailableError('computer-use backend has been disposed')
+    this.#failStart(error)
+    const pending = this.#pending
+    this.#pending = null
+    pending?.reject(error)
+    this.#readyInfo = null
+    if (!child || this.#exitInfo !== null) return
+    let exited = false
+    let onExit
+    const exit = new Promise(resolve => {
+      onExit = () => { exited = true; resolve() }
+      child.once('exit', onExit)
+    })
+    // No shutdown command through the request queue: warmup may still be waiting for ready.
     this.#kill()
+    let timer
+    try {
+      await Promise.race([exit, new Promise(resolve => { timer = setTimeout(resolve, 1000) })])
+      if (!exited && child.exitCode == null && child.signalCode == null) {
+        this.#child = child // Retain the handle so a later cleanup can retry.
+        throw new BridgeUnavailableError('computer-use backend did not exit after disposal')
+      }
+    } finally {
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+    }
   }
 
   #disposePromise

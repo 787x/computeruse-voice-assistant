@@ -16,6 +16,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { writeWav } from '../../packages/voice/wav.mjs'
 import { judgeBargeIn, stripBargeWords } from '../../packages/voice/bargein.mjs'
+import { AgentInitialization } from '../../packages/agent/initialization.mjs'
 import { parseConfirmText } from '../../packages/agent/permissions.mjs'
 import { parseOfflineIntent, offlineUnsupported, formatTime, formatDate, isOfflineError } from '../../packages/agent/offline.mjs'
 import { judgeFollowUp, windowFor, heuristicFollowUp, FOLLOWUP_DEFAULTS } from '../../packages/agent/followup.mjs'
@@ -384,6 +385,8 @@ function dismiss() {
  */
 async function shutdown() {
   cancelActiveTurn('shutdown')
+  // Revoke initialization immediately, before waiting for microphone/TTS shutdown.
+  const agentCleanup = agentInitialization.close()
   log('shutdown requested')
   // 兜底：任何一步卡住都不能让"退出"变成没反应（实测过一次等 worker 不返回）
   const hardStop = setTimeout(() => {
@@ -394,7 +397,7 @@ async function shutdown() {
   try { stopSpeaking() } catch { /* 队列可能已空 */ }
   // TTS worker 常驻 1.5GB 显存，退出必须回收，否则下次启动会和残留进程抢显存
   try { if (ttsEngine !== null) await ttsEngine.dispose() } catch { /* 可能已经退出 */ }
-  try { if (agentRuntime !== null) await agentRuntime.toolkit.dispose() } catch { /* 桥接可能已退出 */ }
+  await agentCleanup
   clearTimeout(hardStop)
   log('shutdown done')
   app.exit(0)
@@ -754,7 +757,10 @@ function finishCommand(reason, voiceEpoch = confirmVoiceEpoch) {
 let turnSeq = 0
 /** @type {{agent:any, toolkit:any, config:any, readyMs:number}|null} */
 let agentRuntime = null
-let agentLoading = null
+const agentInitialization = new AgentInitialization({
+  publish: (runtime) => { agentRuntime = runtime },
+  diagnostic: (error) => log(`agent cleanup failed: ${error.message}`),
+})
 /** 当前回合；agent 的事件都倒进这里 */
 let activeTurn = null
 let latestTurn = null
@@ -855,7 +861,7 @@ async function runOfflineCommand(text, turn) {
       replyOffline(lastAssistantText === '' ? '我刚才没说话。' : lastAssistantText)
       break
     case 'launch': {
-      const launcher = await ensureLauncher()
+      const launcher = await ensureLauncher(turn?.controller.signal)
       if (turn && !isCurrentTurn(turn)) return
       const result = await launcher.launch(parsed.arg)
       if (turn && !isCurrentTurn(turn)) return
@@ -1807,9 +1813,12 @@ async function invokeCuaWithRecovery(toolkit, name, args, launcher, signal) {
  * 单独一个实例：离线兜底要用它，而离线时 agent 根本起不来。
  */
 let appLauncher = null
-async function ensureLauncher() {
+async function ensureLauncher(signal) {
+  signal?.throwIfAborted()
   if (appLauncher !== null) return appLauncher
   const launchModule = await import('../../packages/tools/app-launch.mjs')
+  signal?.throwIfAborted()
+  if (appLauncher !== null) return appLauncher
   appLauncher = new launchModule.AppLauncher()
   void appLauncher.ensureIndex().then((list) => log(`app index ready: ${list.length} entries`)).catch((error) => log(`app index failed: ${error.message}`))
   return appLauncher
@@ -1819,25 +1828,27 @@ async function ensureLauncher() {
  * 模型 + 工具链初始化。LLM 客户端几乎零成本，但 CUA 桥接要起一个 PowerShell
  * （冷启动实测 1050ms），所以只做一次，第一次下指令时才付这个成本。
  */
-async function ensureAgent() {
-  if (agentRuntime !== null) return agentRuntime
-  if (agentLoading !== null) return agentLoading
-  agentLoading = (async () => {
+async function ensureAgent(signal) {
+  const runtime = await agentInitialization.ensure(signal, async ({ signal: initSignal, checkpoint, own }) => {
     const [store, llmModule, loopModule, cuaModule] = await Promise.all([
       import('../../packages/config/store.mjs'),
       import('../../packages/agent/llm.mjs'),
       import('../../packages/agent/loop.mjs'),
       import('../../packages/cua/adapter.mjs'),
     ])
+    checkpoint()
     const config = await store.loadConfig()
+    checkpoint()
     const apiKey = await store.resolveApiKey()
+    checkpoint()
     if (!apiKey) throw new Error('还没配置模型 API Key')
 
-    // 音乐工具的凭据同步给 ncm-cli；异步跑，别挡住这一轮对话
-    void (async () => {
+    // 等待初始化副作用结束；取消后不再启动后续同步或保存。
+    await (async () => {
       try {
         // 带上"上次同步过的哈希"：内容没变就不要写 CLI，否则会把登录态顶掉
-        const result = await syncCredentialsAsync(config.netease ?? {}, { syncedHash: config.netease?.syncedHash })
+        const result = await syncCredentialsAsync(config.netease ?? {}, { syncedHash: config.netease?.syncedHash, signal: initSignal })
+        checkpoint()
         const synced = result.synced ?? []
         if (synced.length > 0) log(`netease credentials synced: ${synced.join(', ')}`)
         if (result.hash !== undefined && result.hash !== config.netease?.syncedHash) {
@@ -1845,21 +1856,27 @@ async function ensureAgent() {
           config.netease = { ...(config.netease ?? {}), syncedHash: result.hash }
         }
       } catch (error) {
+        checkpoint()
         log(`netease sync failed: ${error.message}`)
       }
     })()
 
+    checkpoint()
     const startedAt = Date.now()
-    const toolkit = new cuaModule.CuaToolkit({ frameDir: join(DATA_ROOT, 'frames') })
+    const toolkit = own(new cuaModule.CuaToolkit({ frameDir: join(DATA_ROOT, 'frames') }))
     await toolkit.warmup()
+    checkpoint()
 
     // 联网搜索：key 没配就当这个工具不存在（模型不会去调一个列表里没有的工具）
     const searchModule = await import('../../packages/tools/web-search.mjs')
+    checkpoint()
     const searchKey = await store.resolveSearchKey()
+    checkpoint()
     const webSearch = new searchModule.WebSearch({ apiKey: searchKey })
 
     // 按名字启动程序（Start 菜单级解析）：CUA 的 open_application 只吃真实路径
-    const launcher = await ensureLauncher()
+    const launcher = await ensureLauncher(initSignal)
+    checkpoint()
 
     const tools = {
       listTools: () => {
@@ -1948,16 +1965,14 @@ async function ensureAgent() {
       },
     })
 
-    agentRuntime = { agent, toolkit, config, webSearch, llm, apiKey, readyMs: Date.now() - startedAt }
-    applyModelSchedule('agent-ready')
-    log(`agent ready in ${agentRuntime.readyMs}ms model=${config.model}`)
-    return agentRuntime
-  })()
-  try {
-    return await agentLoading
-  } finally {
-    agentLoading = null
-  }
+    checkpoint()
+    return { agent, toolkit, config, webSearch, llm, apiKey, readyMs: Date.now() - startedAt }
+  })
+  signal?.throwIfAborted()
+  if (shuttingDown) throw new DOMException('Application exiting', 'AbortError')
+  applyModelSchedule('agent-ready')
+  log(`agent ready in ${runtime.readyMs}ms model=${runtime.config.model}`)
+  return runtime
 }
 
 /**
@@ -2089,13 +2104,16 @@ let turnHistoryCounts = []
  * 设置页保存后，把搜索 key 同步到运行中的实例。
  * 每轮开始读一次配置（约 1ms），换来"改完立刻生效、不用重启"。
  */
-async function refreshSearchKey() {
-  if (agentRuntime === null) return
+async function refreshSearchKey(signal) {
+  const runtime = agentRuntime
+  if (runtime === null || signal?.aborted) return
   try {
     const store = await import('../../packages/config/store.mjs')
+    if (signal?.aborted || runtime !== agentRuntime) return
     const key = await store.resolveSearchKey()
-    if (agentRuntime.webSearch.setApiKey(key)) {
-      log(`web search key ${key === '' ? 'cleared' : 'updated'} → ${agentRuntime.webSearch.enabled ? 'enabled' : 'disabled'}`)
+    if (signal?.aborted || runtime !== agentRuntime) return
+    if (runtime.webSearch.setApiKey(key)) {
+      log(`web search key ${key === '' ? 'cleared' : 'updated'} → ${runtime.webSearch.enabled ? 'enabled' : 'disabled'}`)
     }
   } catch (error) {
     log(`refresh search key failed: ${error.message}`)
@@ -2123,28 +2141,27 @@ async function runCommand(text) {
    * 而 system.shell 在标准档是"每次询问"——于是屏幕上弹出一张确认卡，
    * 用户没理它，等满 180 秒按拒绝处理，一轮对话白等三分钟（审计日志里有记录）。
    */
-  const trivial = parseOfflineIntent(text)
-  if (trivial !== null && (trivial.intent === 'time' || trivial.intent === 'date')) {
-    log(`local answer: ${trivial.intent}（不叫模型）`)
-    replyOffline(trivial.intent === 'time' ? `现在是${formatTime()}。` : `今天是${formatDate()}。`)
-    activeTurn = null
-    void afterTurnSpeechSettled()
-    return
-  }
-  // 断网时不必去撞一次 60 秒超时：本地能办的直接办，办不了的明说
-  if (isOfflineNow()) {
-    log('offline mode: 跳过模型，直接走本地兜底')
-    await runOfflineCommand(text, turn)
-    if (!isCurrentTurn(turn)) return
-    activeTurn = null
-    void afterTurnSpeechSettled()
-    return
-  }
-
   try {
-    await refreshSearchKey()
+    const trivial = parseOfflineIntent(text)
+    if (trivial !== null && (trivial.intent === 'time' || trivial.intent === 'date')) {
+      log(`local answer: ${trivial.intent}（不叫模型）`)
+      replyOffline(trivial.intent === 'time' ? `现在是${formatTime()}。` : `今天是${formatDate()}。`)
+      turn.completed = true
+      return
+    }
+    // 断网时不必去撞一次 60 秒超时：本地能办的直接办，办不了的明说
+    if (isOfflineNow()) {
+      log('offline mode: 跳过模型，直接走本地兜底')
+      turn.offlineAttempted = true
+      await runOfflineCommand(text, turn)
+      if (!isCurrentTurn(turn)) return
+      turn.completed = true
+      return
+    }
+
+    await refreshSearchKey(turn.controller.signal)
     if (!isCurrentTurn(turn)) return
-    const { agent, llm } = await ensureAgent()
+    const { agent, llm } = await ensureAgent(turn.controller.signal)
     if (!isCurrentTurn(turn)) return
     const result = await agent.run(text, { history: sessionHistory, signal: turn.controller.signal,
       onEvent: (event) => handleAgentEvent(event, turn) })
@@ -2215,13 +2232,18 @@ async function runCommand(text) {
     turn.completed = true
   } catch (error) {
     if (!isCurrentTurn(turn) || error.name === 'AbortError') return
-    // 网络类错误才走离线兜底；密钥错、参数错这类必须原样暴露，不能被兜底掩盖
-    if (isOfflineError(error)) {
-      log(`turn ${turn.id} offline (${error.message})，转本地兜底`)
-      await runOfflineCommand(text, turn)
-      if (!isCurrentTurn(turn)) return
-      turn.completed = true
-      return
+    // A fallback failure is reported once; it must not escape this turn's cleanup.
+    if (isOfflineError(error) && !turn.offlineAttempted) {
+      try {
+        turn.offlineAttempted = true
+        await runOfflineCommand(text, turn)
+        if (!isCurrentTurn(turn)) return
+        turn.completed = true
+        return
+      } catch (fallbackError) {
+        if (!isCurrentTurn(turn) || fallbackError.name === 'AbortError') return
+        error = fallbackError
+      }
     }
     log(`turn ${turn.id} failed: ${error.message}`)
     wantContinue = false
@@ -2231,6 +2253,8 @@ async function runCommand(text) {
   } finally {
     if (activeTurn === turn) {
       activeTurn = null
+      clearTimeout(commandTimer)
+      commandActive = false
       closeConfirmCard()
       if (turn.completed) void afterTurnSpeechSettled()
     }

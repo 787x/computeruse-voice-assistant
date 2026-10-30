@@ -100,6 +100,7 @@ export function runCliAsync(argv, options = {}) {
     execFile(process.execPath, [entry, ...argv], {
       encoding: 'utf8',
       windowsHide: true,
+      signal: cfg.signal,
       timeout: cfg.timeoutMs,
       maxBuffer: 4 * 1024 * 1024,
       env: childEnv(),
@@ -594,6 +595,7 @@ export function clearLoginCache() {
  * 实测每次保存都要等 2~4 次 CLI 调用（0.5~11 秒），用户体感就是点保存后界面冻住。
  */
 export async function syncCredentialsAsync(credentials = {}, options = {}) {
+  options.signal?.throwIfAborted()
   const appId = String(credentials.appId ?? '').trim()
   const privateKey = String(credentials.privateKey ?? '').trim()
   /*
@@ -608,10 +610,13 @@ export async function syncCredentialsAsync(credentials = {}, options = {}) {
   }
   const synced = []
   for (const [key, value] of [['appId', appId], ['privateKey', privateKey]]) {
+    options.signal?.throwIfAborted()
     if (value === '') continue
     const current = await runCliAsync(['config', 'get', key], options)
+    options.signal?.throwIfAborted()
     if (current.raw.includes(value.slice(0, 24))) continue
     const set = await runCliAsync(['config', 'set', key, value], options)
+    options.signal?.throwIfAborted()
     if (set.code === 0) synced.push(key)
   }
   return { synced, hash }
