@@ -59,6 +59,13 @@
   .actions { display: flex; gap: 10px; align-items: center; margin-top: 4px; }
   pre { background: #0e1015; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 11px;
         color: var(--muted); max-height: 180px; overflow: auto; margin: 0; }
+  /* 系统提示词：单独 class，不去动其它输入区的样式 */
+  textarea.prompt-box {
+    width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid var(--line);
+    background: #0e1015; color: var(--text); font: inherit; resize: vertical; line-height: 1.55;
+  }
+  pre.prompt-view { white-space: pre-wrap; max-height: 300px; color: var(--text); }
+  details.prompt-view summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -141,6 +148,47 @@
         <button id="addSchedule">加一条</button>
         <span class="hint" id="scheduleHint">规则可以有多条，先命中先用；不在任何时段内就用上面的「默认」。结束时间不含在该段内；开始=结束表示全天；跨午夜写 22:00 → 06:00。</span>
       </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>系统提示词</h2>
+    <div class="checks" style="margin-bottom:12px">
+      <label><input type="radio" name="promptMode" id="promptModeDefault" value="default" /> 使用默认提示词</label>
+      <label><input type="radio" name="promptMode" id="promptModeCustom" value="custom" /> 使用自定义提示词</label>
+    </div>
+
+    <div id="promptCustomArea" hidden>
+      <div class="field">
+        <label for="systemPrompt">自定义内容（发给模型的系统消息，原样使用）</label>
+        <textarea id="systemPrompt" class="prompt-box" rows="14" spellcheck="false"
+          placeholder="在这里写你要的人设、性格、语言风格和工具使用指引"></textarea>
+        <div class="hint">
+          这里的内容就是模型收到的人设：可以整段换掉，不会偷偷在后面接回原来的银狼设定。
+          工具能不能执行仍然由下面的「权限」决定，提示词说了也不算。
+        </div>
+      </div>
+      <div class="actions">
+        <button id="copyCustomPrompt">复制当前内容</button>
+        <span class="hint" id="promptCustomChars"></span>
+      </div>
+    </div>
+
+    <!-- 默认提示词常驻可查：改成自定义时也要能对着原文改，或随时复制回去 -->
+    <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="actions" style="margin-bottom:8px">
+        <button id="copyDefaultPrompt">复制默认提示词</button>
+        <button id="restoreDefaultPrompt">恢复默认</button>
+        <span class="hint" id="promptDefaultHint">下面是项目内置的完整默认提示词。</span>
+      </div>
+      <details id="defaultPromptDetails" class="prompt-view">
+        <summary>查看完整默认提示词</summary>
+        <pre id="defaultPrompt" class="prompt-view"></pre>
+      </details>
+    </div>
+
+    <div class="hint" style="margin-top:10px">
+      改完点右上角「保存」；下一轮对话就开始用新提示词，不用重启。第一次切到自定义时会带上完整默认提示词当编辑起点。
     </div>
   </section>
 

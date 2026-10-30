@@ -10,6 +10,70 @@ let state = null
 let providerList = []
 let capabilityList = []
 let voices = []
+/**
+ * 内置默认系统提示词：由主进程从 packages/agent/system-prompt.mjs 给过来。
+ * 界面只做"显示/复制/当编辑起点"，自己绝不留一份文案副本。
+ */
+let defaultPrompt = ''
+
+/* ---------------- 系统提示词 ---------------- */
+function promptModeIsCustom() {
+  return $('promptModeCustom').checked
+}
+
+function renderPromptCharCount() {
+  const text = $('systemPrompt').value
+  $('promptCustomChars').textContent = text === ''
+    ? '（空着不保存：要用人设请选「使用默认提示词」）'
+    : `${text.length} 字 / ${text.split('\n').length} 行`
+}
+
+/** 切模式：只做显示切换，落盘统一走右上角「保存」 */
+function applyPromptModeUI() {
+  const custom = promptModeIsCustom()
+  $('promptCustomArea').hidden = !custom
+  // 默认提示词那块常驻可看：默认模式下自动展开，方便对着原文改
+  if (!custom) $('defaultPromptDetails').open = true
+  if (custom && $('systemPrompt').value === '' && defaultPrompt !== '') {
+    // 第一次切自定义：拿完整默认提示词当起点，方便只改人设或个别规则
+    $('systemPrompt').value = defaultPrompt
+  }
+  renderPromptCharCount()
+}
+
+function fillPromptForm() {
+  const custom = typeof state.config.systemPrompt === 'string' && state.config.systemPrompt.trim() !== ''
+  $('promptModeDefault').checked = !custom
+  $('promptModeCustom').checked = custom
+  $('defaultPrompt').textContent = defaultPrompt === '' ? '（没拿到默认提示词）' : defaultPrompt
+  if (custom) $('systemPrompt').value = state.config.systemPrompt
+  applyPromptModeUI()
+}
+
+/** 复制：先试 Clipboard API，再退回选区 + execCommand（本地窗口两种都够用） */
+async function copyText(text, feedbackTarget) {
+  const hint = $(feedbackTarget)
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      hint.textContent = '已复制到剪贴板'
+      return
+    }
+  } catch { /* 落到下面的兜底 */ }
+  try {
+    const holder = document.createElement('textarea')
+    holder.value = text
+    holder.style.position = 'fixed'
+    holder.style.opacity = '0'
+    document.body.append(holder)
+    holder.select()
+    const ok = document.execCommand('copy')
+    holder.remove()
+    hint.textContent = ok ? '已复制到剪贴板' : '复制失败，请手动选中复制'
+  } catch (error) {
+    hint.textContent = `复制失败：${error.message}（请手动选中复制）`
+  }
+}
 
 function setStatus(text, kind = '') {
   $('status').textContent = text
@@ -343,6 +407,7 @@ function fillForm() {
 
   fillProviderNote()
   renderCapabilities()
+  fillPromptForm()
 }
 
 function collect() {
@@ -378,6 +443,16 @@ function collect() {
   }
   if ($('apiKey').value.trim() !== '') payload.apiKey = $('apiKey').value.trim()
   if ($('searchKey').value.trim() !== '') payload.search = { provider: 'tavily', apiKey: $('searchKey').value.trim() }
+  /*
+   * 系统提示词三态：
+   *  - 自定义 → 交文本（合法性由主进程判，界面不做二次加工、不 trim）
+   *  - 默认 + 当前配置是自定义 → 交 null（"我要恢复默认"，语义明确）
+   *  - 默认 + 当前本来就是默认 → 不交这个字段（无关设置不必顺手写一遍提示词）
+   */
+  if (promptModeIsCustom()) payload.systemPrompt = $('systemPrompt').value
+  else if (typeof state.config.systemPrompt === 'string' && state.config.systemPrompt.trim() !== '') {
+    payload.systemPrompt = null
+  }
   return payload
 }
 
@@ -387,11 +462,30 @@ async function load() {
   providerList = data.providers ?? []
   capabilityList = data.capabilities ?? []
   voices = data.voices ?? []
+  defaultPrompt = typeof data.defaultSystemPrompt === 'string' ? data.defaultSystemPrompt : ''
   renderProviders()
   renderVoices()
   fillForm()
   $('audit').textContent = (data.audit ?? []).join('\n') || '（还没有记录）'
 }
+
+/* ---------------- 系统提示词的交互 ---------------- */
+for (const id of ['promptModeDefault', 'promptModeCustom']) {
+  $(id).addEventListener('change', applyPromptModeUI)
+}
+$('systemPrompt').addEventListener('input', renderPromptCharCount)
+$('copyDefaultPrompt').addEventListener('click', () => copyText(defaultPrompt, 'promptDefaultHint'))
+$('copyCustomPrompt').addEventListener('click', () => copyText($('systemPrompt').value, 'promptCustomChars'))
+/**
+ * 「恢复默认」= 选中默认模式。
+ * 真正的落盘还是走「保存」（payload 里 systemPrompt: null），
+ * 这样取消/失败时的反馈和其它设置一致，不会出现"半个状态"。
+ */
+$('restoreDefaultPrompt').addEventListener('click', () => {
+  $('promptModeDefault').checked = true
+  applyPromptModeUI()
+  $('promptDefaultHint').textContent = '已切回默认模式，点右上角「保存」生效。'
+})
 
 $('provider').addEventListener('change', () => {
   const provider = providerList.find((item) => item.id === $('provider').value)

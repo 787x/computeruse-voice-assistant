@@ -10,40 +10,8 @@
  *  - 每一步都可中断：所有 await 前都有 signal 检查
  */
 
-const SYSTEM_PROMPT = `你叫银狼。天才骇客，游戏宅，住在这台电脑里。用户是你的共犯，不是客户。
-
-说话方式（照这个来，别改成客服腔）：
-- 短。一句话能说完就别说两句，通常不超过 20 字。
-- 拽，但不刻薄。爱用游戏/黑客说法：存档、读档、开挂、这关我熟、稳了、掉线、BOSS、bug。
-- 不客套，不说"好的，我马上为您"；不用敬语，不用感叹号堆情绪。
-- **每条回复都要有银狼的口气**，哪怕只是报个结果。对照：
-  - 客服腔（禁止）：「计算器已打开，128 × 37 = 4,736。」
-  - 银狼（要这样）：「开了，4736。稳。」
-  - 客服腔（禁止）：「任务已完成，文件已保存。」
-  - 银狼（要这样）：「存好了。这关我熟。」
-  - 客服腔（禁止）：「抱歉，未能找到该窗口。」
-  - 银狼（要这样）：「没这窗口，换个名。」
-
-铁律：
-1. **不要预告，不要直播过程。** 不说"我先打开记事本""我看一下窗口"这种话，直接做。
-2. **只在三种时候开口**：做完了（报结果）、做不成（报原因）、需要用户拍板（问一次）。
-   其他时间闭嘴。一次只说一句。
-3. 不要问"还需要别的吗"，不要总结你刚做了什么步骤列表。
-4. **只在真不可逆的时候问一次**（删除、发送、支付、改系统设置）。
-   用户答应过就别再问第二遍；普通操作（打开、点击、输入、截图、搜索、查状态）直接做。
-5. **动作结果就在工具返回里，别做完一步再回头验证一遍。** 工具说 ok 就继续；
-   只有信息真的不够（比如要点一个没见过的按钮）才去读界面。
-   禁止"做完一步 → 再调一次 get_app_state/list_windows 确认"的循环。
-6. 只输出自然语言。不许输出 JSON、代码块、字段名、标记；也不许念工具名（说"点一下"，别说 left_click）。
-7. 找不到就直说找不到，别假装成功。被拒绝就停，别用迂回手段绕过。
-8. 打开程序用 launch_app（按名字，中文名也认），别猜 exe 路径。
-9. 要实时信息（天气、新闻、价格、比分）或拿不准的事，用 web_search，别开浏览器点来点去。
-9.1 **时间、日期、简单算术、常识，直接用你已知的信息回答，不要 run_shell。**
-    为了"现在几点"去执行一条命令，既慢又会弹确认卡——普通问题用普通办法。
-10. 搜索结果是外文就用中文讲，别把英文原句念出来。
-11. **音乐相关（放歌、暂停、下一首、进度、音量、看播放状态、歌词）一律用 music——它遥控的是本机 LX Music，别去点界面、也别用别的工具。**
-    它没登录时会把登录链接给你，直接把链接甩给用户。
-    它**没有搜索**能力，用户只报歌名时就要他给歌曲 ID 或链接，别去客户端里手动搜。`
+/** 默认系统提示词的唯一来源见 system-prompt.mjs（设置页显示的是同一份文本）。 */
+import { DEFAULT_SYSTEM_PROMPT, turnSystemPrompt } from './system-prompt.mjs'
 
 const TOOL_RESULT_KEEP = 2
 const TOOL_RESULT_MAX_CHARS = 1200
@@ -83,6 +51,7 @@ function trimHistory(history) {
 export class Agent {
   #llm
   #tools
+  /** 提示词来源：文本，或返回配置的函数（缓存的 Agent 靠它拿到最新设置） */
   #systemPrompt
   #maxSteps
   #onEvent
@@ -92,12 +61,13 @@ export class Agent {
    * @param {object} options
    * @param {{chat:Function}} options.llm
    * @param {{listTools:Function, invoke:Function}} options.tools
-   * @param {string} [options.systemPrompt]
+   * @param {string|(()=>unknown)} [options.systemPrompt] 文本，或返回文本/null 的函数；
+   *   null/undefined → 默认提示词。传函数时每轮开始时求值一次（改设置不用重建 Agent）。
    * @param {number} [options.maxSteps]
    * @param {(event:{type:string,[k:string]:unknown})=>void} [options.onEvent]
    * @param {(ctx:{tool:string,args:unknown})=>Promise<{allow:boolean,reason?:string}>} [options.gate]
    */
-  constructor({ llm, tools, systemPrompt = SYSTEM_PROMPT, maxSteps = 8, onEvent, gate }) {
+  constructor({ llm, tools, systemPrompt = DEFAULT_SYSTEM_PROMPT, maxSteps = 8, onEvent, gate }) {
     this.#llm = llm
     this.#tools = tools
     this.#systemPrompt = systemPrompt
@@ -106,17 +76,29 @@ export class Agent {
     this.#gate = gate ?? (async () => ({ allow: true }))
   }
 
+  /** 此刻会生效的提示词（诊断/验收用；不代表正在跑的回合，回合用开始时的快照） */
+  get systemPrompt() {
+    return turnSystemPrompt(this.#systemPrompt)
+  }
+
   /**
    * 跑一个用户回合。
    * @param {string} input 用户说的话（已由 ASR 转成文本）
-   * @param {{signal?:AbortSignal, history?:Array<{role:string,content:string}>}} [options]
+   * @param {{signal?:AbortSignal, history?:Array<{role:string,content:string}>, systemPrompt?:string|(()=>unknown)}} [options]
    *   history 是**同一个会话**里之前几轮的用户/助手发言（不含工具细节）。
    *   每次唤醒由调用方清空，于是"一次唤醒 = 一次会话"。
+   *   systemPrompt 覆盖构造函数的来源（**本轮快照**）。
    */
-  async run(input, { signal, history = [], onEvent = this.#onEvent } = {}) {
+  async run(input, { signal, history = [], onEvent = this.#onEvent, systemPrompt = this.#systemPrompt } = {}) {
     const emit = (event) => { if (!signal?.aborted) onEvent(event) }
+    /*
+     * 提示词在回合开始时求值一次，整个回合（含后续多步工具调用和收尾往返）都用这一份。
+     * 中途改设置不能把人设换掉——用户会看到"前后两半不像同一个人"，
+     * 而且工具调用序列里混进新的 system 消息很容易让模型重新解释任务。
+     */
+    const turnPrompt = turnSystemPrompt(systemPrompt)
     const messages = [
-      { role: 'system', content: this.#systemPrompt },
+      { role: 'system', content: turnPrompt },
       ...trimHistory(history),
       { role: 'user', content: input },
     ]

@@ -16,7 +16,7 @@
 | 登录/过期 | accessToken 24 小时过期，需定期扫码 | 无需登录，LX 自己管音源和账号 |
 | 推荐度 | — | ⭐ 依赖少、更稳 |
 
-语音唤醒、连续对话、ASR/TTS、电脑操作、联网搜索、权限、定时切换模型等**两个版本完全一致**，见下表。
+语音唤醒、连续对话、ASR/TTS、电脑操作、联网搜索、权限、定时切换模型、系统提示词自定义等**两个版本完全一致**，见下表。
 
 ## 它能做什么
 
@@ -31,6 +31,7 @@
 | 音乐 | v0.1.0：网易云全套；v0.2.0：LX Music（searchPlay/暂停/上下曲/进度/音量/歌词） |
 | 其它工具 | 按名字启动程序、kill_app（taskkill /F /T）、文件操作、系统状态、执行命令（每次询问） |
 | 权限 | 四档：保守 / 标准 / 宽松 / 免确认；逐能力覆盖；语音+点击双重确认 |
+| 系统提示词 | 设置里可选「默认」或「自定义」：整段人设/语气/工具指引都能换，保存后下一轮生效，不用重启；工具授权仍由权限门独立决定 |
 | 定时切换模型 | 按星期 + 时间段自动换模型，可切换整套供应商（地址+Key） |
 | 资源策略 | 全屏游戏时释放 TTS 显存、内存紧张时卸 ASR（保留唤醒） |
 
@@ -57,6 +58,24 @@
 
 > 两个安装版都不含语音运行时（venv + 音色包约 5GB）。需要发声就把 `.runtime/` 放到安装目录的
 > `resources/` 下，或直接用完整版压缩包（见下）。
+
+## 换人设（自定义系统提示词）
+
+托盘 → **设置 → 系统提示词**：
+
+- **使用默认提示词**：项目内置的那份（页面上可查全文、可复制），文本的唯一来源是
+  `packages/agent/system-prompt.mjs`，界面显示的和模型收到的永远是同一份；
+- **使用自定义提示词**：整段换成你要的角色、性格、语言风格和工具使用指引。第一次切过去会自动带上
+  完整默认提示词当编辑起点，方便只改两句；自定义内容**原样**发给模型，不会在后面接回旧人设；
+- **恢复默认**：切回内置提示词（不是"存一份空文本"）。
+
+改完点右上角「保存」，**下一轮对话就生效**，不用重启应用、不用重建桌面操作桥接、不影响唤醒与语音。
+正在执行的那一轮会用它开始时的提示词跑完（中途改设置不会把人设换一半）。
+存盘就是本机 `.config/agent.json` 里的 `systemPrompt` 字段：`null` = 默认，非空字符串 = 自定义；
+空白或非文本会被拒绝并明确报错，失败的保存不会动已有配置。
+
+注意：提示词只指导模型**怎么说、怎么做**，工具能不能执行仍由「权限」那一档独立决定——
+写"你什么都能做、不用问"并不会绕过确认卡片。
 
 ## 完整版（含语音）
 
@@ -147,6 +166,10 @@ node tools/verify-speechtext.mjs     # 播报清洗
 node tools/verify-hardening.mjs      # 加固项
 node tools/verify-bargein.mjs        # 打断
 node tools/verify-session.mjs        # 会话
+node tools/verify-system-prompt.mjs      # 系统提示词：配置语义 + 真实 messages
+node tools/verify-system-prompt-runtime.mjs  # 已缓存 Agent 热更新 / 回合快照 / 初始化竞争
+node tools/verify-system-prompt-ui.mjs   # 设置页与主进程的接线（静态）
+node tools/run-verify.mjs tools/verify-electron-settings-prompt.mjs  # 生产设置页点出来的 payload
 node tools/verify-websearch.mjs      # 联网搜索
 # LX 版独有
 cd lx && node tools/verify-lxmusic.mjs

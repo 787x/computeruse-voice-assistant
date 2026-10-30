@@ -22,6 +22,7 @@ import { parseConfirmText } from '../../packages/agent/permissions.mjs'
 import { parseOfflineIntent, offlineUnsupported, formatTime, formatDate, isOfflineError } from '../../packages/agent/offline.mjs'
 import { judgeFollowUp, windowFor, heuristicFollowUp, FOLLOWUP_DEFAULTS } from '../../packages/agent/followup.mjs'
 import { cleanLine as cleanLineText } from '../../packages/agent/text.mjs'
+import { DEFAULT_SYSTEM_PROMPT } from '../../packages/agent/system-prompt.mjs'
 import { DEFAULT_WAKE_WORD } from '../../packages/voice/keywords.mjs'
 import { resolveModel } from '../../packages/config/schedule.mjs'
 import { LAUNCH_APP_TOOL } from '../../packages/tools/app-launch.mjs'
@@ -816,6 +817,14 @@ function finishCommand(reason, voiceEpoch = confirmVoiceEpoch, endpointText = nu
 
 /** 回合序号：晚到的旧回合不该覆盖新回合的字幕 */
 let turnSeq = 0
+/**
+ * 当前生效的系统提示词配置：null=用内置默认，非空字符串=用户自定义。
+ *
+ * 为什么放内存里一份：Agent 是缓存的（重建要重新起 CUA 桥接，1 秒多）。
+ * 把它做成**函数注入**，改设置只是换个返回值，下一轮对话自然用新的人设，
+ * 而每一轮开始时求值一次（见 Agent.run），正在跑的多步回合不会被半路换人设。
+ */
+let agentSystemPrompt = null
 /** @type {{agent:any, toolkit:any, config:any, readyMs:number}|null} */
 const musicCredentials = new CredentialSync({
   loadConfig: async () => (await import('../../packages/config/store.mjs')).loadConfig(),
@@ -1989,6 +1998,8 @@ async function ensureAgent(signal) {
     const agent = new loopModule.Agent({
       llm,
       tools,
+      // 提示词按"当前配置"取，而不是初始化时定死：改设置不需要重建 Agent
+      systemPrompt: () => agentSystemPrompt,
       maxSteps: config.maxSteps,
       onEvent: handleAgentEvent,
       // 所有工具调用都要过权限门，拒绝时把原因回填给模型（它会改用别的办法或告诉用户）
@@ -2525,6 +2536,22 @@ function applyModelSchedule(reason) {
   }
 }
 
+/**
+ * 系统提示词：把配置里的 systemPrompt 落到内存状态。
+ *
+ * 两个调用点：启动时 loadUiPrefs（恢复上次选择）、设置保存成功后。
+ * Agent 拿到的是一个"读当前配置"的函数（见 ensureAgent 里的 systemPrompt），
+ * 所以这里赋值之后，**下一轮**对话就换人设；已经开始的那一轮仍用它开始时的快照。
+ * 不需要重建 Agent、不需要重启壳子，也不碰 CUA 桥接和语音。
+ * @param {{systemPrompt?:unknown}} config
+ */
+function syncAgentSystemPrompt(config) {
+  const value = config?.systemPrompt
+  // null/缺省/空白 → null（= 内置默认）；合法自定义文本 → 原样保留，不改写
+  agentSystemPrompt = typeof value === 'string' && value.trim() !== '' ? value : null
+  log(`system prompt: ${agentSystemPrompt === null ? '默认' : `自定义 ${agentSystemPrompt.length} 字`}`)
+}
+
 /** 从配置文件读界面开关（以前这些只活在内存里，重启就丢） */
 async function loadUiPrefs() {
   try {
@@ -2538,6 +2565,7 @@ async function loadUiPrefs() {
     if (typeof ui.releaseOnFullscreen === 'boolean') releaseOnFullscreen = ui.releaseOnFullscreen
     if (typeof ui.wakeEnabled === 'boolean') wakeOnLaunch = ui.wakeEnabled
     if (typeof config.permissions?.mode === 'string') permissionMode = config.permissions.mode
+    syncAgentSystemPrompt(config)
     if (typeof config?.followup === 'object' && config.followup !== null) {
       followUpConfig = {
         ...FOLLOWUP_DEFAULTS,
@@ -2633,7 +2661,6 @@ function registerSettingsIpc() {
     ])
     const config = await store.loadPublicConfig()
     const audit = await readAuditTail(30)
-
     // 音色列表直接读音色包目录（比等 TTS worker 快得多，worker 冷启动要 20 秒）。
     // worker 已经起来时以它为准——那里才是真正能合成的集合。
     let voices = ttsEngine !== null && ttsEngine.voices.length > 0
@@ -2653,6 +2680,12 @@ function registerSettingsIpc() {
       capabilities,
       voices,
       audit,
+      /**
+       * 内置默认提示词（单一来源 packages/agent/system-prompt.mjs）。
+       * 设置页要显示/复制它、并把它当作"切到自定义"的编辑起点——
+       * 必须由主进程从同一个来源给，不能让前端自己抄一份文案。
+       */
+      defaultSystemPrompt: DEFAULT_SYSTEM_PROMPT,
     }
   })
 
@@ -2673,6 +2706,16 @@ function registerSettingsIpc() {
         && (String(payload.netease.appId ?? '') !== ''
           || String(payload.netease.privateKey ?? '') !== '')
       const saved = await store.saveConfig(next)
+      /*
+       * 系统提示词：落盘成功后同步内存里的值，下一轮对话就用新文本。
+       * 保存失败时 store 已经抛错、文件没动，这里也不会执行——
+       * 所以磁盘和内存不会各说一套（Agent 继续用旧人设）。
+       * 不重建 Agent：CUA 桥接、语音、字幕全都不受影响。
+       */
+      if (payload?.systemPrompt !== undefined) {
+        syncAgentSystemPrompt(saved)
+        if (agentRuntime !== null) agentRuntime.config.systemPrompt = saved.systemPrompt
+      }
       // 保存动作本身带点击声，给它一段静默期，别让 KWS 把它当唤醒词
       wakeMutedUntil = Date.now() + 1500
       /*
@@ -3922,6 +3965,28 @@ async function runSettingsTest() {
   })()`)
   report.steps.push('profile-saved')
 
+  /*
+   * 3) 系统提示词：切自定义（应以完整默认提示词为起点）→ 改文本 → 保存。
+   *    这一步只验界面到落盘/内存的接线，模型收到什么由 tools/verify-system-prompt*.mjs 钉。
+   */
+  const promptEdit = await settings.webContents.executeJavaScript(`(async () => {
+    const custom = document.getElementById('promptModeCustom')
+    const box = document.getElementById('systemPrompt')
+    const status = document.getElementById('status')
+    const defaultShown = document.getElementById('defaultPrompt').textContent
+    custom.click()
+    const prefilled = box.value
+    box.value = '自检自定义提示词\\n第二行行首两个空格：  ok'
+    box.dispatchEvent(new Event('input', { bubbles: true }))
+    document.getElementById('save').click()
+    await new Promise((r) => setTimeout(r, 600))
+    return { ok: status.className === 'ok', status: status.textContent,
+             defaultLength: defaultShown.length, prefilledLength: prefilled.length,
+             prefilledSameAsDefault: prefilled === defaultShown }
+  })()`)
+  report.steps.push('prompt-custom-saved')
+  const memoryPromptAfterCustom = agentSystemPrompt
+
   const savedProfiles = (await store.loadConfig()).modelProfiles ?? []
   settings.close()
   await sleep(400)
@@ -3937,8 +4002,39 @@ async function runSettingsTest() {
     neteaseKey: document.getElementById('neteasePrivateKey').value,
     neteasePlaceholder: document.getElementById('neteasePrivateKey').placeholder,
     defaultProfileValue: document.getElementById('defaultProfile').value,
+    promptCustomChecked: document.getElementById('promptModeCustom').checked,
+    promptValue: document.getElementById('systemPrompt').value,
+    promptAreaHidden: document.getElementById('promptCustomArea').hidden,
   }))()`)
   report.steps.push('reopened')
+
+  /*
+   * 4) 非法内容必须保存失败（红字），且**不能**把刚存好的自定义冲掉；
+   *    再点「恢复默认」保存，确认真回到默认（磁盘 null + 内存 null）。
+   */
+  const promptReject = await reopened.webContents.executeJavaScript(`(async () => {
+    const box = document.getElementById('systemPrompt')
+    const status = document.getElementById('status')
+    box.value = '   \\n  '
+    box.dispatchEvent(new Event('input', { bubbles: true }))
+    document.getElementById('save').click()
+    await new Promise((r) => setTimeout(r, 600))
+    return { cls: status.className, text: status.textContent }
+  })()`)
+  await sleep(300)
+  const afterRejectDisk = await store.loadConfig()
+  const afterReject = { memory: agentSystemPrompt, disk: afterRejectDisk.systemPrompt }
+
+  const promptRestore = await reopened.webContents.executeJavaScript(`(async () => {
+    document.getElementById('restoreDefaultPrompt').click()
+    document.getElementById('save').click()
+    await new Promise((r) => setTimeout(r, 600))
+    return { statusCls: document.getElementById('status').className,
+             defaultChecked: document.getElementById('promptModeDefault').checked,
+             defaultOpen: document.getElementById('defaultPromptDetails').open }
+  })()`)
+  await sleep(300)
+  report.steps.push('prompt-invalid-and-restore')
 
   // 3) 导出审计
   report.exportHint = await reopened.webContents.executeJavaScript(`(async () => {
@@ -3967,6 +4063,31 @@ async function runSettingsTest() {
     reloadedRows: afterReopen.profileRows,
     reloadedNames: afterReopen.profileNames,
     defaultOptions: afterReopen.defaultOptions,
+  }
+  report.systemPrompt = {
+    defaultSourceLength: promptEdit.defaultLength,
+    prefilledFromDefault: promptEdit.prefilledSameAsDefault === true,
+    savedOk: promptEdit.ok === true,
+    memoryAfterCustom: memoryPromptAfterCustom,
+    reloadedCustom: afterReopen.promptCustomChecked === true,
+    reloadedValue: afterReopen.promptValue,
+    reloadedAreaHidden: afterReopen.promptAreaHidden,
+    rejectCls: promptReject.cls,
+    rejectText: promptReject.text,
+    diskAfterReject: afterReject.disk,
+    memoryAfterReject: afterReject.memory,
+    restoreCls: promptRestore.statusCls,
+    restoredToDefault: promptRestore.defaultChecked === true && promptRestore.defaultOpen === true,
+    diskAfterRestore: after.systemPrompt,
+    memoryAfterRestore: agentSystemPrompt,
+    savedModel: after.model,
+    savedProvider: after.providerId,
+    savedApiKeyUnchanged: after.apiKey === before.apiKey,
+    savedMaxSteps: after.maxSteps,
+    /** 诊断用：自检开始前的值（provider/model/maxSteps 应保持不变） */
+    beforeModel: before.model,
+    beforeProvider: before.providerId,
+    beforeMaxSteps: before.maxSteps,
   }
   /*
    * 登录入口检查：按钮在不在、状态查询通不通（不点登录，避免自检时弹浏览器）
@@ -4007,6 +4128,26 @@ async function runSettingsTest() {
     profileSaved: report.profileRoundTrip.savedCount >= 1,
     profileReloaded: report.profileRoundTrip.reloadedRows >= 1,
     saveDoesNotWake: report.hudAfter.visible === false && report.listeningAfter === report.listeningBefore,
+    /** 系统提示词：界面 → 落盘 → 内存 → 重开回显 → 非法拒绝 → 恢复默认 */
+    promptDefaultShown: Number(report.systemPrompt.defaultSourceLength) > 500,
+    promptPrefilledFromDefault: report.systemPrompt.prefilledFromDefault,
+    promptCustomSaved: report.systemPrompt.savedOk
+      && report.systemPrompt.memoryAfterCustom === '自检自定义提示词\n第二行行首两个空格：  ok',
+    promptCustomReloaded: report.systemPrompt.reloadedCustom === true
+      && report.systemPrompt.reloadedAreaHidden === false
+      && report.systemPrompt.reloadedValue === '自检自定义提示词\n第二行行首两个空格：  ok',
+    promptBlankRejected: report.systemPrompt.rejectCls === 'bad'
+      && String(report.systemPrompt.rejectText).includes('空白'),
+    promptBlankKeepsOldValue: report.systemPrompt.diskAfterReject === '自检自定义提示词\n第二行行首两个空格：  ok'
+      && report.systemPrompt.memoryAfterReject === '自检自定义提示词\n第二行行首两个空格：  ok',
+    promptRestoredToDefault: report.systemPrompt.restoredToDefault === true
+      && report.systemPrompt.diskAfterRestore === null
+      && report.systemPrompt.memoryAfterRestore === null
+      && report.systemPrompt.restoreCls === 'ok',
+    promptSaveKeepsOtherSettings: report.systemPrompt.savedModel === report.systemPrompt.beforeModel
+      && report.systemPrompt.savedProvider === report.systemPrompt.beforeProvider
+      && report.systemPrompt.savedApiKeyUnchanged === true
+      && report.systemPrompt.savedMaxSteps === report.systemPrompt.beforeMaxSteps,
   }
   report.pass = Object.values(report.verdict).every((value) => value === true)
 
@@ -4016,6 +4157,8 @@ async function runSettingsTest() {
     ui: { ...(before.ui ?? {}), continuousMode: before.ui?.continuousMode !== false },
     permissions: { ...(before.permissions ?? {}), overrides: before.permissions?.overrides ?? {} },
     modelProfiles: before.modelProfiles ?? [],
+    // 用户原本有自定义提示词的话必须还回去——自检不该顺手抹掉他的人设
+    systemPrompt: before.systemPrompt ?? null,
   })
 
   log(`settings-test report ${JSON.stringify(report)}`)

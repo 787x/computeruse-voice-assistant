@@ -11,6 +11,7 @@ import { readFile, writeFile, mkdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { defaultConfig, getProvider, PROVIDERS } from './registry.mjs'
+import { normalizeSystemPromptForStorage } from '../agent/system-prompt.mjs'
 
 const CONFIG_DIR = process.env.CUA_VA_CONFIG_DIR ?? join(process.cwd(), '.config')
 const CONFIG_PATH = join(CONFIG_DIR, 'agent.json')
@@ -146,6 +147,28 @@ export async function saveConfig(patch) {
   next.maxSteps = Number.isFinite(steps) ? Math.min(20, Math.max(1, Math.round(steps))) : 8
   const temp = Number(next.temperature)
   next.temperature = Number.isFinite(temp) ? Math.min(2, Math.max(0, temp)) : 0.3
+
+  /*
+   * 系统提示词（人设）。语义和密钥**故意不同**，因为这里没有"回显掩码"的问题：
+   *  - patch 里没有这个字段 → 保持原值（保存别的设置不会把用户的提示词冲掉）
+   *  - null → 显式恢复内置默认提示词
+   *  - 其它情况交给 normalizeSystemPromptForStorage：非空文本原样保存（换行、缩进、
+   *    尾随空格都是用户写的内容），非法值抛错 → 整次保存失败、磁盘不动
+   * 注意：空字符串在密钥字段里是"不修改"，在这里是"非法值"——传空串说明调用方没搞清
+   * "恢复默认要传 null"，默默收下只会让用户以为保存成功了。
+   */
+  if (patch.systemPrompt === undefined) {
+    /*
+     * 不修改。这里必须把值显式放回去：`{...current, ...patch}` 在 patch 带
+     * `systemPrompt: undefined`（IPC 结构化克隆会保留 undefined）时会把已存的
+     * 自定义提示词冲成 undefined——落盘后字段消失，用户下次打开设置就"变回默认"了。
+     */
+    next.systemPrompt = current.systemPrompt ?? null
+  } else if (patch.systemPrompt === null) {
+    next.systemPrompt = null
+  } else {
+    next.systemPrompt = normalizeSystemPromptForStorage(patch.systemPrompt)
+  }
 
   /*
    * 模型方案：每条方案的 apiKey 单独打码；掩码值（含 * 或「已保存」）不覆盖原值。
