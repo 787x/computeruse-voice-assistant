@@ -15,6 +15,16 @@ let voices = []
  * 界面只做"显示/复制/当编辑起点"，自己绝不留一份文案副本。
  */
 let defaultPrompt = ''
+/**
+ * 加载时框里的提示词原文（或 null）。
+ * collect() 用它判断"用户有没有真的改提示词"：
+ *  - 框值 == loadedPrompt → 没改，不交 systemPrompt
+ *  - 框值 != loadedPrompt → 改了，交新值
+ *
+ * 为什么不用 state.config.systemPrompt：切模式时 applyPromptModeUI 会把框填成默认提示词，
+ * 此时 state.config.systemPrompt 还是旧值，直接比较会误判成"用户改了"。
+ */
+let loadedPrompt = null
 
 /* ---------------- 系统提示词 ---------------- */
 function promptModeIsCustom() {
@@ -34,9 +44,13 @@ function applyPromptModeUI() {
   $('promptCustomArea').hidden = !custom
   // 默认提示词那块常驻可看：默认模式下自动展开，方便对着原文改
   if (!custom) $('defaultPromptDetails').open = true
-  if (custom && $('systemPrompt').value === '' && defaultPrompt !== '') {
-    // 第一次切自定义：拿完整默认提示词当起点，方便只改人设或个别规则
-    $('systemPrompt').value = defaultPrompt
+  if (custom) {
+    // 切到自定义：如果框是空的，拿完整默认提示词当起点
+    // 但如果框里还有上次的旧草稿（用户从自定义→默认→又切回自定义），必须清掉重填默认
+    // 否则用户看到的是恢复默认前写的旧文本，而不是完整默认提示词
+    if (defaultPrompt !== '') {
+      $('systemPrompt').value = defaultPrompt
+    }
   }
   renderPromptCharCount()
 }
@@ -46,7 +60,13 @@ function fillPromptForm() {
   $('promptModeDefault').checked = !custom
   $('promptModeCustom').checked = custom
   $('defaultPrompt').textContent = defaultPrompt === '' ? '（没拿到默认提示词）' : defaultPrompt
-  if (custom) $('systemPrompt').value = state.config.systemPrompt
+  if (custom) {
+    $('systemPrompt').value = state.config.systemPrompt
+    loadedPrompt = state.config.systemPrompt
+  } else {
+    $('systemPrompt').value = ''
+    loadedPrompt = null
+  }
   applyPromptModeUI()
 }
 
@@ -457,12 +477,21 @@ function collect() {
   }
   /*
    * 系统提示词三态：
-   *  - 自定义 → 交文本（合法性由主进程判，界面不做二次加工、不 trim）
+   *  - 自定义且用户改了 → 交文本（合法性由主进程判，界面不做二次加工、不 trim）
+   *  - 自定义但用户没改 → 不交这个字段（避免无关设置顺手写一遍提示词）
    *  - 默认 + 当前配置是自定义 → 交 null（"我要恢复默认"，语义明确）
-   *  - 默认 + 当前本来就是默认 → 不交这个字段（无关设置不必顺手写一遍提示词）
+   *  - 默认 + 当前本来就是默认 → 不交这个字段
+   *
+   * 关键：用 loadedPrompt 而不是 state.config.systemPrompt 来判断"有没有改"。
+   * 因为切模式时 applyPromptModeUI 会把框填成默认提示词，
+   * 此时 state.config.systemPrompt 还是旧值，直接比较会误判成"用户改了"。
    */
-  if (promptModeIsCustom()) payload.systemPrompt = $('systemPrompt').value
-  else if (typeof state.config.systemPrompt === 'string' && state.config.systemPrompt.trim() !== '') {
+  if (promptModeIsCustom()) {
+    const newPrompt = $('systemPrompt').value
+    if (newPrompt !== loadedPrompt) {
+      payload.systemPrompt = newPrompt
+    }
+  } else if (typeof state.config.systemPrompt === 'string' && state.config.systemPrompt.trim() !== '') {
     payload.systemPrompt = null
   }
   return payload

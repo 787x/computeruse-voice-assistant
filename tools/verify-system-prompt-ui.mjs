@@ -76,7 +76,7 @@ check('默认提示词只有单一来源（前端不抄文案）', () => {
 
 /* 3. 自定义文本原样交给主进程 */
 check('自定义文本原样提交（不 trim、不加工）', () => {
-  assert.match(renderer, /payload\.systemPrompt = \$\('systemPrompt'\)\.value/u)
+  assert.match(renderer, /payload\.systemPrompt = newPrompt/u, '改动后交新值')
   assert.ok(!/systemPrompt'\)\.value\.trim\(\)/u.test(renderer), '提交前不得 trim 用户文本')
   assert.ok(!/systemPrompt'\)\.value\.replace/u.test(renderer), '提交前不得改写用户文本')
   return '直接交 textarea 原值'
@@ -92,11 +92,11 @@ check('恢复默认 = 显式 systemPrompt:null（不是清空/省略）', () => 
 })
 
 /* 5. 切自定义时以完整默认提示词为编辑起点 */
-check('首次切自定义用完整默认提示词当起点', () => {
+check('切自定义用完整默认提示词当起点（含恢复默认后切回）', () => {
   assert.match(renderer, /\$\('systemPrompt'\)\.value = defaultPrompt/u)
-  // 且只在框里没东西时填，别把用户已经写的盖掉
-  assert.match(renderer, /\$\('systemPrompt'\)\.value === '' && defaultPrompt !== ''/u)
-  return '默认文本作为编辑起点'
+  // 切自定义时必须用默认提示词重填，避免恢复默认后切回自定义时显示旧草稿
+  assert.match(renderer, /if \(custom\) \{[\s\S]{0,200}?if \(defaultPrompt !== ''\) \{[\s\S]{0,100}?\$\('systemPrompt'\)\.value = defaultPrompt/u)
+  return '默认文本作为编辑起点，恢复默认后切回也显示完整默认'
 })
 
 /* 6. 不在自定义后追加旧人设 */
@@ -147,6 +147,18 @@ check('提示词保存复用现有保存操作与成功/失败反馈', () => {
   // 校验在主进程：渲染层不做"必须包含某某"的强约束
   assert.ok(!/payload\.systemPrompt[\s\S]{0,200}?(必须|一定要|不能为空)/u.test(renderer), '渲染层不得加人设约束')
   return 'ok/bad 反馈照旧'
+})
+
+/* 10. 无关设置保存不改提示词（P2b） */
+check('改无关设置时不顺手重写提示词（用 loadedPrompt 判改动）', () => {
+  // 必须有 loadedPrompt 变量记录加载时的原值
+  assert.match(renderer, /let loadedPrompt = null/u)
+  // collect() 里必须比较 loadedPrompt，而不是直接拿 config 值比
+  assert.match(renderer, /if \(newPrompt !== loadedPrompt\) \{[\s\S]{0,100}?payload\.systemPrompt = newPrompt/u)
+  // fillPromptForm 里要设置 loadedPrompt
+  assert.match(renderer, /loadedPrompt = state\.config\.systemPrompt/u)
+  assert.match(renderer, /loadedPrompt = null/u)
+  return '只在实际改动时才交 systemPrompt'
 })
 
 console.log('='.repeat(62))

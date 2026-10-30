@@ -2534,43 +2534,53 @@ function registerSettingsIpc() {
         }
       }
       // 音乐不需要凭据：LX 自己管账号，这里不再做任何同步
+      // 1) 先落盘。这一步成功就说明配置已经持久化了，后面运行时操作失败不该让用户看到"保存失败"。
       const saved = await store.saveConfig(next)
       /*
-       * 系统提示词：落盘成功后同步内存里的值，下一轮对话就用新文本。
-       * 保存失败时 store 已经抛错、文件没动，这里也不会执行——
-       * 所以磁盘和内存不会各说一套（Agent 继续用旧人设）。
-       * 不重建 Agent：CUA 桥接、语音、字幕全都不受影响。
+       * 2) 运行时同步（系统提示词、权限门、定时规则）——这些失败只记日志，不回 ok:false。
+       *    否则用户改个 TTS 开关，因为权限门初始化慢了一步就看到红字"保存失败"，
+       *    但其实配置已经写进磁盘了——界面反馈和真实状态不一致。
        */
-      if (payload?.systemPrompt !== undefined) {
-        syncAgentSystemPrompt(saved)
-        if (agentRuntime !== null) agentRuntime.config.systemPrompt = saved.systemPrompt
-      }
+      try {
+        /*
+         * 系统提示词：落盘成功后同步内存里的值，下一轮对话就用新文本。
+         * 保存失败时 store 已经抛错、文件没动，这里也不会执行——
+         * 所以磁盘和内存不会各说一套（Agent 继续用旧人设）。
+         * 不重建 Agent：CUA 桥接、语音、字幕全都不受影响。
+         */
+        if (payload?.systemPrompt !== undefined) {
+          syncAgentSystemPrompt(saved)
+          if (agentRuntime !== null) agentRuntime.config.systemPrompt = saved.systemPrompt
+        }
 
-      // 立刻生效（不用重启）——这些都是内存里的开关与默认值
-      if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled
-      if (typeof payload?.ui?.continuousMode === 'boolean') continuousMode = payload.ui.continuousMode
-      if (typeof payload?.ui?.voiceConfirmEnabled === 'boolean') setVoiceConfirmEnabled(payload.ui.voiceConfirmEnabled)
-      if (typeof payload?.ui?.subtitles === 'boolean') subtitlesEnabled = payload.ui.subtitles
-      if (typeof payload?.ui?.autoStart === 'boolean') {
-        autoStartEnabled = payload.ui.autoStart
-        applyAutoStart(autoStartEnabled)
+        // 立刻生效（不用重启）——这些都是内存里的开关与默认值
+        if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled
+        if (typeof payload?.ui?.continuousMode === 'boolean') continuousMode = payload.ui.continuousMode
+        if (typeof payload?.ui?.voiceConfirmEnabled === 'boolean') setVoiceConfirmEnabled(payload.ui.voiceConfirmEnabled)
+        if (typeof payload?.ui?.subtitles === 'boolean') subtitlesEnabled = payload.ui.subtitles
+        if (typeof payload?.ui?.autoStart === 'boolean') {
+          autoStartEnabled = payload.ui.autoStart
+          applyAutoStart(autoStartEnabled)
+        }
+        if (typeof payload?.ui?.releaseOnFullscreen === 'boolean') releaseOnFullscreen = payload.ui.releaseOnFullscreen
+        if (typeof payload?.tts?.emotion === 'string') ttsEmotion = payload.tts.emotion
+        if (Number.isFinite(Number(payload?.tts?.speed))) ttsSpeed = Number(payload.tts.speed)
+        if (payload?.permissions !== undefined) {
+          const gateInstance = await ensurePermissions()
+          gateInstance.update({
+            mode: payload.permissions.mode ?? gateInstance.permissions.mode,
+            overrides: payload.permissions.overrides ?? {},
+          })
+        }
+        // 定时切换改了规则要立刻生效，不用等下一轮轮询
+        if (payload?.modelSchedule !== undefined && agentRuntime !== null) {
+          agentRuntime.config.modelSchedule = payload.modelSchedule
+          applyModelSchedule('settings')
+        }
+        if (!ttsEnabled) stopSpeaking()
+      } catch (runtimeError) {
+        log(`settings runtime sync failed (disk saved ok): ${runtimeError.message}`)
       }
-      if (typeof payload?.ui?.releaseOnFullscreen === 'boolean') releaseOnFullscreen = payload.ui.releaseOnFullscreen
-      if (typeof payload?.tts?.emotion === 'string') ttsEmotion = payload.tts.emotion
-      if (Number.isFinite(Number(payload?.tts?.speed))) ttsSpeed = Number(payload.tts.speed)
-      if (payload?.permissions !== undefined) {
-        const gateInstance = await ensurePermissions()
-        gateInstance.update({
-          mode: payload.permissions.mode ?? gateInstance.permissions.mode,
-          overrides: payload.permissions.overrides ?? {},
-        })
-      }
-      // 定时切换改了规则要立刻生效，不用等下一轮轮询
-      if (payload?.modelSchedule !== undefined && agentRuntime !== null) {
-        agentRuntime.config.modelSchedule = payload.modelSchedule
-        applyModelSchedule('settings')
-      }
-      if (!ttsEnabled) stopSpeaking()
       log(`settings saved: tts=${ttsEnabled} emotion=${ttsEmotion} speed=${ttsSpeed} mode=${payload?.permissions?.mode ?? '-'}`)
       return { ok: true, config: saved }
     } catch (error) {
@@ -3691,10 +3701,13 @@ async function runSearchTest(query) {
  * 只测"接线"：表单 → preload → IPC → store → 内存开关。
  * 不测界面好不好看，也不测模型连通性（那要网络，且已有 --cmd-demo 覆盖）。
  */
+// ---- runSettingsTest body starts here ----
 async function runSettingsTest() {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const store = await import('../../packages/config/store.mjs')
-  const before = await store.loadConfig()
+  // 1) 立即备份完整原文——自检要改很多字段，结束后（无论成功/异常/崩溃）恢复原状
+  let backup = null
+  try { backup = JSON.parse(JSON.stringify(await store.loadConfig())) } catch { backup = null }
 
   const waitReady = async (target, ms = 5000) => {
     if (!target.webContents.isLoading()) return
@@ -3717,223 +3730,251 @@ async function runSettingsTest() {
   await waitReady(settings)
   await sleep(600)
 
-  // 1) 改表单并保存，顺便量保存耗时（保存必须秒回，否则窗口会显示"未响应"）
-  const applied = await settings.webContents.executeJavaScript(`(async () => {
-    const emotion = document.getElementById('emotion')
-    const speed = document.getElementById('speed')
-    const continuous = document.getElementById('continuousMode')
-    const keyboard = document.querySelector('#capabilities select[data-capability="input.keyboard"]')
-    if (!emotion || !speed) return { ok: false, error: '表单没渲染出来' }
-    emotion.value = '生气'
-    speed.value = '1.15'
-    if (continuous) continuous.checked = false
-    if (keyboard) keyboard.value = 'ask'
-    const started = performance.now()
-    document.getElementById('save').click()
-    await new Promise((r) => setTimeout(r, 600))
-    return {
-      ok: true,
-      saveMs: Math.round(performance.now() - started),
-      options: Array.from(emotion.options).map((o) => o.value),
-      capabilityCount: document.querySelectorAll('#capabilities select').length,
+  try {
+    // 1) 改表单并保存，顺便量保存耗时（保存必须秒回，否则窗口会显示"未响应"）
+    const applied = await settings.webContents.executeJavaScript(`(async () => {
+      const emotion = document.getElementById('emotion')
+      const speed = document.getElementById('speed')
+      const continuous = document.getElementById('continuousMode')
+      const keyboard = document.querySelector('#capabilities select[data-capability="input.keyboard"]')
+      if (!emotion || !speed) return { ok: false, error: '表单没渲染出来' }
+      emotion.value = '生气'
+      speed.value = '1.15'
+      if (continuous) continuous.checked = false
+      if (keyboard) keyboard.value = 'ask'
+      const started = performance.now()
+      document.getElementById('save').click()
+      await new Promise((r) => setTimeout(r, 600))
+      return {
+        ok: true,
+        saveMs: Math.round(performance.now() - started),
+        options: Array.from(emotion.options).map((o) => o.value),
+        capabilityCount: document.querySelectorAll('#capabilities select').length,
+      }
+    })()`)
+    report.steps.push('form-saved')
+
+    // 2) 加一套模型方案并保存，然后关窗重开，看它有没有留下来
+    const added = await settings.webContents.executeJavaScript(`(async () => {
+      document.getElementById('addProfile').click()
+      const row = document.querySelector('#profileRows tr')
+      if (!row) return { ok: false }
+      row.querySelector('[data-field="name"]').value = '自检方案'
+      row.querySelector('[data-field="model"]').value = 'mimo-v2.6-flash'
+      row.querySelector('[data-field="apiKey"]').value = 'sk-selftest-not-real'
+      document.getElementById('save').click()
+      await new Promise((r) => setTimeout(r, 600))
+      return { ok: true, rows: document.querySelectorAll('#profileRows tr').length }
+    })()`)
+    report.steps.push('profile-saved')
+
+    /*
+     * 3) 系统提示词：切自定义（应以完整默认提示词为起点）→ 改文本 → 保存。
+     *    这一步只验界面到落盘/内存的接线，模型收到什么由 tools/verify-system-prompt*.mjs 钉。
+     */
+    const promptEdit = await settings.webContents.executeJavaScript(`(async () => {
+      const custom = document.getElementById('promptModeCustom')
+      const box = document.getElementById('systemPrompt')
+      const status = document.getElementById('status')
+      const defaultShown = document.getElementById('defaultPrompt').textContent
+      custom.click()
+      const prefilled = box.value
+      box.value = '自检自定义提示词\\n第二行行首两个空格：  ok'
+      box.dispatchEvent(new Event('input', { bubbles: true }))
+      document.getElementById('save').click()
+      await new Promise((r) => setTimeout(r, 600))
+      return { ok: status.className === 'ok', status: status.textContent,
+               defaultLength: defaultShown.length, prefilledLength: prefilled.length,
+               prefilledSameAsDefault: prefilled === defaultShown }
+    })()`)
+    report.steps.push('prompt-custom-saved')
+    const memoryPromptAfterCustom = agentSystemPrompt
+
+    const savedProfiles = (await store.loadConfig()).modelProfiles ?? []
+    settings.close()
+    await sleep(400)
+    const reopened = openSettings()
+    await waitReady(reopened)
+    await sleep(600)
+
+    const afterReopen = await reopened.webContents.executeJavaScript(`(() => ({
+      profileRows: document.querySelectorAll('#profileRows tr').length,
+      profileNames: Array.from(document.querySelectorAll('#profileRows [data-field="name"]')).map((input) => input.value),
+      defaultOptions: Array.from(document.getElementById('defaultProfile').options).map((option) => option.textContent),
+      neteaseAppId: document.getElementById('neteaseAppId').value,
+      neteaseKey: document.getElementById('neteasePrivateKey').value,
+      neteasePlaceholder: document.getElementById('neteasePrivateKey').placeholder,
+      defaultProfileValue: document.getElementById('defaultProfile').value,
+      promptCustomChecked: document.getElementById('promptModeCustom').checked,
+      promptValue: document.getElementById('systemPrompt').value,
+      promptAreaHidden: document.getElementById('promptCustomArea').hidden,
+    }))()`)
+    report.steps.push('reopened')
+
+    /*
+     * 4) 非法内容必须保存失败（红字），且**不能**把刚存好的自定义冲掉；
+     *    再点「恢复默认」保存，确认真回到默认（磁盘 null + 内存 null）。
+     */
+    const promptReject = await reopened.webContents.executeJavaScript(`(async () => {
+      const box = document.getElementById('systemPrompt')
+      const status = document.getElementById('status')
+      box.value = '   \\n  '
+      box.dispatchEvent(new Event('input', { bubbles: true }))
+      document.getElementById('save').click()
+      await new Promise((r) => setTimeout(r, 600))
+      return { cls: status.className, text: status.textContent }
+    })()`)
+    await sleep(300)
+    const afterRejectDisk = await store.loadConfig()
+    const afterReject = { memory: agentSystemPrompt, disk: afterRejectDisk.systemPrompt }
+
+    const promptRestore = await reopened.webContents.executeJavaScript(`(async () => {
+      document.getElementById('restoreDefaultPrompt').click()
+      document.getElementById('save').click()
+      await new Promise((r) => setTimeout(r, 600))
+      return { statusCls: document.getElementById('status').className,
+               defaultChecked: document.getElementById('promptModeDefault').checked,
+               defaultOpen: document.getElementById('defaultPromptDetails').open }
+    })()`)
+    await sleep(300)
+    report.steps.push('prompt-invalid-and-restore')
+
+    // 3) 导出审计
+    report.exportHint = await reopened.webContents.executeJavaScript(`(async () => {
+      document.getElementById('exportAudit').click()
+      await new Promise((r) => setTimeout(r, 1500))
+      return document.getElementById('auditHint').textContent
+    })()`)
+
+    await sleep(400)
+    const after = await store.loadConfig()
+    report.hudAfter = { visible: win !== null && !win.isDestroyed() && win.isVisible(), listening }
+    report.listeningAfter = listening
+    report.formApplied = applied.ok === true
+    report.saveLatencyMs = applied.saveMs
+    report.emotionOptions = applied.options
+    report.capabilityCount = applied.capabilityCount
+    report.savedEmotion = after.tts?.emotion
+    report.savedSpeed = after.tts?.speed
+    report.savedContinuous = after.ui?.continuousMode
+    report.savedOverride = after.permissions?.overrides?.['input.keyboard']
+    report.memoryEmotion = ttsEmotion
+    report.memoryContinuous = continuousMode
+    report.profileRoundTrip = {
+      added: added.ok === true,
+      savedCount: savedProfiles.length,
+      reloadedRows: afterReopen.profileRows,
+      reloadedNames: afterReopen.profileNames,
+      defaultOptions: afterReopen.defaultOptions,
     }
-  })()`)
-  report.steps.push('form-saved')
-
-  // 2) 加一套模型方案并保存，然后关窗重开，看它有没有留下来
-  const added = await settings.webContents.executeJavaScript(`(async () => {
-    document.getElementById('addProfile').click()
-    const row = document.querySelector('#profileRows tr')
-    if (!row) return { ok: false }
-    row.querySelector('[data-field="name"]').value = '自检方案'
-    row.querySelector('[data-field="model"]').value = 'mimo-v2.6-flash'
-    row.querySelector('[data-field="apiKey"]').value = 'sk-selftest-not-real'
-    document.getElementById('save').click()
-    await new Promise((r) => setTimeout(r, 600))
-    return { ok: true, rows: document.querySelectorAll('#profileRows tr').length }
-  })()`)
-  report.steps.push('profile-saved')
-
-  /*
-   * 3) 系统提示词：切自定义（应以完整默认提示词为起点）→ 改文本 → 保存。
-   *    这一步只验界面到落盘/内存的接线，模型收到什么由 tools/verify-system-prompt*.mjs 钉。
-   */
-  const promptEdit = await settings.webContents.executeJavaScript(`(async () => {
-    const custom = document.getElementById('promptModeCustom')
-    const box = document.getElementById('systemPrompt')
-    const status = document.getElementById('status')
-    const defaultShown = document.getElementById('defaultPrompt').textContent
-    custom.click()
-    const prefilled = box.value
-    box.value = '自检自定义提示词\\n第二行行首两个空格：  ok'
-    box.dispatchEvent(new Event('input', { bubbles: true }))
-    document.getElementById('save').click()
-    await new Promise((r) => setTimeout(r, 600))
-    return { ok: status.className === 'ok', status: status.textContent,
-             defaultLength: defaultShown.length, prefilledLength: prefilled.length,
-             prefilledSameAsDefault: prefilled === defaultShown }
-  })()`)
-  report.steps.push('prompt-custom-saved')
-  const memoryPromptAfterCustom = agentSystemPrompt
-
-  const savedProfiles = (await store.loadConfig()).modelProfiles ?? []
-  settings.close()
-  await sleep(400)
-  const reopened = openSettings()
-  await waitReady(reopened)
-  await sleep(600)
-
-  const afterReopen = await reopened.webContents.executeJavaScript(`(() => ({
-    profileRows: document.querySelectorAll('#profileRows tr').length,
-    profileNames: Array.from(document.querySelectorAll('#profileRows [data-field="name"]')).map((input) => input.value),
-    defaultOptions: Array.from(document.getElementById('defaultProfile').options).map((option) => option.textContent),
-    defaultProfileValue: document.getElementById('defaultProfile').value,
-    promptCustomChecked: document.getElementById('promptModeCustom').checked,
-    promptValue: document.getElementById('systemPrompt').value,
-    promptAreaHidden: document.getElementById('promptCustomArea').hidden,
-  }))()`)
-  report.steps.push('reopened')
-
-  /*
-   * 4) 非法内容必须保存失败（红字），且**不能**把刚存好的自定义冲掉；
-   *    再点「恢复默认」保存，确认真回到默认（磁盘 null + 内存 null）。
-   */
-  const promptReject = await reopened.webContents.executeJavaScript(`(async () => {
-    const box = document.getElementById('systemPrompt')
-    const status = document.getElementById('status')
-    box.value = '   \\n  '
-    box.dispatchEvent(new Event('input', { bubbles: true }))
-    document.getElementById('save').click()
-    await new Promise((r) => setTimeout(r, 600))
-    return { cls: status.className, text: status.textContent }
-  })()`)
-  await sleep(300)
-  const afterReject = { memory: agentSystemPrompt, disk: (await store.loadConfig()).systemPrompt }
-
-  const promptRestore = await reopened.webContents.executeJavaScript(`(async () => {
-    document.getElementById('restoreDefaultPrompt').click()
-    document.getElementById('save').click()
-    await new Promise((r) => setTimeout(r, 600))
-    return { statusCls: document.getElementById('status').className,
-             defaultChecked: document.getElementById('promptModeDefault').checked,
-             defaultOpen: document.getElementById('defaultPromptDetails').open }
-  })()`)
-  await sleep(300)
-  report.steps.push('prompt-invalid-and-restore')
-
-  // 3) 导出审计
-  report.exportHint = await reopened.webContents.executeJavaScript(`(async () => {
-    document.getElementById('exportAudit').click()
-    await new Promise((r) => setTimeout(r, 1500))
-    return document.getElementById('auditHint').textContent
-  })()`)
-
-  await sleep(400)
-  const after = await store.loadConfig()
-  report.hudAfter = { visible: win !== null && !win.isDestroyed() && win.isVisible(), listening }
-  report.listeningAfter = listening
-  report.formApplied = applied.ok === true
-  report.saveLatencyMs = applied.saveMs
-  report.emotionOptions = applied.options
-  report.capabilityCount = applied.capabilityCount
-  report.savedEmotion = after.tts?.emotion
-  report.savedSpeed = after.tts?.speed
-  report.savedContinuous = after.ui?.continuousMode
-  report.savedOverride = after.permissions?.overrides?.['input.keyboard']
-  report.memoryEmotion = ttsEmotion
-  report.memoryContinuous = continuousMode
-  report.profileRoundTrip = {
-    added: added.ok === true,
-    savedCount: savedProfiles.length,
-    reloadedRows: afterReopen.profileRows,
-    reloadedNames: afterReopen.profileNames,
-    defaultOptions: afterReopen.defaultOptions,
-  }
-  report.systemPrompt = {
-    defaultSourceLength: promptEdit.defaultLength,
-    prefilledFromDefault: promptEdit.prefilledSameAsDefault === true,
-    savedOk: promptEdit.ok === true,
-    memoryAfterCustom: memoryPromptAfterCustom,
-    reloadedCustom: afterReopen.promptCustomChecked === true,
-    reloadedValue: afterReopen.promptValue,
-    reloadedAreaHidden: afterReopen.promptAreaHidden,
-    rejectCls: promptReject.cls,
-    rejectText: promptReject.text,
-    diskAfterReject: afterReject.disk,
-    memoryAfterReject: afterReject.memory,
-    restoreCls: promptRestore.statusCls,
-    restoredToDefault: promptRestore.defaultChecked === true && promptRestore.defaultOpen === true,
-    diskAfterRestore: after.systemPrompt,
-    memoryAfterRestore: agentSystemPrompt,
-    savedModel: after.model,
-    savedProvider: after.providerId,
-    savedApiKeyUnchanged: after.apiKey === before.apiKey,
-    savedMaxSteps: after.maxSteps,
-    /** 诊断用：自检开始前的值（provider/model/maxSteps 应保持不变） */
-    beforeModel: before.model,
-    beforeProvider: before.providerId,
-    beforeMaxSteps: before.maxSteps,
-  }
-  /* 音乐改用 LX：检查"LX 在不在"这个入口能否调通 */
-  report.lxStatus = await reopened.webContents.executeJavaScript(`(async () => {
-    try {
-      const result = await window.settingsApi.lxStatus()
-      return { ok: result.ok === true, status: result.status ?? '', error: result.error ?? '' }
-    } catch (error) {
-      return { ok: false, error: String(error && error.message) }
+    report.systemPrompt = {
+      defaultSourceLength: promptEdit.defaultLength,
+      prefilledFromDefault: promptEdit.prefilledSameAsDefault === true,
+      savedOk: promptEdit.ok === true,
+      memoryAfterCustom: memoryPromptAfterCustom,
+      reloadedCustom: afterReopen.promptCustomChecked === true,
+      reloadedValue: afterReopen.promptValue,
+      reloadedAreaHidden: afterReopen.promptAreaHidden,
+      rejectCls: promptReject.cls,
+      rejectText: promptReject.text,
+      diskAfterReject: afterReject.disk,
+      memoryAfterReject: afterReject.memory,
+      restoreCls: promptRestore.statusCls,
+      restoredToDefault: promptRestore.defaultChecked === true && promptRestore.defaultOpen === true,
+      diskAfterRestore: after.systemPrompt,
+      memoryAfterRestore: agentSystemPrompt,
+      savedModel: after.model,
+      savedProvider: after.providerId,
+      savedApiKeyUnchanged: after.apiKey === before.apiKey,
+      savedMaxSteps: after.maxSteps,
+      /** 诊断用：自检开始前的值（provider/model/maxSteps 应保持不变） */
+      beforeModel: before.model,
+      beforeProvider: before.providerId,
+      beforeMaxSteps: before.maxSteps,
     }
-  })()`)
+    /*
+     * 登录入口检查：按钮在不在、状态查询通不通（不点登录，避免自检时弹浏览器）
+     */
+    const loginProbe = await reopened.webContents.executeJavaScript(`(async () => {
+      const button = document.getElementById('neteaseLogin')
+      let statusOk = false
+      let statusText = ''
+      try {
+        const status = await window.settingsApi.neteaseStatus()
+        statusOk = status.ok === true
+        statusText = status.loggedIn === true ? 'loggedIn' : 'notLoggedIn'
+      } catch (error) { statusText = String(error && error.message) }
+      return { hasButton: Boolean(button), statusOk, statusText }
+    })()`)
+    report.neteaseLogin = loginProbe
 
+    report.neteaseUi = {
+      hasFields: afterReopen.neteaseAppId !== undefined,
+      appIdValue: afterReopen.neteaseAppId,
+      keyValue: afterReopen.neteaseKey,
+      keyPlaceholder: afterReopen.neteasePlaceholder,
+    }
 
-  report.verdict = {
-    formWorks: report.formApplied,
-    capabilityTable: Number(report.capabilityCount) >= 10,
-    persisted: report.savedEmotion === '生气' && Number(report.savedSpeed) === 1.15,
-    appliedToRuntime: report.memoryEmotion === '生气' && report.memoryContinuous === false,
-    uiTogglePersisted: report.savedContinuous === false,
-    permissionOverrideSaved: report.savedOverride === 'ask',
-    auditExportWorks: typeof report.exportHint === 'string' && report.exportHint.includes('已导出'),
-    lxStatusWorks: report.lxStatus?.ok === true,
-    settingsSaveFast: Number(report.saveLatencyMs) < 1500,
-    profileSaved: report.profileRoundTrip.savedCount >= 1,
-    profileReloaded: report.profileRoundTrip.reloadedRows >= 1,
-    saveDoesNotWake: report.hudAfter.visible === false && report.listeningAfter === report.listeningBefore,
-    /** 系统提示词：界面 → 落盘 → 内存 → 重开回显 → 非法拒绝 → 恢复默认 */
-    promptDefaultShown: Number(report.systemPrompt.defaultSourceLength) > 500,
-    promptPrefilledFromDefault: report.systemPrompt.prefilledFromDefault,
-    promptCustomSaved: report.systemPrompt.savedOk
-      && report.systemPrompt.memoryAfterCustom === '自检自定义提示词\n第二行行首两个空格：  ok',
-    promptCustomReloaded: report.systemPrompt.reloadedCustom === true
-      && report.systemPrompt.reloadedAreaHidden === false
-      && report.systemPrompt.reloadedValue === '自检自定义提示词\n第二行行首两个空格：  ok',
-    promptBlankRejected: report.systemPrompt.rejectCls === 'bad'
-      && String(report.systemPrompt.rejectText).includes('空白'),
-    promptBlankKeepsOldValue: report.systemPrompt.diskAfterReject === '自检自定义提示词\n第二行行首两个空格：  ok'
-      && report.systemPrompt.memoryAfterReject === '自检自定义提示词\n第二行行首两个空格：  ok',
-    promptRestoredToDefault: report.systemPrompt.restoredToDefault === true
-      && report.systemPrompt.diskAfterRestore === null
-      && report.systemPrompt.memoryAfterRestore === null
-      && report.systemPrompt.restoreCls === 'ok',
-    promptSaveKeepsOtherSettings: report.systemPrompt.savedModel === report.systemPrompt.beforeModel
-      && report.systemPrompt.savedProvider === report.systemPrompt.beforeProvider
-      && report.systemPrompt.savedApiKeyUnchanged === true
-      && report.systemPrompt.savedMaxSteps === report.systemPrompt.beforeMaxSteps,
+    report.verdict = {
+      formWorks: report.formApplied,
+      capabilityTable: Number(report.capabilityCount) >= 10,
+      persisted: report.savedEmotion === '生气' && Number(report.savedSpeed) === 1.15,
+      appliedToRuntime: report.memoryEmotion === '生气' && report.memoryContinuous === false,
+      uiTogglePersisted: report.savedContinuous === false,
+      permissionOverrideSaved: report.savedOverride === 'ask',
+      auditExportWorks: typeof report.exportHint === 'string' && report.exportHint.includes('已导出'),
+      neteaseFields: report.neteaseUi.appIdValue !== undefined,
+      neteaseKeyNotEchoed: report.neteaseUi.keyValue === '',
+      neteaseLoginButton: report.neteaseLogin?.hasButton === true,
+      neteaseStatusWorks: report.neteaseLogin?.statusOk === true,
+      settingsSaveFast: Number(report.saveLatencyMs) < 1500,
+      profileSaved: report.profileRoundTrip.savedCount >= 1,
+      profileReloaded: report.profileRoundTrip.reloadedRows >= 1,
+      saveDoesNotWake: report.hudAfter.visible === false && report.listeningAfter === report.listeningBefore,
+      /** 系统提示词：界面 → 落盘 → 内存 → 重开回显 → 非法拒绝 → 恢复默认 */
+      promptDefaultShown: Number(report.systemPrompt.defaultSourceLength) > 500,
+      promptPrefilledFromDefault: report.systemPrompt.prefilledFromDefault,
+      promptCustomSaved: report.systemPrompt.savedOk
+        && report.systemPrompt.memoryAfterCustom === '自检自定义提示词\n第二行行首两个空格：  ok',
+      promptCustomReloaded: report.systemPrompt.reloadedCustom === true
+        && report.systemPrompt.reloadedAreaHidden === false
+        && report.systemPrompt.reloadedValue === '自检自定义提示词\n第二行行首两个空格：  ok',
+      promptBlankRejected: report.systemPrompt.rejectCls === 'bad'
+        && String(report.systemPrompt.rejectText).includes('空白'),
+      promptBlankKeepsOldValue: report.systemPrompt.diskAfterReject === '自检自定义提示词\n第二行行首两个空格：  ok'
+        && report.systemPrompt.memoryAfterReject === '自检自定义提示词\n第二行行首两个空格：  ok',
+      promptRestoredToDefault: report.systemPrompt.restoredToDefault === true
+        && report.systemPrompt.diskAfterRestore === null
+        && report.systemPrompt.memoryAfterRestore === null
+        && report.systemPrompt.restoreCls === 'ok',
+      promptSaveKeepsOtherSettings: report.systemPrompt.savedModel === report.systemPrompt.beforeModel
+        && report.systemPrompt.savedProvider === report.systemPrompt.beforeProvider
+        && report.systemPrompt.savedApiKeyUnchanged === true
+        && report.systemPrompt.savedMaxSteps === report.systemPrompt.beforeMaxSteps,
+    }
+    report.pass = Object.values(report.verdict).every((value) => value === true)
+  } finally {
+    // 无论自检是否顺利甚至过程崩溃，都把备份的原文完整写回，保证用户的真实配置不受影响
+    if (backup !== null) {
+      try {
+        await store.saveConfig({
+          tts: { ...(backup.tts ?? {}) },
+          ui: { ...(backup.ui ?? {}), continuousMode: backup.ui?.continuousMode !== false },
+          permissions: { ...(backup.permissions ?? {}), overrides: backup.permissions?.overrides ?? {} },
+          modelProfiles: backup.modelProfiles ?? [],
+          // 用户原本有自定义提示词的话必须还回去——自检不该顺手抹掉他的人设
+          systemPrompt: backup.systemPrompt ?? null,
+        })
+      } catch (restoreError) {
+        log(`settings-test config restore failed: ${restoreError.message}`)
+      }
+    }
   }
-  report.pass = Object.values(report.verdict).every((value) => value === true)
-
-  // 还原现场：把自检改过的配置写回去
-  await store.saveConfig({
-    tts: { ...(before.tts ?? {}) },
-    ui: { ...(before.ui ?? {}), continuousMode: before.ui?.continuousMode !== false },
-    permissions: { ...(before.permissions ?? {}), overrides: before.permissions?.overrides ?? {} },
-    modelProfiles: before.modelProfiles ?? [],
-  })
 
   log(`settings-test report ${JSON.stringify(report)}`)
   console.log('__SETTINGS__' + JSON.stringify(report))
   setTimeout(() => { app.isQuitting = true; app.exit(0) }, 300)
 }
-
 /**
  * 离线兜底验收（--offline-test）：强制断网，跑三句话。
  *   "现在几点"        → 本地时钟，应当答出来

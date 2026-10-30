@@ -15,6 +15,7 @@ let voices = []
  * 界面只做"显示/复制/当编辑起点"，自己绝不留一份文案副本。
  */
 let defaultPrompt = ''
+let loadedPrompt = null
 
 /* ---------------- 系统提示词 ---------------- */
 function promptModeIsCustom() {
@@ -46,7 +47,13 @@ function fillPromptForm() {
   $('promptModeDefault').checked = !custom
   $('promptModeCustom').checked = custom
   $('defaultPrompt').textContent = defaultPrompt === '' ? '（没拿到默认提示词）' : defaultPrompt
-  if (custom) $('systemPrompt').value = state.config.systemPrompt
+  if (custom) {
+    $('systemPrompt').value = state.config.systemPrompt
+    loadedPrompt = state.config.systemPrompt
+  } else {
+    $('systemPrompt').value = ''
+    loadedPrompt = null
+  }
   applyPromptModeUI()
 }
 
@@ -449,8 +456,12 @@ function collect() {
    *  - 默认 + 当前配置是自定义 → 交 null（"我要恢复默认"，语义明确）
    *  - 默认 + 当前本来就是默认 → 不交这个字段（无关设置不必顺手写一遍提示词）
    */
-  if (promptModeIsCustom()) payload.systemPrompt = $('systemPrompt').value
-  else if (typeof state.config.systemPrompt === 'string' && state.config.systemPrompt.trim() !== '') {
+  if (promptModeIsCustom()) {
+    const newPrompt = $('systemPrompt').value
+    if (newPrompt !== loadedPrompt) {
+      payload.systemPrompt = newPrompt
+    }
+  } else if (typeof state.config.systemPrompt === 'string' && state.config.systemPrompt.trim() !== '') {
     payload.systemPrompt = null
   }
   return payload
