@@ -16,6 +16,12 @@ let voices = []
  */
 let defaultPrompt = ''
 let loadedPrompt = null
+/**
+ * 用户是否已点击「恢复默认」并成功保存。
+ * 为 true 时，切回自定义模式应以完整默认提示词为起点，
+ * 而不是显示恢复默认前写的旧草稿。
+ */
+let restoredDefault = false
 
 /* ---------------- 系统提示词 ---------------- */
 function promptModeIsCustom() {
@@ -54,6 +60,7 @@ function fillPromptForm() {
     $('systemPrompt').value = ''
     loadedPrompt = null
   }
+  restoredDefault = !custom
   applyPromptModeUI()
 }
 
@@ -510,13 +517,22 @@ $('provider').addEventListener('change', () => {
 $('save').addEventListener('click', async () => {
   setStatus('保存中…')
   $('save').disabled = true
-  const result = await window.settingsApi.save(collect())
+  const payload = collect()
+  const result = await window.settingsApi.save(payload)
   $('save').disabled = false
   if (result.ok) {
     state.config = result.config
     fillForm()
-    setStatus('已保存', 'ok')
+    if (payload.systemPrompt === null) restoredDefault = true
+    if (result.warnings && result.warnings.length > 0) {
+      // 磁盘已保存但部分运行时同步失败——明确告知用户哪些没生效
+      setStatus(`已保存，但有 ${result.warnings.length} 项未即时生效：${result.warnings.join('；')}`, 'warn')
+    } else {
+      setStatus('已保存', 'ok')
+    }
   } else {
+    // 保存失败：loadedPrompt 不变（还是加载时的原值），
+    // 用户草稿保留在框里，下次保存时会正确提交
     setStatus(result.error ?? '保存失败', 'bad')
   }
 })

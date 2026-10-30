@@ -92,11 +92,11 @@ check('恢复默认 = 显式 systemPrompt:null（不是清空/省略）', () => 
 })
 
 /* 5. 切自定义时以完整默认提示词为编辑起点 */
-check('切自定义用完整默认提示词当起点（含恢复默认后切回）', () => {
+check('切自定义用完整默认提示词当起点（仅在框空时）', () => {
+  // 只在框是空的时候才填默认提示词，不覆盖已保存的自定义或未保存的草稿
+  assert.match(renderer, /if \(custom && \$\('systemPrompt'\)\.value === '' && defaultPrompt !== ''\)/u)
   assert.match(renderer, /\$\('systemPrompt'\)\.value = defaultPrompt/u)
-  // 切自定义时必须用默认提示词重填，避免恢复默认后切回自定义时显示旧草稿
-  assert.match(renderer, /if \(custom\) \{[\s\S]{0,200}?if \(defaultPrompt !== ''\) \{[\s\S]{0,100}?\$\('systemPrompt'\)\.value = defaultPrompt/u)
-  return '默认文本作为编辑起点，恢复默认后切回也显示完整默认'
+  return '仅在框空时填默认，不覆盖已保存内容或草稿'
 })
 
 /* 6. 不在自定义后追加旧人设 */

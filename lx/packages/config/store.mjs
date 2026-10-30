@@ -16,10 +16,25 @@ import { normalizeSystemPromptForStorage } from '../agent/system-prompt.mjs'
 const CONFIG_DIR = process.env.CUA_VA_CONFIG_DIR ?? join(process.cwd(), '.config')
 const CONFIG_PATH = join(CONFIG_DIR, 'agent.json')
 
+/** 当前配置目录（可动态修改，供 --settings-test 隔离使用） */
+let currentConfigDir = CONFIG_DIR
+let currentConfigPath = CONFIG_PATH
+
+/** 设置配置目录（供测试隔离使用）。必须在任何 loadConfig/saveConfig 调用前设置。 */
+export function setConfigDir(dir) {
+  currentConfigDir = dir
+  currentConfigPath = join(dir, 'agent.json')
+}
+
+/** 获取当前配置路径（供日志/审计使用） */
+export function getConfigPath() {
+  return currentConfigPath
+}
+
 /** 读取原始配置（含明文密钥），供内部调用。落盘的 `enc:` 密文在这里解回明文。 */
 export async function loadConfig() {
   try {
-    const raw = await readFile(CONFIG_PATH, 'utf8')
+    const raw = await readFile(currentConfigPath, 'utf8')
     const parsed = JSON.parse(raw)
     const merged = { ...defaultConfig(), ...parsed }
     merged.apiKey = decryptField(merged.apiKey)
@@ -196,10 +211,10 @@ export async function saveConfig(patch) {
     next.search = { ...next.search, apiKey: encryptField(next.search.apiKey) }
   }
 
-  await mkdir(CONFIG_DIR, { recursive: true })
-  const tmp = `${CONFIG_PATH}.tmp`
+  await mkdir(currentConfigDir, { recursive: true })
+  const tmp = `${currentConfigPath}.tmp`
   await writeFile(tmp, JSON.stringify(next, null, 2), 'utf8')
-  await rename(tmp, CONFIG_PATH)
+  await rename(tmp, currentConfigPath)
   return loadPublicConfig()
 }
 
@@ -228,4 +243,9 @@ export function listProviders() {
   return PROVIDERS
 }
 
+export function getConfigFile() {
+  return currentConfigPath
+}
+
+/** 兼容旧代码：动态获取当前配置文件路径 */
 export const CONFIG_FILE = CONFIG_PATH

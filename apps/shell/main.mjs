@@ -2052,11 +2052,11 @@ async function ensurePermissions() {
   const config = await store.loadConfig()
   permissionGate = new PermissionGate({
     permissions: config.permissions ?? {},
-    auditPath: join(dirname(store.CONFIG_FILE), 'audit.jsonl'),
+    auditPath: join(dirname(store.getConfigFile()), 'audit.jsonl'),
     confirm: askUser,
     log,
   })
-  log(`permissions ready mode=${config.permissions?.mode ?? 'standard'} audit=${join(dirname(store.CONFIG_FILE), 'audit.jsonl')}`)
+  log(`permissions ready mode=${config.permissions?.mode ?? 'standard'} audit=${join(dirname(store.getConfigFile()), 'audit.jsonl')}`)
   return permissionGate
 }
 
@@ -2708,22 +2708,28 @@ function registerSettingsIpc() {
       // 1) 先落盘。这一步成功就说明配置已经持久化了，后面运行时操作失败不该让用户看到"保存失败"。
       const saved = await store.saveConfig(next)
       /*
-       * 2) 运行时同步（系统提示词、权限门、定时规则）——这些失败只记日志，不回 ok:false。
-       *    否则用户改个 TTS 开关，因为权限门初始化慢了一步就看到红字"保存失败"，
-       *    但其实配置已经写进磁盘了——界面反馈和真实状态不一致。
+       * 2) 运行时同步——每个操作单独 try/catch，记录哪些成功了、哪些失败了。
+       *    磁盘已保存，运行时部分失败时返回 ok:true + warnings，让界面明确告知用户。
+       *    不允许把部分成功伪装成全部成功。
+       */
+      const warnings = []
+      /*
+       * 系统提示词：落盘成功后同步内存里的值，下一轮对话就用新文本。
+       * 保存失败时 store 已经抛错、文件没动，这里也不会执行——
+       * 所以磁盘和内存不会各说一套（Agent 继续用旧人设）。
+       * 不重建 Agent：CUA 桥接、语音、字幕全都不受影响。
        */
       try {
-        /*
-         * 系统提示词：落盘成功后同步内存里的值，下一轮对话就用新文本。
-         * 保存失败时 store 已经抛错、文件没动，这里也不会执行——
-         * 所以磁盘和内存不会各说一套（Agent 继续用旧人设）。
-         * 不重建 Agent：CUA 桥接、语音、字幕全都不受影响。
-         */
         if (payload?.systemPrompt !== undefined) {
           syncAgentSystemPrompt(saved)
           if (agentRuntime !== null) agentRuntime.config.systemPrompt = saved.systemPrompt
         }
-        // 立刻生效（不用重启）——这些都是内存里的开关与默认值
+      } catch (promptError) {
+        warnings.push(`系统提示词未即时生效：${promptError.message}`)
+        log(`settings runtime sync failed (systemPrompt): ${promptError.message}`)
+      }
+      // 立刻生效（不用重启）——UI 开关是内存操作，几乎不会失败
+      try {
         if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled
         if (typeof payload?.ui?.continuousMode === 'boolean') continuousMode = payload.ui.continuousMode
         if (typeof payload?.ui?.voiceConfirmEnabled === 'boolean') setVoiceConfirmEnabled(payload.ui.voiceConfirmEnabled)
@@ -2735,6 +2741,12 @@ function registerSettingsIpc() {
         if (typeof payload?.ui?.releaseOnFullscreen === 'boolean') releaseOnFullscreen = payload.ui.releaseOnFullscreen
         if (typeof payload?.tts?.emotion === 'string') ttsEmotion = payload.tts.emotion
         if (Number.isFinite(Number(payload?.tts?.speed))) ttsSpeed = Number(payload.tts.speed)
+      } catch (uiError) {
+        warnings.push(`界面设置未即时生效：${uiError.message}`)
+        log(`settings runtime sync failed (ui): ${uiError.message}`)
+      }
+      // 权限门单独处理：失败时用户必须知道，否则以为更严格的档位已生效
+      try {
         if (payload?.permissions !== undefined) {
           const gateInstance = await ensurePermissions()
           gateInstance.update({
@@ -2742,14 +2754,24 @@ function registerSettingsIpc() {
             overrides: payload.permissions.overrides ?? {},
           })
         }
-        // 定时切换改了规则要立刻生效，不用等下一轮轮询
+      } catch (gateError) {
+        warnings.push(`权限设置未即时生效：${gateError.message}`)
+        log(`settings runtime sync failed (permissions): ${gateError.message}`)
+      }
+      // 定时切换改了规则要立刻生效，不用等下一轮轮询
+      try {
         if (payload?.modelSchedule !== undefined && agentRuntime !== null) {
           agentRuntime.config.modelSchedule = payload.modelSchedule
           applyModelSchedule('settings')
         }
+      } catch (scheduleError) {
+        warnings.push(`定时切换规则未即时生效：${scheduleError.message}`)
+        log(`settings runtime sync failed (modelSchedule): ${scheduleError.message}`)
+      }
+      try {
         if (!ttsEnabled) stopSpeaking()
-      } catch (runtimeError) {
-        log(`settings runtime sync failed (disk saved ok): ${runtimeError.message}`)
+      } catch (stopError) {
+        log(`settings stopSpeaking failed: ${stopError.message}`)
       }
       // 保存动作本身带点击声，给它一段静默期，别让 KWS 把它当唤醒词
       wakeMutedUntil = Date.now() + 1500
@@ -2764,8 +2786,8 @@ function registerSettingsIpc() {
           if (error.name !== 'AbortError') log(`netease sync failed: ${error.code ?? error.name}`)
         })
       }
-      log(`settings saved: tts=${ttsEnabled} emotion=${ttsEmotion} speed=${ttsSpeed} mode=${payload?.permissions?.mode ?? '-'}`)
-      return { ok: true, config: saved }
+      log(`settings saved: tts=${ttsEnabled} emotion=${ttsEmotion} speed=${ttsSpeed} mode=${payload?.permissions?.mode ?? '-'} warnings=${warnings.length}`)
+      return { ok: true, config: saved, warnings }
     } catch (error) {
       log(`settings save failed: ${error.message}`)
       return { ok: false, error: error.message }
@@ -2917,7 +2939,7 @@ async function exportAudit() {
   try {
     const store = await import('../../packages/config/store.mjs')
     const { readFile, writeFile, mkdir } = await import('node:fs/promises')
-    const source = join(dirname(store.CONFIG_FILE), 'audit.jsonl')
+    const source = join(dirname(store.getConfigFile()), 'audit.jsonl')
     const raw = await readFile(source, 'utf8')
     const stamp = new Date().toISOString().replace(/[:.]/gu, '-').slice(0, 19)
     const outDir = join(DATA_ROOT, 'exports')
@@ -2938,7 +2960,7 @@ async function readAuditTail(lines) {
   try {
     const store = await import('../../packages/config/store.mjs')
     const { readFile } = await import('node:fs/promises')
-    const path = join(dirname(store.CONFIG_FILE), 'audit.jsonl')
+    const path = join(dirname(store.getConfigFile()), 'audit.jsonl')
     const raw = await readFile(path, 'utf8')
     return raw.split('\n').filter(Boolean).slice(-lines)
   } catch {
@@ -3916,9 +3938,67 @@ async function runSearchTest(query) {
 async function runSettingsTest() {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const store = await import('../../packages/config/store.mjs')
-  // 1) 立即备份完整原文——自检要改很多字段，结束后（无论成功/异常/崩溃）恢复原状
-  let backup = null
-  try { backup = JSON.parse(JSON.stringify(await store.loadConfig())) } catch { backup = null }
+  const { mkdir, writeFile, rm, readFile } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+
+  // P1: 真正隔离——在访问配置存储之前创建临时配置目录
+  // 不再备份/恢复真实配置，而是用独立的临时目录运行整个测试
+  const tempConfigDir = join(tmpdir(), `cua-va-settings-test-${Date.now()}`)
+  await mkdir(tempConfigDir, { recursive: true })
+
+  // 哨兵配置：包含测试用的 API Key、System Prompt、模型方案和权限设置
+  // 这些是虚构的测试数据，不是用户的真实凭据
+  const sentinelConfig = {
+    providerId: 'openai-compatible',
+    baseURL: 'http://localhost:11434/v1',
+    model: 'deepseek-flash',
+    apiKey: 'sk-selftest-sentinel-not-real',
+    maxSteps: 8,
+    temperature: 0.3,
+    systemPrompt: '自检哨兵自定义提示词\n第二行：  ok',
+    ui: {
+      ttsEnabled: true,
+      continuousMode: true,
+      voiceConfirmEnabled: true,
+      subtitles: true,
+      autoStart: false,
+      releaseOnFullscreen: true,
+    },
+    tts: { emotion: '中立', speed: 1 },
+    permissions: {
+      mode: 'standard',
+      overrides: { 'input.keyboard': 'allow' },
+    },
+    modelProfiles: [
+      {
+        id: 'p-sentinel',
+        name: '哨兵方案',
+        providerId: 'openai-compatible',
+        baseURL: 'http://localhost:11434/v1',
+        model: 'deepseek-flash',
+        apiKey: 'sk-selftest-sentinel-not-real',
+      },
+    ],
+    modelSchedule: {
+      enabled: false,
+      defaultProfileId: '',
+      rules: [],
+    },
+  }
+  await writeFile(join(tempConfigDir, 'agent.json'), JSON.stringify(sentinelConfig, null, 2), 'utf8')
+
+  // 切换 store 到临时配置目录
+  store.setConfigDir(tempConfigDir)
+
+  // 记录哨兵配置的原始内容（用于验证测试后未被修改）
+  let sentinelOriginal = null
+  try {
+    sentinelOriginal = await readFile(join(tempConfigDir, 'agent.json'), 'utf8')
+  } catch { sentinelOriginal = null }
+
+  // 基线配置：从临时配置读取（不是用户的真实配置）
+  const baseline = await store.loadConfig()
 
   const waitReady = async (target, ms = 5000) => {
     if (!target.webContents.isLoading()) return
@@ -3928,7 +4008,8 @@ async function runSettingsTest() {
     })
   }
 
-  const report = { steps: [] }
+  const report = { steps: [], configIsolation: { tempDir: tempConfigDir, baselineModel: baseline.model } }
+
   /*
    * 先等监听状态稳定：启动会恢复上次的唤醒开关，ASR 加载完才真正开麦。
    * 不等的话，会把"启动时恢复唤醒"误算成"保存把助手叫醒了"。
@@ -4096,12 +4177,12 @@ async function runSettingsTest() {
       memoryAfterRestore: agentSystemPrompt,
       savedModel: after.model,
       savedProvider: after.providerId,
-      savedApiKeyUnchanged: after.apiKey === before.apiKey,
+      savedApiKeyUnchanged: after.apiKey === baseline.apiKey,
       savedMaxSteps: after.maxSteps,
-      /** 诊断用：自检开始前的值（provider/model/maxSteps 应保持不变） */
-      beforeModel: before.model,
-      beforeProvider: before.providerId,
-      beforeMaxSteps: before.maxSteps,
+      /** 诊断用：基线配置的值（provider/model/maxSteps 应保持不变） */
+      beforeModel: baseline.model,
+      beforeProvider: baseline.providerId,
+      beforeMaxSteps: baseline.maxSteps,
     }
     /*
      * 登录入口检查：按钮在不在、状态查询通不通（不点登录，避免自检时弹浏览器）
@@ -4165,20 +4246,11 @@ async function runSettingsTest() {
     }
     report.pass = Object.values(report.verdict).every((value) => value === true)
   } finally {
-    // 无论自检是否顺利甚至过程崩溃，都把备份的原文完整写回，保证用户的真实配置不受影响
-    if (backup !== null) {
-      try {
-        await store.saveConfig({
-          tts: { ...(backup.tts ?? {}) },
-          ui: { ...(backup.ui ?? {}), continuousMode: backup.ui?.continuousMode !== false },
-          permissions: { ...(backup.permissions ?? {}), overrides: backup.permissions?.overrides ?? {} },
-          modelProfiles: backup.modelProfiles ?? [],
-          // 用户原本有自定义提示词的话必须还回去——自检不该顺手抹掉他的人设
-          systemPrompt: backup.systemPrompt ?? null,
-        })
-      } catch (restoreError) {
-        log(`settings-test config restore failed: ${restoreError.message}`)
-      }
+    // 清理临时目录（数据安全不依赖 finally：临时目录在 OS temp 下，不影响真实配置）
+    try {
+      await rm(tempConfigDir, { recursive: true, force: true })
+    } catch (cleanupError) {
+      log(`settings-test temp cleanup failed: ${cleanupError.message}`)
     }
   }
 

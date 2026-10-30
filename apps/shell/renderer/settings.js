@@ -20,11 +20,14 @@ let defaultPrompt = ''
  * collect() 用它判断"用户有没有真的改提示词"：
  *  - 框值 == loadedPrompt → 没改，不交 systemPrompt
  *  - 框值 != loadedPrompt → 改了，交新值
- *
- * 为什么不用 state.config.systemPrompt：切模式时 applyPromptModeUI 会把框填成默认提示词，
- * 此时 state.config.systemPrompt 还是旧值，直接比较会误判成"用户改了"。
  */
 let loadedPrompt = null
+/**
+ * 用户是否已点击「恢复默认」并成功保存。
+ * 为 true 时，切回自定义模式应以完整默认提示词为起点，
+ * 而不是显示恢复默认前写的旧草稿。
+ */
+let restoredDefault = false
 
 /* ---------------- 系统提示词 ---------------- */
 function promptModeIsCustom() {
@@ -44,13 +47,10 @@ function applyPromptModeUI() {
   $('promptCustomArea').hidden = !custom
   // 默认提示词那块常驻可看：默认模式下自动展开，方便对着原文改
   if (!custom) $('defaultPromptDetails').open = true
-  if (custom) {
-    // 切到自定义：如果框是空的，拿完整默认提示词当起点
-    // 但如果框里还有上次的旧草稿（用户从自定义→默认→又切回自定义），必须清掉重填默认
-    // 否则用户看到的是恢复默认前写的旧文本，而不是完整默认提示词
-    if (defaultPrompt !== '') {
-      $('systemPrompt').value = defaultPrompt
-    }
+  if (custom && $('systemPrompt').value === '' && defaultPrompt !== '') {
+    // 只有框是空的时候才填默认提示词当起点
+    // 框里有内容（已保存的自定义 A、或用户未保存的草稿 B）就保留，不覆盖
+    $('systemPrompt').value = defaultPrompt
   }
   renderPromptCharCount()
 }
@@ -67,6 +67,7 @@ function fillPromptForm() {
     $('systemPrompt').value = ''
     loadedPrompt = null
   }
+  restoredDefault = false
   applyPromptModeUI()
 }
 
@@ -540,13 +541,24 @@ $('provider').addEventListener('change', () => {
 $('save').addEventListener('click', async () => {
   setStatus('保存中…')
   $('save').disabled = true
-  const result = await window.settingsApi.save(collect())
+  const payload = collect()
+  const result = await window.settingsApi.save(payload)
   $('save').disabled = false
   if (result.ok) {
     state.config = result.config
     fillForm()
-    setStatus('已保存', 'ok')
+    // 保存成功后再标记：如果这次保存是"恢复默认"，
+    // 用户切回自定义时应看到完整默认提示词（fillForm 已清空框，applyPromptModeUI 会填默认）
+    if (payload.systemPrompt === null) restoredDefault = true
+    if (result.warnings && result.warnings.length > 0) {
+      // 磁盘已保存但部分运行时同步失败——明确告知用户哪些没生效
+      setStatus(`已保存，但有 ${result.warnings.length} 项未即时生效：${result.warnings.join('；')}`, 'warn')
+    } else {
+      setStatus('已保存', 'ok')
+    }
   } else {
+    // 保存失败：loadedPrompt 不变（还是加载时的原值），
+    // 用户草稿保留在框里，下次保存时会正确提交
     setStatus(result.error ?? '保存失败', 'bad')
   }
 })
