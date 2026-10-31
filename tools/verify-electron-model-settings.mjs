@@ -84,6 +84,10 @@ function registerIpc() {
   })
   ipcMain.handle('settings:models', async (_event, payload) => {
     modelsCalls.push(payload)
+    // 竞态测试：若设置了对该提供商的“暂停”，先等 releaseModels
+    if (modelsHold !== null && modelsHold.providerId === payload?.providerId) {
+      await modelsHold.promise
+    }
     if (modelsMode === 'fail') return { ok: false, error: '模型服务返回 401（API Key 无效或未填）', models: [], stale: false }
     if (modelsMode === 'fail-with-cache') {
       return { ok: false, error: '模型列表返回 429（请求过于频繁，稍后再试）', models: MIMO_LIST, stale: true, cached: true }
@@ -109,6 +113,20 @@ function registerIpc() {
   ipcMain.handle('settings:lxStatus', () => ({ ok: false, error: '本测试不连 LX', launched: false }))
 }
 const openConsoleCalls = []
+/** 竞态测试用：暂停某个提供商的模型列表响应，等测试放行 */
+let modelsHold = null
+function holdModels(providerId) {
+  releaseModels()
+  const holder = { providerId }
+  holder.promise = new Promise((resolve) => { holder.resolve = resolve })
+  modelsHold = holder
+}
+function releaseModels() {
+  if (modelsHold === null) return
+  const resolve = modelsHold.resolve
+  modelsHold = null
+  resolve?.()
+}
 
 const js = (win, code) => win.webContents.executeJavaScript(code)
 
@@ -434,6 +452,56 @@ async function main() {
     })()`)
     record('保存失败时界面显示失败（不显示已生效）',
       failedSave.cls === 'bad' && failedSave.text.includes('baseURL'), failedSave.text)
+
+    /* ---------------- 15. 模型列表异步竞态：旧响应不覆盖新选择 ---------------- */
+    saveMode = 'ok'
+    // 先切到 MiMo：帮它设置“请求暂停”，让 MiMo 的列表请求挂起
+    await js(win, `(async () => {
+      const p = document.getElementById('provider');
+      p.value = 'mimo';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 300));
+    })()`)
+    holdModels('mimo')
+    const mimoStarted = modelsCalls.length
+    await js(win, `(async () => {
+      document.getElementById('refreshModels').click();
+      await new Promise((r) => setTimeout(r, 120));
+    })()`)
+    const afterMimoStart = await js(win, `(() => document.getElementById('modelsHint').textContent)()`)
+    record('15a MiMo 手动刷新请求已发出（挂起中）',
+      modelsCalls.length === mimoStarted + 1 && afterMimoStart.includes('正在获取'),
+      `calls=${modelsCalls.length} hint=${afterMimoStart}`)
+
+    // 切到 DeepSeek：DeepSeek 请求不挂起，应该先返回并显示 DeepSeek 列表
+    await js(win, `(async () => {
+      const p = document.getElementById('provider');
+      p.value = 'deepseek';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 500));
+    })()`)
+    const dsAfterSwitch = await js(win, `(() => ({
+      provider: document.getElementById('provider').value,
+      candidates: Array.from(document.getElementById('modelList').options).map((o) => o.value),
+      hint: document.getElementById('modelsHint').textContent,
+    }))()`)
+    record('15b 切到 DeepSeek 后显示 DeepSeek 列表',
+      dsAfterSwitch.provider === 'deepseek' && dsAfterSwitch.candidates.includes('deepseek-flash'),
+      JSON.stringify({ p: dsAfterSwitch.provider, cands: dsAfterSwitch.candidates.length, hint: dsAfterSwitch.hint }))
+
+    // 释放 MiMo 的旧请求：返回后不得把页面改成 MiMo 列表
+    releaseModels()
+    await sleep(400)
+    const afterRelease = await js(win, `(() => ({
+      provider: document.getElementById('provider').value,
+      candidates: Array.from(document.getElementById('modelList').options).map((o) => o.value),
+      hint: document.getElementById('modelsHint').textContent,
+    }))()`)
+    record('15c 释放后旧 MiMo 响应不覆盖当前 DeepSeek 页面',
+      afterRelease.provider === 'deepseek' && afterRelease.candidates.includes('deepseek-flash')
+        && !afterRelease.candidates.includes('mimo-v2.6-pro'),
+      JSON.stringify({ p: afterRelease.provider, cands: afterRelease.candidates, hint: afterRelease.hint }))
+    releaseModels()
 
     clearTimeout(watchdog)
     const failed = results.filter((r) => !r.pass).length

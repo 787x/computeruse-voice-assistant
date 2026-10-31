@@ -24,8 +24,6 @@ let loadedPrompt = null
 let discoveredModels = null
 /** 上一次取列表失败的原因（界面要如实显示，并说明"仍可手填"） */
 let modelsError = ''
-/** 取列表进行中的请求（避免连点把 API 打爆） */
-let modelsLoading = false
 /**
  * 用户是否已点击「恢复默认」并成功保存。
  * 为 true 时，切回自定义模式应以完整默认提示词为起点，
@@ -324,6 +322,18 @@ function fillSelect(select, items, selected) {
  * - `force` 跳过主进程的短期缓存（改了 Key / 地址时用）
  * - 失败时保留现有候选与用户已选的模型，只报错，不动选择
  */
+/**
+ * 在线模型列表获取的请求序号：每次发起都会 +1，回来时若不是最新序号就直接丢弃。
+ * 解决"MiMo 请求还没回、用户已经切到 DeepSeek"的竞态——旧请求绝不能覆盖新提供商的候选。
+ */
+let modelsFetchSeq = 0
+
+/**
+ * 拉取当前提供商的聊天模型列表。
+ * - `force` 跳过主进程的短期缓存（用户主动点“刷新模型列表”或改了 Key 时用）
+ * - 失败时保留现有候选与用户已选的模型，只报错，不动选择
+ * - 并发保护：每次调用取最新序号，返回时只有序号仍是最新才更新界面
+ */
 async function fetchModels({ force = false, silent = false } = {}) {
   const provider = currentProvider()
   if (provider === null || provider.modelDiscovery !== true || typeof window.settingsApi.models !== 'function') {
@@ -343,22 +353,26 @@ async function fetchModels({ force = false, silent = false } = {}) {
     if (!silent) fillProviderNote()
     return
   }
-  if (modelsLoading) return
-  modelsLoading = true
+  // 记录本次请求的提供商标识与序号；旧请求回来时发现序号/提供商不对就丢弃
+  const seq = ++modelsFetchSeq
+  const requestProviderId = provider.id
   if (!silent) $('modelsHint').textContent = '正在获取模型列表…'
-  if (force && key !== '') await window.settingsApi.clearModelsCache?.({ providerId: provider.id })
+  // 手动刷新必须真正绕过缓存：清缓存 + 显式 force
+  if (force) await window.settingsApi.clearModelsCache?.({ providerId: provider.id }).catch(() => null)
   let result
   try {
     result = await window.settingsApi.models({
       providerId: provider.id,
       baseURL: $('baseURL').value.trim() || provider.baseURL,
       apiKey: key,
+      force,
     })
   } catch (error) {
     // IPC 都没通（主进程没实现/窗口刚关）也一样：只提示，不动用户选的模型，不阻止保存
     result = { ok: false, error: error.message ?? String(error) }
   }
-  modelsLoading = false
+  // 竞态丢弃：请求期间用户又切了提供商/换了输入，旧响应不得覆盖新页面
+  if (seq !== modelsFetchSeq || requestProviderId !== currentProvider()?.id) return
   if (result.ok === true) {
     discoveredModels = result.models ?? []
     modelsError = ''

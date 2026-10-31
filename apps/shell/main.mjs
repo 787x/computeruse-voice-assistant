@@ -663,12 +663,35 @@ function resetSession(reason) {
   sessionHistory = []
 }
 
-/** 记下一轮对话（只存话，不存工具细节） */
-function rememberTurn(userText, assistantText, toolNames) {
-  sessionHistory.push({ role: 'user', content: userText })
-  const note = toolNames.length > 0 ? `\n（这一轮动过：${toolNames.join(', ')}）` : ''
-  sessionHistory.push({ role: 'assistant', content: `${assistantText}${note}` })
-  while (sessionHistory.length > SESSION_MAX_TURNS * 2) sessionHistory.shift()
+/**
+ * 记下一轮对话（保存完整交互单元：user + assistant，可含 reasoning_content / tool_calls / tool 结果）。
+ *
+ * 为什么不是只存纯文本：MiMo/DeepSeek 思考模式下，同一唤醒会话的后续提问如果带 `tools`，
+ * 官方要求把涉及工具调用的历史轮次（含推理字段与工具结果）一起回传，否则 400。
+ * 所以这里保留 `result.conversation`（Agent.run 返回，已除 system），并做会话上限的完整单元裁剪，
+ * 交给 `Agent.run` 的 `trimHistory` 在每轮开始时再做预算裁剪与跨提供商剥离合。
+ *
+ * 只在内存里保留，不落盘、不打日志、不进字幕/TTS（推理内容不默认持久化）。
+ */
+function rememberTurn(userText, resultOrText, toolNames = []) {
+  if (resultOrText !== null && typeof resultOrText === 'object' && Array.isArray(resultOrText.conversation)) {
+    // 完整会话已含本轮 user + assistant（Agent.run 的 conversation 过滤掉了 system）
+    // 合并到 sessionHistory，避免重复 user 消息。
+    sessionHistory.push(...resultOrText.conversation)
+  } else {
+    sessionHistory.push({ role: 'user', content: userText })
+    const assistantText = typeof resultOrText === 'string' ? resultOrText : (resultOrText?.text ?? '')
+    const note = (toolNames ?? []).length > 0 ? `\n（这一轮动过：${toolNames.join(', ')}）` : ''
+    sessionHistory.push({ role: 'assistant', content: `${assistantText}${note}` })
+  }
+  // 会话上限：按「完整交互单元」裁掉最老的轮次（user 起，直到下一个 user 前）
+  while (sessionHistory.length > SESSION_MAX_TURNS * 4) {
+    const firstUser = sessionHistory.findIndex((m) => m.role === 'user')
+    if (firstUser === -1) break
+    let end = firstUser + 1
+    while (end < sessionHistory.length && sessionHistory[end].role !== 'user') end += 1
+    sessionHistory.splice(firstUser, end - firstUser)
+  }
 }
 
 // ---------------------------------------------------------------- 识别（ASR）
@@ -2319,7 +2342,7 @@ async function runCommand(text) {
     flushTurn(turn)
     // 旧的文本标记只留作日志线索，真正决定要不要等的是下面的判定
     wantContinue = process.env.CUA_VA_FORCE_CONTINUE === '1' || /\[\[继续\]\]/u.test(turn.raw)
-    rememberTurn(text, result.text ?? '', (result.steps ?? []).map((step) => step.tool))
+    rememberTurn(text, result, (result.steps ?? []).map((step) => step.tool))
     log(`turn ${turn.id} done in ${Date.now() - turn.startedAt}ms tools=${turn.tools} chars=${result.text.length}`)
     setState('speaking')
 

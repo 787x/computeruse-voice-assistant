@@ -282,6 +282,25 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
   const hinted = await captureBody({ providerId: 'openai-compatible', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-flash', providerHint: 'deepseek', deepseekReasoningEffort: 'low' })
   check('C12 自定义端点声明协议后才发对应参数', hinted?.reasoning_effort === 'low', hinted?.reasoning_effort)
 
+  // 官方 MiMo/DeepSeek 的协议能力以注册表为准，残留的 providerHint 不得覆盖
+  const mimoWithDsHint = await captureBody({
+    providerId: 'mimo', baseURL: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.6-flash',
+    providerHint: 'deepseek', deepseekReasoningEffort: 'low', mimoThinking: 'enabled', temperature: 0.3,
+  })
+  check('C12b 官方 MiMo 不受旧 DeepSeek hint 干扰（不发 deepseek 专属参数）',
+    mimoWithDsHint?.reasoning_effort === undefined
+      && JSON.stringify(mimoWithDsHint?.thinking) === '{"type":"enabled"}',
+    JSON.stringify({ thinking: mimoWithDsHint?.thinking, effort: mimoWithDsHint?.reasoning_effort, temperature: mimoWithDsHint?.temperature }))
+
+  const deepseekWithMimoHint = await captureBody({
+    providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-flash',
+    providerHint: 'mimo', mimoThinking: 'enabled', deepseekReasoningEffort: 'max', temperature: 0.3,
+  })
+  check('C12c 官方 DeepSeek 不受旧 MiMo hint 干扰（不带 MiMo-only 假设）',
+    deepseekWithMimoHint?.reasoning_effort === 'max'
+      && JSON.stringify(deepseekWithMimoHint?.thinking) === '{"type":"enabled"}',
+    JSON.stringify({ thinking: deepseekWithMimoHint?.thinking, effort: deepseekWithMimoHint?.reasoning_effort, temperature: deepseekWithMimoHint?.temperature }))
+
   // 按提供商判断，不按模型名
   const misnamed = await captureBody({ providerId: 'openai-compatible', baseURL: 'http://127.0.0.1:8080/v1', model: 'deepseek-flash', providerHint: 'auto' })
   check('C13 模型名像 DeepSeek 但端点是标准兼容 → 不发 DeepSeek 参数',
@@ -490,7 +509,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'm' })
     const r = await client.chat({ messages: [{ role: 'user', content: 'x' }] })
     check('D18 服务端提前断开标为 incomplete（不假装正常收尾）',
-      r.incomplete === true && r.finishReason === 'stop' && r.text === '只说了半句话',
+      r.incomplete === true && r.finishReason === 'incomplete' && r.text === '只说了半句话',
       `incomplete=${r.incomplete} reason=${r.finishReason}`)
   })
 
@@ -505,6 +524,87 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     const r = await client.chat({ messages: [{ role: 'user', content: 'x' }] })
     check('D19 声明要调工具却没给出可用调用 → 标记不完整',
       r.toolCalls.length === 0 && r.toolCallsIncomplete === true, `valid=${r.toolCalls.length} incomplete=${r.toolCallsIncomplete}`)
+  })
+
+  // D20：合法 JSON 工具调用，但 SSE 在完整结束标记之前断流 → Agent 不得执行任何工具
+  await withMock(() => ({
+    sse: [
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'trunc1', function: { name: 'launch_app', arguments: '{"query":"记事本"}' } }] } }] },
+      // 没有任何 finish_reason / [DONE]，直接断流（closeEarly）
+    ],
+    closeEarly: true,
+  }), async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash', profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }) })
+    let executed = 0
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [{}], invoke: async () => { executed += 1; return { text: 'ok' } } },
+      maxSteps: 2,
+    })
+    const r = await agent.run('执行一下')
+    check('D20 完整结束前断流：工具调用执行次数为零',
+      executed === 0 && r.steps.every((s) => s.ok !== true),
+      `executed=${executed}`)
+    // 已流出的普通文字/思考仍可保留（这里没有正文，只验证不执行）
+    check('D20b 断流不误当作正常完成', r.text !== undefined)
+  })
+
+  // D20c：完整结束（finish_reason=tool_calls）的对照用例 → 正常执行
+  await withMock(({ attempt }) => {
+    if (attempt === 1) {
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'ok1', function: { name: 'launch_app', arguments: '{"query":"记事本"}' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+        ],
+      }
+    }
+    return {
+      sse: [
+        { choices: [{ index: 0, delta: { content: '开了' }, finish_reason: 'stop' }] },
+      ],
+    }
+  }, async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash', profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }) })
+    let executed = 0
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [{}], invoke: async () => { executed += 1; return { text: 'ok' } } },
+      maxSteps: 3,
+    })
+    const r = await agent.run('执行一下')
+    check('D20c 完整结束的工具调用照常执行',
+      executed === 1 && r.steps.some((s) => s.ok === true),
+      `executed=${executed}`)
+  })
+
+  // D20d：finish_reason='length' 截断 + 合法 JSON 工具调用 → 不执行
+  await withMock(({ attempt }) => {
+    if (attempt === 1) {
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'len1', function: { name: 'launch_app', arguments: '{"query":"记事本"}' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'length' }] },
+        ],
+      }
+    }
+    return {
+      sse: [
+        { choices: [{ index: 0, delta: { content: '输出被截断了' }, finish_reason: 'stop' }] },
+      ],
+    }
+  }, async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash', profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }) })
+    let executed = 0
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [{}], invoke: async () => { executed += 1; return { text: 'ok' } } },
+      maxSteps: 3,
+    })
+    await agent.run('执行一下')
+    check('D20d finish_reason=length 的合法 JSON 工具调用不执行',
+      executed === 0,
+      `executed=${executed}`)
   })
 }
 
@@ -655,8 +755,12 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     check('F10 压缩后没有孤立 tool 结果', danglingToolResults.length === 0, danglingToolResults.map((m) => m.tool_call_id))
     check('F11 压缩后每个工具调用仍带 reasoning_content 字段',
       assistants.every((m) => typeof m.reasoning_content === 'string'), assistants.map((m) => (m.reasoning_content ?? '').length))
-    check('F12 思考内容被折叠但不丢字段（保住协议也省 token）',
-      assistants.some((m) => m.reasoning_content.length < 300) && assistants.every((m) => m.reasoning_content !== ''),
+    // 长推理历史：保留的 reasoning_content 必须与原始响应逐字一致（不得截断/折叠/占位）
+    // mock 第 1..10 步分别生成 `第 N 步的思考，内容相当长。` ×12（N 不同长度不同：180/192）
+    const expectedReasoning = new Set()
+    for (let n = 1; n <= 12; n += 1) expectedReasoning.add(`第 ${n} 步的思考，内容相当长。`.repeat(12))
+    check('F12 长推理历史完整保留（逐字一致，不被截断或折叠）',
+      assistants.every((m) => typeof m.reasoning_content === 'string' && expectedReasoning.has(m.reasoning_content)),
       assistants.map((m) => m.reasoning_content.length))
   })
 
@@ -693,10 +797,10 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
       client.setEndpoint({ baseURL: mock.url, apiKey: 'sk-deep', model: 'deepseek-flash' })
       client.setProfile(profileFromConfig({ providerId: 'deepseek', model: 'deepseek-flash', deepseekReasoningEffort: 'low' }))
       await new Agent({ llm: client, tools, maxSteps: 3 }).run('第二问', {
-        // 故意把上一轮"原样带思考字段"的 assistant 当会话历史交进去
+        // 模拟 rememberTurn 实际写入的跨回合历史：旧提供商 MiMo 的轮次带 `_providerId: 'mimo'`
         history: [
           { role: 'user', content: '第一问' },
-          { role: 'assistant', content: '第一问办好了', reasoning_content: '这一轮的思考只属于 MiMo。' },
+          { role: 'assistant', content: '第一问办好了', reasoning_content: '这一轮的思考只属于 MiMo。', _providerId: 'mimo' },
         ],
       })
 
@@ -721,29 +825,73 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     })
   }
 
-  // F15：会话内后续提问不能带出不完整工具链（trimHistory 只留纯文本）
+  // F15：同一唤醒会话的跨用户回合——完整单元被保留，残缺单元被剔除
   {
     const mixed = [
+      // 完整单元 1：user + assistant(带 tool_calls) + tool 结果 配对
       { role: 'user', content: '第一问' },
-      { role: 'assistant', content: '第一答', tool_calls: [{ id: 'x' }] },
+      { role: 'assistant', content: '第一答', tool_calls: [{ id: 'x', type: 'function', function: { name: 'list_windows', arguments: '{}' } }], reasoning_content: '第一问的思考过程' },
       { role: 'tool', tool_call_id: 'x', content: '结果' },
+      // 残缺单元：缺 tool 结果的 tool_calls（应整体剔除）
+      { role: 'user', content: '残缺问' },
+      { role: 'assistant', content: '残缺答', tool_calls: [{ id: 'y', type: 'function', function: { name: 'launch_app', arguments: '{}' } }], reasoning_content: '残缺思考' },
+      // 完整单元 2
       { role: 'user', content: '第二问' },
       { role: 'assistant', content: '第二答' },
     ]
     const client = new LLMClient({ baseURL: 'http://127.0.0.1:1/v1', apiKey: 'k', model: 'm' })
     void client
-    // 用假 llm 直接看 loop 组装出来的消息
+    // 同提供商（MiMo）跨回合：完整单元应保留工具链与推理字段
     const calls = []
     const fakeAgent = new Agent({
-      llm: { chat: async ({ messages }) => { calls.push(messages.map((m) => ({ role: m.role, hasToolCalls: Array.isArray(m.tool_calls), hasReasoning: typeof m.reasoning_content === 'string' }))); return { text: 'ok', toolCalls: [], reasoning: '', capability: 'mimo' } } },
+      llm: {
+        profile: { providerId: 'mimo', capability: 'mimo' },
+        chat: async ({ messages }) => { calls.push(messages.map((m) => ({ role: m.role, hasToolCalls: Array.isArray(m.tool_calls), hasReasoning: typeof m.reasoning_content === 'string', content: m.content }))); return { text: 'ok', toolCalls: [], reasoning: '', capability: 'mimo' } },
+      },
       tools: { listTools: () => [], invoke: async () => ({ text: '' }) },
     })
     await fakeAgent.run('第三问', { history: mixed })
     const roles = calls[0]
-    check('F15 跨回合历史不携带残缺工具调用/孤立 tool 结果',
-      roles.every((m) => m.hasToolCalls === false) && !roles.some((m) => m.role === 'tool'),
+    check('F15a 跨回合保留完整单元的工具调用（同提供商）',
+      roles.some((m) => m.role === 'assistant' && m.hasToolCalls === true),
       roles.map((m) => m.role))
-    check('F16 跨回合历史也不带旧提供商的思考字段', roles.every((m) => m.hasReasoning === false))
+    check('F15b 跨回合保留完整单元的 tool 结果',
+      roles.some((m) => m.role === 'tool'),
+      roles.map((m) => m.role))
+    check('F15c 残缺单元（缺 tool 结果的 tool_calls）被整体剔除',
+      !roles.some((m) => m.role === 'assistant' && m.hasToolCalls === true && m.content === '残缺答'),
+      roles.map((m) => m.content))
+    // 同提供商：reasoning_content 完整保留（MiMo/DeepSeek 回传要求）
+    check('F16 同一唤醒会话、同提供商的跨回合历史保留推理字段',
+      roles.some((m) => m.hasReasoning === true),
+      roles.map((m) => ({ role: m.role, hasReasoning: m.hasReasoning })))
+    check('F16b 残缺单元的推理字段也不带入（整单元剔除）',
+      !roles.some((m) => m.hasReasoning === true && m.content === '残缺思考'),
+      roles.map((m) => m.content))
+  }
+
+  // F17：切到别的提供商时，旧提供商的 reasoning_content 被剥离、但纯文本历史保留
+  {
+    const mixed = [
+      { role: 'user', content: '旧问' },
+      { role: 'assistant', content: '旧答', reasoning_content: '旧思考只属于旧提供商', _providerId: 'mimo' },
+    ]
+    const calls = []
+    const fakeAgent = new Agent({
+      llm: {
+        profile: { providerId: 'openai-compatible', capability: 'openai-compatible' },
+        chat: async ({ messages }) => { calls.push(messages.map((m) => ({ role: m.role, hasReasoning: typeof m.reasoning_content === 'string', content: m.content }))); return { text: 'ok', toolCalls: [], reasoning: '', capability: 'openai-compatible' } },
+      },
+      tools: { listTools: () => [], invoke: async () => ({ text: '' }) },
+    })
+    await fakeAgent.run('新提供商的问', { history: mixed })
+    const roles = calls[0]
+    check('F17 跨提供商剥离旧 reasoning（不污染新端点）',
+      roles.every((m) => !m.hasReasoning),
+      roles.map((m) => m.hasReasoning))
+    check('F17b 纯文本历史仍保留（不无意义丢上下文）',
+      roles.some((m) => m.content === '旧答'),
+      roles.map((m) => m.content))
   }
 }
 
@@ -943,6 +1091,75 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
   check('G17 切到 MiMo 方案后按 MiMo 参数发（不是 DeepSeek 的）',
     built.capability === 'mimo' && JSON.stringify(built.fields.thinking) === '{"type":"disabled"}' && built.fields.reasoning_effort === undefined,
     JSON.stringify(built.fields))
+
+  // ============ 方案凭据边界：同 ID 换认证目标不得沿用旧 Key；同源仅改模型保留 Key ============
+  // 先把 pm 方案的 Key 清掉，构造"改目标"场景
+  await store.saveConfig({
+    modelProfiles: [
+      { id: 'pm', name: 'MiMo 白天', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', apiKey: '' },
+    ],
+  })
+  const swappedAuth = await store.loadConfig()
+  const pmSwapped = swappedAuth.modelProfiles.find((p) => p.id === 'pm')
+  check('G33 方案 ID 不变但换了提供商/地址 → 不沿用旧 Key',
+    pmSwapped?.apiKey === '' || pmSwapped?.apiKey === undefined,
+    `apiKey=${JSON.stringify(pmSwapped?.apiKey)} (应清空)`)
+
+  // 同源仅改模型 → 保留 Key
+  await store.saveConfig({
+    modelProfiles: [
+      { id: 'pm', name: 'MiMo 白天', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-flash', apiKey: 'sk-keep-me' },
+    ],
+  })
+  await store.saveConfig({
+    modelProfiles: [
+      // 只改模型，apiKey 留空 → 应保留 sk-keep-me
+      { id: 'pm', name: 'MiMo 白天', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', apiKey: '' },
+    ],
+  })
+  const sameAuth = await store.loadConfig()
+  const pmSame = sameAuth.modelProfiles.find((p) => p.id === 'pm')
+  check('G34 同源仅改模型 → Key 保留（用户不必重填）',
+    pmSame?.apiKey === 'sk-keep-me',
+    `apiKey=${JSON.stringify(pmSame?.apiKey)}`)
+
+  // ============ 方案 Key 加密落盘（safeStorage 注入后） ============
+  // store 的协议：hooks.encrypt 只返回密文本身，前缀 `enc:` 由 store 负责加；decrypt 只收到不含前缀的密文。
+  store.setCryptoHooks({
+    encrypt: (value) => Buffer.from(value).toString('base64'),
+    decrypt: (value) => Buffer.from(value, 'base64').toString('utf8'),
+  })
+  await store.saveConfig({
+    modelProfiles: [
+      { id: 'pm', name: 'MiMo 白天', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-flash', apiKey: 'sk-encrypted-secret' },
+    ],
+  })
+  // 读回：loadConfig 应解回明文，loadPublicConfig 应打码
+  const encryptedRead = await store.loadConfig()
+  const pmEnc = encryptedRead.modelProfiles.find((p) => p.id === 'pm')
+  check('G35 方案 Key 加密落盘后读回为明文（可用）', pmEnc?.apiKey === 'sk-encrypted-secret', JSON.stringify(pmEnc?.apiKey))
+  // 磁盘上应为 enc: 而非明文
+  const fs2 = await import('node:fs/promises')
+  const rawOnDisk = await fs2.readFile(store.getConfigFile(), 'utf8')
+  const diskHasEnc = rawOnDisk.includes('enc:c2stZW5jcnlwdGVkLXNlY3JldA==') || rawOnDisk.includes('"apiKey":"enc:')
+  check('G36 方案 Key 确实加密落盘（非明文）',
+    diskHasEnc && !rawOnDisk.includes('sk-encrypted-secret'),
+    diskHasEnc ? 'enc: 前缀可见' : '未发现加密')
+  const publicWithEnc = await store.loadPublicConfig()
+  const pmPub = publicWithEnc.modelProfiles.find((p) => p.id === 'pm')
+  check('G37 loadPublicConfig 对方案 Key 打码', pmPub?.apiKey?.includes('*') === true && pmPub?.apiKey !== 'sk-encrypted-secret', pmPub?.apiKey)
+  // 解密失败：enc: 值解不开 → 不能当有效 Key 用，也不该把密文发给 HTTP
+  store.setCryptoHooks({
+    encrypt: (value) => `enc:${Buffer.from(value).toString('base64')}`,
+    decrypt: () => { throw new Error('safeStorage unlock failed') },
+  })
+  const undecryptable = await store.loadConfig()
+  const pmUndec = undecryptable.modelProfiles.find((p) => p.id === 'pm')
+  check('G38 无法解密的 enc: 方案 Key 读回为空（不把密文当 Key）',
+    pmUndec?.apiKey === '' || pmUndec?.apiKey === undefined,
+    `apiKey=${JSON.stringify(pmUndec?.apiKey)}`)
+  // 还原 hooks（后续用例不受影响）
+  store.setCryptoHooks(null)
 }
 
 // ============================================================ H 回合快照与热生效

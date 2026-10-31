@@ -33,6 +33,13 @@ export async function loadConfig() {
     merged.apiKey = decryptField(merged.apiKey)
     // 每个提供商自己的 Key 也逐个解回（缺这个就会把密文当 Key 发出去）
     merged.providerKeys = decryptKeyMap(merged.providerKeys)
+    // 模型方案的 Key 同样解回：可能来自旧明文配置，也可能是 safeStorage 加密后的 enc: 值
+    if (Array.isArray(merged.modelProfiles)) {
+      merged.modelProfiles = merged.modelProfiles.map((profile) => ({
+        ...profile,
+        apiKey: decryptField(profile?.apiKey ?? ''),
+      }))
+    }
     if (merged.search !== undefined && merged.search !== null) {
       merged.search = { ...merged.search, apiKey: decryptField(merged.search.apiKey) }
     }
@@ -327,16 +334,34 @@ export async function saveConfig(patch) {
         deepseekReasoningEffort: keepOr(profile?.deepseekReasoningEffort, previous?.deepseekReasoningEffort, normalizeEffortLevel),
         providerHint: keepOr(profile?.providerHint, previous?.providerHint, normalizeHint),
       }
-      if (isRealSecret(profile?.apiKey)) merged.apiKey = String(profile.apiKey).trim()
-      // 方案指向某个提供商时，没填 Key 就沿用**这条方案自己**原来的 Key；
-      // 绝不用"当前全局 Key"去顶——那可能是另一个提供商的凭据。
-      else if (typeof previous?.apiKey === 'string') merged.apiKey = previous.apiKey
+      /*
+       * 方案 Key 的凭据边界：
+       *  - 用户主动给了新 Key → 用新的；
+       *  - 没给新 Key，且**认证目标没变**（providerId 与 baseURL 都与原方案一致）→ 沿用原 Key；
+       *  - 没给新 Key，但方案换了提供商或换了 Base URL → 这是新的认证目标，
+       *    绝不能把旧 Key 发到新主机，Key 清空并留待用户填写。
+       * 这与顶层 providerKeys 的语义一致：凭据跟着认证源走，不跟着方案 ID 走。
+       */
+      const sameTarget = previous !== undefined
+        && String(previous.providerId ?? '').trim() === merged.providerId
+        && String(previous.baseURL ?? '').trim() === merged.baseURL
+      if (isRealSecret(profile?.apiKey)) {
+        merged.apiKey = String(profile.apiKey).trim()
+      } else if (sameTarget && typeof previous?.apiKey === 'string') {
+        merged.apiKey = previous.apiKey
+      }
       return merged
     })
   }
   // 落盘前加密（主进程注入了 safeStorage 才生效；工具脚本里就是明文）
   next.apiKey = encryptField(next.apiKey)
   next.providerKeys = encryptKeyMap(next.providerKeys)
+  if (Array.isArray(next.modelProfiles)) {
+    next.modelProfiles = next.modelProfiles.map((profile) => ({
+      ...profile,
+      apiKey: encryptField(profile?.apiKey ?? ''),
+    }))
+  }
   if (next.search !== undefined && next.search !== null) {
     next.search = { ...next.search, apiKey: encryptField(next.search.apiKey) }
   }

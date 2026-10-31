@@ -74,10 +74,16 @@ export function resolveCapability({ capability, providerId, hint } = {}) {
   if (declared !== '') return declared
   const id = normalizeToken(providerId)
   const fromRegistry = capabilityOfProviderId(id)
-  const hinted = normalizeToken(hint)
-  // 用户显式声明了协议（比如自建 OneAPI 转发 DeepSeek）→ 以声明为准
-  if (hinted !== '' && hinted !== 'auto') return hinted
+  /*
+   * 官方内置提供商（MiMo / DeepSeek）的协议能力**必须**以注册表声明为准。
+   * 旧版本可能在配置里留下 providerHint（比如用户曾把 MiMo 端点标成 DeepSeek 协议），
+   * 如果让 hint 覆盖注册表，官方端点就会被错误的专属参数打坏。所以注册表有声明时，
+   * hint 一律忽略；只有注册表没有这个 id（真·自定义端点）才允许 hint 显式声明协议。
+   */
   if (fromRegistry !== '') return fromRegistry
+  // 用户显式声明了协议（比如自建 OneAPI 转发 DeepSeek）→ 以声明为准
+  const hinted = normalizeToken(hint)
+  if (hinted !== '' && hinted !== 'auto') return hinted
   // 注册表里没有这个 id：按标准 OpenAI 兼容处理，什么专属参数都不发
   return KNOWN_CAPABILITIES.has(id) && id !== '' ? id : PLAIN_CAPABILITY
 }
@@ -108,6 +114,17 @@ export function supportsReasoningEffort(capability) {
 export function requiresReasoningEcho(capability) {
   const id = normalizeToken(capability)
   return id === MIMO_CAPABILITY || id === DEEPSEEK_CAPABILITY
+}
+
+/**
+ * 从一条「配置/模型方案」记录解析协议能力，供历史回传等场景复用。
+ *
+ * 与 `resolveCapability` 的差别：这里总是先把 providerId 放进注册表匹配；
+ * `providerHint` 只在注册表里没有该 providerId（真·自定义端点）时才生效。
+ * 这样旧配置里残留的 providerHint 永远不会让官方 MiMo/DeepSeek 退化成别的协议。
+ */
+export function capabilityForSource({ capability, providerId, hint } = {}) {
+  return resolveCapability({ capability, providerId, hint })
 }
 
 /** 用户选的思考档位（非法值回 default，绝不猜成 disabled） */

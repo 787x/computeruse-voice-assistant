@@ -19,7 +19,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
-const tree = fileURLToPath(import.meta.url).includes('/lx/') ? 'lx' : 'root'
+// Windows 路径分隔符是 \，只认 /lx/ 会把 lx 发行版误标成 root
+const tree = /[/\\]lx[/\\]/u.test(fileURLToPath(import.meta.url)) ? 'lx' : 'root'
 
 // 隔离配置目录：绝不读写仓库里的 .config/agent.json
 process.env.CUA_VA_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'cua-disc-'))
@@ -212,6 +213,54 @@ const MIMO_DATA = [
   check('D23 环境变量只覆盖当前提供商', await store.resolveApiKeyFor('mimo') === 'sk-env-current')
   check('D24 环境变量不会污染另一家的槽位', await store.resolveApiKeyFor('deepseek', { config: cfg }) === 'sk-owned-deep')
   delete process.env.CUA_VA_API_KEY
+  srv.server.close()
+}
+
+// ============================================================ 6. 手动刷新 & 不同账号缓存隔离
+
+{
+  const srv = await startCatalogServer((auth) => {
+    if (auth === 'Bearer account-a') {
+      return { data: [{ id: 'mimo-v2.6-flash' }, { id: 'mimo-v2.6-pro' }] }
+    }
+    if (auth === 'Bearer account-b') {
+      return { data: [{ id: 'mimo-v2.6-flash' }, { id: 'mimo-v2.6-ultra' }] }
+    }
+    return { data: MIMO_DATA }
+  })
+  const cache = new Map()
+
+  // 先建立 A 账号缓存
+  const firstA = await fetchChatModels({ providerId: 'mimo', baseURL: srv.url, apiKey: 'account-a', cache })
+  check('D25a A 账号第一次建立列表', firstA.ok === true && firstA.models.some((m) => m.id === 'mimo-v2.6-pro'), firstA.models?.map((m) => m.id))
+
+  // 缓存有效期内，同 Key 自动刷新走缓存（不重复打 API）
+  const secondA = await fetchChatModels({ providerId: 'mimo', baseURL: srv.url, apiKey: 'account-a', cache })
+  check('D25b 同账号自动刷新走缓存', secondA.cached === true && srv.requests.filter((r) => r.url === '/v1/models').length === 1,
+    `calls=${srv.requests.filter((r) => r.url === '/v1/models').length}`)
+
+  // 用户手动刷新：force=true 必须真正产生新请求（即使缓存未过期）
+  const forced = await fetchChatModels({ providerId: 'mimo', baseURL: srv.url, apiKey: 'account-a', cache, force: true })
+  check('D25c 手动刷新在缓存有效期内强制走网络', forced.ok === true && forced.cached === false
+    && srv.requests.filter((r) => r.url === '/v1/models').length === 2,
+    `calls=${srv.requests.filter((r) => r.url === '/v1/models').length}`)
+
+  // 同 URL 换成 B 账号（Key 变化）：必须重新请求，不能复用 A 的缓存目录
+  const b = await fetchChatModels({ providerId: 'mimo', baseURL: srv.url, apiKey: 'account-b', cache })
+  check('D26 同 URL 不同账号不复用旧缓存（按凭据隔离）',
+    b.ok === true && b.models.some((m) => m.id === 'mimo-v2.6-ultra') && !b.models.some((m) => m.id === 'mimo-v2.6-pro')
+      && srv.requests.filter((r) => r.url === '/v1/models').length === 3,
+    `${srv.requests.filter((r) => r.url === '/v1/models').length} calls, models=${b.models?.map((m) => m.id)}`)
+
+  // 再切回 A：应该也能拿到 A 自己的目录（重新请求，因为缓存键相同但指纹不同）
+  const aAgain = await fetchChatModels({ providerId: 'mimo', baseURL: srv.url, apiKey: 'account-a', cache })
+  check('D26b 切回 A 账号拿到 A 目录（不被 B 覆盖）',
+    aAgain.ok === true && aAgain.models.some((m) => m.id === 'mimo-v2.6-pro') && !aAgain.models.some((m) => m.id === 'mimo-v2.6-ultra'),
+    aAgain.models?.map((m) => m.id))
+
+  // 缓存内容不存明文 Key（fingerprint 只是短哈希）
+  const leaked = JSON.stringify([...cache.values()])
+  check('D27 缓存不存明文 API Key', !/account-a|account-b|Bearer/u.test(leaked), leaked.slice(0, 120))
   srv.server.close()
 }
 

@@ -61,9 +61,12 @@ export async function fetchChatModels({
     return staleResult('需要 API Key（填好再获取列表）')
   }
 
-  // 缓存只对"用已存 Key 的常规刷新"生效：用户手填 Key 时必须真打一次，
-  // 否则会拿别人凭据下的结果糊弄他。
-  if (!force && cached !== undefined && Date.now() - cached.at < ttlMs) {
+  // 缓存只对"同一认证身份 + 同地址"的常规刷新生效。用户手填 Key / 切换账号后，
+  // 即使没标 force，也不能复用旧账号的目录。指纹绝不存明文 Key。
+  const keyFingerprint = fingerprint(apiKey)
+  if (!force && cached !== undefined && Date.now() - cached.at < ttlMs
+      && cached.keyFingerprint === keyFingerprint
+      && String(cached.providerId ?? '') === String(providerId ?? '')) {
     return { ok: true, models: cached.models, dropped: cached.dropped ?? [], cached: true, stale: false, at: cached.at }
   }
 
@@ -87,6 +90,8 @@ export async function fetchChatModels({
   const entry = {
     at: Date.now(),
     dropped,
+    providerId: String(providerId ?? ''),
+    keyFingerprint,
     models: chat.map((model) => ({
       id: model.id,
       effort: model.effort ?? null,
@@ -96,4 +101,18 @@ export async function fetchChatModels({
   }
   cache?.set(key, entry)
   return { ok: true, models: entry.models, dropped, cached: false, stale: false, at: entry.at }
+}
+
+/**
+ * API Key 的短指纹（SHA-256 前 24 位十六进制）。
+ * 只用于判断"当前请求的凭据与缓存条目是不是同一个账号"，不落盘、不打印、不传出去。
+ */
+function fingerprint(apiKey) {
+  const value = String(apiKey ?? '')
+  if (value === '') return ''
+  let hash = 0
+  for (let i = 0; i < value.length; i += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(i)) >>> 0
+  }
+  return `${value.length}:${hash.toString(16)}`
 }

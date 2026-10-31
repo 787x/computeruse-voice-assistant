@@ -275,6 +275,8 @@ export class LLMClient {
     /** 有没有收到过收尾信号：finish_reason 或 [DONE]，一个都没有就是被截断了 */
     let sawFinish = false
     let sawDone = false
+    /** 流里出现过 `delta.error` / `error` 事件（服务端异常传输，不能当正常收尾） */
+    let sawError = false
 
     const pump = (chunk) => {
       // 归一化换行：SSE 允许 \r\n，但事件分隔统一按 \n\n 找最省事。
@@ -290,18 +292,26 @@ export class LLMClient {
           const payload = trimmed.slice(5).trim()
           if (payload === '') continue
           if (payload === '[DONE]') { sawDone = true; continue }
+          // 服务端错误事件（OpenAI 兼容的 `event: error` / `data: {"error": ...}`）
+          if (rawEvent.includes('\nevent: error') || (payload.startsWith('{') && /"error"\s*:/u.test(payload))) {
+            sawError = true
+            continue
+          }
           let json
           try {
             json = JSON.parse(payload)
           } catch {
             continue
           }
+          if (json?.error) { sawError = true; continue }
           if (json?.usage) usage = json.usage
           // 有些端点在最后一个 chunk 里把 choices 置空，只带 usage
           const choice = json?.choices?.[0]
           if (choice === undefined) continue
           if (choice.finish_reason) { finishReason = choice.finish_reason; sawFinish = true }
           const delta = choice.delta ?? choice.message ?? {}
+          // 个别实现把错误放在 delta.error 上（OpenAI 流式错误规范之一）
+          if (delta?.error) { sawError = true; continue }
           if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
             reasoning += delta.reasoning_content
             // 思考内容**只**走 onReasoning（默认不接），绝不混进字幕/TTS 的 text_delta
@@ -332,7 +342,7 @@ export class LLMClient {
        */
       if (signal?.aborted === true) {
         try { await reader.cancel() } catch { /* 已经关掉了不算错 */ }
-        return finalize({ text, reasoning, assembler, finishReason, usage, profile: this.profile, signal, interrupted: true })
+        return finalize({ text, reasoning, assembler, finishReason, usage, profile: this.profile, signal, interrupted: true, sawError })
       }
       // 超时：必须像非流式那样报错，否则用户只看到"话说到一半没了"，不知道是模型没回。
       if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
@@ -352,7 +362,7 @@ export class LLMClient {
     }
 
     return finalize({ text, reasoning, assembler, finishReason, usage, profile: this.profile, signal,
-      incomplete: !sawFinish && !sawDone })
+      incomplete: !sawFinish && !sawDone, sawError })
   }
 
   /** 拉取该端点可用模型列表（返回聊天模型 id + 能力元数据）。 */
@@ -438,27 +448,50 @@ class ToolCallAssembler {
  *
  * 关键规则：模型说「我要调工具」但工具调用本身不完整（被截断、被中断、参数坏掉）时，
  * **不能**当成有效调用返回，否则上层会拿半截参数去执行动作。
- * `finish_reason === 'tool_calls'` 而一个都凑不齐，就是这个回合出问题了，
- * 标成 `toolCallsIncomplete` 交给上层收尾。
+ *
+ * 完整性判定（LLMClient 与 Agent 必须一致）：
+ *  - 只要出现了 `finish_reason`（任何值）或 `[DONE]`，都算**有可靠结束信号**，
+ *    不机械要求每家端点都必须发 `[DONE]`（OpenAI 兼容端点普遍只发 finish_reason）。
+ *  - 完全没有结束信号就断流（`incomplete`）→ 不确定响应，任何工具调用都不得执行。
+ *  - `finish_reason: 'length'`（或其它非 tool_calls 的截断态）→ 即使参数是合法 JSON，
+ *    也只代表模型"说到一半被截断"，调用不完整，不得执行。
+ *  - 流内出现 `error` 事件 / `delta.error` → 服务端异常，不得执行。
  */
-function finalize({ text, reasoning, assembler, finishReason, usage, profile, signal, interrupted = false, incomplete = false }) {
+function finalize({ text, reasoning, assembler, finishReason, usage, profile, signal, interrupted = false, incomplete = false, sawError = false }) {
   const all = assembler.done()
-  const valid = all.filter((call) => call.valid === true)
-  const broken = all.filter((call) => call.valid !== true)
+  // 参数本身坏掉的（valid=false）
+  const invalid = all.filter((call) => call.valid !== true)
   const aborted = interrupted || signal?.aborted === true
+  // 端到端完整性：只有"收到过明确结束信号"才算完整完成。注意 interrupted 时 finishReason 会被改成 'interrupted'，
+  // 那同样不是可靠完成信号，aborted 一律视为不完整。
+  const reliablyComplete = !aborted && !incomplete && !sawError
+  const truncated = !reliablyComplete || finishReason === 'length'
+  // 完整结束（finish_reason='tool_calls' 或 [DONE]）才算有效工具调用；截断/异常一律按不完整处理
+  const valid = reliablyComplete && !truncated ? all.filter((call) => call.valid === true) : []
+  // 截断时，即使参数是合法 JSON，也不得执行——归入 broken（带原因），让 Agent 感知并触发"不执行+提示"
+  const broken = truncated
+    ? [...invalid, ...all.filter((call) => call.valid === true).map((call) => ({
+        ...call,
+        valid: false,
+        invalidReason: call.invalidReason ?? (finishReason === 'length' ? '响应被长度上限截断' : '响应未完整结束（缺少可靠结束信号）'),
+      }))]
+    : invalid
   return {
     text,
     reasoning,
     toolCalls: valid,
     brokenToolCalls: broken,
-    finishReason: aborted && finishReason === 'stop' ? 'interrupted' : finishReason,
+    // 截断/异常时如实标注 finishReason，避免被当成正常 stop 收尾
+    finishReason: aborted && finishReason === 'stop' ? 'interrupted'
+      : (truncated && finishReason === 'stop' ? 'incomplete' : finishReason),
     usage,
     // 回合内的协议判断靠这两个：能力 + 是否真的产生过思考内容
     capability: resolveCapability(profile),
     reasoningContent: reasoning !== '',
     interrupted: aborted,
     incomplete: incomplete && !aborted,
-    toolCallsIncomplete: (finishReason === 'tool_calls' && valid.length === 0 && broken.length > 0)
+    // Agent 据此决定"该不该把这次调用当作可执行指令"
+    toolCallsIncomplete: truncated || (finishReason === 'tool_calls' && valid.length === 0 && broken.length > 0)
       || (aborted && all.length > 0),
   }
 }
