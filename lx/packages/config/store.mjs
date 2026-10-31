@@ -33,6 +33,8 @@ export async function loadConfig() {
     merged.apiKey = decryptField(merged.apiKey)
     // 每个提供商自己的 Key 也逐个解回（缺这个就会把密文当 Key 发出去）
     merged.providerKeys = decryptKeyMap(merged.providerKeys)
+    // 认证目标 Key（providerId|baseURL）也解回
+    merged.providerTargets = decryptKeyMap(merged.providerTargets)
     // 模型方案的 Key 同样解回：可能来自旧明文配置，也可能是 safeStorage 加密后的 enc: 值
     if (Array.isArray(merged.modelProfiles)) {
       merged.modelProfiles = merged.modelProfiles.map((profile) => ({
@@ -55,12 +57,21 @@ export async function loadConfig() {
     if (typeof merged.providerKeys[merged.providerId] !== 'string' && typeof merged.apiKey === 'string' && merged.apiKey !== '') {
       merged.providerKeys = { ...merged.providerKeys, [merged.providerId]: merged.apiKey }
     }
+    // 真正生效的 apiKey 按「认证目标」推导：providerTargets[currentTarget] > providerKeys[providerId]
+    const currentTarget = targetKey(merged.providerId, merged.baseURL)
+    const targets = effectiveTargetKeys(merged)
+    if (typeof targets[currentTarget] === 'string' && targets[currentTarget] !== '') {
+      merged.apiKey = targets[currentTarget]
+    } else if (typeof merged.providerKeys[merged.providerId] === 'string') {
+      merged.apiKey = merged.providerKeys[merged.providerId]
+    }
     // 每次读都重算生效摘要：档位是纯函数，磁盘上那份只是给人看的，不能当真值源
     merged.effectiveReasoning = reasoningSummary(merged)
     return merged
   } catch {
     const fresh = defaultConfig()
     fresh.providerKeys = {}
+    fresh.providerTargets = {}
     fresh.effectiveReasoning = reasoningSummary(fresh)
     return fresh
   }
@@ -70,6 +81,12 @@ export async function loadConfig() {
 export async function loadPublicConfig() {
   const config = await loadConfig()
   const searchKey = config.search?.apiKey ?? ''
+  const targetFor = (providerId, baseURL) => {
+    const t = targetKey(providerId, baseURL)
+    const targets = effectiveTargetKeys(config)
+    const value = typeof targets[t] === 'string' ? targets[t] : ''
+    return { value, has: value !== '' }
+  }
   return {
     ...config,
     apiKey: maskKey(config.apiKey),
@@ -77,9 +94,23 @@ export async function loadPublicConfig() {
     // 每个提供商的 Key 只报掩码 + 有没有，界面据此决定"切回去要不要重新填"
     providerKeys: Object.fromEntries(Object.entries(config.providerKeys ?? {}).map(([id, key]) => [id, maskKey(key)])),
     hasProviderKey: Object.fromEntries(Object.entries(config.providerKeys ?? {}).map(([id, key]) => [id, Boolean(key)])),
+    // 认证目标维度：界面/主进程按 providerId+baseURL 判断是否存在可用凭据
+    targetKeys: Object.fromEntries(Object.entries(effectiveTargetKeys(config)).map(([t, key]) => [t, maskKey(key)])),
+    hasTargetKey: Object.fromEntries(Object.entries(effectiveTargetKeys(config)).map(([t, key]) => [t, Boolean(key)])),
+    // 便捷查询：给定 providerId + baseURL 是否已有对应凭据（界面提示用）
+    keyForTarget: (providerId, baseURL) => targetFor(providerId, baseURL),
     search: { ...(config.search ?? {}), apiKey: maskKey(searchKey), hasApiKey: Boolean(searchKey || process.env.TAVILY_API_KEY) },
     // 网易云：appId 可以明示，私钥只报长度（1600 字符塞进界面毫无意义）
     modelProfiles: (config.modelProfiles ?? []).map((profile) => ({ ...profile, apiKey: maskKey(profile.apiKey), hasApiKey: Boolean(profile.apiKey) })),
+    netease: {
+      appId: config.netease?.appId ?? '',
+      privateKey: config.netease?.privateKey === undefined || config.netease.privateKey === ''
+        ? ''
+        : `已保存（${String(config.netease.privateKey).length} 字符）`,
+      hasPrivateKey: Boolean(config.netease?.privateKey),
+      // 界面要显示「已保存（N 字符）」；长度必须由这里给，掩码串自己的长度没有意义
+      privateKeyLength: String(config.netease?.privateKey ?? '').length,
+    },
   }
 }
 
@@ -117,6 +148,45 @@ function isRealSecret(value) {
   return true
 }
 const ENC_PREFIX = 'enc:'
+
+/**
+ * 认证目标键：`providerId|baseURL`。
+ *
+ * 凭据按「认证目标」隔离：同一 providerId 但不同 baseURL（例如官方 MiMo 与
+ * 自研代理、不同账号入口）是不同认证目标，绝不能自动把 A 目标的 Key 发到 B 目标。
+ */
+export function targetKey(providerId, baseURL) {
+  return `${String(providerId ?? '').trim()}|${String(baseURL ?? '').trim()}`
+}
+
+/**
+ * 从配置中取「认证目标 → Key」映射（兼容旧 providerKeys 迁移）。
+ *
+ * 返回一个新对象：键为 targetKey（providerId|baseURL），值为明文 Key。
+ * 旧配置只有 providerKeys[providerId] 时，兜底为当前 providerId 的默认 baseURL。
+ * @param {object} config loadConfig 后的配置（providerKeys 已解密）
+ */
+function effectiveTargetKeys(config) {
+  const out = {}
+  const targets = config?.providerTargets && typeof config.providerTargets === 'object' && !Array.isArray(config.providerTargets)
+    ? config.providerTargets
+    : {}
+  for (const [rawKey, value] of Object.entries(targets)) {
+    if (typeof value === 'string' && value !== '') out[rawKey] = value
+  }
+  // 旧数据迁移：providerKeys[providerId] 存在且当前目标未覆盖时，作为当前目标的凭据
+  const legacy = config?.providerKeys && typeof config.providerKeys === 'object' && !Array.isArray(config.providerKeys)
+    ? config.providerKeys
+    : {}
+  for (const [providerId, value] of Object.entries(legacy)) {
+    if (typeof value !== 'string' || value === '') continue
+    const t = targetKey(providerId, config?.baseURL ?? '')
+    if (out[t] === undefined && String(providerId) === String(config?.providerId ?? '')) {
+      out[t] = value
+    }
+  }
+  return out
+}
 
 function isEncrypted(value) {
   return typeof value === 'string' && value.startsWith(ENC_PREFIX)
@@ -163,8 +233,20 @@ function encryptKeyMap(map) {
 /** 更新配置。
  * 空字符串或掩码值（含 *）表示"不修改密钥"，避免界面把打码值写回去。
  */
-export async function saveConfig(patch) {
+let saveQueue = Promise.resolve()
+export function saveConfig(patch, options = {}) {
+  const pending = saveQueue.then(() => saveConfigOnce(patch, options))
+  saveQueue = pending.catch(() => {})
+  return pending
+}
+async function saveConfigOnce(patch, { signal, expectedCredentials } = {}) {
+  signal?.throwIfAborted()
   const current = await loadConfig()
+  signal?.throwIfAborted()
+  if (expectedCredentials && (current.netease?.appId !== expectedCredentials.appId
+      || current.netease?.privateKey !== expectedCredentials.privateKey)) {
+    throw Object.assign(new Error('音乐配置版本已变化'), { code: 'STALE_CREDENTIALS' })
+  }
   const next = { ...current, ...patch }
 
   /*
@@ -195,53 +277,80 @@ export async function saveConfig(patch) {
   }
   const targetProviderId = next.providerId
 
-  /*
-   * 「提供商 → Key」映射：每个提供商自己那份凭据。
+  /**
+   * 凭据按「认证目标」（providerId|baseURL）隔离：
+   *  - `providerTargets` 是真正生效的凭据表（键 = targetKey(providerId, baseURL)）；
+   *  - `providerKeys` 保留为向后兼容的 providerId 键（旧界面/旧测试依赖），
+   *    保存时与 providerTargets 同步维护，读取时 priority 为 providerTargets。
+   *
    * 语义和其它密钥字段一致：空串/掩码=**不修改**、null=清除、真值=替换。
-   * 从当前（已解密的）映射出发逐条覆盖，所以调用方就算把打码后的整份配置回传，
-   * 也只会把掩码丢掉、不会把真 Key 抹了。
    */
+  const providerTargets = { ...(current.providerTargets ?? {}) }
   const providerKeys = { ...(current.providerKeys ?? {}) }
+  // 旧 providerKeys patch 的兼容：逐 id 映射到「该 id 当前默认 baseURL」的目标键
   const incomingKeys = patch.providerKeys && typeof patch.providerKeys === 'object' && !Array.isArray(patch.providerKeys)
     ? patch.providerKeys
     : null
   if (incomingKeys !== null) {
     for (const [rawId, value] of Object.entries(incomingKeys)) {
-      // id 也要 trim：留着空格会开出一个"查不到的槽位"，等于把用户的 Key 弄丢
       const id = typeof rawId === 'string' ? rawId.trim() : ''
       if (id === '') continue
-      if (value === null) delete providerKeys[id]
-      else if (isRealSecret(value)) providerKeys[id] = String(value).trim()
+      const provider = getProvider(id)
+      const baseURL = provider?.baseURL ?? next.baseURL ?? ''
+      const t = targetKey(id, baseURL)
+      if (value === null) {
+        delete providerTargets[t]
+        delete providerKeys[id]
+      } else if (isRealSecret(value)) {
+        const secret = String(value).trim()
+        providerTargets[t] = secret
+        providerKeys[id] = secret
+      }
       // 空串/掩码：不修改
     }
   }
+  // 当前认证目标
+  const currentTarget = targetKey(targetProviderId, next.baseURL)
   if (typeof patch.apiKey === 'string') {
     if (patch.apiKey === '' || patch.apiKey.includes('*')) {
       /*
        * 不修改。界面回显的是掩码，把它当新值写回去就等于把 Key 抹了（实测踩过）。
-       * 只有"还在同一个提供商上"时，才用 global apiKey 补齐该槽位（老配置只有一份 Key）；
-       * **切到别的提供商时绝不能这么补**——那等于把上一家的 Key 塞进新家的槽位，
-       * 下一次请求就会拿 DeepSeek 的 Key 去打 MiMo（401，而且凭据越境）。
+       * 只有"还在同一个认证目标"时，才用 global apiKey 补齐该目标（老配置只有一份 Key）；
+       * **切换到别的目标时绝不能这么补**——那等于把旧目标的 Key 塞进新目标的槽位。
        */
-      if (targetProviderId === current.providerId && providerKeys[targetProviderId] === undefined
+      if (targetProviderId === current.providerId
+        && String(next.baseURL) === String(current.baseURL)
+        && providerTargets[currentTarget] === undefined
         && isRealSecret(current.apiKey)) {
-        providerKeys[targetProviderId] = current.apiKey
+        providerTargets[currentTarget] = current.apiKey
+        if (providerKeys[targetProviderId] === undefined) providerKeys[targetProviderId] = current.apiKey
       }
     } else {
-      providerKeys[targetProviderId] = patch.apiKey.trim()
+      const secret = patch.apiKey.trim()
+      providerTargets[currentTarget] = secret
+      providerKeys[targetProviderId] = secret
     }
   }
   // 显式清空：apiKey: null。空串表示"不修改"，null 表示"删掉"——两者语义不同。
-  if (patch.apiKey === null) delete providerKeys[targetProviderId]
+  if (patch.apiKey === null) {
+    delete providerTargets[currentTarget]
+    // 仅当该 providerId 没有其它目标凭据时才删兼容槽（避免误删同 provider 别处 Key）
+    const hasOtherTarget = Object.keys(providerTargets).some((t) =>
+      t.startsWith(`${targetProviderId}|`) && providerTargets[t] !== undefined)
+    if (!hasOtherTarget) delete providerKeys[targetProviderId]
+  }
+  next.providerTargets = providerTargets
   next.providerKeys = providerKeys
 
   /*
-   * 真正生效的 apiKey **由提供商推导**，不做"顺手保留上一个提供商的 Key"。
-   * 这是切提供商时的凭据隔离：DeepSeek 的 Key 绝不能跟着配置一起打到 MiMo 的端点上
+   * 真正生效的 apiKey **按认证目标推导**，不做"顺手保留上一个提供商的 Key"。
+   * 这是切目标时的凭据隔离：旧目标的 Key 绝不能跟着配置打到新目标上
    * （反过来也一样，而且两家 Key 前缀不同，发错就是 401）。
-   * 回切便利性靠 providerKeys：切回来时那一份还在。
+   * 回切便利性靠 providerTargets：切回原目标时那一份还在。
    */
-  next.apiKey = typeof providerKeys[next.providerId] === 'string' ? providerKeys[next.providerId] : ''
+  next.apiKey = typeof providerTargets[currentTarget] === 'string'
+    ? providerTargets[currentTarget]
+    : (typeof providerKeys[next.providerId] === 'string' ? providerKeys[next.providerId] : '')
 
   // 搜索密钥同样遵守"空串=不修改、掩码=不修改、null=清除"
   if (patch.search !== undefined && patch.search !== null) {
@@ -310,6 +419,25 @@ export async function saveConfig(patch) {
   }
 
   /*
+   * 网易云凭据：两个字段各自"空/掩码=不修改、null=清除"，跟 API Key 同一套语义。
+   * 私钥很长，界面读回来只给"已保存（N 字符）"，绝不能把明文当占位符写回去。
+   */
+  if (patch.netease !== undefined && patch.netease !== null) {
+    const currentNetease = current.netease ?? { appId: '', privateKey: '' }
+    const incoming = patch.netease
+    const merged = { ...currentNetease }
+    if (incoming.appId === null) merged.appId = ''
+    else if (isRealSecret(incoming.appId)) merged.appId = incoming.appId.trim()
+    if (incoming.privateKey === null) merged.privateKey = ''
+    else if (isRealSecret(incoming.privateKey)) merged.privateKey = incoming.privateKey.trim()
+    /*
+     * 记下"同步过哪一版凭据"。这个字段丢了会导致每次启动都重写 CLI 凭据，
+     * 而重写会让已有的网易云登录态失效（token 变 Expired）。
+     */
+    if (typeof incoming.syncedHash === 'string') merged.syncedHash = incoming.syncedHash
+    next.netease = merged
+  }
+  /*
    * 模型方案：每条方案的 apiKey 单独打码；掩码值（含 * 或「已保存」）不覆盖原值。
    * 方案还要带上**推理策略**（提供商 + 地址 + Key + 模型 + 档位是一套），
    * 否则定时切到 MiMo 方案却仍用 DeepSeek 的参数发请求，正是这次要修的毛病。
@@ -349,6 +477,9 @@ export async function saveConfig(patch) {
         merged.apiKey = String(profile.apiKey).trim()
       } else if (sameTarget && typeof previous?.apiKey === 'string') {
         merged.apiKey = previous.apiKey
+      } else if (sameTarget && previous !== undefined && previous.apiKey !== undefined) {
+        // previous.apiKey 已是解密后的明文（loadConfig 解过），保留
+        merged.apiKey = typeof previous.apiKey === 'string' ? previous.apiKey : ''
       }
       return merged
     })
@@ -362,13 +493,17 @@ export async function saveConfig(patch) {
       apiKey: encryptField(profile?.apiKey ?? ''),
     }))
   }
+  next.providerTargets = encryptKeyMap(next.providerTargets)
   if (next.search !== undefined && next.search !== null) {
     next.search = { ...next.search, apiKey: encryptField(next.search.apiKey) }
   }
 
+  signal?.throwIfAborted()
   await mkdir(CONFIG_DIR, { recursive: true })
   const tmp = `${CONFIG_PATH}.tmp`
+  signal?.throwIfAborted()
   await writeFile(tmp, JSON.stringify(next, null, 2), 'utf8')
+  signal?.throwIfAborted()
   await rename(tmp, CONFIG_PATH)
   return loadPublicConfig()
 }
@@ -421,18 +556,26 @@ export async function resolveApiKey() {
 }
 
 /**
- * 取「某个提供商」该用的 Key。设置页的下拉可以先选中一家还没保存的提供商，
+ * 取「某个提供商 + 认证目标」该用的 Key。设置页的下拉可以先选中一家还没保存的提供商，
  * 这时**绝不能**拿当前生效的那一份去请求——那是另一家的凭据（凭据越境 + 必定 401）。
  *
- * - 目标就是当前提供商：走 resolveApiKey()（环境变量优先、密文检查都在那里）
- * - 目标是别家：只用它自己槽位里的 Key，没有就返回空（让调用方提示"请先填 Key"）
+ * - 目标就是当前提供商且未另行指定 baseURL：走 resolveApiKey()（环境变量优先、密文检查都在那里）
+ * - 目标是别家（或别家 + 不同 baseURL）：只用它自己目标槽位里的 Key，没有就返回空
+ *   （让调用方提示"请先填 Key"）
  */
-export async function resolveApiKeyFor(providerId, { config } = {}) {
+export async function resolveApiKeyFor(providerId, { config, baseURL } = {}) {
   const target = typeof providerId === 'string' ? providerId.trim() : ''
   const current = config ?? (await loadConfig())
-  if (target === '' || target === current.providerId) return await resolveApiKey()
-  const own = (current.providerKeys ?? {})[target]
-  return typeof own === 'string' ? own : ''
+  if (target === '' || (target === current.providerId && (baseURL === undefined || String(baseURL).trim() === ''))) {
+    return await resolveApiKey()
+  }
+  // 按认证目标取：providerTargets 优先，其次旧 providerKeys（providerId 槽）
+  const t = targetKey(target, baseURL ?? current.baseURL ?? '')
+  const targets = effectiveTargetKeys(current)
+  const own = typeof targets[t] === 'string' ? targets[t] : ''
+  if (own !== '') return own
+  const legacy = (current.providerKeys ?? {})[target]
+  return typeof legacy === 'string' ? legacy : ''
 }
 
 /** 搜索用的密钥：环境变量 TAVILY_API_KEY 优先于配置文件。 */

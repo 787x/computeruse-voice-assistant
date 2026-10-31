@@ -664,32 +664,30 @@ function resetSession(reason) {
 }
 
 /**
- * 记下一轮对话（保存完整交互单元：user + assistant，可含 reasoning_content / tool_calls / tool 结果）。
+ * 记下一轮对话：把 `Agent.run` 返回的**本轮增量** `result.turn` 追加到会话历史。
  *
- * 为什么不是只存纯文本：MiMo/DeepSeek 思考模式下，同一唤醒会话的后续提问如果带 `tools`，
- * 官方要求把涉及工具调用的历史轮次（含推理字段与工具结果）一起回传，否则 400。
- * 所以这里保留 `result.conversation`（Agent.run 返回，已除 system），并做会话上限的完整单元裁剪，
- * 交给 `Agent.run` 的 `trimHistory` 在每轮开始时再做预算裁剪与跨提供商剥离合。
+ * 为什么是增量而不是全量：`Agent.run` 的 messages 是「旧历史(trimHistory 后) + 本轮」，
+ * 若把整段 conversation 再 push 一次，旧历史就会重复。现在 Agent 只回 `turn`
+ * （本轮 user + assistant + tool + 截图），这里直接追加即得到不重复的完整历史。
  *
  * 只在内存里保留，不落盘、不打日志、不进字幕/TTS（推理内容不默认持久化）。
  */
 function rememberTurn(userText, resultOrText, toolNames = []) {
-  if (resultOrText !== null && typeof resultOrText === 'object' && Array.isArray(resultOrText.conversation)) {
-    // 完整会话已含本轮 user + assistant（Agent.run 的 conversation 过滤掉了 system）
-    // 合并到 sessionHistory，避免重复 user 消息。
-    sessionHistory.push(...resultOrText.conversation)
+  if (resultOrText !== null && typeof resultOrText === 'object' && Array.isArray(resultOrText.turn)) {
+    sessionHistory.push(...resultOrText.turn)
   } else {
     sessionHistory.push({ role: 'user', content: userText })
     const assistantText = typeof resultOrText === 'string' ? resultOrText : (resultOrText?.text ?? '')
     const note = (toolNames ?? []).length > 0 ? `\n（这一轮动过：${toolNames.join(', ')}）` : ''
     sessionHistory.push({ role: 'assistant', content: `${assistantText}${note}` })
   }
-  // 会话上限：按「完整交互单元」裁掉最老的轮次（user 起，直到下一个 user 前）
+  // 会话上限：按「完整交互单元」裁掉最老的轮次（普通文本 user 起，直到下一个普通文本 user 前）
   while (sessionHistory.length > SESSION_MAX_TURNS * 4) {
-    const firstUser = sessionHistory.findIndex((m) => m.role === 'user')
+    const firstUser = sessionHistory.findIndex((m) => m.role === 'user' && typeof m.content === 'string')
     if (firstUser === -1) break
     let end = firstUser + 1
-    while (end < sessionHistory.length && sessionHistory[end].role !== 'user') end += 1
+    while (end < sessionHistory.length
+      && !(sessionHistory[end].role === 'user' && typeof sessionHistory[end].content === 'string')) end += 1
     sessionHistory.splice(firstUser, end - firstUser)
   }
 }

@@ -490,9 +490,26 @@ function renderProfileRows(profiles) {
       if (matched !== undefined) {
         row.querySelector('[data-field="baseURL"]').value = matched.baseURL
         const modelInput = row.querySelector('[data-field="model"]')
-        // 推荐初始模型用该提供商自己的 defaultModel（MiMo 是 mimo-v2.6-flash），不是 models[0]
+        const urlInput = row.querySelector('[data-field="baseURL"]')
+        const keyInput = row.querySelector('[data-field="apiKey"]')
+        // 推荐初始模型：只有空值或「上一家推荐值」才替换；用户手填的自定义模型保留
         const suggested = matched.defaultModel ?? matched.models?.[0] ?? ''
-        if (modelInput.value.trim() === '' && suggested !== '') modelInput.value = suggested
+        const currentModel = modelInput.value.trim()
+        const oldSuggestion = profile.model ?? ''
+        if (currentModel === '' || currentModel === oldSuggestion) {
+          if (suggested !== '') modelInput.value = suggested
+        } else {
+          modelInput.title = `当前填写的 «${currentModel}» 可能不属于 ${matched.name}，保存前请确认`
+        }
+        // Key 提示按「新提供商 + 新地址」的实际目标判断，避免误以为旧 Key 仍有效
+        const keyForTarget = state?.config?.targetKeys?.[`${provider.value}|${urlInput.value}`]
+        const hasForTarget = typeof keyForTarget === 'string' && keyForTarget !== ''
+        keyInput.placeholder = hasForTarget ? '已保存，留空不修改' : (matched.apiKeyRequired === false ? '本地端点可留空' : '未配置（可在控制台获取）')
+        if (!hasForTarget && keyInput.value === '') {
+          keyInput.title = `该认证目标尚未保存 Key${matched.apiKeyRequired === false ? '' : '，需要填写后该方案才能使用'}`
+        } else {
+          keyInput.title = ''
+        }
       }
     })
     providerCell.append(provider)
@@ -509,7 +526,12 @@ function renderProfileRows(profiles) {
     const key = document.createElement('input')
     key.type = 'password'
     key.value = ''
-    key.placeholder = profile.hasApiKey === true ? `已保存（${profile.apiKey}）` : 'sk-…'
+    // 按「该方案当前认证目标」提示是否已有 Key：profile.hasApiKey 来自旧 provider/baseURL，
+    // 若目标已变化，不能继续暗示旧 Key 有效。
+    const targetKeyValueLx = state?.config?.targetKeys?.[`${profile.providerId ?? ''}|${profile.baseURL ?? ''}`]
+    const profileTargetHasKey = typeof targetKeyValueLx === 'string' && targetKeyValueLx !== ''
+    key.placeholder = profileTargetHasKey ? `已保存（${targetKeyValueLx}），留空不修改`
+      : (profile.apiKeyRequired === false ? '本地端点可留空' : (profile.hasApiKey === true ? `已保存（${profile.apiKey}），留空不修改` : 'sk-…'))
     key.dataset.field = 'apiKey'
     keyCell.append(key)
 

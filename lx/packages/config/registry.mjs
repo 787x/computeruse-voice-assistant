@@ -98,6 +98,12 @@ export function defaultConfig() {
      * 这样切提供商不会把上一家的 Key 发到新端点，切回来又不用重填。
      */
     providerKeys: {},
+    /*
+     * 认证目标 Key：键为 `providerId|baseURL`，值是真正生效的 API Key。
+     * 凭据按「认证目标」隔离：同一 provider 不同 baseURL 是不同目标，
+     * 切换目标绝不自动发送旧目标的 Key；切回原目标自动复用。
+     */
+    providerTargets: {},
     temperature: 0.3,
     /*
      * 推理控制（按提供商生效，互不冲突）：

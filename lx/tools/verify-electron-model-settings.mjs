@@ -69,7 +69,12 @@ const DS_LIST = [
 
 function registerIpc() {
   ipcMain.handle('settings:load', async () => ({
-    config: configState,
+    config: {
+      ...configState,
+      // 界面按「认证目标」判断是否已有 Key（providerId|baseURL），纯数据 map 可被 IPC 克隆
+      targetKeys: configState.targetKeys ?? {},
+      hasTargetKey: configState.hasTargetKey ?? {},
+    },
     providers: PROVIDERS,
     capabilities: [{ id: 'input.keyboard', label: '键盘输入', level: 'ask' }],
     voices: ['中立'],
@@ -149,7 +154,10 @@ async function main() {
       search: { provider: 'tavily', apiKey: '', hasApiKey: false },
       permissions: { mode: 'standard', overrides: {} },
       tts: { emotion: '中立', speed: 1 },
-      ui: { ttsEnabled: true, continuousMode: true, voiceConfirmEnabled: true, subtitles: true, autoStart: false, releaseOnFullscreen: true, wakeEnabled: true } }
+      ui: { ttsEnabled: true, continuousMode: true, voiceConfirmEnabled: true, subtitles: true, autoStart: false, releaseOnFullscreen: true, wakeEnabled: true },
+      // 认证目标 Key（providerId|baseURL → 掩码）：用于方案行“是否已有 Key”提示
+      targetKeys: { 'deepseek|https://api.deepseek.com/v1': 'sk-ds-masked' },
+      hasTargetKey: { 'deepseek|https://api.deepseek.com/v1': true } }
 
     win = new BrowserWindow({
       width: 820, height: 900, show: false, backgroundColor: '#14161c',
@@ -438,6 +446,45 @@ async function main() {
     record('保存方案把该提供商的档位写进对应字段',
       savedProfile?.deepseekReasoningEffort === 'low' && savedProfile?.providerId === 'deepseek',
       JSON.stringify({ p: savedProfile?.providerId, e: savedProfile?.deepseekReasoningEffort, t: savedProfile?.mimoThinking }))
+
+    /* ---------------- 12b. 方案换提供商：模型建议与 Key 提示不误导 ---------------- */
+    // 初始 configState 已预先声明 DeepSeek 目标有 Key、MiMo 目标无 Key（见上方初始化）
+    const profileSwitch = await js(win, `(async () => {
+      const row = document.querySelector('#profileRows tr');
+      const p = row.querySelector('[data-field="providerId"]');
+      const model = row.querySelector('[data-field="model"]');
+      const key = row.querySelector('[data-field="apiKey"]');
+      const baseURL = row.querySelector('[data-field="baseURL"]');
+      // 当前方案是 DeepSeek，先记下模型（deepseek-v4-pro 来自上一保存）
+      const before = {
+        provider: p.value, model: model.value,
+        keyPlaceholder: key.placeholder, baseURL: baseURL.value,
+      };
+      // 切到 MiMo：应替换模型为推荐值，Key 提示按新目标（无 Key）
+      p.value = 'mimo';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 150));
+      const afterMimo = {
+        provider: p.value, model: model.value,
+        keyPlaceholder: key.placeholder, baseURL: baseURL.value,
+        keyTitle: key.title,
+      };
+      // 再切回 DeepSeek：Key 提示应恢复为“已保存”
+      p.value = 'deepseek';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 150));
+      const backDs = { provider: p.value, keyPlaceholder: key.placeholder };
+      return { before, afterMimo, backDs };
+    })()`)
+    record('12b 方案换提供商：模型自动换成新推荐值',
+      profileSwitch.afterMimo.provider === 'mimo' && profileSwitch.afterMimo.model === 'mimo-v2.6-flash',
+      JSON.stringify({ before: profileSwitch.before.model, after: profileSwitch.afterMimo.model }))
+    record('12b2 新提供商（无 Key 目标）不再暗示旧 Key 有效',
+      profileSwitch.afterMimo.keyPlaceholder.includes('未配置') && profileSwitch.afterMimo.keyTitle.includes('尚未保存'),
+      JSON.stringify({ ph: profileSwitch.afterMimo.keyPlaceholder, title: profileSwitch.afterMimo.keyTitle }))
+    record('12b3 切回有 Key 目标时提示已保存',
+      profileSwitch.backDs.provider === 'deepseek' && profileSwitch.backDs.keyPlaceholder.includes('已保存'),
+      JSON.stringify(profileSwitch.backDs.keyPlaceholder))
 
     /* ---------------- 13. PR3 提示词语义未受影响 ---------------- */
     const noPrompt = !('systemPrompt' in savedPayloads.at(-1))

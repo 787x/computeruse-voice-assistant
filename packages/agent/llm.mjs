@@ -444,6 +444,31 @@ class ToolCallAssembler {
 }
 
 /**
+ * 不可作为“命令执行许可”的结束原因。
+ *
+ * `length`：输出被长度上限截断；`content_filter`：内容被过滤（可能只返回部分内容）；
+ * `repetition_truncation`：因重复被截断；其余未知原因也一律视为不可靠完成。
+ *
+ * 只有 `finish_reason === 'tool_calls'`（模型明确结束本轮并给出了完整的工具调用）
+ * 或 `'stop'`（正常完成，未产生工具调用）才允许工具调用被视为可执行。
+ */
+const NON_EXECUTABLE_FINISH_REASONS = new Set([
+  'length',
+  'content_filter',
+  'repetition_truncation',
+  'abort',
+  'cancel',
+  'error',
+])
+
+/** 该 finish_reason 是否允许执行工具调用 */
+function finishAllowsToolExecution(reason) {
+  return typeof reason === 'string' && reason !== ''
+    && (reason === 'tool_calls' || reason === 'stop')
+    && !NON_EXECUTABLE_FINISH_REASONS.has(reason)
+}
+
+/**
  * 收口一次请求的结果。
  *
  * 关键规则：模型说「我要调工具」但工具调用本身不完整（被截断、被中断、参数坏掉）时，
@@ -453,8 +478,9 @@ class ToolCallAssembler {
  *  - 只要出现了 `finish_reason`（任何值）或 `[DONE]`，都算**有可靠结束信号**，
  *    不机械要求每家端点都必须发 `[DONE]`（OpenAI 兼容端点普遍只发 finish_reason）。
  *  - 完全没有结束信号就断流（`incomplete`）→ 不确定响应，任何工具调用都不得执行。
- *  - `finish_reason: 'length'`（或其它非 tool_calls 的截断态）→ 即使参数是合法 JSON，
- *    也只代表模型"说到一半被截断"，调用不完整，不得执行。
+ *  - `finish_reason` 不是 `tool_calls` / `stop`（例如 `length`、`content_filter`、
+ *    `repetition_truncation`、未知原因）→ 即使参数是合法 JSON，也只代表模型
+ *    “没有成功完成”，调用不完整，不得执行。
  *  - 流内出现 `error` 事件 / `delta.error` → 服务端异常，不得执行。
  */
 function finalize({ text, reasoning, assembler, finishReason, usage, profile, signal, interrupted = false, incomplete = false, sawError = false }) {
@@ -465,15 +491,20 @@ function finalize({ text, reasoning, assembler, finishReason, usage, profile, si
   // 端到端完整性：只有"收到过明确结束信号"才算完整完成。注意 interrupted 时 finishReason 会被改成 'interrupted'，
   // 那同样不是可靠完成信号，aborted 一律视为不完整。
   const reliablyComplete = !aborted && !incomplete && !sawError
-  const truncated = !reliablyComplete || finishReason === 'length'
-  // 完整结束（finish_reason='tool_calls' 或 [DONE]）才算有效工具调用；截断/异常一律按不完整处理
-  const valid = reliablyComplete && !truncated ? all.filter((call) => call.valid === true) : []
+  const badFinish = typeof finishReason !== 'string' || finishReason === '' || !finishAllowsToolExecution(finishReason)
+  const truncated = !reliablyComplete || badFinish
+  // 完整结束（finish_reason='tool_calls'）才算有效工具调用；截断/异常/stop-with-tools 一律按不完整处理
+  // （stop 且没有工具调用 = 正常文本回答；stop 却出现工具调用 = 协议不一致，不能执行）
+  const allowsTools = finishReason === 'tool_calls'
+  const valid = reliablyComplete && !truncated && allowsTools ? all.filter((call) => call.valid === true) : []
   // 截断时，即使参数是合法 JSON，也不得执行——归入 broken（带原因），让 Agent 感知并触发"不执行+提示"
-  const broken = truncated
+  const broken = truncated || (reliablyComplete && !allowsTools && all.length > 0)
     ? [...invalid, ...all.filter((call) => call.valid === true).map((call) => ({
         ...call,
         valid: false,
-        invalidReason: call.invalidReason ?? (finishReason === 'length' ? '响应被长度上限截断' : '响应未完整结束（缺少可靠结束信号）'),
+        invalidReason: call.invalidReason ?? (finishReason === 'length' || finishReason === 'content_filter' || finishReason === 'repetition_truncation'
+          ? `响应被终止（finish_reason=${finishReason}）`
+          : '响应未完整结束（缺少可靠结束信号或结束状态不允许执行）'),
       }))]
     : invalid
   return {
@@ -492,6 +523,7 @@ function finalize({ text, reasoning, assembler, finishReason, usage, profile, si
     incomplete: incomplete && !aborted,
     // Agent 据此决定"该不该把这次调用当作可执行指令"
     toolCallsIncomplete: truncated || (finishReason === 'tool_calls' && valid.length === 0 && broken.length > 0)
+      || (reliablyComplete && finishReason !== 'tool_calls' && all.length > 0)
       || (aborted && all.length > 0),
   }
 }

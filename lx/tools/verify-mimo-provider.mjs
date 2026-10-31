@@ -727,12 +727,13 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     check('F9 拒绝后仍如实收尾（不吞掉那轮对话）', r.text.includes('没做') || r.text !== '', JSON.stringify(r.text))
   })
 
-  // F10：历史压缩不能制造残缺工具链
+  // F10：历史压缩不能制造残缺工具链（且必须真正触发压缩）
   await withMock(({ attempt, body }) => {
     if (attempt <= 10) {
       return {
         sse: [
-          { choices: [{ index: 0, delta: { reasoning_content: `第 ${attempt} 步的思考，内容相当长。`.repeat(12) } }] },
+          // 推理内容做成长文本：单步 ≈ 6K 字符，10 步远超 40K 预算，必触发 compress
+          { choices: [{ index: 0, delta: { reasoning_content: `第 ${attempt} 步的思考，内容相当长。${'填充'.repeat(3000)}` } }] },
           { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `s${attempt}`, function: { name: 'scroll', arguments: '{"n":1}' } }] } }] },
           { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
         ],
@@ -744,7 +745,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash', profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }) })
     const agent = new Agent({
       llm: client,
-      tools: { listTools: () => [], invoke: async () => ({ text: `结果 ${'很长内容'.repeat(200)}` }) },
+      tools: { listTools: () => [], invoke: async () => ({ text: `结果 ${'很长内容'.repeat(500)}` }) },
       maxSteps: 12,
     })
     await agent.run('一路滚到底')
@@ -753,15 +754,76 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     const danglingToolResults = last.filter((m) => m.role === 'tool')
       .filter((t) => !last.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => c.id === t.tool_call_id)))
     check('F10 压缩后没有孤立 tool 结果', danglingToolResults.length === 0, danglingToolResults.map((m) => m.tool_call_id))
+    check('F10b 单回合多步工具链不被拆散（assistant 与结果仍配对）',
+      assistants.length === (last.filter((m) => m.role === 'tool').length)
+        && assistants.every((m) => Array.isArray(m.tool_calls) && m.tool_calls.length === 1),
+      `assistants=${assistants.length} tools=${last.filter((m) => m.role === 'tool').length}`)
+    check('F10c 压缩后 system 消息仍保留（PR3 自定义提示词不被删）',
+      last.some((m) => m.role === 'system' && typeof m.content === 'string' && m.content !== ''),
+      JSON.stringify(last.filter((m) => m.role === 'system').map((m) => m.content?.slice(0, 30))))
+    check('F10d 请求体没有任何内部 _providerId 字段',
+      last.every((m) => !('_providerId' in m)),
+      JSON.stringify(last.map((m) => Object.keys(m).join('|'))))
     check('F11 压缩后每个工具调用仍带 reasoning_content 字段',
       assistants.every((m) => typeof m.reasoning_content === 'string'), assistants.map((m) => (m.reasoning_content ?? '').length))
     // 长推理历史：保留的 reasoning_content 必须与原始响应逐字一致（不得截断/折叠/占位）
-    // mock 第 1..10 步分别生成 `第 N 步的思考，内容相当长。` ×12（N 不同长度不同：180/192）
-    const expectedReasoning = new Set()
-    for (let n = 1; n <= 12; n += 1) expectedReasoning.add(`第 ${n} 步的思考，内容相当长。`.repeat(12))
+    // 每步推理 = `第 N 步的思考，内容相当长。` + '填充'×3000（约 6000+ 字），必须整段保留
     check('F12 长推理历史完整保留（逐字一致，不被截断或折叠）',
-      assistants.every((m) => typeof m.reasoning_content === 'string' && expectedReasoning.has(m.reasoning_content)),
+      assistants.every((m) => {
+        const step = /^第 (\d+) 步的思考，内容相当长。?(?:填充)+$/u
+        return step.test(m.reasoning_content)
+          && m.reasoning_content.length >= 6000
+          && !m.reasoning_content.includes('（较早的思考已折叠）')
+          && !m.reasoning_content.endsWith('…（折叠）')
+      }),
       assistants.map((m) => m.reasoning_content.length))
+  })
+
+  // F10e：多个独立用户回合、每个都调工具且结果很大——压缩必须实际丢弃最老的完整单元，
+  //        system 保留、无孤立 tool、截图不拆散工具链
+  await withMock(({ body, attempt }) => {
+    // 忽略 system/user 是否带图片，只看有没有 tool 消息决定是否再调工具
+    const hasToolResult = body?.messages?.some((m) => m.role === 'tool')
+    if (!hasToolResult) {
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { reasoning_content: `第 ${attempt} 轮的思考。${'很长'.repeat(2500)}` } }] },
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `m${attempt}`, function: { name: 'screenshot', arguments: '{}' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+        ],
+      }
+    }
+    return { sse: [{ choices: [{ index: 0, delta: { content: '好，第几个任务完成' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash', profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }) })
+    const agent = new Agent({
+      llm: client,
+      // 每次都返回截图（模拟截图工具）+ 大文本，触发压缩
+      tools: {
+        listTools: () => [],
+        invoke: async () => ({
+          text: `截图结果 ${'很长内容'.repeat(800)}`,
+          image: { base64: 'a'.repeat(5000), mediaType: 'image/jpeg', width: 1920, height: 1080 },
+        }),
+      },
+      maxSteps: 6,
+    })
+    // 连续 5 个用户回合（同一 Agent，但 sessionHistory 由主进程维护，Agent 不接 history 时每轮独立）
+    for (let i = 0; i < 5; i += 1) {
+      await agent.run(`第 ${i + 1} 个任务`)
+    }
+    const last = mock.requests.at(-1).body.messages
+    const toolMsgs = last.filter((m) => m.role === 'tool')
+    const danglingToolResults = toolMsgs
+      .filter((t) => !last.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => c.id === t.tool_call_id)))
+    check('F10e 多用户回合压缩后没有孤立 tool 结果', danglingToolResults.length === 0, danglingToolResults.map((m) => m.tool_call_id))
+    check('F10f system 在所有请求中保留（含压缩后）',
+      last.some((m) => m.role === 'system' && typeof m.content === 'string' && m.content !== ''),
+      JSON.stringify(last.filter((m) => m.role === 'system').map((m) => m.content?.slice(0, 20))))
+    check('F10g 截图消息归入工具调用单元、未被当作新用户回合（无孤立图片 user）',
+      last.every((m) => !(m.role === 'user' && Array.isArray(m.content) && m.content.some((c) => c?.type === 'image_url')
+        && !last.some((a) => a.role === 'assistant' && Array.isArray(a.tool_calls)) )),
+      JSON.stringify(last.filter((m) => m.role === 'user').map((m) => typeof m.content === 'string' ? m.content : 'image-use')))
   })
 
   // F13：切换提供商后，新请求里绝不出现旧提供商的推理字段/私有历史
@@ -1262,6 +1324,143 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
   } finally {
     await toolkit.dispose()
     mock.server.close()
+  }
+}
+
+// ============================================================ J 连续对话真实数据流 + 认证目标隔离
+
+// J1-J5：串起「Agent.run → result.turn → sessionHistory → 下一轮 Agent.run(history)」
+// 模拟主进程 rememberTurn 的语义，验证：历史不重复、纯文本回复进入下一轮、同提供商 reasoning 保留。
+{
+  const bodies = []
+  let turnCount = 0
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    turnCount += 1
+    if (turnCount === 1) {
+      // 第一轮：思考 + 工具调用（MiMo）
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { reasoning_content: '第一轮思考，需要查一下窗口。' } }] },
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'j1', function: { name: 'list_windows', arguments: '{}' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+        ],
+      }
+    }
+    if (turnCount === 2) {
+      // 工具结果后：最终回答（纯文本）
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { reasoning_content: '第一轮总结思考' } }] },
+          { choices: [{ index: 0, delta: { content: '我看到桌面上有记事本。' }, finish_reason: 'stop' }] },
+        ],
+      }
+    }
+    // 第二轮：纯文本回答
+    return {
+      sse: [
+        { choices: [{ index: 0, delta: { reasoning_content: '第二轮思考，无需工具。' } }] },
+        { choices: [{ index: 0, delta: { content: '当然可以。' }, finish_reason: 'stop' }] },
+      ],
+    }
+  }, async (mock) => {
+    const client = new LLMClient({
+      baseURL: mock.url, apiKey: 'sk-mimo', model: 'mimo-v2.6-flash',
+      profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash', mimoThinking: 'enabled' }),
+    })
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [], invoke: async () => ({ text: '记事本、浏览器' }) },
+      maxSteps: 4,
+      onEvent: () => {},
+    })
+    // 第一轮
+    const r1 = await agent.run('看看开了什么')
+    check('J1 第一轮返回本轮增量 turn（第一个为 user）',
+      Array.isArray(r1.turn) && r1.turn.length >= 2 && r1.turn[0]?.role === 'user' && r1.turn[0]?.content === '看看开了什么',
+      JSON.stringify(r1.turn?.map((m) => `${m.role}:${typeof m.content === 'string' ? m.content.slice(0, 10) : 'img'}`)))
+    check('J1b 增量 turn 含最终纯文本回复（工具后收尾）',
+      r1.turn.some((m) => m.role === 'assistant' && m.content === '我看到桌面上有记事本。'),
+      JSON.stringify(r1.turn?.map((m) => m.role)))
+    check('J1c 增量 turn 含工具调用与结果配对', r1.turn.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))
+      && r1.turn.some((m) => m.role === 'tool' && m.tool_call_id === 'j1'))
+
+    // 主进程 rememberTurn 语义：sessionHistory = [...history, ...turn]
+    let sessionHistory = [...r1.turn]
+
+    const r2 = await agent.run('帮我开一下', { history: sessionHistory })
+    sessionHistory = [...sessionHistory, ...r2.turn]
+    check('J2 第二轮请求历史不重复（user 只出现一次）',
+      bodies[2].messages.filter((m) => m.role === 'user' && typeof m.content === 'string').length === 2,
+      JSON.stringify(bodies[2].messages.filter((m) => m.role === 'user').map((m) => m.content)))
+    check('J2b 第二轮请求带有第一轮真实 assistant 回复',
+      bodies[2].messages.some((m) => m.role === 'assistant' && m.content === '我看到桌面上有记事本。'),
+      JSON.stringify(bodies[2].messages.filter((m) => m.role === 'assistant').map((m) => m.content)))
+    check('J2c 第二轮请求仍带上第一轮的 reasoning（同提供商回传要求）',
+      bodies[2].messages.some((m) => m.role === 'assistant' && typeof m.reasoning_content === 'string' && m.reasoning_content.includes('第一轮思考')),
+      JSON.stringify(bodies[2].messages.filter((m) => m.role === 'assistant').map((m) => Object.keys(m).join('|'))))
+
+    // 第三轮：纯文本无工具
+    const r3 = await agent.run('好的', { history: sessionHistory })
+    check('J3 纯文本回复也进入 turn（可在后续回合回传）',
+      Array.isArray(r3.turn) && r3.turn.some((m) => m.role === 'assistant' && m.content === '当然可以。'),
+      JSON.stringify(r3.turn?.map((m) => m.role)))
+  })
+}
+
+// J6-J9：认证目标凭据隔离——同一 providerId 改 baseURL 不越境；切回原目标复用
+{
+  const srv = await startMockServer({ port: 0, handler: ({ headers, url }) => {
+    const auth = headers.authorization ?? ''
+    if (url.endsWith('/models')) {
+      if (auth === 'Bearer sk-target-a') return { json: { data: [{ id: 'mimo-v2.6-flash' }, { id: 'mimo-v2.6-pro' }] } }
+      if (auth === 'Bearer sk-target-b') return { json: { data: [{ id: 'mimo-v2.6-flash' }, { id: 'mimo-v2.6-ultra' }] } }
+      return { json: { data: [] } }
+    }
+    return { json: { choices: [{ index: 0, message: { role: 'assistant', content: 'ok', finish_reason: 'stop' } }] } }
+  } })
+  try {
+    // 目标 A：mimo @ srv.url，Key=sk-target-a
+    await store.saveConfig({ providerId: 'mimo', baseURL: srv.url, model: 'mimo-v2.6-flash', apiKey: 'sk-target-a' })
+    const cfgA = await store.loadConfig()
+    const resolvedA = await store.resolveApiKeyFor('mimo', { config: cfgA, baseURL: srv.url })
+    check('J6 保存后当前目标持有自己的 Key',
+      cfgA.apiKey === 'sk-target-a' && resolvedA === 'sk-target-a',
+      `apiKey=${cfgA.apiKey} resolved=${resolvedA}`)
+
+    // 换成不同认证目标（同一 providerId 但不同 baseURL）
+    const srvB = await startMockServer({ port: 0, handler: () => ({}) })
+    try {
+      const srvBUrl = srvB.url
+      const switched = await store.saveConfig({ providerId: 'mimo', baseURL: srvBUrl, model: 'mimo-v2.6-flash', apiKey: 'sk-target-b' })
+      check('J7 换目标后新 Key 存到新目标', (await store.loadConfig()).apiKey === 'sk-target-b')
+
+      // 切回目标 A：应复用 sk-target-a（不需要重填）
+      const back = await store.saveConfig({ providerId: 'mimo', baseURL: srv.url })
+      check('J8 切回原目标自动复用已保存 Key', (await store.loadConfig()).apiKey === 'sk-target-a',
+        `apiKey=${back.config?.apiKey}`)
+
+      // 目标隔离：在目标 B 时，`resolveApiKeyFor('mimo', {baseURL: srv.url})` 应为 A 的 Key，绝不能是 B
+      const cfgB = await store.loadConfig()
+      check('J9 不同目标取 Key 互不越境（B 目标只取 B 的 Key）',
+        await store.resolveApiKeyFor('mimo', { config: cfgB, baseURL: srvBUrl }) === 'sk-target-b',
+        await store.resolveApiKeyFor('mimo', { config: cfgB, baseURL: srvBUrl }))
+    } finally {
+      srvB.server.close()
+    }
+
+    // 模型发现也用目标 Key：目标 A 的列表请求带 sk-target-a
+    const { fetchChatModels } = await import('../packages/config/model-discovery.mjs')
+    const fetched = await fetchChatModels({
+      providerId: 'mimo', baseURL: srv.url,
+      apiKey: await store.resolveApiKeyFor('mimo', { config: await store.loadConfig(), baseURL: srv.url }),
+      cache: new Map(), apiKeyRequired: true,
+    })
+    check('J10 模型发现使用目标对应 Key 且拿到该目标目录',
+      fetched.ok === true && fetched.models.some((m) => m.id === 'mimo-v2.6-pro'),
+      JSON.stringify(fetched.models?.map((m) => m.id)))
+  } finally {
+    srv.server.close()
   }
 }
 

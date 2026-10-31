@@ -112,8 +112,39 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
     return true
   })
 
+  // 3) 跨提供商：旧提供商的工具链（assistant tool_calls + 配对 tool 结果）是
+  //    私有协议上下文，发给新端点既不兼容也没意义；只保留纯文本(user/assistant content)单元。
+  //    判断依据：单元内**任一**消息的 `_providerId` 与当前 providerId 不同 → 该单元属于旧家。
+  //    无标记（老会话/外部构造）视为当前提供商，保留完整内容。
+  const providersDiffer = providerId !== ''
+    ? (unit) => {
+        const all = [unit.head, ...unit.calls]
+        return all.some((m) => m._providerId !== undefined && String(m._providerId) !== String(providerId))
+      }
+    : () => false
+  const compatible = complete.filter((unit) => {
+    if (!providersDiffer(unit)) return true
+    // 旧提供商单元：含工具链的整组剔除；纯文本单元剥掉 reasoning 后保留
+    const hasToolchain = unit.calls.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))
+      || unit.calls.some((m) => m.role === 'tool')
+    return !hasToolchain
+  })
+  // 兼容性过滤后统一处理 reasoning_content：
+  //  - 旧提供商的纯文本单元（providersDiffer）必然剥掉；
+  //  - 当前端点不要求回传（非 MiMo/DeepSeek，比如普通 OpenAI 兼容）时，
+  //    无标记/同提供商历史的 reasoning 也不该带出去——它是私有字段。
+  const needEcho = requiresReasoningEcho(providerCapability)
+  for (const unit of compatible) {
+    const old = providersDiffer(unit)
+    for (const m of unit.calls) {
+      if (m.role !== 'assistant' || typeof m.reasoning_content !== 'string') continue
+      if (old || !needEcho) delete m.reasoning_content
+    }
+    delete unit.head._providerId
+  }
+
   // 2) 从最老开始丢弃单元，直到不超过消息数与字符预算
-  let kept = complete.slice(-HISTORY_MAX_MESSAGES)
+  let kept = compatible.slice(-HISTORY_MAX_MESSAGES)
   const totalChars = () => kept.reduce((sum, u) => sum + unitChars(u), 0)
   while (kept.length > 1 && totalChars() > HISTORY_MAX_CHARS) {
     kept = kept.slice(1)
@@ -123,38 +154,21 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
     kept = kept.slice(-1)
   }
 
-  // 3) 重组为平铺消息
+  // 4) 重组为平铺消息，并统一剥离内部 `_providerId` 标记（绝不发往模型）
   const flat = []
   for (const unit of kept) {
     flat.push(unit.head)
     for (const m of unit.calls) flat.push(m)
   }
-
-  // 4) 跨提供商时不把旧提供商的 reasoning_content 发给新端点
-  //    判断依据：消息上若带 `_providerId`（rememberTurn 从回合快照带上来的），
-  //    与当前 providerId 不同 → 该 reasoning 属于旧家，剥离；
-  //    没有标记的（老会话/外部构造的历史），按当前提供商是否需要回传闻决定：
-  //    需要回传（MiMo/DeepSeek）默认保留，否则剥离。
   for (const m of flat) {
-    if (m.role !== 'assistant' || typeof m.reasoning_content !== 'string') continue
-    const fromOldProvider = m._providerId !== undefined
-      && providerId !== '' && String(m._providerId) !== String(providerId)
-    if (fromOldProvider || !requiresReasoningEcho(providerCapability)) {
-      delete m.reasoning_content
-    }
-    // `_providerId` 只是内部追踪标记，绝不能发到模型请求里
-    delete m._providerId
+    if ('_providerId' in m && typeof m._providerId !== 'undefined') delete m._providerId
   }
   return flat
 }
 
-/** 一个交互单元的字符数（content 可能是字符串或数组） */
+/** 一个交互单元的字符数（含 reasoning/tool 字段，与 messageLength 同口径） */
 function unitChars(unit) {
-  let total = typeof unit.head.content === 'string' ? unit.head.content.length : JSON.stringify(unit.head.content ?? '').length
-  for (const m of unit.calls) {
-    total += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length
-  }
-  return total
+  return messageLength([unit.head, ...unit.calls])
 }
 
 export class Agent {
@@ -240,8 +254,14 @@ export class Agent {
     const messages = [
       { role: 'system', content: turnPrompt },
       ...trimHistory(history, { providerCapability: capability, providerId }),
-      { role: 'user', content: input },
     ]
+    /*
+     * 本轮增量起点：之后 push 到 messages 的都是「本轮产生的消息」
+     * （本轮 user + assistant/toool/截图）。返回时只切这一段，绝不把
+     * trimHistory 之后的旧历史带回去，避免保存方重复追加。
+     */
+    const turnStart = messages.length
+    messages.push({ role: 'user', content: input })
     const steps = []
     const availableTools = this.#tools.listTools()
     let finalText = ''
@@ -297,6 +317,9 @@ export class Agent {
       }
 
       if (toolCalls.length === 0 && broken.length === 0) {
+        // 纯文本回复也要进消息历史：后续同一会话的提问需要带着这条回复，
+        // 且如果是思考模式下，reasoning_content 也要如实回传。
+        messages.push(assistantMessageFrom(result))
         emit({ type: 'assistant', text: result.text, step })
         break
       }
@@ -428,24 +451,21 @@ export class Agent {
      * 甚至换个提供商，判出来的东西和刚说的这段话不是一套。
      */
     /*
-     * 同时返回本回合完整会话（含 reasoning_content / tool_calls / tool 结果），
-     * 供主进程 `rememberTurn` 做跨用户回合记忆——同一唤醒会话的下一轮提问需要这些字段
-     * 才能满足 MiMo/DeepSeek 思考模式的回传要求。这里只做浅拷贝 + 深拷贝 content，
-     * 不把 system 消息带出去（主进程记忆不需要人设）。
+     * 返回**本轮增量** `turn`（turnStart 之后的 messages）：本轮 user + 全部 assistant
+     * （含 reasoning_content / tool_calls） + tool 结果 + 截图消息。**不包含**传入 history
+     * 里的旧消息——旧历史由保存方自行维护，不能由 Agent 反复带出造成重复。
+     *
+     * 每条消息打 `_providerId` 标记供跨提供商剥离，但该字段绝不会进请求体（trimHistory 会删）。
      */
-    const conversation = messages
-      .filter((m) => m.role !== 'system')
-      .map((m) => ({
-        ...m,
-        // `_providerId` 是内部追踪标记：跨回合记忆时用它判断历史推理属于哪个提供商，
-        // 供 trimHistory 跨提供商剥离。它绝不进请求体（trimHistory 会删）。
-        _providerId: providerId,
-        content: typeof m.content === 'string' ? m.content : (m.content === undefined || m.content === null ? null : JSON.parse(JSON.stringify(m.content))),
-        ...(m.tool_calls !== undefined ? { tool_calls: JSON.parse(JSON.stringify(m.tool_calls)) } : {}),
-        ...(m.reasoning_content !== undefined ? { reasoning_content: m.reasoning_content } : {}),
-        ...(m.tool_call_id !== undefined ? { tool_call_id: m.tool_call_id } : {}),
-      }))
-    return { text: finalText, steps, limited: hitStepLimit, reasoningChars, llm, conversation, providerId }
+    const turn = messages.slice(turnStart).map((m) => ({
+      ...m,
+      _providerId: providerId,
+      content: typeof m.content === 'string' ? m.content : (m.content === undefined || m.content === null ? null : JSON.parse(JSON.stringify(m.content))),
+      ...(m.tool_calls !== undefined ? { tool_calls: JSON.parse(JSON.stringify(m.tool_calls)) } : {}),
+      ...(m.reasoning_content !== undefined ? { reasoning_content: m.reasoning_content } : {}),
+      ...(m.tool_call_id !== undefined ? { tool_call_id: m.tool_call_id } : {}),
+    }))
+    return { text: finalText, steps, limited: hitStepLimit, reasoningChars, llm, turn, providerId }
   }
 }
 
@@ -472,40 +492,59 @@ function clamp(text, max) {
  *
  * 新行为：
  *  - 不再截断/改写任何 `reasoning_content`。
+ *  - **不会删除 system 消息**：system（含 PR3 自定义提示词）是每个请求的头部，永远保留。
+ *  - 工具返回的截图（content 数组、含 image_url 的 user 消息）归入其所属 assistant
+ *    工具单元，绝不会被当成新对话回合；压缩不会拆散 tool_calls 与配对结果。
  *  - 上下文超长时，从最老的 user 单元开始整体删除（user + assistant + tool 结果一起），
  *    不留下孤立 tool、不留下缺结果的 tool_calls。
+ *  - 预算同时计入 reasoning_content、工具参数与截图数据，而不只统计 content 文本。
  */
 function compress(messages) {
   if (messages.length <= COMPRESS_AFTER_MESSAGES) return
-  // 仍给一个宽松上限：大多数正常回合不会触发；超长时丢弃最老的完整单元。
-  const budget = CONTEXT_BUDGET_CHARS
-  if (messageLength(messages) <= budget) return
+  // 预算：按完整消息长度（含推理/工具/图片）
+  if (messageLength(messages) <= CONTEXT_BUDGET_CHARS) return
 
-  const units = splitCompleteUnits(messages)
-  // 从最老开始丢弃完整单元，直到不超过预算
+  // 1) 分离 system（不可裁剪，必须是请求头部）
+  const systemMsgs = messages.filter((m) => m.role === 'system')
+  const rest = messages.filter((m) => m.role !== 'system')
+
+  // 2) 拆分完整交互单元（截图 user 归入所属工具单元）
+  const units = splitCompleteUnits(rest)
+  // 3) 从最老开始丢弃完整单元，直到不超过预算；至少保留一个用户回合
   let kept = units
-  while (kept.length > 1 && messageLength(flattenUnits(kept)) > budget) {
+  while (kept.length > 1 && messageLength(flattenUnits(kept)) > CONTEXT_BUDGET_CHARS) {
     kept = kept.slice(1)
   }
-  const flat = flattenUnits(kept)
-  // 原地替换 messages（保留对调用方数组的引用）
-  messages.splice(0, messages.length, ...flat)
+  const flat = flattenUnits(kept.length > 0 ? kept : rest.slice(-1))
+  // 4) 原地替换 messages：system 在前，后跟保留下来的单元
+  messages.splice(0, messages.length, ...systemMsgs, ...flat)
 }
 
-/** 回合内完整交互单元拆分：user 开头，assistant/tool 配对，残缺单元整体剔除 */
+/**
+ * 回合内完整交互单元拆分：user 开头，assistant/tool 配对，残缺单元整体剔除。
+ *
+ * “用户回合”只有**普通文本 user 消息**（content 为字符串）才会开启新单元；
+ * 工具返回的截图是 `{role:'user', content:[{type:'image_url',...}]}`，
+ * 它会归入**当前正在进行**的 assistant 工具单元（作为工具结果的附件），
+ * 不会拆散 tool_calls 与截图之间的关联。
+ */
 function splitCompleteUnits(messages) {
   const units = []
   let current = null
   let pendingIds = new Set()
   const flush = (unit) => { if (unit !== null && unitComplete(unit)) units.push(unit) }
   for (const msg of messages) {
-    if (msg.role === 'user') {
+    if (msg.role === 'user' && typeof msg.content === 'string') {
+      // 真正的用户指令：开启新单元
       flush(current)
       current = { head: msg, calls: [] }
       pendingIds = new Set()
       continue
     }
-    if (current === null) continue
+    if (current === null) {
+      // 没有用户开头就出现 assistant/tool/图片：残缺开头，跳过
+      continue
+    }
     if (msg.role === 'assistant') {
       current.calls.push(msg)
       if (Array.isArray(msg.tool_calls)) {
@@ -524,12 +563,17 @@ function splitCompleteUnits(messages) {
       }
       continue
     }
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      // 工具返回的截图附件：归入当前单元（若当前确实有正在进行的工具调用）
+      current.calls.push(msg)
+      continue
+    }
   }
   flush(current)
   const kept = units.filter((u) => u.calls.length > 0)
-  if (kept.length === 0 && messages.some((m) => m.role === 'user')) {
+  if (kept.length === 0 && messages.some((m) => m.role === 'user' && typeof m.content === 'string')) {
     // 至少保住当前回合的 user（避免裁空）
-    const lastUser = [...messages].reverse().find((m) => m.role === 'user')
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user' && typeof m.content === 'string')
     return [{ head: lastUser, calls: [] }]
   }
   return kept
@@ -555,11 +599,24 @@ function flattenUnits(units) {
   return out
 }
 
+/**
+ * 字符长度：除 content 外，还计入 reasoning_content、tool_calls 参数等，
+ * 因为 MiMo/DeepSeek 回传要求保留这些字段，它们同样占用上下文预算。
+ */
 function messageLength(list) {
-  return list.reduce((sum, m) => {
+  let total = 0
+  for (const m of list) {
     const c = m.content
-    return sum + (typeof c === 'string' ? c.length : JSON.stringify(c ?? '').length)
-  }, 0)
+    total += typeof c === 'string' ? c.length : JSON.stringify(c ?? '').length
+    if (typeof m.reasoning_content === 'string') total += m.reasoning_content.length
+    if (Array.isArray(m.tool_calls)) total += JSON.stringify(m.tool_calls).length
+    if (Array.isArray(m.tool_calls)) {
+      for (const t of m.tool_calls) {
+        if (t?.function?.arguments) total += String(t.function.arguments).length
+      }
+    }
+  }
+  return total
 }
 
 function throwIfAborted(signal) {
