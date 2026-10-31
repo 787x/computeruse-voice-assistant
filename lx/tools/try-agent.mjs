@@ -9,6 +9,7 @@
 import { loadConfig, resolveApiKey } from '../packages/config/store.mjs'
 import { LLMClient } from '../packages/agent/llm.mjs'
 import { Agent } from '../packages/agent/loop.mjs'
+import { resolveSystemPrompt } from '../packages/agent/system-prompt.mjs'
 import { CuaToolkit } from '../packages/cua/adapter.mjs'
 
 const input = process.argv.slice(2).join(' ') || '帮我看看现在开了哪些窗口'
@@ -53,6 +54,8 @@ const toolkit = new CuaToolkit({ frameDir: 'packages/cua/frames' })
 const agent = new Agent({
   llm,
   tools: toolkit,
+  // 与壳子里一致：配置里存了自定义就用它，没存就用内置默认（同一份文本来源）
+  systemPrompt: resolveSystemPrompt(config.systemPrompt),
   maxSteps: config.maxSteps,
   onEvent: (event) => {
     if (event.type === 'tool_start') console.log(`[→ ${event.name}]`)

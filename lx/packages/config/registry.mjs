@@ -67,6 +67,13 @@ export function defaultConfig() {
     maxSteps: 16,
     timeoutMs: 60000,
     /**
+     * 系统提示词（人设与行为指引）。
+     *  - null / 未设置：用 packages/agent/system-prompt.mjs 里的内置默认提示词
+     *  - 非空字符串：用户自定义，**原样**发给模型（不追加、不改写）
+     * 语义见 store.saveConfig：字段缺省=不修改，null=显式恢复默认，空白/非文本=保存失败。
+     */
+    systemPrompt: null,
+    /**
      * 权限（R7）。默认"标准档"：低风险放行、不可逆询问、破坏性系统操作拒绝。
      * pausedUntil / allowedOnce 是运行期状态，落盘是为了重启后不丢"暂停 10 分钟"的承诺。
      */
