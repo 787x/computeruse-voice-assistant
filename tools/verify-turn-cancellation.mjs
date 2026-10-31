@@ -4,10 +4,13 @@ import vm from 'node:vm'
 const source=(await readFile(new URL('../apps/shell/main.mjs',import.meta.url),'utf8')).replace(/\r\n/g,'\n')
 const fn=name=>{const a=source.indexOf(name);assert.ok(a>=0,name);return source.slice(a,source.indexOf('\n}',a)+2)}
 const deferred=()=>{let resolve,reject;const promise=new Promise((r,j)=>{resolve=r;reject=j});return {promise,resolve,reject}}
+const stubIsOfflineError='function isOfflineError(){return false}\n'
 for (const phase of ['refresh','init','model','model-error']) {
- const pause=deferred(), entered=deferred(), runDone=deferred();let runOptions, runCount=0
+ const pause=deferred(), entered=deferred(), runDone=deferred();let runOptions, runCount=0, syncCount=0
  const ctx=vm.createContext({AbortController,console,process,Date,clearTimeout(){},
  refreshSearchKey:async()=>{if(phase==='refresh'){entered.resolve();await pause.promise}},
+ // 回合入口的端点对账：桩件记一次调用次数，顺便证明它确实在 ensureAgent 之前跑
+ syncAgentEndpointIfChanged:async()=>{syncCount++},
  ensureAgent:async()=>{if(phase==='init'){entered.resolve();await pause.promise}; return {agent:{run:async(_text,options)=>{
  runOptions=options;runCount++;entered.resolve();return await runDone.promise
  }}}}})
@@ -15,11 +18,15 @@ for (const phase of ['refresh','init','model','model-error']) {
  const musicCredentials={cancelPending(){}};let turnSeq=0,activeTurn=null,latestTurn=null,hideTimer=null,commandTimer=null,commandActive=false;
  let wantContinue=false,followUpJudgement=null,followUpJudgePromise=null,asr=null,lastCommandText='',lastSentPartial='';
  let lastUtterance='',deniedInTurn={},turnHistoryCounts=[],sessionHistory=[],userDismissedHud=false,listening=false;
- let ui=[],closed=0;
+ let ui=[],closed=0,agentRuntime=null;
+ ${stubIsOfflineError}
  function closeConfirmCard(){closed++} function stopSpeaking(){} function hideHud(){ui.push('hide')}
  function log(){} function sendSubtitle(x){ui.push(x)} function setState(x){ui.push(x)}
  function parseOfflineIntent(){return null} function isOfflineNow(){return false}
  function takeSentences(){return []} function flushTurn(){ui.push('flush')} function speakLine(){ui.push('speak')}
+ function rememberTurn(){} function judgeFollowUp(){return Promise.resolve({wait:false,confidence:0.5,source:'stub'})}
+ function heuristicFollowUp(){return {wait:false,confidence:0.5}} function windowFor(){return 0}
+ function afterTurnSpeechSettled(){} function scheduleHide(){}
  ${fn('function cancelActiveTurn(reason)')}
  ${fn('function isCurrentTurn(turn)')}
  ${fn('function dismiss()')}
@@ -46,6 +53,9 @@ for (const phase of ['refresh','init','model','model-error']) {
  assert.equal(run('closed'),count,'old finally must not close new confirmation')
  assert.equal(run('JSON.stringify(ui)'),snapshot)
  assert.equal(runCount,phase.startsWith('model')?1:0)
+ // 端点对账必须在 ensureAgent 之前、每个真正往下走的回合恰好一次；
+ // 卡在 refreshSearchKey 的那轮被 dismiss 后提前返回，绝不能再改运行时。
+ assert.equal(syncCount,phase==='refresh'?0:1,'reconcile once per surviving turn, never before a paused refresh')
 }
 console.log('Shell turn cancellation: 4 asynchronous phases PASS (dismiss, late UI/results, new-turn isolation)')
 

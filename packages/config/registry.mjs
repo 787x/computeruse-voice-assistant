@@ -4,18 +4,41 @@
  * 只描述"有哪些可选"，不负责存储。存储见 store.mjs。
  * 所有提供商都按 OpenAI 兼容协议调用（/chat/completions），
  * 这样 agent loop 只写一套代码，切换提供商不改逻辑。
+ *
+ * `capabilities` 决定这个提供商能接受哪些推理参数（见 agent/ll-params.mjs）：
+ *  - `mimo`：只有 `thinking:{type:enabled|disabled}`，没有强度档位
+ *  - `deepseek`：`thinking` 开关 + `reasoning_effort` 强度
+ *  - 其它：标准 OpenAI 兼容，**不发送任何提供商专属字段**
+ * `modelDiscovery` 表示这个提供商的 `/v1/models` 是官方在线目录，设置页会自动拉取。
  */
 
-/** @typedef {{id:string,name:string,baseURL:string,models:string[],apiKeyRequired:boolean,notes:string}} Provider */
+/** @typedef {{id:string,name:string,baseURL:string,models:string[],apiKeyRequired:boolean,notes:string,capabilities?:string,modelDiscovery?:boolean,keyConsoleUrl?:string,defaultModel?:string}} Provider */
 
 export const PROVIDERS = [
+  {
+    id: 'mimo',
+    name: 'Xiaomi MiMo',
+    // 按量付费的 OpenAI 兼容端点（Token Plan 是另一个地址 + tp-/ttp- 开头的 Key，不能混用）
+    baseURL: 'https://api.xiaomimimo.com/v1',
+    models: ['mimo-v2.6-flash', 'mimo-v2.6-pro', 'mimo-v2.6-pro-ultraspeed'],
+    defaultModel: 'mimo-v2.6-flash',
+    apiKeyRequired: true,
+    capabilities: 'mimo',
+    modelDiscovery: true,
+    keyConsoleUrl: 'https://platform.xiaomimimo.com/#/console/api-keys',
+    notes: '按量付费地址。在线模型列表会自动获取；V2.6 系列默认开启思考。ASR/TTS 模型已从选择器里排除。',
+  },
   {
     id: 'deepseek',
     name: 'DeepSeek 官方',
     baseURL: 'https://api.deepseek.com/v1',
     models: ['deepseek-flash', 'deepseek-v4-pro'],
+    defaultModel: 'deepseek-flash',
     apiKeyRequired: true,
-    notes: 'tool calling 稳定，作为默认云端选择',
+    capabilities: 'deepseek',
+    modelDiscovery: true,
+    keyConsoleUrl: 'https://platform.deepseek.com/api_keys',
+    notes: 'tool calling 稳定；可单独设置推理等级（none/low/high/max）',
   },
   {
     id: 'openai-compatible',
@@ -43,10 +66,21 @@ export const PROVIDERS = [
   },
 ]
 
-export const DEFAULT_PROVIDER_ID = 'deepseek'
+/**
+ * 新装默认提供商：MiMo。
+ * 注意这只影响**全新配置**（磁盘上还没有 providerId）。
+ * 已有 DeepSeek / 自定义端点的配置升级后保持原样，见 store.mjs 的迁移说明。
+ */
+export const DEFAULT_PROVIDER_ID = 'mimo'
 
 export function getProvider(id) {
   return PROVIDERS.find((provider) => provider.id === id)
+}
+
+/** 该提供商的推荐初始模型（新装/切提供商时用；在线列表优先于它） */
+export function defaultModelFor(provider) {
+  if (typeof provider?.defaultModel === 'string' && provider.defaultModel !== '') return provider.defaultModel
+  return provider?.models?.[0] ?? ''
 }
 
 /** 生成一份默认配置。 */
@@ -56,9 +90,31 @@ export function defaultConfig() {
     schemaVersion: 1,
     providerId: provider.id,
     baseURL: provider.baseURL,
-    model: provider.models[0],
+    model: defaultModelFor(provider),
     apiKey: '',
+    /*
+     * 每个提供商自己的 Key（`{deepseek: 'sk-…', mimo: 'sk-…'}`）。
+     * `apiKey` 是「当前提供商正在用的那一份」，由本表推导出来，不单独存意义。
+     * 这样切提供商不会把上一家的 Key 发到新端点，切回来又不用重填。
+     */
+    providerKeys: {},
     temperature: 0.3,
+    /*
+     * 推理控制（按提供商生效，互不冲突）：
+     *  - mimoThinking: default（跟随服务端；V2.6 官方默认开）| enabled | disabled
+     *  - deepseekReasoningEffort: default | none | low | high | max
+     * 存"档位"而不是存布尔：换提供商时另一个字段不会被误当成"用户表过态"。
+     * 未识别的取值一律回 default（详见 agent/ll-params.mjs）。
+     */
+    mimoThinking: 'default',
+    deepseekReasoningEffort: 'default',
+    /**
+     * 自定义端点上的协议提示（`openai-compatible` 这类没有内置能力的提供商用）：
+     *  - `auto`：什么都不发（默认，最安全）
+     *  - `deepseek` / `mimo`：按该协议的推理参数发
+     * 内置提供商会直接用注册表里的 capabilities，这个字段只对自定义端点起作用。
+     */
+    providerHint: 'auto',
     /**
      * 步数上限：一步 = 一次模型往返（可含多个工具调用）。
      * 8 步只够"看一眼+点一下"，开个程序经常用到第 9 步就被截断（实测无畏契约那轮 tools=10 还没点结果）。

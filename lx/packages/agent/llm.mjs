@@ -1,11 +1,29 @@
 /**
  * LLM 客户端：只实现 OpenAI 兼容的 /chat/completions。
  *
- * 一套代码适配所有提供商（DeepSeek / 自定义端点 / 本地 llama.cpp），
- * 因为它们的差异只有 baseURL 和 apiKey，协议是一致的。
+ * 一套代码适配所有提供商（MiMo / DeepSeek / 自定义端点 / 本地 llama.cpp / mock），
+ * 协议的差异由 **提供商档案（profile）** 决定，而不是散落着按模型名猜：
+ *  - 推理控制参数（thinking / reasoning_effort / 都不发）见 agent/ll-params.mjs
+ *  - 思考内容 `reasoning_content` 与最终回答 `content` **分开返回**：
+ *    思考内容只用于协议要求的上下文回传，绝不进字幕/TTS（否则用户会听到模型自言自语，
+ *    还会重复播报）。
+ *  - 模型发起工具调用时，assistant 消息必须原样带回 reasoning_content + tool_calls，
+ *    否则 MiMo / DeepSeek 在思考模式下会返回 HTTP 400。
  *
- * 支持流式（SSE）与非流式；流式下逐块解析 tool_calls 增量。
+ * 支持流式（SSE）与非流式；流式下逐块解析 tool_calls 增量（按 index 归并，
+ * 函数名和参数都是分片到达的）。
  */
+
+import { buildProfileFor, buildRequestFields, requiresReasoningEcho, resolveCapability } from './ll-params.mjs'
+import { parseModelResponse } from '../config/model-catalog.mjs'
+
+/**
+ * 由一份配置（或一个模型方案）生成 LLM 客户端的提供商档案。
+ * 壳子里三处（初始化、保存设置、定时切换）都用它，保证"生效的推理策略"只有一套算法。
+ */
+export function profileFromConfig(source = {}) {
+  return buildProfileFor(source)
+}
 
 export class LLMError extends Error {
   constructor(message, details = {}) {
@@ -17,14 +35,60 @@ export class LLMError extends Error {
 
 const DEFAULT_TIMEOUT_MS = 60000
 
+/** 请求体里 assistant 消息的 reasoning 字段名（两家的 OpenAI 兼容端点同名） */
+const REASONING_FIELD = 'reasoning_content'
+
+/**
+ * 组装要放回对话历史的 assistant 消息。
+ *
+ * 为什么单独导出：loop 和 shell 都要用同一份规则。少带一个字段就是 400，
+ * 多带一个字段可能把旧提供商的私有字段发给新提供商，所以规则只能有一份。
+ *
+ * @param {{text:string, reasoning?:string, toolCalls?:Array, capability?:string,
+ *          echoReasoning?:boolean}} result
+ * @param {{capability?:string}} options 当前端点的能力；
+ *   `echoReasoning` 显式覆盖（Agent 用它按回合快照决定要不要带思考内容）
+ */
+export function assistantMessageFrom(result, options = {}) {
+  const capability = options.capability ?? result.capability ?? ''
+  // 只有「官方要求回传」的提供商才带 reasoning_content；
+  // 标准 OpenAI 兼容端点带上它属于提供商私有字段，可能直接被参数校验拒掉。
+  const echoReasoning = options.echoReasoning ?? requiresReasoningEcho(capability)
+  const message = { role: 'assistant' }
+  const text = typeof result.text === 'string' ? result.text : ''
+  const calls = Array.isArray(result.toolCalls) ? result.toolCalls.filter((call) => call?.valid !== false) : []
+
+  if (calls.length > 0) {
+    // OpenAI 兼容协议：有 tool_calls 时 content 允许为 null，但**两家都要求字段存在**
+    message.content = text === '' ? null : text
+    message.tool_calls = calls.map((call) => ({
+      id: call.id,
+      type: 'function',
+      function: { name: call.name, arguments: call.arguments },
+    }))
+  } else {
+    message.content = text
+  }
+
+  if (echoReasoning) {
+    const reasoning = typeof result.reasoning === 'string' ? result.reasoning : ''
+    // 只在真的想过的时候带。空串与缺省在协议上不是一回事：
+    // 模型没思考却回一个空 reasoning，部分实现会当成"上一轮的思考丢了"。
+    if (reasoning !== '') message[REASONING_FIELD] = reasoning
+  }
+  return message
+}
+
 export class LLMClient {
   #baseURL
   #apiKey
   #model
   #temperature
   #timeoutMs
+  /** 提供商档案：capability / thinking / reasoningEffort / 模型能力元数据 */
+  #profile
 
-  constructor({ baseURL, apiKey, model, temperature = 0.3, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  constructor({ baseURL, apiKey, model, temperature = 0.3, timeoutMs = DEFAULT_TIMEOUT_MS, profile = {} }) {
     if (typeof baseURL !== 'string' || baseURL === '') throw new Error('baseURL 不能为空')
     if (typeof model !== 'string' || model === '') throw new Error('model 不能为空')
     this.#baseURL = baseURL.replace(/\/+$/u, '')
@@ -32,6 +96,7 @@ export class LLMClient {
     this.#model = model
     this.#temperature = temperature
     this.#timeoutMs = timeoutMs
+    this.#profile = { ...profile }
   }
 
   get model() {
@@ -41,6 +106,18 @@ export class LLMClient {
   /** 运行中换模型（定时切换用），下一条请求即生效 */
   setModel(model) {
     if (typeof model === 'string' && model.trim() !== '') this.#model = model.trim()
+  }
+
+  /** 运行中改温度（保存设置后下一轮生效，不重建客户端） */
+  setTemperature(temperature) {
+    const value = Number(temperature)
+    if (Number.isFinite(value)) this.#temperature = value
+  }
+
+  /** 运行中改超时：思考模式确实更慢，60 秒上限是实测会撞到的 */
+  setTimeout(timeoutMs) {
+    const value = Number(timeoutMs)
+    if (Number.isFinite(value) && value > 0) this.#timeoutMs = value
   }
 
   /**
@@ -55,33 +132,93 @@ export class LLMClient {
     if (typeof model === 'string' && model.trim() !== '') this.#model = model.trim()
   }
 
-  /** 当前端点摘要（日志用，不含 Key） */
-  get endpoint() {
-    return { baseURL: this.#baseURL, model: this.#model, hasKey: this.#apiKey !== '' }
+  /**
+   * 换提供商档案（保存设置或定时切换后调用）。
+   * 只认这个入口来改推理参数，避免"界面改了、请求还是旧的"。
+   */
+  setProfile(profile = {}) {
+    this.#profile = { ...profile }
   }
 
-  #headers() {
-    const headers = { 'content-type': 'application/json' }
+  /**
+   * 取一份**回合快照**：地址、Key、模型、推理档位全部冻结在这一刻。
+   *
+   * 为什么必须有：一次多步任务要来回打好几趟模型。如果中途用户保存了设置或
+   * 定时切换改了提供商，后面的请求就会带着上一个提供商的 reasoning_content /
+   * 工具历史打到新端点上——轻则模型答非所问，重则直接 400，用户看到的
+   * 就是"任务做到一半断了"。回合用快照，改动只对**下一轮**生效。
+   */
+  snapshot() {
+    return new LLMClient({
+      baseURL: this.#baseURL,
+      apiKey: this.#apiKey,
+      model: this.#model,
+      temperature: this.#temperature,
+      timeoutMs: this.#timeoutMs,
+      profile: { ...this.#profile },
+    })
+  }
+
+  get profile() {
+    return { ...this.#profile }
+  }
+
+  /** 当前端点摘要（日志用，不含 Key） */
+  get endpoint() {
+    return {
+      baseURL: this.#baseURL,
+      model: this.#model,
+      hasKey: this.#apiKey !== '',
+      providerId: this.#profile.providerId ?? '',
+      capability: resolveCapability(this.#profile),
+      thinking: this.#profile.thinking ?? 'default',
+      reasoningEffort: this.#profile.reasoningEffort ?? 'default',
+    }
+  }
+
+  #headers(extra = {}) {
+    const headers = { 'content-type': 'application/json', ...extra }
     if (this.#apiKey !== '') headers.authorization = `Bearer ${this.#apiKey}`
     return headers
   }
 
   /**
-   * 发一次对话请求。
-   * @param {{messages:object[], tools?:object[], signal?:AbortSignal, onDelta?:(text:string)=>void, stream?:boolean}} options
-   * @returns {Promise<{text:string, toolCalls:{id:string,name:string,arguments:string}[], finishReason:string, usage?:object}>}
+   * 组装请求体（导出给测试与"测试模型"路径复用，保证界面测的就是实际发的）。
+   * @param {{messages:object[], tools?:object[], stream?:boolean}} options
    */
-  async chat({ messages, tools, signal, onDelta, stream = true }) {
+  buildBody({ messages, tools, stream = true, temperatureOverride } = {}) {
+    const sampling = {
+      temperature: temperatureOverride ?? this.#temperature,
+    }
+    const built = buildRequestFields({ ...this.#profile, model: this.#model }, sampling)
     const body = {
       model: this.#model,
       messages,
-      temperature: this.#temperature,
       stream,
     }
+    if (built.temperature !== null) body.temperature = built.temperature
     if (Array.isArray(tools) && tools.length > 0) {
+      // 空数组**不能**当 tools 发：多家实现会把 `tools: []` 当非法参数（400）。
+      // loop 的收尾往返传空数组，意思就是"这一步别调工具"。
       body.tools = tools
+      // MiMo 官方：非 auto 的 tool_choice 会被后端剥掉；DeepSeek 思考模式下
+      // required/指定工具直接 400。所以只用 auto，两家都安全。
       body.tool_choice = 'auto'
     }
+    Object.assign(body, built.fields)
+    return { body, built }
+  }
+
+  /**
+   * 发一次对话请求。
+   * @param {{messages:object[], tools?:object[], signal?:AbortSignal,
+   *          onDelta?:(text:string)=>void, onReasoning?:(text:string)=>void, stream?:boolean}} options
+   * @returns {Promise<{text:string, reasoning:string, toolCalls:Array, finishReason:string,
+   *            usage?:object, capability:string, reasoningContent:boolean}>}
+   *   `toolCalls` 里参数不完整/无法解析的条目会带 `valid:false`，调用方**不得**当有效调用执行。
+   */
+  async chat({ messages, tools, signal, onDelta, onReasoning, stream = true, temperatureOverride } = {}) {
+    const { body } = this.buildBody({ messages, tools, stream, temperatureOverride })
 
     const timeout = AbortSignal.timeout(this.#timeoutMs)
     const composed = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
@@ -111,31 +248,38 @@ export class LLMClient {
     if (!stream) {
       const json = await response.json()
       const message = json?.choices?.[0]?.message ?? {}
-      return {
-        text: message.content ?? '',
-        toolCalls: normalizeToolCalls(message.tool_calls),
+      return finalize({
+        text: textOf(message.content),
+        reasoning: textOf(message[REASONING_FIELD]),
+        assembler: new ToolCallAssembler().feed(message.tool_calls),
         finishReason: json?.choices?.[0]?.finish_reason ?? 'stop',
         usage: json?.usage,
-      }
+        profile: this.profile,
+        signal,
+      })
     }
 
-    return await this.#consumeStream(response, onDelta)
+    return await this.#consumeStream(response, { onDelta, onReasoning, signal })
   }
 
-  async #consumeStream(response, onDelta) {
+  async #consumeStream(response, { onDelta, onReasoning, signal }) {
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
+    const assembler = new ToolCallAssembler()
     let buffer = ''
     let text = ''
-    const calls = new Map()
+    let reasoning = ''
     let finishReason = 'stop'
     let usage
+    let ended = false
+    /** 有没有收到过收尾信号：finish_reason 或 [DONE]，一个都没有就是被截断了 */
+    let sawFinish = false
+    let sawDone = false
 
-    for (;;) {
-      const { value, done } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-
+    const pump = (chunk) => {
+      // 归一化换行：SSE 允许 \r\n，但事件分隔统一按 \n\n 找最省事。
+      // 原始 CR 只可能出现在行分隔符上（JSON 里的换行是转义后的字面 \n），所以安全。
+      buffer += chunk.replace(/\r\n/gu, '\n').replace(/\r/gu, '\n')
       let boundary
       while ((boundary = buffer.indexOf('\n\n')) >= 0) {
         const rawEvent = buffer.slice(0, boundary)
@@ -144,66 +288,183 @@ export class LLMClient {
           const trimmed = line.trim()
           if (!trimmed.startsWith('data:')) continue
           const payload = trimmed.slice(5).trim()
-          if (payload === '[DONE]') continue
+          if (payload === '') continue
+          if (payload === '[DONE]') { sawDone = true; continue }
           let json
           try {
             json = JSON.parse(payload)
           } catch {
             continue
           }
-          const choice = json?.choices?.[0]
           if (json?.usage) usage = json.usage
+          // 有些端点在最后一个 chunk 里把 choices 置空，只带 usage
+          const choice = json?.choices?.[0]
           if (choice === undefined) continue
-          if (choice.finish_reason) finishReason = choice.finish_reason
-          const delta = choice.delta ?? {}
+          if (choice.finish_reason) { finishReason = choice.finish_reason; sawFinish = true }
+          const delta = choice.delta ?? choice.message ?? {}
+          if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
+            reasoning += delta.reasoning_content
+            // 思考内容**只**走 onReasoning（默认不接），绝不混进字幕/TTS 的 text_delta
+            onReasoning?.(delta.reasoning_content)
+          }
           if (typeof delta.content === 'string' && delta.content !== '') {
             text += delta.content
             onDelta?.(delta.content)
           }
-          if (Array.isArray(delta.tool_calls)) {
-            for (const part of delta.tool_calls) {
-              const index = Number(part.index ?? 0)
-              const current = calls.get(index) ?? { id: '', name: '', arguments: '' }
-              if (part.id) current.id = part.id
-              if (part.function?.name) current.name += part.function.name
-              if (part.function?.arguments) current.arguments += part.function.arguments
-              calls.set(index, current)
-            }
-          }
+          if (Array.isArray(delta.tool_calls)) assembler.feed(delta.tool_calls)
         }
       }
     }
 
-    return {
-      text,
-      toolCalls: [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, v], i) => ({
-        id: v.id || `call_${i}`,
-        name: v.name,
-        arguments: v.arguments,
-      })),
-      finishReason,
-      usage,
+    try {
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) { ended = true; break }
+        if (signal?.aborted === true) break
+        pump(decoder.decode(value, { stream: true }))
+      }
+      if (!ended) buffer += decoder.decode()
+      pump('')
+    } catch (error) {
+      /*
+       * 用户打断（dismiss / barge-in）：把手上已解析的东西如实交出去，
+       * 上层会按中断处理——这不是错误，不该弹红字。
+       */
+      if (signal?.aborted === true) {
+        try { await reader.cancel() } catch { /* 已经关掉了不算错 */ }
+        return finalize({ text, reasoning, assembler, finishReason, usage, profile: this.profile, signal, interrupted: true })
+      }
+      // 超时：必须像非流式那样报错，否则用户只看到"话说到一半没了"，不知道是模型没回。
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        try { await reader.cancel() } catch { /* 已经关掉了不算错 */ }
+        throw new LLMError(`模型响应超时（${this.#timeoutMs}ms），已中止`, {
+          baseURL: this.#baseURL, model: this.#model, timeoutMs: this.#timeoutMs,
+        })
+      }
+      throw error
+    } finally {
+      /*
+       * 无论正常结束、打断还是超时，都要取消 reader：
+       * 连接已经建立后不 cancel，模型侧的连接会一直挂着（思考模式一次生成十几秒，
+       * 攒几个就被中断的回合，端点侧会当成你赖着不走）。
+       */
+      try { await reader.cancel() } catch { /* 已经关掉了不算错 */ }
     }
+
+    return finalize({ text, reasoning, assembler, finishReason, usage, profile: this.profile, signal,
+      incomplete: !sawFinish && !sawDone })
   }
 
-  /** 拉取该端点可用模型列表（配置页的"测试连接"会用到）。 */
+  /** 拉取该端点可用模型列表（返回聊天模型 id + 能力元数据）。 */
   async listModels({ signal } = {}) {
     const timeout = AbortSignal.timeout(Math.min(this.#timeoutMs, 15000))
     const composed = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
     const response = await fetch(`${this.#baseURL}/models`, { headers: this.#headers(), signal: composed })
-    if (!response.ok) throw new LLMError(`模型列表返回 ${response.status}`, { status: response.status })
-    const json = await response.json()
-    return (json?.data ?? []).map((entry) => entry.id).filter(Boolean)
+    if (!response.ok) {
+      const detail = response.status === 401 ? '（API Key 无效或未填）'
+        : response.status === 429 ? '（请求过于频繁，稍后再试）' : ''
+      throw new LLMError(`模型列表返回 ${response.status}${detail}`, { status: response.status })
+    }
+    let json
+    try {
+      json = await response.json()
+    } catch {
+      throw new LLMError('模型列表返回的不是 JSON', { status: response.status })
+    }
+    return parseModelResponse(json)
   }
 }
 
-function normalizeToolCalls(list) {
-  if (!Array.isArray(list)) return []
-  return list.map((call, index) => ({
-    id: call.id ?? `call_${index}`,
-    name: call.function?.name ?? '',
-    arguments: call.function?.arguments ?? '{}',
-  }))
+/**
+ * 流式 tool_calls 归并器。
+ * OpenAI 协议里 id/name/arguments 是分片到达的（arguments 常拆成几十片），
+ * 按 `index` 归并，并**保留到达顺序**。
+ */
+class ToolCallAssembler {
+  #calls = new Map()
+
+  feed(list) {
+    if (!Array.isArray(list)) return this
+    for (const part of list) {
+      if (part === null || typeof part !== 'object') continue
+      const index = Number.isFinite(Number(part.index)) ? Number(part.index) : this.#calls.size
+      const current = this.#calls.get(index) ?? { id: '', name: '', arguments: '' }
+      if (typeof part.id === 'string' && part.id !== '') current.id = part.id
+      if (typeof part.function?.name === 'string') current.name += part.function.name
+      if (typeof part.function?.arguments === 'string') current.arguments += part.function.arguments
+      this.#calls.set(index, current)
+    }
+    return this
+  }
+
+  /**
+   * 收尾：把原始分片变成可执行的调用。
+   * 参数不是合法 JSON、或函数名缺失的，标记 `valid:false` 而不是硬执行——
+   * 半截参数喂给 CUA（点击、键盘、杀进程）比不调用危险得多。
+   */
+  done() {
+    const out = []
+    const entries = [...this.#calls.entries()].sort((a, b) => a[0] - b[0])
+    for (const [position, [, call]] of entries.entries()) {
+      const id = call.id !== '' ? call.id : `call_${position}`
+      const name = call.name.trim()
+      const raw = call.arguments
+      const record = { id, name, arguments: raw, valid: true }
+      if (name === '') {
+        record.valid = false
+        record.invalidReason = '缺少函数名'
+      } else if (raw.trim() === '') {
+        // 空参数按 {} 处理是各家 SDK 的通行做法（无参工具就是空对象）
+        record.arguments = '{}'
+      } else {
+        try {
+          const parsed = JSON.parse(raw)
+          if (parsed === null || typeof parsed !== 'object') throw new Error('参数不是对象')
+          record.arguments = raw
+        } catch (error) {
+          record.valid = false
+          record.arguments = raw
+          record.invalidReason = `参数不是合法 JSON：${error.message}`
+        }
+      }
+      out.push(record)
+    }
+    return out
+  }
+}
+
+/**
+ * 收口一次请求的结果。
+ *
+ * 关键规则：模型说「我要调工具」但工具调用本身不完整（被截断、被中断、参数坏掉）时，
+ * **不能**当成有效调用返回，否则上层会拿半截参数去执行动作。
+ * `finish_reason === 'tool_calls'` 而一个都凑不齐，就是这个回合出问题了，
+ * 标成 `toolCallsIncomplete` 交给上层收尾。
+ */
+function finalize({ text, reasoning, assembler, finishReason, usage, profile, signal, interrupted = false, incomplete = false }) {
+  const all = assembler.done()
+  const valid = all.filter((call) => call.valid === true)
+  const broken = all.filter((call) => call.valid !== true)
+  const aborted = interrupted || signal?.aborted === true
+  return {
+    text,
+    reasoning,
+    toolCalls: valid,
+    brokenToolCalls: broken,
+    finishReason: aborted && finishReason === 'stop' ? 'interrupted' : finishReason,
+    usage,
+    // 回合内的协议判断靠这两个：能力 + 是否真的产生过思考内容
+    capability: resolveCapability(profile),
+    reasoningContent: reasoning !== '',
+    interrupted: aborted,
+    incomplete: incomplete && !aborted,
+    toolCallsIncomplete: (finishReason === 'tool_calls' && valid.length === 0 && broken.length > 0)
+      || (aborted && all.length > 0),
+  }
+}
+
+function textOf(value) {
+  return typeof value === 'string' ? value : ''
 }
 
 function truncate(text, max) {

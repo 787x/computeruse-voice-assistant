@@ -24,7 +24,8 @@ function fixture(stage, failure=false, initializer=code) {
  class Agent {constructor(options){this.tools=options.tools;counts.agent++;if(stage==='agent-failure')throw Error('agent construction failed')}}
  const modules={
   '../../packages/config/store.mjs':store,
-  '../../packages/agent/llm.mjs':{LLMClient:class{}},
+  // 壳子给 LLMClient 传提供商档案（决定推理参数），桩件必须提供同一个函数
+  '../../packages/agent/llm.mjs':{LLMClient:class{constructor(options){this.options=options}},profileFromConfig:(source)=>({ providerId:source?.providerId ?? '', capability:source?.providerId ?? '' })},
   '../../packages/agent/loop.mjs':{Agent},
   '../../packages/cua/adapter.mjs':{CuaToolkit:Toolkit},
   '../../packages/tools/web-search.mjs':{WebSearch:class{enabled=false}},

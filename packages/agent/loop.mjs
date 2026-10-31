@@ -8,10 +8,15 @@
  *  - 工具结果是文本信封（上游 format.js 生成），模型只读文本，不直接吃图片
  *  - 上下文只保留最近 2 条完整工具结果，更早的压成一行摘要（截图会撑爆上下文）
  *  - 每一步都可中断：所有 await 前都有 signal 检查
+ *  - **思考内容（reasoning_content）与最终回答分开**：思考内容只放回上下文（MiMo /
+ *    DeepSeek 在思考模式下做工具调用时不回传会 HTTP 400），绝不进字幕/TTS；
+ *    裁剪历史时按"完整消息组"下手，不留孤立的工具结果或缺 thinking 字段的工具调用
+ *  - 参数不完整/解析失败的工具调用**不执行**，只把失败原因回给模型
  */
 
 /** 默认系统提示词的唯一来源见 system-prompt.mjs（设置页显示的是同一份文本）。 */
 import { DEFAULT_SYSTEM_PROMPT, turnSystemPrompt } from './system-prompt.mjs'
+import { assistantMessageFrom } from './llm.mjs'
 
 const TOOL_RESULT_KEEP = 2
 const TOOL_RESULT_MAX_CHARS = 1200
@@ -21,16 +26,28 @@ const COMPRESS_AFTER_MESSAGES = 12
 /** 会话记忆：最多带几轮、多少字（多了既贵又容易跑偏） */
 const HISTORY_MAX_MESSAGES = 10
 const HISTORY_MAX_CHARS = 3000
+/**
+ * 被压掉的老思考内容留多少字。
+ * 字段本身**必须保留**（MiMo/DeepSeek 的回传要求），但十几步任务的思维链能长到几万字，
+ * 不压就一定撑爆上下文。留个开头既保住协议要求的字段，也把token花在今天真正要做的事上。
+ */
+const REASONING_KEPT_CHARS = 120
 
 /**
  * 整理会话记忆：只保留最近若干条，且必须以 user 开头。
  *
  * 为什么必须以 user 开头：消息序列若从 assistant 开始，部分模型会认为
  * "上一条是我的发言，用户还没说话"，进而答非所问（不同厂商实现差异很大）。
+ *
+ * 只留纯文本的 user/assistant：工具调用链属于**某一个回合**，跨回合带过去会留下
+ * "有 tool_calls 却没有对应 tool 结果"的残缺链（协议上就是 400 的来源），
+ * 而思考内容是提供商私有字段，更不该跟着跨提供商跑。
  */
 function trimHistory(history) {
   if (!Array.isArray(history) || history.length === 0) return []
-  const usable = history.filter((m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content !== '')
+  const usable = history
+    .filter((m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content !== '')
+    .map((m) => ({ role: m.role, content: m.content }))
   const recent = usable.slice(-HISTORY_MAX_MESSAGES)
   // 从头去掉 assistant，直到第一条是 user
   while (recent.length > 0 && recent[0].role !== 'user') recent.shift()
@@ -81,6 +98,20 @@ export class Agent {
     return turnSystemPrompt(this.#systemPrompt)
   }
 
+  /** 此刻会生效的步数上限 */
+  get maxSteps() {
+    return this.#maxSteps
+  }
+
+  /**
+   * 运行中改步数上限（保存设置后下一轮生效，不重建 Agent）。
+   * 正在跑的回合已经按旧上限在走循环，不受影响——上限只在循环开始时比较。
+   */
+  setMaxSteps(maxSteps) {
+    const value = Number(maxSteps)
+    if (Number.isFinite(value) && value >= 1) this.#maxSteps = Math.min(20, Math.max(1, Math.round(value)))
+  }
+
   /**
    * 跑一个用户回合。
    * @param {string} input 用户说的话（已由 ASR 转成文本）
@@ -91,6 +122,18 @@ export class Agent {
    */
   async run(input, { signal, history = [], onEvent = this.#onEvent, systemPrompt = this.#systemPrompt } = {}) {
     const emit = (event) => { if (!signal?.aborted) onEvent(event) }
+    /*
+     * 端点快照：整回合用同一套「地址 + Key + 模型 + 推理档位」。
+     * 中途保存设置或定时切换都不能把正在跑的工具调用链换到另一个提供商上——
+     * 旧提供商的 reasoning_content / 工具历史发给新提供商就是 400。
+     * 没有 snapshot()（mock、测试注入的假 llm）就直接用它本身。
+     */
+    const llm = typeof this.#llm.snapshot === 'function' ? this.#llm.snapshot() : this.#llm
+    /*
+     * 步数上限同样是回合快照：中途保存把它调小，不该把正在跑的多步任务从中间掐断
+     * （那等于"话说到一半停了"，而且残留在上下文里的工具调用链不完整）。
+     */
+    const maxSteps = this.#maxSteps
     /*
      * 提示词在回合开始时求值一次，整个回合（含后续多步工具调用和收尾往返）都用这一份。
      * 中途改设置不能把人设换掉——用户会看到"前后两半不像同一个人"，
@@ -108,11 +151,13 @@ export class Agent {
     let hitStepLimit = false
     /** 本轮已经塞给模型多少张图 */
     let imagesAttached = 0
+    /** 本轮累计的思考内容字数（只记长度，不落盘、不播报） */
+    let reasoningChars = 0
 
-    for (let step = 1; step <= this.#maxSteps; step += 1) {
+    for (let step = 1; step <= maxSteps; step += 1) {
       throwIfAborted(signal)
 
-      const result = await this.#llm.chat({
+      const result = await llm.chat({
         messages,
         tools: availableTools,
         signal,
@@ -122,23 +167,50 @@ export class Agent {
       throwIfAborted(signal)
 
       if (result.text) finalText += result.text
+      if (result.reasoning) {
+        reasoningChars += result.reasoning.length
+        // 只带长度，不带内容：思考过程不播报、不入库
+        emit({ type: 'reasoning', step, chars: result.reasoning.length })
+      }
+      const toolCalls = result.toolCalls ?? []
+      const broken = result.brokenToolCalls ?? []
 
-      if (result.toolCalls.length === 0) {
+      if (toolCalls.length === 0 && broken.length === 0) {
         emit({ type: 'assistant', text: result.text, step })
         break
       }
 
-      messages.push({
-        role: 'assistant',
-        content: result.text || null,
-        tool_calls: result.toolCalls.map((call) => ({
-          id: call.id,
-          type: 'function',
-          function: { name: call.name, arguments: call.arguments },
-        })),
-      })
+      /*
+       * 模型这一轮想调工具，但调用本身残缺（流被截断、参数不是合法 JSON、缺函数名）。
+       * 绝不能拿半截参数去执行——点击/键盘/杀进程这类动作，参数错一位就是事故。
+       *
+       * 处理方式：assistant 消息里**只写成功的调用**（残缺的那些不进 tool_calls，
+       * 也就不给它们补 tool 结果——孤立的 tool 消息同样是协议错误），
+       * 思考内容与文本照常回传（协议要求），再用一条 user 消息如实说明没执行。
+       */
+      if (toolCalls.length === 0) {
+        messages.push(assistantMessageFrom(result))
+        messages.push({
+          role: 'user',
+          content: `（上一步的工具调用参数不完整，没有执行${broken.map((call) => call.name ? `（${call.name}）` : '').join('')}。`
+            + '请重新给出完整参数，或直接用一句话告诉用户做不到以及原因。）',
+        })
+        for (const call of broken) {
+          steps.push({ step, tool: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行' })
+          emit({ type: 'tool_end', name: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行', step })
+        }
+        compress(messages)
+        if (step === maxSteps) hitStepLimit = true
+        continue
+      }
 
-      for (const call of result.toolCalls) {
+      // 混合情况（有的能解析、有的坏了）：assistant 只带能用的那些，坏的直接不认
+      if (broken.length > 0) {
+        emit({ type: 'tool_end', name: broken.map((call) => call.name || '(未知工具)').join(', '), ok: false, text: '参数不完整，已丢弃', step })
+      }
+      messages.push(assistantMessageFrom(result))
+
+      for (const call of toolCalls) {
         throwIfAborted(signal)
         const args = safeParseArgs(call.arguments)
 
@@ -191,7 +263,7 @@ export class Agent {
 
       compress(messages)
       // 这是最后一步，且这一步还在调工具 → 走完就撞上限，需要补一次交代
-      if (step === this.#maxSteps) hitStepLimit = true
+      if (step === maxSteps) hitStepLimit = true
     }
 
     /*
@@ -204,12 +276,12 @@ export class Agent {
     throwIfAborted(signal)
     if (hitStepLimit && steps.length > 0) {
       try {
-        const closing = await this.#llm.chat({
+        const closing = await llm.chat({
           messages: [
             ...messages,
             {
               role: 'user',
-              content: `（已经用满 ${this.#maxSteps} 步，不能再调工具了。用一句话告诉用户：你做到哪一步、还差什么、需要他怎么配合。）`,
+              content: `（已经用满 ${maxSteps} 步，不能再调工具了。用一句话告诉用户：你做到哪一步、还差什么、需要他怎么配合。）`,
             },
           ],
           tools: [],
@@ -220,23 +292,29 @@ export class Agent {
         throwIfAborted(signal)
         if (closing.text) {
           finalText += closing.text
-          emit({ type: 'assistant', text: closing.text, step: this.#maxSteps + 1, limited: true })
+          emit({ type: 'assistant', text: closing.text, step: maxSteps + 1, limited: true })
         }
       } catch (error) {
         throwIfAborted(signal)
-        emit({ type: 'assistant', text: `（步数用完了，没能收尾：${error.message}）`, step: this.#maxSteps + 1, limited: true })
+        emit({ type: 'assistant', text: `（步数用完了，没能收尾：${error.message}）`, step: maxSteps + 1, limited: true })
       }
     }
 
-    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit })
-    return { text: finalText, steps, limited: hitStepLimit }
+    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit, reasoningChars })
+    /*
+     * 把这一回合用的端点快照一起返回：回合之后的旁路请求（比如"还要不要继续听"的判定）
+     * 必须用**同一套**提供商与推理参数，否则中途改了设置会让那次判定换个模型、
+     * 甚至换个提供商，判出来的东西和刚说的这段话不是一套。
+     */
+    return { text: finalText, steps, limited: hitStepLimit, reasoningChars, llm }
   }
 }
 
 function safeParseArgs(raw) {
   if (typeof raw !== 'string' || raw.trim() === '') return {}
   try {
-    return JSON.parse(raw)
+    const parsed = JSON.parse(raw)
+    return parsed !== null && typeof parsed === 'object' ? parsed : { __raw: raw }
   } catch {
     return { __raw: raw }
   }
@@ -250,6 +328,10 @@ function clamp(text, max) {
 /**
  * 上下文压缩：只保留最近 N 条工具结果，更早的替换成一行摘要。
  * 截图结果单条可达数 KB，不压缩的话多步任务必然超长。
+ *
+ * 边界（很重要）：这里**只改内容、不删消息**。
+ * 删掉一条 tool 结果，或者抹掉带 tool_calls 的 assistant 的 reasoning_content，
+ * 都会让 MiMo / DeepSeek 在思考模式下直接 400，所以只能就地缩短。
  */
 function compress(messages) {
   if (messages.length <= COMPRESS_AFTER_MESSAGES) return
@@ -264,6 +346,23 @@ function compress(messages) {
     if (target.content.startsWith('（已压缩）')) continue
     const firstLine = String(target.content).split('\n')[0].slice(0, 80)
     target.content = `（已压缩）${firstLine}`
+  }
+
+  /*
+   * 思考内容同理：保留最近若干条完整的，更早的只留开头。
+   * 字段一定留着（协议要求回传），值变短（省 token）。
+   */
+  const reasoningIndexes = []
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messages[i].role === 'assistant' && typeof messages[i].reasoning_content === 'string') reasoningIndexes.push(i)
+  }
+  const keepReasoningFrom = reasoningIndexes.length - TOOL_RESULT_KEEP
+  for (let i = 0; i < reasoningIndexes.length; i += 1) {
+    if (i >= keepReasoningFrom) continue
+    const target = messages[reasoningIndexes[i]]
+    const value = target.reasoning_content
+    if (value.length <= REASONING_KEPT_CHARS) continue
+    target.reasoning_content = `${value.slice(0, REASONING_KEPT_CHARS)}…（较早的思考已折叠）`
   }
 }
 

@@ -123,9 +123,29 @@ export function findProfile(config, profileId) {
 /**
  * 算出"此刻应该用哪个模型/哪套端点"。
  *
- * 返回 endpoint 表示要**连供应商一起换**（地址 + Key）；
+ * 返回 endpoint 表示要**连供应商一起换**（地址 + Key + 提供商 + 推理档位）；
  * 只有 model 时表示同一供应商内换模型。
+ *
+ * 为什么 endpoint 里必须带 providerId 和推理档位：定时切到 MiMo 方案时，
+ * 若只换地址和 Key、推理参数还留着上一个提供商的，请求就会带着
+ * DeepSeek 的 reasoning_effort 去打 MiMo（或反过来），轻则参数被忽略、重则报错。
+ * 「提供商、地址、Key、模型、推理策略」是一个整体，切换必须整套一起换。
  */
+function endpointOf(config, profile) {
+  return {
+    baseURL: String(profile.baseURL ?? '').trim(),
+    apiKey: String(profile.apiKey ?? ''),
+    providerId: String(profile.providerId ?? '').trim(),
+    // 档位缺省时回落到全局配置那一档：老配置只有 4 个字段的方案不该被当成"用户要求 default"
+    mimoThinking: typeof profile.mimoThinking === 'string' && profile.mimoThinking !== ''
+      ? profile.mimoThinking : config?.mimoThinking,
+    deepseekReasoningEffort: typeof profile.deepseekReasoningEffort === 'string' && profile.deepseekReasoningEffort !== ''
+      ? profile.deepseekReasoningEffort : config?.deepseekReasoningEffort,
+    providerHint: typeof profile.providerHint === 'string' && profile.providerHint !== ''
+      ? profile.providerHint : config?.providerHint,
+  }
+}
+
 export function resolveModel(config, now = new Date()) {
   const schedule = config?.modelSchedule ?? {}
   /*
@@ -140,16 +160,14 @@ export function resolveModel(config, now = new Date()) {
         rule: null,
         source: 'default',
         profile: defaultProfile,
-        endpoint: {
-          baseURL: String(defaultProfile.baseURL ?? '').trim(),
-          apiKey: String(defaultProfile.apiKey ?? ''),
-        },
+        endpoint: endpointOf(config, defaultProfile),
       }
     : {
         model: typeof config?.model === 'string' ? config.model : '',
         rule: null,
         source: 'default',
         profile: null,
+        // null = 用全局那一套（地址/Key/提供商/档位都在 config 顶层）
         endpoint: null,
       }
   if (schedule.enabled !== true) return defaultResult
@@ -163,12 +181,10 @@ export function resolveModel(config, now = new Date()) {
       rule,
       source: 'schedule',
       profile,
-      endpoint: {
-        baseURL: String(profile.baseURL ?? '').trim(),
-        apiKey: String(profile.apiKey ?? ''),
-      },
+      endpoint: endpointOf(config, profile),
     }
   }
+  // 规则只给了模型名：同一套全局端点内换模型（提供商/档位都跟着 config 顶层走）
   return { model: String(rule.model ?? '').trim(), rule, source: 'schedule', profile: null, endpoint: null }
 }
 

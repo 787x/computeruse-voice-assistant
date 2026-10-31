@@ -24,6 +24,10 @@ import { cleanLine as cleanLineText } from '../../packages/agent/text.mjs'
 import { DEFAULT_SYSTEM_PROMPT } from '../../packages/agent/system-prompt.mjs'
 import { DEFAULT_WAKE_WORD } from '../../packages/voice/keywords.mjs'
 import { resolveModel } from '../../packages/config/schedule.mjs'
+import { profileFromConfig, LLMClient } from '../../packages/agent/llm.mjs'
+import { buildReasoningMeta } from '../../packages/agent/ll-params.mjs'
+import { getProvider, defaultModelFor, PROVIDERS } from '../../packages/config/registry.mjs'
+import { modelCacheKey } from '../../packages/config/model-discovery.mjs'
 import { LAUNCH_APP_TOOL } from '../../packages/tools/app-launch.mjs'
 import { SHELL_TOOL, runShell } from '../../packages/tools/shell.mjs'
 import { FILES_TOOL, runFiles } from '../../packages/tools/files.mjs'
@@ -1839,7 +1843,13 @@ async function ensureAgent(signal) {
       model: config.model,
       temperature: config.temperature,
       timeoutMs: config.timeoutMs,
+      // 提供商档案：决定这次会话发哪种推理参数（见 packages/agent/ll-params.mjs）
+      profile: llmModule.profileFromConfig(config),
     })
+    /*
+     * 缓存里这套端点的"出处"要记清楚：定时切换与保存设置都按 profileId 判断
+     * 该不该换整套端点（含 Key）。apiKey 单独存一份是为了切回默认时能拿回来。
+     */
     const agent = new loopModule.Agent({
       llm,
       tools,
@@ -1879,6 +1889,59 @@ async function ensureAgent(signal) {
   applyModelSchedule('agent-ready')
   log(`agent ready in ${runtime.readyMs}ms model=${runtime.config.model}`)
   return runtime
+}
+
+/**
+ * 每一轮开始前核对一次磁盘配置，有变化就同步到运行时（**下一轮生效**）。
+ *
+ * 为什么放在回合入口而不是初始化里：
+ *  - 初始化期间（CUA 冷启动 1 秒+）用户完全可能点了保存；
+ *  - 回合入口这道检查同时覆盖"初始化中改""定时切换刚改""另一处代码改了配置"三种情况，
+ *    不需要每个改配置的地方都记得来通知壳子。
+ * 失败绝不阻断这一轮：拿最新配置失败就用运行时现有的端点继续（和以前行为一致）。
+ */
+async function syncAgentEndpointIfChanged() {
+  if (agentRuntime === null) return
+  try {
+    const store = await import('../../packages/config/store.mjs')
+    const latest = await store.loadConfig()
+    if (!endpointFieldsDiffer(agentRuntime.config, latest)) return
+    await syncAgentEndpoint(store, latest)
+  } catch (error) {
+    log(`agent endpoint reconcile skipped: ${error.message}`)
+  }
+}
+
+/**
+ * 会影响"这一轮该用哪套端点与推理参数"的字段。
+ *
+ * 比较用**规整后的生效摘要**，不是直接比对象：loadConfig 每次返回新对象，
+ * 而 modelSchedule / modelProfiles 是每次新建的数组——按引用比会"每轮都算有变化"，
+ * 白白多跑一次同步与定时切换。
+ */
+function endpointSignature(config) {
+  return JSON.stringify({
+    providerId: config?.providerId,
+    baseURL: config?.baseURL,
+    model: config?.model,
+    apiKey: config?.apiKey ?? '',
+    temperature: config?.temperature,
+    timeoutMs: config?.timeoutMs,
+    maxSteps: config?.maxSteps,
+    mimoThinking: config?.mimoThinking,
+    deepseekReasoningEffort: config?.deepseekReasoningEffort,
+    providerHint: config?.providerHint,
+    modelSchedule: config?.modelSchedule,
+    modelProfiles: (config?.modelProfiles ?? []).map((p) => ({
+      id: p?.id, name: p?.name, providerId: p?.providerId, baseURL: p?.baseURL, model: p?.model,
+      apiKey: p?.apiKey ?? '', mimoThinking: p?.mimoThinking, deepseekReasoningEffort: p?.deepseekReasoningEffort,
+      providerHint: p?.providerHint,
+    })),
+  })
+}
+
+function endpointFieldsDiffer(before, after) {
+  return endpointSignature(before) !== endpointSignature(after)
 }
 
 /**
@@ -2068,11 +2131,22 @@ async function runCommand(text) {
 
     await refreshSearchKey(turn.controller.signal)
     if (!isCurrentTurn(turn)) return
-    const { agent, llm } = await ensureAgent(turn.controller.signal)
+    /*
+     * 回合入口先核对磁盘配置：初始化期间、定时切换、或别的代码改了设置，
+     * 都在这一步被吸收，保证这一轮用的端点与推理参数就是磁盘上那一份。
+     */
+    await syncAgentEndpointIfChanged()
+    if (!isCurrentTurn(turn)) return
+    const { agent } = await ensureAgent(turn.controller.signal)
     if (!isCurrentTurn(turn)) return
     const result = await agent.run(text, { history: sessionHistory, signal: turn.controller.signal,
       onEvent: (event) => handleAgentEvent(event, turn) })
     if (!isCurrentTurn(turn)) return
+    /*
+     * 回合用的端点快照。判定请求要用它，而不是运行时那套：
+     * 中途保存设置或定时切换都可能已经换掉了提供商，判定必须和刚说的那段话同一家。
+     */
+    const turnLlm = result.llm ?? agentRuntime?.llm ?? null
     flushTurn(turn)
     // 旧的文本标记只留作日志线索，真正决定要不要等的是下面的判定
     wantContinue = process.env.CUA_VA_FORCE_CONTINUE === '1' || /\[\[继续\]\]/u.test(turn.raw)
@@ -2088,7 +2162,9 @@ async function runCommand(text) {
     followUpJudgement = null
     const judgeStartedAt = Date.now()
     followUpJudgePromise = judgeFollowUp({
-      chat: (options) => llm.chat({ ...options, signal: turn.controller.signal }),
+      chat: (options) => turnLlm === null
+        ? Promise.reject(new Error('没有可用的模型客户端'))
+        : turnLlm.chat({ ...options, signal: turn.controller.signal }),
       userText: text,
       replyText: lastReplyText,
       timeoutMs: followUpConfig.judgeTimeoutMs,
@@ -2364,18 +2440,33 @@ function applyModelSchedule(reason) {
     const decisionKey = decided.profile === null ? 'default' : String(decided.profile.id)
     if (decisionKey === lastAppliedProfileId && llm.model === target) return
 
+    /*
+     * 定时切换换的是**整套**：地址、Key、提供商、推理档位一起。
+     * 少了后两项，就会用上一个提供商的推理参数打新提供商（400 / 参数被忽略）。
+     * 没配方案时回到全局那一套（config 顶层的 providerId / apiKey / 档位）。
+     */
     const endpoint = decided.endpoint ?? {
       baseURL: config.baseURL,
+      // 用 runtime 里那份**已解析**的 Key（环境变量覆盖也在这里生效），
+      // 而不是 config.apiKey——后者可能是没解密的密文槽位
       apiKey: agentRuntime.apiKey ?? '',
+      providerId: config.providerId,
+      mimoThinking: config.mimoThinking,
+      deepseekReasoningEffort: config.deepseekReasoningEffort,
+      providerHint: config.providerHint,
     }
-    llm.setEndpoint({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model: target })
+    if (typeof target === 'string' && target !== '') {
+      llm.setEndpoint({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model: target })
+    }
+    llm.setProfile(profileFromConfig({ ...endpoint, model: target }))
     lastAppliedProfileId = decisionKey
 
     const rule = decided.rule
     const profile = decided.profile
     log(`model switch (${reason}): → ${target} @ ${endpoint.baseURL}`
       + `${profile === null ? '' : `（方案 ${profile.name ?? profile.id}）`}`
-      + `${rule === null ? '' : `（规则 ${rule.from}-${rule.to}）`}`)
+      + `${rule === null ? '' : `（规则 ${rule.from}-${rule.to}）`}`
+      + ` 提供商=${endpoint.providerId ?? '-'}`)
   } catch (error) {
     log(`model schedule failed: ${error.message}`)
   }
@@ -2395,6 +2486,48 @@ function syncAgentSystemPrompt(config) {
   // null/缺省/空白 → null（= 内置默认）；合法自定义文本 → 原样保留，不改写
   agentSystemPrompt = typeof value === 'string' && value.trim() !== '' ? value : null
   log(`system prompt: ${agentSystemPrompt === null ? '默认' : `自定义 ${agentSystemPrompt.length} 字`}`)
+}
+
+/**
+ * 这次保存有没有动到「模型端点 / 推理档位」。
+ * 只认这些字段：动别的（音色、权限）不该去碰 LLM 客户端。
+ */
+function touchesModelSettings(payload) {
+  if (payload === null || typeof payload !== 'object') return false
+  for (const key of ['providerId', 'baseURL', 'model', 'apiKey', 'temperature',
+    'mimoThinking', 'deepseekReasoningEffort', 'providerHint', 'timeoutMs', 'modelProfiles', 'maxSteps']) {
+    if (payload[key] !== undefined) return true
+  }
+  return false
+}
+
+/**
+ * 把磁盘上的模型设置同步到运行时（下一轮对话生效）。
+ *
+ * 为什么要单独一个函数、而不是"保存时重建 Agent"：
+ * 重建 Agent 会连带把 CUA 桥接和语音链路一起拆了重来（冷启动 1 秒+，
+ * 正在跑的回合还会被打断）。LLM 客户端本身零成本，换端点只要改几个字段。
+ *
+ * Key 走 resolveApiKey()：环境变量覆盖、密文检查都在那里，和首次初始化同一条路径。
+ */
+async function syncAgentEndpoint(store, preloaded) {
+  if (agentRuntime === null) return
+  const config = preloaded ?? await store.loadConfig()
+  agentRuntime.config = config
+  const apiKey = await store.resolveApiKey()
+  agentRuntime.apiKey = apiKey
+  const llm = agentRuntime.llm
+  if (llm === undefined) return
+  llm.setEndpoint({ baseURL: config.baseURL, apiKey, model: config.model })
+  llm.setProfile(profileFromConfig(config))
+  llm.setTemperature(config.temperature)
+  if (Number.isFinite(Number(config.timeoutMs)) && Number(config.timeoutMs) > 0) llm.setTimeout(config.timeoutMs)
+  // 步数上限：下一轮生效（正在跑的回合用它开始时的快照）
+  if (agentRuntime.agent?.setMaxSteps !== undefined) agentRuntime.agent.setMaxSteps(config.maxSteps)
+  // 方案/规则可能在本次保存里改了：重算一次，让"此刻该用哪套"和磁盘一致
+  lastAppliedProfileId = null
+  applyModelSchedule('settings-model')
+  log(`model runtime synced: ${config.providerId} @ ${config.baseURL} model=${config.model} thinking=${config.mimoThinking} effort=${config.deepseekReasoningEffort}`)
 }
 
 /** 从配置文件读界面开关（以前这些只活在内存里，重启就丢） */
@@ -2467,6 +2600,23 @@ async function saveUiPrefs() {
 
 // ---------------------------------------------------------------- 设置窗口
 
+/**
+ * 在线模型列表的短期缓存（`提供商|地址` → 结果）。
+ * 只存模型 id 和能力元数据，**绝不存 API Key**。
+ * 60 秒：够界面来回切提供商不重复打 API（MiMo 有 RPM 限制），
+ * 又短到"上新模型"这件事不会半天看不见。
+ */
+const MODEL_LIST_TTL_MS = 60_000
+const modelListCache = new Map()
+
+/**
+ * 推理控件元数据。文案与档位都来自 packages/agent/ll-params.mjs——
+ * 界面不许自己编一份 MiMo/DeepSeek 的能力表，验收脚本读的也是同一份。
+ */
+function reasoningControls() {
+  return buildReasoningMeta(PROVIDERS)
+}
+
 /** 设置窗口：普通窗口（有自己的标题栏），关掉就销毁，不做常驻 */
 function openSettings() {
   if (settingsWin !== null && !settingsWin.isDestroyed()) {
@@ -2532,7 +2682,74 @@ function registerSettingsIpc() {
        * 必须由主进程从同一个来源给，不能让前端自己抄一份文案。
        */
       defaultSystemPrompt: DEFAULT_SYSTEM_PROMPT,
+      /*
+       * 推理控件的元数据（哪套档位、官方对采样参数的限制）。
+       * 由主进程从同一份 ll-params 给：界面不许自己抄一份"MiMo 有 low/high/max"这种
+       * 不存在的能力，也不许显示"温度生效"而实际被模型覆盖。
+       */
+      reasoning: reasoningControls(),
     }
+  })
+
+  /*
+   * 拉取在线模型列表（`GET /v1/models`）。
+   *
+   * 逻辑本体在 packages/config/model-discovery.mjs（与根目录发行版共用同一份，
+   * 两套的缓存语义、凭据选择、失败回落逐字节一致），这里只做三件事：
+   * 定目标提供商、按提供商挑 Key、把结果转给界面。
+   *
+   *  - Key 允许由界面直接传（用户刚粘贴、还没保存的 Key 也要能测通）；
+   *    传进来的 Key 只用于这一次请求，**不进缓存、不落盘、不打日志**。
+   *  - 目标提供商不是当前那一家时，只用它自己槽位里的 Key（见 resolveApiKeyFor）。
+   *  - 失败时把上一次成功的列表一起返回，并明确标 `stale: true`：
+   *    界面据此保留当前模型和手动输入能力，绝不因为"列表没刷出来"就改用户的模型选择。
+   */
+  ipcMain.handle('settings:models', async (_event, payload) => {
+    const [store, discovery] = await Promise.all([
+      import('../../packages/config/store.mjs'),
+      import('../../packages/config/model-discovery.mjs'),
+    ])
+    const stored = await store.loadConfig()
+    const providerId = typeof payload?.providerId === 'string' && payload.providerId.trim() !== ''
+      ? payload.providerId.trim() : stored.providerId
+    const provider = getProvider(providerId)
+    const baseURL = typeof payload?.baseURL === 'string' && /^https?:\/\//u.test(payload.baseURL.trim())
+      ? payload.baseURL.trim() : (provider?.baseURL ?? stored.baseURL)
+    const typedKey = typeof payload?.apiKey === 'string' && payload.apiKey.trim() !== '' && !payload.apiKey.includes('*')
+      ? payload.apiKey.trim() : ''
+    const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(providerId, { config: stored }).catch(() => '')
+    return await discovery.fetchChatModels({
+      providerId,
+      baseURL,
+      apiKey,
+      apiKeyRequired: provider?.apiKeyRequired !== false,
+      fallbackModel: stored.model || defaultModelFor(provider) || 'models',
+      cache: modelListCache,
+      ttlMs: MODEL_LIST_TTL_MS,
+      force: typedKey !== '' || payload?.force === true,
+    })
+  })
+
+  /** 清除模型列表缓存（提供商/地址/Key 改了以后强制重取） */
+  ipcMain.handle('settings:models:clear', (_event, payload) => {
+    if (typeof payload?.providerId === 'string' && payload.providerId.trim() !== '') {
+      // 缓存键是「提供商|地址」：只清这一家的键（Provider 前缀，避免误删别家）
+      const prefix = modelCacheKey(payload.providerId.trim(), '')
+      for (const key of [...modelListCache.keys()]) {
+        if (key.startsWith(prefix)) modelListCache.delete(key)
+      }
+    } else {
+      modelListCache.clear()
+    }
+    return { ok: true }
+  })
+
+  /** 在系统浏览器打开提供商控制台（拿 API Key 用）。只允许 http(s)。 */
+  ipcMain.handle('settings:openKeyConsole', (_event, payload) => {
+    const url = String(payload?.url ?? '')
+    if (!/^https?:\/\//u.test(url)) return { ok: false, error: '地址不合法' }
+    void shell.openExternal(url)
+    return { ok: true }
   })
 
   ipcMain.handle('settings:save', async (_event, payload) => {
@@ -2612,6 +2829,17 @@ function registerSettingsIpc() {
         warnings.push(`定时切换规则未即时生效：${scheduleError.message}`)
         log(`settings runtime sync failed (modelSchedule): ${scheduleError.message}`)
       }
+      /*
+       * 模型端点与推理档位：落盘成功后同步到运行时，**下一轮对话生效**。
+       * 不重启应用、不重建 CUA 桥接和语音；正在跑的回合用它开始时的快照，
+       * 中途不会被这次保存换掉端点（见 Agent.run 里的 snapshot）。
+       */
+      try {
+        if (touchesModelSettings(payload)) await syncAgentEndpoint(store)
+      } catch (endpointError) {
+        warnings.push(`模型设置未即时生效：${endpointError.message}`)
+        log(`settings runtime sync failed (model): ${endpointError.message}`)
+      }
       try {
         if (!ttsEnabled) stopSpeaking()
       } catch (stopError) {
@@ -2625,27 +2853,59 @@ function registerSettingsIpc() {
     }
   })
 
+  /*
+   * 测试模型：必须走**和真实请求同一条组装路径**，否则会出现"测着是绿的、
+   * 用起来 400"或反过来——测试路径多带一个该提供商不支持的 temperature /
+   * reasoning_effort，就会被判成失败（假失败）。
+   * 所以这里用 profileFromConfig + 同一个 LLMClient，只是把界面当前填的值当生效值。
+   */
   ipcMain.handle('settings:testModel', async (_event, payload) => {
     try {
-      const [{ LLMClient }, store] = await Promise.all([
-        import('../../packages/agent/llm.mjs'),
-        import('../../packages/config/store.mjs'),
-      ])
+      const store = await import('../../packages/config/store.mjs')
       const stored = await store.loadConfig()
-      const apiKey = typeof payload?.apiKey === 'string' && payload.apiKey !== '' && !payload.apiKey.includes('*')
-        ? payload.apiKey
-        : await store.resolveApiKey()
-      if (!apiKey) return { ok: false, error: '还没配置 API Key' }
+      const targetProviderId = typeof payload?.providerId === 'string' && payload.providerId.trim() !== ''
+        ? payload.providerId.trim() : stored.providerId
+      const typedKey = typeof payload?.apiKey === 'string' && payload.apiKey !== '' && !payload.apiKey.includes('*')
+        ? payload.apiKey.trim() : ''
+      // 界面上选中的提供商可能还没保存：测试必须用**那一家**的 Key，
+      // 用当前生效的 Key 去打它，结果只会是假的 401（或假的成功）。
+      const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(targetProviderId, { config: stored })
+      if (!apiKey) return { ok: false, error: '还没配置该提供商的 API Key' }
+      /*
+       * 地址必须跟着"选中的那一家"走：没显式给地址时，切了提供商就不能再用
+       * stored.baseURL——那还是上一家的端点，会把这一家的 Key 发错地方。
+       */
+      const merged = {
+        ...stored,
+        providerId: targetProviderId,
+        baseURL: typeof payload?.baseURL === 'string' && payload.baseURL.trim() !== ''
+          ? payload.baseURL.trim()
+          : (getProvider(targetProviderId)?.baseURL ?? stored.baseURL),
+        model: payload?.model ?? stored.model,
+        temperature: payload?.temperature ?? stored.temperature,
+        mimoThinking: payload?.mimoThinking ?? stored.mimoThinking,
+        deepseekReasoningEffort: payload?.deepseekReasoningEffort ?? stored.deepseekReasoningEffort,
+        providerHint: payload?.providerHint ?? stored.providerHint,
+      }
       const client = new LLMClient({
-        baseURL: payload?.baseURL || stored.baseURL,
+        baseURL: merged.baseURL,
         apiKey,
-        model: payload?.model || stored.model,
-        temperature: 0,
+        model: merged.model,
+        temperature: merged.temperature,
         timeoutMs: 20000,
+        profile: profileFromConfig(merged),
       })
       const startedAt = Date.now()
-      const reply = await client.chat({ messages: [{ role: 'user', content: '回复 ok' }], stream: false })
-      return { ok: true, ms: Date.now() - startedAt, text: (reply.text ?? '').slice(0, 40) }
+      const reply = await client.chat({ messages: [{ role: 'user', content: '回复 ok' }], stream: false, tools: undefined })
+      return {
+        ok: true,
+        ms: Date.now() - startedAt,
+        text: (reply.text ?? '').slice(0, 40),
+        // 思考内容不进字幕、不播报，这里只报"有没有"，让用户确认档位确实生效
+        reasoningChars: (reply.reasoning ?? '').length,
+        finishReason: reply.finishReason,
+        endpoint: client.endpoint,
+      }
     } catch (error) {
       return { ok: false, error: error.message }
     }

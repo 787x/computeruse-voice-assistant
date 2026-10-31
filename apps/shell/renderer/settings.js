@@ -23,6 +23,16 @@ let defaultPrompt = ''
  */
 let loadedPrompt = null
 /**
+ * 在线获取到的模型候选（`{id, effort, ...}`）。
+ * 它是**当前提供商**的列表：切提供商要重新取，不能把上一家的结果留着当候选。
+ * null = 还没取过（此时候选来自注册表里的静态建议列表）。
+ */
+let discoveredModels = null
+/** 上一次取列表失败的原因（界面要如实显示，并说明"仍可手填"） */
+let modelsError = ''
+/** 取列表进行中的请求（避免连点把 API 打爆） */
+let modelsLoading = false
+/**
  * 用户是否已点击「恢复默认」并成功保存。
  * 为 true 时，切回自定义模式应以完整默认提示词为起点，
  * 而不是显示恢复默认前写的旧草稿。
@@ -102,15 +112,279 @@ function setStatus(text, kind = '') {
 }
 
 function fillProviderNote() {
-  const provider = providerList.find((item) => item.id === $('provider').value)
+  const provider = currentProvider()
   const list = $('modelList')
   list.innerHTML = ''
-  for (const model of provider?.models ?? []) {
+  for (const id of modelCandidates()) {
     const option = document.createElement('option')
-    option.value = model
+    option.value = id
     list.append(option)
   }
-  $('modelHint').textContent = provider?.notes ?? ''
+  const notes = []
+  if (provider?.notes) notes.push(provider.notes)
+  if (discoveredModels !== null) notes.push(`模型列表：在线获取 ${discoveredModels.length} 个（${modelsFetchedAt ? modelsFetchedAt : '本次会话'}）`)
+  if (modelsError !== '') notes.push(`在线列表没拿到：${modelsError}——可手填模型名，保存不受影响`)
+  $('modelHint').textContent = notes.join('　')
+
+  // 提供商控制台的入口：填 Key 时不用自己去搜地址
+  const consoleUrl = provider?.keyConsoleUrl ?? ''
+  $('openKeyConsole').hidden = consoleUrl === ''
+  // Key 输入框的提示要跟着提供商走：MiMo 已存过 Key 时切回来不该看起来像"没配"
+  const hasKey = state?.config?.hasProviderKey?.[provider?.id] === true
+  if ($('apiKey').value.trim() === '') {
+    $('apiKey').placeholder = hasKey ? '已保存，留空不修改' : (provider?.apiKeyRequired === false ? '本地端点可留空' : '未配置（可在控制台获取）')
+  }
+  renderReasoning()
+}
+
+/** 当前界面上选中的提供商对象 */
+function currentProvider() {
+  return providerList.find((item) => item.id === $('provider').value) ?? null
+}
+
+/**
+ * 聊天模型候选：在线列表优先，其次注册表里的静态建议。
+ * 静态列表只是"第一次还没联网时的提示"，不是永远完整的目录。
+ */
+function modelCandidates() {
+  const provider = currentProvider()
+  if (discoveredModels !== null && discoveredModels.length > 0) return discoveredModels.map((model) => model.id)
+  return provider?.models ?? []
+}
+
+/* ---------------- 推理控制（MiMo 思考 / DeepSeek 等级） ---------------- */
+let modelsFetchedAt = ''
+/**
+ * 界面上的档位草稿（用户改了但还没保存）。
+ *
+ * 为什么必须有：MiMo 和 DeepSeek 各一个下拉，当前提供商只会显示其中一个，另一个是隐藏的。
+ * 隐藏不等于"用户想清空"——collect() 两个字段都要交，所以没被看见的那个必须继续
+ * 交出**原来存着的值**，否则改 MiMo 就会顺手把 DeepSeek 的档位冲掉。
+ * 保存成功后清空草稿（以磁盘为准），重新加载时也清空。
+ */
+const reasoningDraft = { mimoThinking: null, deepseekReasoningEffort: null }
+/** 兜底档位表：主进程没给元数据时用（正常情况由 state.reasoning 提供） */
+const FALLBACK_MIMO_OPTIONS = [
+  { value: 'default', label: '默认（跟随服务端）' },
+  { value: 'enabled', label: '开启思考' },
+  { value: 'disabled', label: '关闭思考' },
+]
+const FALLBACK_DEEPSEEK_OPTIONS = [
+  { value: 'default', label: '默认（跟随服务端）' },
+  { value: 'none', label: '关闭' },
+  { value: 'low', label: '低' },
+  { value: 'high', label: '高' },
+  { value: 'max', label: '极高' },
+]
+function mimoOptions() {
+  const meta = state?.reasoning?.byProvider?.mimo?.options
+  return Array.isArray(meta) && meta.length > 0 ? meta : FALLBACK_MIMO_OPTIONS
+}
+function deepseekOptions() {
+  const meta = state?.reasoning?.byProvider?.deepseek?.options
+  return Array.isArray(meta) && meta.length > 0 ? meta : FALLBACK_DEEPSEEK_OPTIONS
+}
+
+/**
+ * 当前生效的控件描述。
+ * 数据全部由主进程给（reasoning.byProvider / byHint），界面不许自己编能力表。
+ */
+function currentReasoningControl() {
+  const provider = currentProvider()
+  if (provider === undefined || provider === null) return null
+  const meta = state?.reasoning ?? null
+  const byProvider = meta?.byProvider?.[provider.id] ?? { kind: 'none', levels: [], note: '' }
+  // 自定义端点：按用户选的协议提示决定控件（不按模型名猜）
+  if (provider.id === 'openai-compatible') {
+    const hint = $('providerHint')?.value ?? 'auto'
+    const byHint = meta?.byHint?.[hint]
+    return byHint ?? { kind: 'none', levels: [], note: '标准 OpenAI 兼容端点：不发送提供商专属推理参数' }
+  }
+  return byProvider
+}
+
+function renderReasoning() {
+  const control = currentReasoningControl()
+  const provider = currentProvider()
+  const hintList = state?.reasoning?.hints ?? [{ id: 'auto', name: '自动（不发送提供商专属参数）' }]
+  // 兼容协议提示：只在自定义端点上出现
+  $('providerHintField').hidden = provider?.id !== 'openai-compatible'
+  fillSelect($('providerHint'), hintList.map((item) => ({ value: item.id, label: item.name })),
+    state?.config?.providerHint ?? 'auto')
+
+  const mimo = control?.kind === 'mimo-thinking'
+  const deepseek = control?.kind === 'deepseek-effort'
+  $('reasoningRow').hidden = !(mimo || deepseek || provider?.id === 'openai-compatible')
+  $('mimoThinkingField').hidden = !mimo
+  $('deepseekField').hidden = !deepseek
+
+  /*
+   * 两个下拉都照常填选项；当前提供商用不到的那个只是**藏起来**。
+   * 藏起来不等于清空：collect() 两个字段都要交，隐藏的那个继续交出原值，
+   * 否则改 MiMo 会顺手把 DeepSeek 存好的档位冲成 default。
+   */
+  fillSelect($('mimoThinking'), mimoOptions(), reasoningValue('mimoThinking'))
+  fillSelect($('deepseekEffort'), deepseekOptions(), reasoningValue('deepseekReasoningEffort'))
+
+  const notes = []
+  if (control?.note) notes.push(control.note)
+  /*
+   * 温度到底会不会被发送，由主进程那套规则决定（见 ll-params.buildRequestFields），
+   * 界面只做如实说明。绝不允许"显示温度 0.3"而实际请求里模型用的是自己的默认值。
+   */
+  const thinkingOn = mimo ? ($('mimoThinking').value || 'default') !== 'disabled'
+    : deepseek ? ($('deepseekEffort').value || 'default') !== 'none' : false
+  let ignoresTemp = false
+  if (mimo && thinkingOn) {
+    ignoresTemp = true
+    notes.push('MiMo V2.6 思考模式下 temperature/top_p 会被模型强制覆盖（1.0 / 0.95），实际请求不发送温度。')
+  } else if (deepseek && thinkingOn) {
+    ignoresTemp = true
+    notes.push('DeepSeek 思考模式下 temperature/top_p 不生效（官方：传了不报错但也不生效），实际请求不发送温度。')
+  }
+  $('reasoningNote').textContent = notes.join(' ')
+
+  // 温度框：该档位实际会忽略它时如实禁用，不做"显示能改其实无效"
+  $('temperature').disabled = ignoresTemp
+  $('temperatureHint').textContent = ignoresTemp ? '当前档位下模型会忽略温度，不发送该参数' : ''
+  syncEffortAvailability()
+}
+
+/** 取某一档的界面值：草稿优先，其次磁盘配置，都没有才 default */
+function reasoningValue(field) {
+  const draft = reasoningDraft[field]
+  if (typeof draft === 'string' && draft !== '') return draft
+  return state?.config?.[field] ?? 'default'
+}
+
+/**
+ * 某个提供商（+ 自定义端点的协议提示）该显示哪套推理控件。
+ * 和主进程 reasoningControlFor 同一套判断依据：**看提供商，不看模型名**。
+ */
+function reasoningKindForProvider(providerId, hint) {
+  const meta = state?.reasoning
+  if (providerId === 'mimo') return 'mimo'
+  if (providerId === 'deepseek') return 'deepseek'
+  if (providerId === 'openai-compatible') {
+    const picked = typeof hint === 'string' ? hint : 'auto'
+    if (picked === 'mimo' || picked === 'deepseek') return picked
+  }
+  // 主进程没给元数据时（老壳子）也别硬编一份：按 id 认，认不出就不显示
+  const byProvider = meta?.byProvider?.[providerId]
+  if (byProvider?.kind === 'mimo-thinking') return 'mimo'
+  if (byProvider?.kind === 'deepseek-effort') return 'deepseek'
+  return 'none'
+}
+
+/**
+ * 用在线列表带回的能力元数据限制档位选择。
+ * DeepSeek 的 `/models` 会给 `effort.supported_levels`；模型不支持的档位就置灰，
+ * 并说明原因——不假定未来模型的能力永远相同。
+ */
+function syncEffortAvailability() {
+  if ($('deepseekField').hidden) return
+  const selected = ($('model').value || '').trim().toLowerCase()
+  const entry = (discoveredModels ?? []).find((model) => String(model.id).toLowerCase() === selected)
+  const supported = entry?.effort?.supported_levels
+  if (!Array.isArray(supported)) return
+  const canonical = (level) => ({ minimal: 'low', medium: 'high', xhigh: 'high', ultra: 'max' })[level] ?? level
+  const allowed = new Set(['default', 'none', ...supported.map(canonical)])
+  let downgraded = false
+  for (const option of $('deepseekEffort').options) {
+    const ok = allowed.has(option.value)
+    option.disabled = !ok
+    if (!ok && $('deepseekEffort').value === option.value) downgraded = true
+  }
+  if (downgraded) {
+    /*
+     * 只在界面上降到该模型真支持的档位，并把选择记进草稿：
+     * 请求组装时主进程也会做一次同样的就近降级，两边算出同一个结果，
+     * 界面才不会"显示 max、实际发 low"。磁盘上用户原本选的档位不动。
+     */
+    const list = [...$('deepseekEffort').options].filter((option) => !option.disabled).map((option) => option.value)
+    const next = list.includes(reasoningValue('deepseekReasoningEffort'))
+      ? reasoningValue('deepseekReasoningEffort')
+      : (list.includes('low') ? 'low' : (list.at(-1) ?? 'default'))
+    $('deepseekEffort').value = next
+    reasoningDraft.deepseekReasoningEffort = next
+    $('reasoningNote').textContent = `${$('reasoningNote').textContent} ${entry.id} 只支持 ${supported.join('/')}，已按此选择。`.trim()
+  }
+}
+
+function fillSelect(select, items, selected) {
+  if (select === null || select === undefined) return
+  select.innerHTML = ''
+  for (const item of items) {
+    const option = document.createElement('option')
+    option.value = item.value
+    option.textContent = item.label
+    if (item.note) option.title = item.note
+    select.append(option)
+  }
+  select.value = items.some((item) => item.value === selected) ? selected : (items[0]?.value ?? '')
+}
+
+/* ---------------- 在线模型列表 ---------------- */
+
+/**
+ * 拉取当前提供商的聊天模型列表。
+ * - `force` 跳过主进程的短期缓存（改了 Key / 地址时用）
+ * - 失败时保留现有候选与用户已选的模型，只报错，不动选择
+ */
+async function fetchModels({ force = false, silent = false } = {}) {
+  const provider = currentProvider()
+  if (provider === null || provider.modelDiscovery !== true || typeof window.settingsApi.models !== 'function') {
+    discoveredModels = null
+    modelsError = ''
+    if (!silent) fillProviderNote()
+    return
+  }
+  // 用户刚粘贴、还没保存的 Key 也要能取列表；主进程只把它用于这一次请求
+  const key = $('apiKey').value.trim()
+  const storedKey = state?.config?.hasProviderKey?.[provider.id] === true
+    || state?.config?.hasApiKey === true
+  if (key === '' && !storedKey) {
+    modelsError = '还没有 API Key'
+    discoveredModels = null
+    $('modelsHint').textContent = '填了 API Key 才能获取模型列表（也可以直接手填模型名）'
+    if (!silent) fillProviderNote()
+    return
+  }
+  if (modelsLoading) return
+  modelsLoading = true
+  if (!silent) $('modelsHint').textContent = '正在获取模型列表…'
+  if (force && key !== '') await window.settingsApi.clearModelsCache?.({ providerId: provider.id })
+  let result
+  try {
+    result = await window.settingsApi.models({
+      providerId: provider.id,
+      baseURL: $('baseURL').value.trim() || provider.baseURL,
+      apiKey: key,
+    })
+  } catch (error) {
+    // IPC 都没通（主进程没实现/窗口刚关）也一样：只提示，不动用户选的模型，不阻止保存
+    result = { ok: false, error: error.message ?? String(error) }
+  }
+  modelsLoading = false
+  if (result.ok === true) {
+    discoveredModels = result.models ?? []
+    modelsError = ''
+    modelsFetchedAt = result.cached === true ? '缓存' : '刚刚'
+    $('modelsHint').textContent = `已获取 ${discoveredModels.length} 个聊天模型`
+      + `${(result.dropped ?? []).length > 0 ? `（已排除 ${result.dropped.length} 个非聊天模型）` : ''}`
+    // 在线列表是主要依据：当前模型确实不在列表里时只提示，**不擅自改写**用户的选择
+    const current = ($('model').value || '').trim()
+    if (current !== '' && !discoveredModels.some((model) => model.id === current)) {
+      $('modelsHint').textContent += `（当前填写的 ${current} 不在列表里，可能是新模型或已下线）`
+    }
+  } else {
+    modelsError = result.error ?? '获取失败'
+    $('modelsHint').textContent = result.stale === true
+      ? `获取失败：${modelsError}（先用上一次拿到的列表）`
+      : `获取失败：${modelsError}（可以手填模型名，不影响保存）`
+    // 失败不能阻止保存：这里只更新提示，不动 model 的值
+  }
+  fillProviderNote()
 }
 
 function renderProviders() {
@@ -209,7 +483,9 @@ function renderProfileRows(profiles) {
       if (matched !== undefined) {
         row.querySelector('[data-field="baseURL"]').value = matched.baseURL
         const modelInput = row.querySelector('[data-field="model"]')
-        if (modelInput.value.trim() === '' && matched.models.length > 0) modelInput.value = matched.models[0]
+        // 推荐初始模型用该提供商自己的 defaultModel（MiMo 是 mimo-v2.6-flash），不是 models[0]
+        const suggested = matched.defaultModel ?? matched.models?.[0] ?? ''
+        if (modelInput.value.trim() === '' && suggested !== '') modelInput.value = suggested
       }
     })
     providerCell.append(provider)
@@ -238,6 +514,37 @@ function renderProfileRows(profiles) {
     model.dataset.field = 'model'
     modelCell.append(model)
 
+    /*
+     * 方案的推理策略：提供商、地址、Key、模型、推理参数是**一套**，
+     * 定时切过来必须整套一致，否则会拿上一家的推理参数打这一家。
+     * 一个下拉按该行的提供商显示对应的档位；collect 时写进对应字段，
+     * 另一家的字段原样留着（用户以后切回去还是他选的那档）。
+     */
+    const reasoningCell = document.createElement('td')
+    const reasoningSelect = document.createElement('select')
+    reasoningSelect.dataset.field = 'reasoning'
+    reasoningCell.append(reasoningSelect)
+    const hintSelect = document.createElement('select')
+    hintSelect.dataset.field = 'providerHint'
+    hintSelect.className = 'hint-select'
+    reasoningCell.append(hintSelect)
+    const applyProfileReasoningUI = () => {
+      const matched = providerList.find((item) => item.id === provider.value)
+      const kind = reasoningKindForProvider(matched?.id, hintSelect.value)
+      const options = kind === 'mimo' ? mimoOptions() : kind === 'deepseek' ? deepseekOptions() : []
+      const stored = kind === 'mimo'
+        ? (profile.mimoThinking ?? 'default')
+        : kind === 'deepseek' ? (profile.deepseekReasoningEffort ?? 'default') : 'default'
+      fillSelect(reasoningSelect, options, stored)
+      reasoningSelect.hidden = options.length === 0
+      fillSelect(hintSelect, (state?.reasoning?.hints ?? [{ id: 'auto', name: '自动' }]).map((item) => ({ value: item.id, label: item.name })), profile.providerHint ?? 'auto')
+      hintSelect.hidden = matched?.id !== 'openai-compatible'
+    }
+    provider.addEventListener('change', applyProfileReasoningUI)
+    hintSelect.addEventListener('change', applyProfileReasoningUI)
+    fillSelect(hintSelect, (state?.reasoning?.hints ?? [{ id: 'auto', name: '自动' }]).map((item) => ({ value: item.id, label: item.name })), profile.providerHint ?? 'auto')
+    applyProfileReasoningUI()
+
     const delCell = document.createElement('td')
     const del = document.createElement('button')
     del.textContent = '删'
@@ -249,7 +556,7 @@ function renderProfileRows(profiles) {
     })
     delCell.append(del)
 
-    row.append(nameCell, providerCell, urlCell, keyCell, modelCell, delCell)
+    row.append(nameCell, providerCell, urlCell, keyCell, modelCell, reasoningCell, delCell)
     body.append(row)
   }
 }
@@ -258,28 +565,43 @@ function collectProfiles() {
   const rows = []
   for (const row of $('profileRows').querySelectorAll('tr')) {
     const pick = (name) => row.querySelector(`[data-field="${name}"]`)?.value ?? ''
-    rows.push({
+    const providerId = pick('providerId')
+    const kind = reasoningKindForProvider(providerId, pick('providerHint'))
+    const level = pick('reasoning')
+    const record = {
       id: row.dataset.id,
       name: pick('name').trim(),
-      providerId: pick('providerId'),
+      providerId,
       baseURL: pick('baseURL').trim(),
       model: pick('model').trim(),
+      providerHint: pick('providerHint') || 'auto',
       // 空=不修改（主进程按掩码语义保留原 Key）
       apiKey: pick('apiKey').trim(),
-    })
+    }
+    /*
+     * 只交当前提供商看得懂的那一档；另一档**整个字段都不交**（undefined），
+     * 让主进程沿用这条方案原来存的那个值。
+     * 注意不能交 'default'：'default' 是用户明确选的合法档位，
+     * 当成"没选过"就会把这家存好的档位冲掉。
+     */
+    if (kind === 'mimo' && level !== '') record.mimoThinking = level
+    if (kind === 'deepseek' && level !== '') record.deepseekReasoningEffort = level
+    rows.push(record)
   }
   return rows
 }
 
 $('addProfile').addEventListener('click', () => {
   const current = collectProfiles()
-  const provider = providerList[0]
+  // 新方案的默认提供商：跟当前设置页选的提供商一致（新装就是 MiMo），
+  // 而不是一律 openai-compatible——那样用户每次都要重挑一遍
+  const provider = currentProvider() ?? providerList[0]
   current.push({
     id: profileRowId(),
     name: `方案 ${current.length + 1}`,
     providerId: provider?.id ?? 'openai-compatible',
     baseURL: provider?.baseURL ?? '',
-    model: provider?.models?.[0] ?? '',
+    model: provider?.defaultModel ?? provider?.models?.[0] ?? '',
     apiKey: '',
   })
   renderProfileRows(current)
@@ -402,9 +724,16 @@ function fillForm() {
   $('baseURL').value = config.baseURL
   $('model').value = config.model
   $('apiKey').value = ''
-  $('apiKey').placeholder = config.hasApiKey ? `已保存（${config.apiKey}），留空不修改` : '未配置'
+  // 提供商各自的 Key 分开存：这一格显示的是**当前提供商**那份
+  const providerHasKey = config.hasProviderKey?.[config.providerId] === true
+  $('apiKey').placeholder = providerHasKey
+    ? `已保存（${config.providerKeys?.[config.providerId] ?? config.apiKey}），留空不修改`
+    : (config.hasApiKey ? `已保存（${config.apiKey}），留空不修改` : '未配置')
   $('maxSteps').value = config.maxSteps
   $('temperature').value = config.temperature
+  $('mimoThinking').value = config.mimoThinking ?? 'default'
+  $('deepseekEffort').value = config.deepseekReasoningEffort ?? 'default'
+  $('providerHint').value = config.providerHint ?? 'auto'
 
   $('searchKey').value = ''
   $('searchKey').placeholder = config.search?.hasApiKey ? `已保存（${config.search.apiKey}），留空不修改` : '未配置（可选）'
@@ -451,6 +780,10 @@ function collect() {
     model: $('model').value.trim(),
     maxSteps: Number($('maxSteps').value),
     temperature: Number($('temperature').value),
+    // 推理档位：两家的字段都交（主进程按当前提供商取用，另一个字段原样留着）
+    mimoThinking: reasoningValue('mimoThinking'),
+    deepseekReasoningEffort: reasoningValue('deepseekReasoningEffort'),
+    providerHint: $('providerHint').value || 'auto',
     tts: { emotion, speed: Number($('speed').value) },
     ui: {
       ttsEnabled: $('ttsEnabled').checked,
@@ -505,10 +838,19 @@ async function load() {
   capabilityList = data.capabilities ?? []
   voices = data.voices ?? []
   defaultPrompt = typeof data.defaultSystemPrompt === 'string' ? data.defaultSystemPrompt : ''
+  // 重新加载 = 一切以磁盘为准：清掉未保存的草稿和上一轮的在线列表
+  reasoningDraft.mimoThinking = null
+  reasoningDraft.deepseekReasoningEffort = null
+  discoveredModels = null
+  modelsError = ''
+  modelsFetchedAt = ''
+  $('modelsHint').textContent = ''
   renderProviders()
   renderVoices()
   fillForm()
   $('audit').textContent = (data.audit ?? []).join('\n') || '（还没有记录）'
+  // 有 Key 就顺手把在线模型列表取回来（失败只提示，不影响显示与保存）
+  await maybeFetchModels()
 }
 
 /* ---------------- 系统提示词的交互 ---------------- */
@@ -529,14 +871,68 @@ $('restoreDefaultPrompt').addEventListener('click', () => {
   $('promptDefaultHint').textContent = '已切回默认模式，点右上角「保存」生效。'
 })
 
-$('provider').addEventListener('change', () => {
-  const provider = providerList.find((item) => item.id === $('provider').value)
+$('provider').addEventListener('change', async () => {
+  const provider = currentProvider()
   if (provider) {
     $('baseURL').value = provider.baseURL
-    if (provider.models.length > 0) $('model').value = provider.models[0]
+    // 新提供商用**它自己的推荐模型**（MiMo 是 mimo-v2.6-flash），不是上一家那个
+    const suggested = provider.defaultModel ?? provider.models?.[0] ?? ''
+    if (suggested !== '') $('model').value = suggested
   }
+  // 在线列表按提供商各自取：清掉上一家的结果，避免拿 MiMo 的目录去填 DeepSeek
+  discoveredModels = null
+  modelsError = ''
+  modelsFetchedAt = ''
+  $('modelsHint').textContent = ''
   fillProviderNote()
+  await maybeFetchModels()
 })
+
+/* 推理下拉一改就记进草稿，并重算提示与温度可用性 */
+for (const [id, field] of [['mimoThinking', 'mimoThinking'], ['deepseekEffort', 'deepseekReasoningEffort'], ['providerHint', 'providerHint']]) {
+  $(id).addEventListener('change', () => {
+    if (field === 'providerHint') {
+      if (state !== null) state.config.providerHint = $(id).value
+    } else {
+      reasoningDraft[field] = $(id).value
+    }
+    renderReasoning()
+  })
+}
+$('model').addEventListener('change', () => {
+  renderReasoning()
+  syncEffortAvailability()
+})
+let keyFetchTimer = null
+$('apiKey').addEventListener('input', () => {
+  /*
+   * 刚粘贴的 Key 值得重取列表（主进程只把它用于这一次请求）。
+   * 但必须防抖：逐字符敲就逐字符打一次 API，429 是自找的。停手 700ms 才发一次。
+   */
+  if (keyFetchTimer !== null) clearTimeout(keyFetchTimer)
+  keyFetchTimer = setTimeout(() => {
+    keyFetchTimer = null
+    if ($('apiKey').value.trim() !== '') void maybeFetchModels({ force: true })
+  }, 700)
+})
+$('refreshModels').addEventListener('click', () => fetchModels({ force: true }))
+$('openKeyConsole').addEventListener('click', () => {
+  const url = currentProvider()?.keyConsoleUrl
+  if (typeof url === 'string' && url !== '') void window.settingsApi.openKeyConsole({ url })
+})
+
+/**
+ * 选中了会做在线发现的提供商、且已经有 Key（已保存或刚填）时，自动取一次列表。
+ * 静默进行：失败只在提示里说明，不打扰、更不阻止保存。
+ */
+async function maybeFetchModels({ force = false } = {}) {
+  const provider = currentProvider()
+  if (provider?.modelDiscovery !== true) return
+  const typed = $('apiKey').value.trim()
+  const stored = state?.config?.hasProviderKey?.[provider.id] === true || state?.config?.hasApiKey === true
+  if (typed === '' && !stored) return
+  await fetchModels({ force, silent: true })
+}
 
 $('save').addEventListener('click', async () => {
   setStatus('保存中…')
@@ -546,6 +942,10 @@ $('save').addEventListener('click', async () => {
   $('save').disabled = false
   if (result.ok) {
     state.config = result.config
+    // 已落盘：草稿作废，之后一律以磁盘上的档位为准
+    reasoningDraft.mimoThinking = null
+    reasoningDraft.deepseekReasoningEffort = null
+    if (typeof state.config.providerHint !== 'string') state.config.providerHint = 'auto'
     fillForm()
     // 保存成功后再标记：如果这次保存是"恢复默认"，
     // 用户切回自定义时应看到完整默认提示词（fillForm 已清空框，applyPromptModeUI 会填默认）
