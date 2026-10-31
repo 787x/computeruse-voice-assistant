@@ -12,9 +12,9 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { loadPublicConfig, saveConfig, resolveApiKey, resolveSearchKey, listProviders, CONFIG_FILE } from '../packages/config/store.mjs'
+import { loadPublicConfig, loadConfig, saveConfig, resolveApiKeyFor, resolveSearchKey, listProviders, CONFIG_FILE } from '../packages/config/store.mjs'
 import { getProvider } from '../packages/config/registry.mjs'
-import { LLMClient } from '../packages/agent/llm.mjs'
+import { LLMClient, profileFromConfig } from '../packages/agent/llm.mjs'
 import { WebSearch } from '../packages/tools/web-search.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -52,21 +52,33 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/test') {
       const body = await readJson(req)
       const stored = await loadPublicConfig()
-      const baseURL = body.baseURL || stored.baseURL
-      const model = body.model || stored.model
+      const targetProviderId = body.providerId ?? stored.providerId
+      // 选了别家就用别家自己那份 Key：拿当前凭据去打陌生端点只会得到假的 401
       const apiKey = typeof body.apiKey === 'string' && body.apiKey !== '' && !body.apiKey.includes('*')
         ? body.apiKey
-        : await resolveApiKey()
+        : await resolveApiKeyFor(targetProviderId, { config: await loadConfig() })
+      const baseURL = body.baseURL || getProvider(targetProviderId)?.baseURL || stored.baseURL
+      const model = body.model || stored.model
 
-      const provider = getProvider(body.providerId ?? stored.providerId)
+      const provider = getProvider(targetProviderId)
       if (provider?.apiKeyRequired === true && !apiKey) {
         return send(res, 200, JSON_TYPE, JSON.stringify({ ok: false, error: '该提供商需要 API Key，但当前未配置' }))
       }
 
-      const client = new LLMClient({ baseURL, apiKey, model, timeoutMs: 20000 })
+      /*
+       * 和实际请求走同一套提供商档案：测试路径多发一个该提供商不支持的参数，
+       * 就会出现"测着是红的、其实能用"的假失败。
+       */
+      const client = new LLMClient({
+        baseURL, apiKey, model, timeoutMs: 20000,
+        profile: profileFromConfig({ ...stored, providerId: targetProviderId, baseURL, model }),
+      })
       const checks = {}
       try {
-        checks.models = await client.listModels()
+        const listed = await client.listModels()
+        // listModels 返回的是整个账号目录（含 ASR/TTS）；这里只留能聊天的，和设置页一致
+        checks.models = listed.models.filter((item) => item.chat).map((item) => item.id)
+        checks.modelsExcluded = listed.models.filter((item) => !item.chat).map((item) => item.id)
       } catch (error) {
         checks.modelsError = error.message
       }

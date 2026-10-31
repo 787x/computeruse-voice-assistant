@@ -7,7 +7,7 @@
  * 用法：node tools/try-agent.mjs "帮我看看现在开了哪些窗口"
  */
 import { loadConfig, resolveApiKey } from '../packages/config/store.mjs'
-import { LLMClient } from '../packages/agent/llm.mjs'
+import { LLMClient, profileFromConfig } from '../packages/agent/llm.mjs'
 import { Agent } from '../packages/agent/loop.mjs'
 import { resolveSystemPrompt } from '../packages/agent/system-prompt.mjs'
 import { CuaToolkit } from '../packages/cua/adapter.mjs'
@@ -22,6 +22,8 @@ const base = new LLMClient({
   model: config.model,
   temperature: config.temperature,
   timeoutMs: config.timeoutMs,
+  // 和壳子里同一套提供商档案：这个 CLI 的实测数据才代表真实请求
+  profile: profileFromConfig(config),
 })
 
 // 逐轮计时包装：对每次 chat 调用记录 ttft / decode / total
@@ -45,6 +47,8 @@ const llm = {
       total: Math.round(total),
       toolCalls: result.toolCalls.map((c) => c.name),
       chars: result.text.length,
+      // 思考内容只记长度：它不进播报，但排"为什么这么慢"必须要看它
+      reasoningChars: (result.reasoning ?? '').length,
     })
     return result
   },

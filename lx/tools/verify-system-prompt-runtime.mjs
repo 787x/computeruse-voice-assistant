@@ -104,6 +104,11 @@ function fixture({ gateVerdicts = [] } = {}) {
     constructor(options) { this.options = options }
     setModel() {}
     setEndpoint() {}
+    setProfile() {}
+    setTemperature() {}
+    setTimeout() {}
+    /** 回合快照：本用例关心的是提示词与调用顺序，返回自身即可 */
+    snapshot() { return this }
     async chat({ messages }) {
       llmCalls.push(messages.map((m) => ({
         role: m.role,
@@ -116,7 +121,8 @@ function fixture({ gateVerdicts = [] } = {}) {
   }
   const modules = {
     '../../packages/config/store.mjs': storeShim,
-    '../../packages/agent/llm.mjs': { LLMClient: FakeLLMClient },
+    // 壳子会给 LLMClient 传提供商档案（决定推理参数），桩件必须提供同一个函数
+    '../../packages/agent/llm.mjs': { LLMClient: FakeLLMClient, profileFromConfig: (source) => ({ providerId: source?.providerId ?? '', capability: source?.providerId ?? '' }) },
     '../../packages/agent/loop.mjs': { Agent: RealAgent },
     '../../packages/cua/adapter.mjs': { CuaToolkit: FakeToolkit },
     '../../packages/tools/web-search.mjs': { WebSearch: class { enabled = false }, WEB_SEARCH_TOOL: {} },

@@ -108,11 +108,35 @@
       <div class="field">
         <label for="temperature">温度</label>
         <input id="temperature" type="number" min="0" max="2" step="0.1" />
+        <span class="hint" id="temperatureHint"></span>
       </div>
     </div>
+    <!--
+      推理控制：按当前提供商显示对应的一套。
+      MiMo 只有思考开关（官方 Chat Completions 没有强度档位，绝不伪造）；
+      DeepSeek 是 none/low/high/max（官方把 medium 映射为 high，所以不单独列）。
+    -->
+    <div class="row" id="reasoningRow" hidden>
+      <div class="field" id="mimoThinkingField" hidden>
+        <label for="mimoThinking">思考模式</label>
+        <select id="mimoThinking"></select>
+      </div>
+      <div class="field" id="deepseekField" hidden>
+        <label for="deepseekEffort">推理等级</label>
+        <select id="deepseekEffort"></select>
+      </div>
+      <div class="field" id="providerHintField" hidden>
+        <label for="providerHint">兼容协议</label>
+        <select id="providerHint"></select>
+      </div>
+    </div>
+    <div class="hint" id="reasoningNote" style="margin-bottom:8px"></div>
     <div class="actions">
       <button id="testModel">测试模型</button>
+      <button id="refreshModels">获取模型列表</button>
+      <button id="openKeyConsole" hidden>获取 API Key</button>
       <span class="hint" id="modelHint"></span>
+      <span class="hint" id="modelsHint"></span>
     </div>
 
     <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
@@ -121,7 +145,7 @@
       </div>
       <table>
         <thead>
-          <tr><th style="width:110px">名称</th><th style="width:130px">提供商</th><th>接口地址</th><th style="width:150px">Key</th><th style="width:150px">模型</th><th style="width:44px"></th></tr>
+          <tr><th style="width:96px">名称</th><th style="width:120px">提供商</th><th>接口地址</th><th style="width:130px">Key</th><th style="width:130px">模型</th><th style="width:150px">推理</th><th style="width:40px"></th></tr>
         </thead>
         <tbody id="profileRows"></tbody>
       </table>
