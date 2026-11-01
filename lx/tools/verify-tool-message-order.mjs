@@ -403,8 +403,58 @@ function imagesBetweenToolResults(messages) {
     withBadCall.tool_calls.map((c) => c.id))
 }
 
-// ============================================================ 汇总
+// ============================================================ 5 内部标记绝不进请求体
 
+{
+  /*
+   * loop 会插"（参数不完整，请重新生成）"这类内部提示，并给消息打 `internal` 标记，
+   * 供压缩时区分"用户回合"与"程序提示"。这些标记是本地语义：
+   * 一旦随请求发出去，模型会收到它看不懂的字段，严格的端点会直接 400。
+   */
+  const bodies = []
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    if (bodies.length === 1) {
+      // 参数坏掉 → loop 会插入一条带 internal 标记的提示
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'b1', function: { name: 'scroll', arguments: '{bad' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+        ],
+      }
+    }
+    return { sse: [{ choices: [{ index: 0, delta: { content: '好了' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'm', profile: profileFromConfig({ providerId: 'openai-compatible', model: 'm' }) })
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [{ type: 'function', function: { name: 'scroll', parameters: {} } }], invoke: async () => ({ text: 'ok' }) },
+      maxSteps: 4,
+    })
+    const result = await agent.run('滚到底')
+    const leaked = bodies.flatMap((body) => body.messages
+      .filter((message) => 'internal' in message || '_providerId' in message))
+    // 内部提示是在"参数坏了之后"才插进来的，所以它出现在**下一个**请求里
+    check('M29 内部提示确实被插入了（这条测试才有意义）',
+      bodies.some((body) => body.messages.some((m) => typeof m.content === 'string'
+        && (m.content.includes('参数不完整') || m.content.includes('模型响应不完整')))),
+      bodies.length)
+    check('M30 本地标记（internal / _providerId）绝不进请求体', leaked.length === 0,
+      JSON.stringify(leaked.map((m) => m.role)))
+    check('M31 回合增量仍然保留 internal 标记（下一轮压缩还认得出）',
+      result.turn.some((m) => m.internal === true), result.turn.map((m) => m.internal ?? null).join(','))
+
+    // 下一轮带着历史重放：仍然不得泄漏
+    bodies.length = 0
+    await agent.run('再来一下', { history: result.turn })
+    const leakedAgain = bodies.flatMap((body) => body.messages
+      .filter((message) => 'internal' in message || '_providerId' in message))
+    check('M32 历史重放时标记同样不泄漏', leakedAgain.length === 0,
+      JSON.stringify(leakedAgain.map((m) => m.role)))
+  })
+}
+
+// ============================================================ 汇总
 const failed = results.filter((r) => !r.pass)
 console.log('='.repeat(72))
 console.log(JSON.stringify({ suite: 'tool message order', cases: results.length, failed: failed.length, failedNames: failed.map((r) => r.name) }))

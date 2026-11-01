@@ -445,6 +445,67 @@ async function main() {
       `${emptyUi.candidates.length}/${emptyUi.model}`)
     modelsMode = 'ok'
 
+    /* ---------------- 10b. API Key 草稿按提供商归属 ---------------- */
+    /*
+     * 场景（用户实际会做的事）：在 MiMo 输入一颗还没保存的 Key，切到 DeepSeek，
+     * 再切回 MiMo。要求：
+     *   - 那颗 Key **不能**被带到 DeepSeek 的输入框里（否则会被当成 DeepSeek 的
+     *     Key 去取列表/保存，等于把 A 家的凭据发给 B 家）；
+     *   - 切回 MiMo 时草稿还在，不用重填。
+     * 这必须用真界面验证：错的实现（change 事件里读 $('provider').value 当归属）
+     * 在代码里看起来完全正常，只有点一下才会露馅。
+     */
+    const draftFlow = await js(win, `(async () => {
+      const p = document.getElementById('provider');
+      const key = document.getElementById('apiKey');
+      const baseURL = document.getElementById('baseURL');
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const pick = async (id) => {
+        p.value = id;
+        p.dispatchEvent(new Event('change', { bubbles: true }));
+        await wait(250);
+      };
+      await pick('mimo');
+      key.value = 'sk-mimo-draft-A';
+      key.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(50);
+      // 切到 DeepSeek
+      await pick('deepseek');
+      const dsView = { value: key.value, placeholder: key.placeholder };
+      // 切回 MiMo
+      await pick('mimo');
+      const mimoBack = { value: key.value, placeholder: key.placeholder };
+      // 同一个提供商只改地址：Key 与草稿都必须还在
+      baseURL.value = 'https://proxy.example.com/v1';
+      baseURL.dispatchEvent(new Event('change', { bubbles: true }));
+      await wait(250);
+      const afterUrlChange = { value: key.value, provider: p.value };
+      // 切走再切回，草稿仍按提供商各归各的
+      await pick('deepseek');
+      const dsAgain = key.value;
+      await pick('mimo');
+      const mimoAgain = key.value;
+      return { dsView, mimoBack, afterUrlChange, dsAgain, mimoAgain };
+    })()`)
+    record('10b1 在 MiMo 输入的未保存 Key 不会被带到 DeepSeek',
+      draftFlow.dsView.value === '', JSON.stringify(draftFlow.dsView))
+    record('10b2 切回 MiMo 时草稿仍在（不用重填）',
+      draftFlow.mimoBack.value === 'sk-mimo-draft-A', JSON.stringify(draftFlow.mimoBack))
+    record('10b3 同一提供商改 Base URL 不丢 Key 草稿',
+      draftFlow.afterUrlChange.value === 'sk-mimo-draft-A' && draftFlow.afterUrlChange.provider === 'mimo',
+      JSON.stringify(draftFlow.afterUrlChange))
+    record('10b4 再次往返：DeepSeek 仍是空、MiMo 仍是那颗草稿',
+      draftFlow.dsAgain === '' && draftFlow.mimoAgain === 'sk-mimo-draft-A',
+      JSON.stringify({ ds: draftFlow.dsAgain, mimo: draftFlow.mimoAgain }))
+    // 清掉这颗草稿，避免影响后面的保存用例
+    await js(win, `(async () => {
+      const p = document.getElementById('provider');
+      p.value = 'mimo';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 150));
+      document.getElementById('apiKey').value = '';
+    })()`)
+
     /* ---------------- 11. 控制台入口 ---------------- */
     await js(win, `(async () => { document.getElementById('openKeyConsole').click(); await new Promise((r) => setTimeout(r, 200)); })()`)
     record('控制台入口打开的是官方 Key 页面',
@@ -526,6 +587,52 @@ async function main() {
     record('12b3 切回有 Key 目标时提示已保存',
       profileSwitch.backDs.provider === 'deepseek' && profileSwitch.backDs.keyPlaceholder.includes('已保存'),
       JSON.stringify(profileSwitch.backDs.keyPlaceholder))
+
+    /* ---------------- 12c. 方案推理档位：切协议不丢未保存的选择 ---------------- */
+    /*
+     * 两家档位集合不重叠（MiMo: default/enabled/disabled，DeepSeek: default/none/low/high/max）。
+     * 共用一个记忆键时，切到 MiMo 会因为 'max' 不在 MiMo 选项里而落到 default，
+     * 并把记忆覆盖成 default——切回 DeepSeek 时用户刚选的 max 就没了。
+     */
+    const reasoningDraft = await js(win, `(async () => {
+      const row = document.querySelector('#profileRows tr');
+      const p = row.querySelector('[data-field="providerId"]');
+      const sel = row.querySelector('[data-field="reasoning"]');
+      const pick = async (provider) => {
+        p.value = provider;
+        p.dispatchEvent(new Event('change', { bubbles: true }));
+        await new Promise((r) => setTimeout(r, 120));
+      };
+      await pick('deepseek');
+      sel.value = 'max';
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 80));
+      const dsAfterPick = sel.value;
+      // 切到 MiMo：档位集合换成 MiMo 的三档
+      await pick('mimo');
+      const mimoView = Array.from(sel.options).map((o) => o.value);
+      // 在 MiMo 上另选一档
+      sel.value = 'disabled';
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 80));
+      const mimoPicked = sel.value;
+      // 切回 DeepSeek：刚才未保存的 max 必须还在
+      await pick('deepseek');
+      const dsBack = sel.value;
+      // 再切回 MiMo：MiMo 那边的 disabled 也还在（没被 DeepSeek 的 max 顶掉）
+      await pick('mimo');
+      const mimoBack = sel.value;
+      return { dsAfterPick, mimoView, mimoPicked, dsBack, mimoBack };
+    })()`)
+    record('12c 未保存的 DeepSeek 档位（max）切到 MiMo 再切回仍在',
+      reasoningDraft.dsAfterPick === 'max' && reasoningDraft.dsBack === 'max',
+      JSON.stringify({ pick: reasoningDraft.dsAfterPick, back: reasoningDraft.dsBack }))
+    record('12c2 切到 MiMo 时显示的是 MiMo 三档（不是 DeepSeek 的档位）',
+      JSON.stringify(reasoningDraft.mimoView) === JSON.stringify(['default', 'enabled', 'disabled']),
+      reasoningDraft.mimoView)
+    record('12c3 MiMo 这边选的档位也没有被 DeepSeek 那边的顶掉',
+      reasoningDraft.mimoPicked === 'disabled' && reasoningDraft.mimoBack === 'disabled',
+      JSON.stringify({ picked: reasoningDraft.mimoPicked, back: reasoningDraft.mimoBack }))
 
     /* ---------------- 13. PR3 提示词语义未受影响 ---------------- */
     const noPrompt = !('systemPrompt' in savedPayloads.at(-1))

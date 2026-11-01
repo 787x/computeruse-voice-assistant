@@ -155,7 +155,10 @@ function fixture({ gateVerdicts = [] } = {}) {
     ensureLauncher: async () => ({ launch: async () => ({ text: '已启动' }) }),
     loadModule: async (path) => modules[path],
     LAUNCH_APP_TOOL: {}, SHELL_TOOL: {}, FILES_TOOL: {}, PROC_TOOL: {}, KILL_TOOL: {},
+    // 两套发行版各有一件音乐工具：根目录用 netease_music，lx 用 lx_music。
+    // 这份测试是共用的，两个都提供，哪一套主程序引用都能跑起来。
     SYSINFO_TOOL: {}, NETEASE_TOOL: { function: { name: 'netease_music' } },
+    LX_MUSIC_TOOL: { function: { name: 'lx_music' } },
     runShell: async () => ({ text: 'ok' }), runFiles: async () => ({ text: 'ok' }),
     runAppControl: async () => ({ text: 'ok' }), runKillApp: async () => ({ text: 'ok' }),
     runSystemInfo: async () => ({ text: 'ok' }),

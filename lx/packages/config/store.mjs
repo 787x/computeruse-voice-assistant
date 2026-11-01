@@ -444,16 +444,20 @@ async function saveConfigOnce(patch, { signal, expectedCredentials } = {}) {
         providerHint: keepOr(profile?.providerHint, previous?.providerHint, normalizeHint),
       }
       /*
-       * 方案 Key 的语义和全局那一份完全一致（这也是"简单凭据"的要求）：
+       * 方案 Key 的语义和全局那一份一致（这也是"简单凭据"的要求）：
        *  - 用户给了新 Key（非空、非掩码）→ 用新的；
-       *  - 没给新 Key → 沿用这条方案原来存的 Key，**不管地址有没有改**。
+       *  - 没给新 Key、**提供商也没变** → 沿用这条方案原来存的 Key，不管地址有没有改。
        *    改了地址却把 Key 清空，用户下次定时切过来只会拿到一条 401，
-       *    而他明明在同一个提供商下填过 Key。切提供商时如果那条方案从没填过 Key，
-       *    就沿用全局 providerKeys 里该提供商的那一份（同一个账号，没必要填两遍）。
+       *    而他明明在同一个提供商下填过 Key。
+       *  - **换了提供商 → 绝不沿用旧 Key**：那是 A 家的凭据，发给 B 家只会 401，
+       *    更糟的是用户会以为"这套方案能用了"。此时按新提供商的顺序取：
+       *    全局 providerKeys[新提供商]（同一账号，没必要填两遍）→ 空（界面提示去填）。
        */
+      const providerChanged = typeof previous?.providerId === 'string'
+        && previous.providerId !== '' && previous.providerId !== merged.providerId
       if (isRealSecret(profile?.apiKey)) {
         merged.apiKey = String(profile.apiKey).trim()
-      } else if (typeof previous?.apiKey === 'string' && isRealSecret(previous.apiKey)) {
+      } else if (!providerChanged && typeof previous?.apiKey === 'string' && isRealSecret(previous.apiKey)) {
         merged.apiKey = previous.apiKey
       } else if (isRealSecret(providerKeys[merged.providerId])) {
         merged.apiKey = providerKeys[merged.providerId]
@@ -475,7 +479,20 @@ async function saveConfigOnce(patch, { signal, expectedCredentials } = {}) {
    * 旧配置里如果还留着这块，落盘时**原样写回**（不删、不改），
    * 这样回滚到 PR#4 的旧版本时用户的凭据还在；新代码读它时只做只读回收。
    * 新保存不会再往里写任何东西。
+   *
+   * 唯一的例外是**用户明确清了 Key**（apiKey: null）：那时必须把这一家的旧条目
+   * 一起删掉，否则下次 loadConfig 又会从旧数据里把它"回收"回来——
+   * 用户点了清除、重启之后 Key 又出现了，这比丢了更让人无法信任。
    */
+  if (patch.apiKey === null && next.providerTargets !== undefined && next.providerTargets !== null
+      && typeof next.providerTargets === 'object') {
+    const cleaned = {}
+    for (const [key, value] of Object.entries(next.providerTargets)) {
+      if (key.startsWith(`${targetProviderId}|`)) continue
+      cleaned[key] = value
+    }
+    next.providerTargets = cleaned
+  }
   if (next.providerTargets !== undefined && next.providerTargets !== null) {
     next.providerTargets = encryptKeyMap(next.providerTargets)
   }
@@ -594,18 +611,32 @@ export function listProviders() {
  *  1. 用户设置 `contextWindow`（默认 1M）+ `contextCompressPercent`（默认 90）；
  *  2. 该端点在注册表里声明的**可信**窗口（local 是 32K），以及 /models 带回的窗口元数据；
  *  3. 都没有 → 按 1M 处理（未知模型不猜小）。
- * 元数据只能**收紧**预算（取 min），不能把用户设的 1M 放宽成更大。
+ *
+ * 注册表里的窗口是**默认值**，不是硬上限：
+ *  - 用户没动过窗口设置（还是全局默认 1M）时，按注册表值（本地 llama.cpp 默认 32K）算，
+ *    这比按 1M 硬发靠谱；
+ *  - 用户**明确配过一个不一样的窗口**（比如把 llama-server 起成 --ctx-size 131072），
+ *    就以用户为准——注册表里的 32K 只是示例值，不能覆盖用户对自己机器的了解。
+ * /models 带回的窗口元数据是端点自报的真实容量，任何时候都参与收紧（取 min）。
  *
  * @param {object} config loadConfig() 的结果
  * @param {{modelContextWindow?:number}} [modelMeta] 在线模型列表带回的能力元数据
  */
 export function resolveContextPolicyFor(config, modelMeta = {}) {
   const provider = getProvider(String(config?.providerId ?? '').trim())
-  const metaWindow = Number(modelMeta?.modelContextWindow ?? provider?.contextWindow)
+  const metadataWindow = Number(modelMeta?.modelContextWindow)
+  const registryWindow = Number(provider?.contextWindow)
+  const userWindow = Number(config?.contextWindow)
+  // 用户"没表态"的唯一可靠信号：窗口仍是全局默认值（设置页每次保存都会带上这个字段，
+  // 所以不能拿 "patch 里有没有它" 判断是不是用户改的）
+  const userPickedWindow = Number.isFinite(userWindow) && userWindow > 0 && userWindow !== DEFAULT_CONTEXT_WINDOW
+  const modelContextWindow = Number.isFinite(metadataWindow) && metadataWindow > 0
+    ? metadataWindow
+    : (userPickedWindow ? null : (Number.isFinite(registryWindow) && registryWindow > 0 ? registryWindow : null))
   return resolveContextPolicy({
     contextWindow: config?.contextWindow,
     compressPercent: config?.contextCompressPercent,
-    modelContextWindow: Number.isFinite(metaWindow) && metaWindow > 0 ? metaWindow : null,
+    modelContextWindow,
   })
 }
 

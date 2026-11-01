@@ -1644,6 +1644,24 @@ function handleAgentEvent(event, turn = activeTurn) {
     for (const sentence of takeSentences(turn)) speakLine(turn, sentence)
     return
   }
+  if (event.type === 'stream_error') {
+    /*
+     * 模型这一路响应没正常结束（服务端错误 / 断流 / 输出被长度上限截断）。
+     *
+     * 已经流出来的话照常说完——用户听到的内容是真的，不该因为后半段出错就吞掉，
+     * 也不重播。这里只做一个**标记**，由 runCommand 在本轮收尾时如实告知
+     * "回答没有完整完成"，绝不把这一轮当成正常成功。
+     *
+     * 注意：用户主动打断走的是 AbortController + 正常取消路径（signal.aborted 为真时
+     * 本函数开头就返回了），不会走到这里，所以不会把"用户喊停"误报成模型故障。
+     */
+    turn.streamError = true
+    turn.streamErrorReason = typeof event.finishReason === 'string' && event.finishReason !== ''
+      ? event.finishReason
+      : 'unknown'
+    log(`stream_error: reason=${turn.streamErrorReason} partial=${String(event.text ?? '').length}chars`)
+    return
+  }
   if (event.type === 'tool_start') {
     turn.tools += 1
     // 模型调工具前会先说一句"我看一下窗口"，这句必须在动作之前读出来。
@@ -2372,6 +2390,38 @@ async function runCommand(text) {
     // 旧的文本标记只留作日志线索，真正决定要不要等的是下面的判定
     wantContinue = process.env.CUA_VA_FORCE_CONTINUE === '1' || /\[\[继续\]\]/u.test(turn.raw)
     rememberTurn(text, result, (result.steps ?? []).map((step) => step.tool))
+    /*
+     * 模型这一轮**没有正常完成**（服务端错误 / 断流 / 输出被截断）。
+     *
+     * 已经说出口的话不回收、不重播，工具也确实执行过了（不自动重试，避免重复点击/输入）。
+     * 但这一轮不能被当成"正常完成"：字幕上说清楚没答完，状态落到出错，
+     * 也不做"还要不要继续听"的判定（那会基于一段半截回答去猜用户意图）。
+     */
+    const turnFailed = result.failed === true || turn.streamError === true
+    if (turnFailed) {
+      const reason = turn.streamErrorReason ?? result.finishReason ?? 'unknown'
+      log(`turn ${turn.id} failed in model response (${reason}) tools=${turn.tools} chars=${(result.text ?? '').length}`)
+      wantContinue = false
+      followUpJudgement = null
+      followUpJudgePromise = null
+      turn.completed = true
+      if (turn.raw.trim() === '') {
+        // 一个字都没出来：必须给一句明确的失败说明，不能只留下"我想一下…"然后静默收场
+        const text = '模型这次没有正常回答，可以再说一次。'
+        lastAssistantText = text
+        setState('error')
+        sendSubtitle({ final: text })
+        enqueueSpeech(text)
+      } else {
+        // 已经说了一半：让这句话播完，再接一句"没说完"，不重播、不吞掉已说的内容
+        setState('error')
+        // 状态渲染会重写字幕副标题，所以这条提示必须在 setState 之后再推
+        sendSubtitle({ hint: '回答没有完整完成，可以再问我一次' })
+        enqueueSpeech('（刚才的回答没有说完，可以再问我一次。）')
+      }
+      scheduleHide()
+      return
+    }
     log(`turn ${turn.id} done in ${Date.now() - turn.startedAt}ms tools=${turn.tools} chars=${result.text.length}`)
     setState('speaking')
 

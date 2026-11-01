@@ -87,6 +87,20 @@ async function withMock(handler, run) {
   check('K10 MiMo 官方端点按 1M 算', mimoPolicy.contextWindow === 1_000_000, mimoPolicy.contextWindow)
   const unknownPolicy = store.resolveContextPolicyFor({ providerId: 'openai-compatible', contextWindow: 1_000_000 })
   check('K11 未知模型默认按 1M 处理', unknownPolicy.contextWindow === 1_000_000, unknownPolicy.contextWindow)
+
+  /*
+   * 注册表里的窗口是**默认值**，不是硬上限：用户把 llama-server 起成
+   * `--ctx-size 131072` 后，在设置里填真实容量，不该被示例值 32K 覆盖回去。
+   */
+  const localBigger = store.resolveContextPolicyFor({ providerId: 'local', contextWindow: 131_072, contextCompressPercent: 90 })
+  check('K11a 用户明确配置的本地真实窗口不被注册表 32K 覆盖',
+    localBigger.contextWindow === 131_072, localBigger.contextWindow)
+  // 端点上自报的窗口元数据仍可收紧（那是模型自己的真实容量）
+  const metaTightens = store.resolveContextPolicyFor(
+    { providerId: 'local', contextWindow: 131_072, contextCompressPercent: 90 },
+    { modelContextWindow: 65_536 })
+  check('K11b 端点自报的更小窗口仍然用于收紧',
+    metaTightens.contextWindow === 65_536, metaTightens.contextWindow)
 }
 
 // ============================================================ 1 估算器：字符数 ≠ tokens
@@ -431,6 +445,133 @@ function makeHistory(turns, charsPerTurn) {
     check('K49 残缺单元的 tool_calls 被整体剔除（不留孤立调用）',
       !sent.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => c.id === 'a2')),
       JSON.stringify(sent.filter((m) => m.role === 'assistant').map((m) => m.tool_calls?.map((c) => c.id))))
+  })
+}
+
+// ============================================================ 8 内部提示 vs 真实用户回合
+
+{
+  /*
+   * 场景：本轮真实目标 + 之后 loop 生成的内部提示（"工具参数不完整，请重新生成"）。
+   * 压缩时内部提示**不能**开启新回合，否则真实目标会被当成"更老的回合"删掉——
+   * 用户看到的就是"它忘了我要干什么"。
+   */
+  const messages = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: '旧任务 A' },
+    { role: 'assistant', content: '好'.repeat(3000) },
+    { role: 'user', content: '把页面滚到最底部并截图确认' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'a', type: 'function', function: { name: 'scroll', arguments: '{}' } }], reasoning_content: '思'.repeat(2000) },
+    { role: 'tool', tool_call_id: 'a', content: '滚好了' },
+    { role: 'user', content: '（上一步的工具调用参数不完整，没有执行。请重新给出完整参数。）', internal: true },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'b', type: 'function', function: { name: 'scroll', arguments: '{"n":999}' } }], reasoning_content: '思'.repeat(2000) },
+    { role: 'tool', tool_call_id: 'b', content: '滚好了' },
+  ]
+  const units = context.splitInteractionUnits(messages.filter((m) => m.role !== 'system'))
+  check('K50 内部提示不开启新交互单元（只有真实用户回合算单元）',
+    units.length === 2 && units[1].head.content === '把页面滚到最底部并截图确认',
+    units.map((u) => String(u.head.content).slice(0, 16)))
+
+  const policy = context.resolveContextPolicy({ contextWindow: 6_000, compressPercent: 90 })
+  const outcome = context.compressMessages(messages, policy, { tools: [] })
+  check('K51 压缩发生了（这条测试才有意义）', outcome.compressed === true, outcome.compressed)
+  check('K52 真实用户目标没有被内部提示挤掉',
+    messages.some((m) => m.role === 'user' && m.content === '把页面滚到最底部并截图确认'),
+    messages.filter((m) => m.role === 'user').map((m) => String(m.content).slice(0, 18)))
+  check('K53 摘要被标成内部提示（不会伪装成用户新指令）',
+    messages.filter((m) => typeof m.content === 'string' && m.content.startsWith('（为控制上下文长度'))
+      .every((m) => m.internal === true),
+    messages.filter((m) => m.role === 'user').map((m) => m.internal))
+
+  // 旧版本落进历史的内部提示（没有 internal 标记）：按固定措辞也要认出来
+  const legacy = [
+    { role: 'user', content: '真实目标' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c', type: 'function', function: { name: 'x', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c', content: 'ok' },
+    { role: 'user', content: '（已经用满 16 步，不能再调工具了。用一句话告诉用户。）' },
+  ]
+  const legacyUnits = context.splitInteractionUnits(legacy)
+  check('K54 旧历史里的内部提示（无标记）也按措辞识别',
+    legacyUnits.length === 1 && legacyUnits[0].head.content === '真实目标',
+    legacyUnits.map((u) => String(u.head.content).slice(0, 14)))
+}
+
+// ============================================================ 9 压完仍超硬上限要如实报告
+
+{
+  const messages = [
+    { role: 'system', content: 'S'.repeat(2000) },
+    { role: 'user', content: '目标' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'z', type: 'function', function: { name: 'x', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'z', content: '果'.repeat(100000) },
+  ]
+  const policy = context.resolveContextPolicy({ contextWindow: 5_000, compressPercent: 90 })
+  const outcome = context.compressMessages(messages, policy, { tools: [] })
+  const after = context.estimateRequestTokens({ messages })
+  check('K55 单条超大工具结果按预算截断（不是固定 1,200 字）',
+    outcome.shrunkToolResults === 1 && messages.find((m) => m.role === 'tool').content.length > 500,
+    `${messages.find((m) => m.role === 'tool').content.length} 字`)
+  check('K56 截断后模型能看出这是截断内容',
+    messages.find((m) => m.role === 'tool').content.includes('已按上下文预算截断'),
+    messages.find((m) => m.role === 'tool').content.slice(-30))
+  check('K57 截断后回到硬上限以内', after <= policy.hardLimitTokens, `${after} <= ${policy.hardLimitTokens}`)
+  check('K58 工具配对仍然完整（assistant.tool_calls 与 tool 结果都在）',
+    messages.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))
+      && messages.some((m) => m.role === 'tool'), messages.map((m) => m.role))
+
+  // 真的压不下去（system 本身就把窗口撑满）→ 必须报 overLimit，而不是假装成功
+  const impossible = [
+    { role: 'system', content: 'S'.repeat(40000) },
+    { role: 'user', content: '目标' },
+  ]
+  const tinyPolicy = context.resolveContextPolicy({ contextWindow: 5_000, compressPercent: 90 })
+  const impossibleOutcome = context.compressMessages(impossible, tinyPolicy, { tools: [] })
+  check('K59 压完仍超硬上限时明确标记 overLimit（不静默照发）',
+    impossibleOutcome.overLimit === true && impossibleOutcome.overLimitTokens > tinyPolicy.hardLimitTokens,
+    `${impossibleOutcome.overLimitTokens} > ${tinyPolicy.hardLimitTokens}`)
+}
+
+// ============================================================ 10 跨回合：内部提示身份不丢
+
+{
+  /*
+   * 第一轮生成了内部提示，第二轮带着那段历史继续。压缩必须仍然认得出
+   * "这条不是用户说的话"——否则上一轮的真实目标会在第二轮被当成旧回合删掉。
+   * 这要求 `internal` 标记跨回合保留在 turn 增量里（但不进请求体）。
+   */
+  const bodies = []
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    if (bodies.length === 1) {
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'b1', function: { name: 'scroll', arguments: '{bad' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+        ],
+      }
+    }
+    return { sse: [{ choices: [{ index: 0, delta: { content: '完成这一步' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'm', profile: profileFromConfig({ providerId: 'openai-compatible', model: 'm' }) })
+    const policy = context.resolveContextPolicy({ contextWindow: 20_000, compressPercent: 90 })
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [{ type: 'function', function: { name: 'scroll', parameters: {} } }], invoke: async () => ({ text: 'ok' }) },
+      maxSteps: 4,
+      contextPolicy: policy,
+    })
+    const first = await agent.run('把页面滚到最底部')
+    check('K60 第一轮的内部提示带 internal 标记且随 turn 返回',
+      first.turn.some((m) => m.internal === true), first.turn.map((m) => m.internal ?? m.role).join(','))
+    const before = bodies.length
+    await agent.run('再滚一次', { history: first.turn })
+    const last = bodies.at(-1)
+    check('K61 第二轮真的发了请求（这条测试才有意义）', bodies.length > before, `${bodies.length}`)
+    check('K62 第二轮里上一轮的真实用户目标仍在（没被内部提示挤掉）',
+      last.messages.some((m) => m.content === '把页面滚到最底部'),
+      last.messages.filter((m) => m.role === 'user').map((m) => String(m.content).slice(0, 16)))
+    check('K63 internal 标记没有进请求体',
+      !last.messages.some((m) => 'internal' in m), '')
   })
 }
 

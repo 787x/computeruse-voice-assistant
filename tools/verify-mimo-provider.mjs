@@ -94,6 +94,44 @@ async function withMock(handler, run) {
       && upgradedCustom.model === 'qwen2.5:7b' && upgradedCustom.providerHint === 'auto',
     `${upgradedCustom.baseURL} hint=${upgradedCustom.providerHint}`)
   await fs.rm(join(configDir, 'agent.json'), { force: true })
+
+  /*
+   * PR#4 曾把凭据拆成 providerTargets（`providerId|baseURL`）。迁移时**只读回收**：
+   * 把属于当前提供商的 Key 搬回 providerKeys；用户明确清除后**不得因为旧数据复活**。
+   */
+  const legacyTargets = {
+    schemaVersion: 2,
+    providerId: 'mimo',
+    baseURL: 'https://api.xiaomimimo.com/v1',
+    model: 'mimo-v2.6-flash',
+    apiKey: '',
+    providerKeys: {},
+    providerTargets: {
+      'mimo|https://api.xiaomimimo.com/v1': 'sk-legacy-mimo',
+      'mimo|https://token-plan.example.com/v1': 'sk-legacy-mimo-tp',
+      'deepseek|https://api.deepseek.com/v1': 'sk-legacy-deepseek',
+    },
+  }
+  await fs.writeFile(join(configDir, 'agent.json'), JSON.stringify(legacyTargets, null, 2), 'utf8')
+  const migrated = await store.loadConfig()
+  check('A9 旧 providerTargets 能迁移到当前提供商的 Key',
+    migrated.providerKeys?.mimo === 'sk-legacy-mimo' && migrated.apiKey === 'sk-legacy-mimo',
+    JSON.stringify(Object.keys(migrated.providerKeys ?? {})))
+  check('A10 不把别家的旧目标 Key 搬给当前提供商',
+    migrated.providerKeys?.deepseek === undefined,
+    JSON.stringify(migrated.providerKeys))
+
+  // 用户明确清除 Key → 旧迁移数据不得让它复活（包括重启后再读）
+  await store.saveConfig({ apiKey: null })
+  const cleared = await store.loadConfig()
+  check('A11 明确清除 Key 后为空', cleared.apiKey === '' && cleared.providerKeys?.mimo === undefined,
+    JSON.stringify(cleared.providerKeys))
+  const afterRestart = await store.loadConfig()
+  check('A12 重启后再读也不会从旧 providerTargets 复活 Key',
+    afterRestart.apiKey === '' && afterRestart.providerKeys?.mimo === undefined,
+    JSON.stringify(afterRestart.providerKeys))
+
+  await fs.rm(join(configDir, 'agent.json'), { force: true })
 }
 
 // ============================================================ B 模型发现
@@ -1172,7 +1210,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     built.capability === 'mimo' && JSON.stringify(built.fields.thinking) === '{"type":"disabled"}' && built.fields.reasoning_effort === undefined,
     JSON.stringify(built.fields))
 
-  // ============ 方案凭据语义：改地址/换提供商都保留用户填过的 Key ============
+  // ============ 方案凭据语义：同提供商改地址保留，换提供商不继承 ============
   await store.saveConfig({
     modelProfiles: [
       { id: 'pm', name: 'MiMo 白天', providerId: 'mimo', baseURL: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.6-flash', apiKey: 'sk-profile-keep' },
@@ -1180,15 +1218,49 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
   })
   await store.saveConfig({
     modelProfiles: [
-      // 同一条方案改了提供商与地址，但没重新填 Key → 沿用方案原来那份（用户不必重填）
+      // 同一个提供商只改地址 → 沿用方案原来那份 Key（用户不必重填）
+      { id: 'pm', name: 'MiMo 白天', providerId: 'mimo', baseURL: 'https://proxy.example.com/v1', model: 'mimo-v2.6-flash', apiKey: '' },
+    ],
+  })
+  const swappedAddress = await store.loadConfig()
+  const pmAddress = swappedAddress.modelProfiles.find((p) => p.id === 'pm')
+  check('G33 方案同提供商改地址 → 沿用已保存的 Key（不意外清空）',
+    pmAddress?.apiKey === 'sk-profile-keep',
+    `apiKey=${JSON.stringify(pmAddress?.apiKey)}`)
+
+  /*
+   * 换提供商 → **不得**沿用旧提供商的 Key（那是 A 家的凭据，发给 B 家只会 401）。
+   * 用户没填新 Key 时，退回「新提供商在全局 providerKeys 里那一份」，没有就留空。
+   */
+  await store.saveConfig({ providerKeys: { deepseek: 'sk-ds-global' } })
+  await store.saveConfig({
+    modelProfiles: [
       { id: 'pm', name: 'MiMo 白天', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', apiKey: '' },
     ],
   })
-  const swappedAuth = await store.loadConfig()
-  const pmSwapped = swappedAuth.modelProfiles.find((p) => p.id === 'pm')
-  check('G33 方案改地址/提供商后仍沿用已保存的 Key（不意外清空）',
-    pmSwapped?.apiKey === 'sk-profile-keep',
-    `apiKey=${JSON.stringify(pmSwapped?.apiKey)}`)
+  const switchedProvider = await store.loadConfig()
+  const pmSwitched = switchedProvider.modelProfiles.find((p) => p.id === 'pm')
+  check('G33a 方案换提供商 → 不继承旧提供商的 Key',
+    pmSwitched?.apiKey !== 'sk-profile-keep',
+    `apiKey=${JSON.stringify(pmSwitched?.apiKey)}`)
+  check('G33b 方案换提供商 → 用新提供商在全局已保存的 Key',
+    pmSwitched?.apiKey === 'sk-ds-global',
+    `apiKey=${JSON.stringify(pmSwitched?.apiKey)}`)
+
+  // 新提供商全局也没有 Key → 留空（界面提示去填），绝不沿用旧家那份
+  await store.saveConfig({ modelProfiles: [{ id: 'pm2', name: '晚上', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-flash', apiKey: 'sk-ds-only' }] })
+  // 两家的全局 Key 都清掉，才能验证"新家没 Key 时留空"
+  await store.saveConfig({ providerKeys: { deepseek: null, mimo: null } })
+  await store.saveConfig({
+    modelProfiles: [
+      { id: 'pm2', name: '晚上', providerId: 'mimo', baseURL: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.6-flash', apiKey: '' },
+    ],
+  })
+  const noInherit = await store.loadConfig()
+  const pmNoInherit = noInherit.modelProfiles.find((p) => p.id === 'pm2')
+  check('G33c 方案换提供商且新家没有 Key → 留空（不拿旧家 Key 顶）',
+    typeof pmNoInherit?.apiKey === 'string' && pmNoInherit.apiKey === '',
+    `apiKey=${JSON.stringify(pmNoInherit?.apiKey)}`)
 
   // 同源仅改模型 → 保留 Key
   await store.saveConfig({

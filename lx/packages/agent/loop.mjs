@@ -28,15 +28,28 @@ import {
   splitInteractionUnits,
 } from './context.mjs'
 
-const TOOL_RESULT_MAX_CHARS = 1200
 /**
  * 一轮里最多把几张图塞给模型。
  *
  * 以前是 4——那是"字符预算"时代的产物（一张截图 16 万字符，四张就"撑爆"了）。
  * 现在图片按 token 计价（见 context.mjs 的 estimateImageTokens），预算自己会管住用量，
  * 所以这里只留一个防跑飞的硬上限，不再把长 CUA 任务的截图提前砍掉。
+ *
+ * 这个值只防"模型自己陷入截图死循环"，正常 CUA 任务（几步到十几步）根本碰不到。
+ * 真的到了这里，会**明确告诉模型**"后面的截图没进来"，不让它以为屏幕上没变化。
  */
-const MAX_IMAGES_PER_RUN = 16
+const MAX_IMAGES_PER_RUN = 24
+/**
+ * 单条工具结果的长度上限。
+ *
+ * 为什么不再是一个 1,200 字的人拍数字：CUA / 文件 / 命令输出的前 1,200 字
+ * 经常只是表头或日志，模型据此做判断就会"看着半截结果瞎猜"。
+ * 现在只在**真的过长**时才截断，并且：
+ *  - 截断点之前的内容原样保留（不压缩空白，不打断结构）；
+ *  - 明确标注"已截断 + 原长"，模型知道自己看到的是片段，可以改用其它办法取全。
+ * 剩下的由上下文预算（context.mjs）按真实余量决定要不要进一步缩。
+ */
+const TOOL_RESULT_MAX_CHARS = 24_000
 
 /**
  * 会话历史整理：只做**协议安全**的整理，不做预算裁剪。
@@ -56,11 +69,14 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
   if (!Array.isArray(history) || history.length === 0) return []
   const units = splitInteractionUnits(history.map((message) => ({ ...message })))
 
+  /** 一个片段里的全部消息（调用 + 结果 + 截图 + 内部说明），顺序与压缩时一致 */
+  const segmentMessages = (segment) => [
+    ...segment.calls, ...segment.results, ...segment.attachments, ...segment.notes,
+  ]
+
   const providersDiffer = providerId !== ''
     ? (unit) => {
-        const all = [unit.head, ...unit.segments.flatMap((segment) => [
-          ...segment.calls, ...segment.results, ...segment.attachments,
-        ])]
+        const all = [unit.head, ...unit.segments.flatMap(segmentMessages)]
         return all.some((message) => message._providerId !== undefined && String(message._providerId) !== String(providerId))
       }
     : () => false
@@ -89,7 +105,7 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
     }
     flat.push({ ...unit.head })
     for (const segment of unit.segments) {
-      for (const message of [...segment.calls, ...segment.results, ...segment.attachments]) {
+      for (const message of segmentMessages(segment)) {
         const copy = { ...message }
         if (copy.role === 'assistant' && typeof copy.reasoning_content === 'string' && !needEcho) {
           delete copy.reasoning_content
@@ -98,8 +114,16 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
       }
     }
   }
-  // 内部标记绝不发往模型
-  for (const message of flat) delete message._providerId
+  /*
+   * `_providerId` 是纯本地标记，绝不发往模型。
+   *
+   * `internal`（"这是程序生成的提示，不是用户说的话"）**保留**：压缩要靠它
+   * 把内部提示归到当前任务里，否则真实用户目标会被当成旧回合先删掉。
+   * 发请求前由 stripLocalMarkers 统一剥掉，不会进请求体。
+   */
+  for (const message of flat) {
+    delete message._providerId
+  }
   return flat
 }
 
@@ -229,19 +253,51 @@ export class Agent {
     /**
      * 每次发请求前压一次。**没到 90% 会立刻返回**（只花一次估算），
      * 到了才按完整片段整体删除——所以"低于阈值不压缩"是结构上保证的。
+     *
+     * 返回的 `overLimit` 表示"压完仍然装不下"：这种情况不能继续盲目发请求，
+     * 也不能静默截断用户任务后假装正常完成——本回合直接如实失败，
+     * 让上层明确告诉用户（见下面的 checkBudget）。
      */
     const compress = () => compressMessages(messages, policy, { tools: availableTools })
+    /**
+     * 发请求前的预算闸。
+     * @returns {string|null} 失败说明（非 null 表示这一轮装不下，不能再发）
+     */
+    const checkBudget = (report) => {
+      if (report.overLimit !== true) return null
+      return `上下文装不下这一轮（估算 ${report.overLimitTokens.toLocaleString('en-US')} tokens，`
+        + `模型输入上限 ${policy.hardLimitTokens.toLocaleString('en-US')}）。`
+    }
     /*
      * 发第一枪之前先看一眼总预算：历史本身就可能已经很大（长时间 CUA 会话）。
      * 没到触发点这一步什么都不做。
      */
-    compress()
+    const initialBudget = compress()
+    const initialOverflow = checkBudget(initialBudget)
+    if (initialOverflow !== null) {
+      emit({ type: 'stream_error', text: '', finishReason: 'context_overflow' })
+      return {
+        text: initialOverflow,
+        steps: [],
+        limited: false,
+        reasoningChars: 0,
+        llm,
+        turn: [{ ...turnUserMessage, _providerId: providerId }],
+        providerId,
+        failed: true,
+        failureReason: 'context_overflow',
+        contextTokens: initialBudget.after,
+        contextWindow: policy.contextWindow,
+      }
+    }
 
     const steps = []
     let finalText = ''
     let hitStepLimit = false
     /** 本轮因流式异常/错误而未正常完成（上层不应把 finalText 当作成功回答） */
     let turnFailed = false
+    /** 失败的具体原因（stream_error / context_overflow / step_limit…），供上层如实说明 */
+    let failureReason = ''
     /** 本轮已经塞给模型多少张图 */
     let imagesAttached = 0
     /** 本轮累计的思考内容字数（只记长度，不落盘、不播报） */
@@ -251,7 +307,8 @@ export class Agent {
       throwIfAborted(signal)
 
       const result = await llm.chat({
-        messages,
+        // 本地标记（internal / _providerId）只用于回合内部判断，绝不能进请求体
+        messages: stripLocalMarkers(messages),
         tools: availableTools,
         signal,
         stream: true, // 必须流式：首字和"先说话后动手"的白描都依赖它
@@ -284,12 +341,23 @@ export class Agent {
             role: 'user',
             content: `（上一步的模型响应不完整${result.finishReason === 'length' ? '（输出被长度上限截断）' : ''}，`
               + '未执行任何工具调用。请重新组织你的回答；如果需要工具，请完整地重新发起调用。）',
+            // 程序生成的说明，不是用户说的话（压缩不能把它当新回合，见 context.mjs）
+            internal: true,
           })
           for (const call of [...toolCalls, ...broken]) {
             steps.push({ step, tool: call.name || '(未知工具)', ok: false, text: '响应不完整，未执行' })
             emit({ type: 'tool_end', name: call.name || '(未知工具)', ok: false, text: '响应不完整，未执行', step })
           }
-          compress()
+          const internalReport = compress()
+          const internalOverflow = checkBudget(internalReport)
+          if (internalOverflow !== null) {
+            // 装不下就别再发：如实结束，不把注定失败的请求发出去
+            finalText = finalText || internalOverflow
+            emit({ type: 'stream_error', text: '', finishReason: 'context_overflow' })
+            turnFailed = true
+            failureReason = 'context_overflow'
+            break
+          }
           if (step === maxSteps) hitStepLimit = true
           continue
         }
@@ -307,6 +375,7 @@ export class Agent {
           if (result.text) messages.push(assistantMessageFrom(result))
           emit({ type: 'stream_error', text: result.text ?? '', finishReason: result.finishReason })
           turnFailed = true
+          failureReason = 'stream_error'
           break
         }
         // 纯文本回复也要进消息历史：后续同一会话的提问需要带着这条回复，
@@ -330,12 +399,27 @@ export class Agent {
           role: 'user',
           content: `（上一步的工具调用参数不完整，没有执行${broken.map((call) => call.name ? `（${call.name}）` : '').join('')}。`
             + '请重新给出完整参数，或直接用一句话告诉用户做不到以及原因。）',
+          // 程序生成的说明，不是用户说的话（压缩不能把它当新回合，见 context.mjs）
+          internal: true,
         })
         for (const call of broken) {
           steps.push({ step, tool: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行' })
           emit({ type: 'tool_end', name: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行', step })
         }
-        compress()
+        const toolReport = compress()
+        const toolOverflow = checkBudget(toolReport)
+        if (toolOverflow !== null) {
+          /*
+           * 工具已经真的执行完了（有副作用），但这一轮已经装不下它的结果。
+           * 绝不能自动重试（会重复点击/输入），也不能把残缺历史发出去：
+           * 如实结束本回合，让用户知道"做了一半、后面接不下去"。
+           */
+          finalText = finalText || toolOverflow
+          emit({ type: 'stream_error', text: toolOverflow, finishReason: 'context_overflow' })
+          turnFailed = true
+          failureReason = 'context_overflow'
+          break
+        }
         if (step === maxSteps) hitStepLimit = true
         continue
       }
@@ -384,15 +468,37 @@ export class Agent {
            * OpenAI 兼容协议里图片只能放在 user 消息的 content 数组上，所以单独补一条；
            * 但补的时机是**这一批工具全部返回之后**（见上面的 pendingImages 说明）。
            */
-          if (invoked?.image !== undefined && invoked.image !== null && imagesAttached < MAX_IMAGES_PER_RUN) {
-            imagesAttached += 1
-            pendingImages.push({
-              role: 'user',
-              content: [
-                { type: 'text', text: `（这是 ${call.name} 刚返回的图，${invoked.image.width ?? '?'}x${invoked.image.height ?? '?'}）` },
-                { type: 'image_url', image_url: { url: `data:${invoked.image.mediaType ?? 'image/jpeg'};base64,${invoked.image.base64}` } },
-              ],
-            })
+          if (invoked?.image !== undefined && invoked.image !== null) {
+            /*
+             * 图片上限只防跑飞，正常任务碰不到。真碰到了也**不能静默丢图**：
+             * 模型会以为"屏幕上没变化"而继续瞎点。所以不给图，但给一句明确说明，
+             * 让它改用 get_app_state 的文字描述继续干活。
+             */
+            if (imagesAttached < MAX_IMAGES_PER_RUN) {
+              imagesAttached += 1
+              pendingImages.push({
+                role: 'user',
+                content: [
+                  { type: 'text', text: `（这是 ${call.name} 刚返回的图，${invoked.image.width ?? '?'}x${invoked.image.height ?? '?'}）` },
+                  { type: 'image_url', image_url: { url: `data:${invoked.image.mediaType ?? 'image/jpeg'};base64,${invoked.image.base64}` } },
+                ],
+                // 截图附件属于这一段工具调用，压缩时跟着片段走（不能当新用户回合）
+                internal: true,
+              })
+            } else {
+              /*
+               * 超上限：不给图，但给一句明确说明。它和截图一样**排在这一批工具结果之后**
+               * （pendingImages 里全是"工具结果之后才允许出现的 user 消息"），
+               * 绝不在未完成的工具结果之间插 user。
+               */
+              pendingImages.push({
+                role: 'user',
+                content: `（这一轮已经附了 ${imagesAttached} 张截图，达到单轮上限，`
+                  + `${call.name} 的这张图没有附上。请改用 get_app_state 这类文字描述来确认界面状态，不要假设屏幕没变化。）`,
+                internal: true,
+              })
+              emit({ type: 'tool_end', name: call.name, ok: true, text: '截图超出单轮上限，未附图', step })
+            }
           }
         } catch (error) {
           throwIfAborted(signal)
@@ -405,7 +511,15 @@ export class Agent {
       // 这一批工具结果已经齐了，截图附件现在才能进来（不会插在结果之间）
       messages.push(...pendingImages)
 
-      compress()
+      const batchReport = compress()
+      const batchOverflow = checkBudget(batchReport)
+      if (batchOverflow !== null) {
+        finalText = finalText || batchOverflow
+        emit({ type: 'stream_error', text: '', finishReason: 'context_overflow' })
+        turnFailed = true
+        failureReason = 'context_overflow'
+        break
+      }
       // 这是最后一步，且这一步还在调工具 → 走完就撞上限，需要补一次交代
       if (step === maxSteps) hitStepLimit = true
     }
@@ -426,10 +540,12 @@ export class Agent {
       messages.push({
         role: 'user',
         content: `（已经用满 ${maxSteps} 步，不能再调工具了。用一句话告诉用户：你做到哪一步、还差什么、需要他怎么配合。）`,
+        // 程序生成的提示，不是用户说的话
+        internal: true,
       })
       try {
         const closing = await llm.chat({
-          messages,
+          messages: stripLocalMarkers(messages),
           tools: [],
           signal,
           stream: true,
@@ -454,7 +570,7 @@ export class Agent {
       }
     }
 
-    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit, reasoningChars, failed: turnFailed })
+    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit, reasoningChars, failed: turnFailed, failureReason: failureReason || null })
     /*
      * 把这一回合用的端点快照一起返回：回合之后的旁路请求（比如"还要不要继续听"的判定）
      * 必须用**同一套**提供商与推理参数，否则中途改了设置会让那次判定换个模型、
@@ -479,6 +595,8 @@ export class Agent {
       ...(m.tool_calls !== undefined ? { tool_calls: JSON.parse(JSON.stringify(m.tool_calls)) } : {}),
       ...(m.reasoning_content !== undefined ? { reasoning_content: m.reasoning_content } : {}),
       ...(m.tool_call_id !== undefined ? { tool_call_id: m.tool_call_id } : {}),
+      // 内部提示的身份要跨回合保留：下一轮压缩仍要认得出它不是用户说的话
+      ...(m.internal === true ? { internal: true } : {}),
     }))
     return {
       text: finalText,
@@ -489,6 +607,7 @@ export class Agent {
       turn,
       providerId,
       failed: turnFailed,
+      failureReason: failureReason || null,
       contextTokens: estimateRequestTokens({ messages, tools: availableTools }),
       contextWindow: policy.contextWindow,
     }
@@ -507,7 +626,10 @@ function safeParseArgs(raw) {
 
 function clamp(text, max) {
   const value = String(text ?? '')
-  return value.length <= max ? value : `${value.slice(0, max)}…（截断）`
+  if (value.length <= max) return value
+  // 说清楚被砍了多少：模型据此知道自己看的是片段（而不是"结果就这么多"）
+  return `${value.slice(0, max)}\n…（结果过长已截断：原文 ${value.length} 字，只保留前 ${max} 字。`
+    + '如果判断还需要后面的内容，请换更精确的命令/参数重新获取，不要凭空推测。）'
 }
 
 function throwIfAborted(signal) {
@@ -516,4 +638,23 @@ function throwIfAborted(signal) {
     error.name = 'AbortError'
     throw error
   }
+}
+
+/**
+ * 去掉只属于本地的标记，得到真正可以发出去的 messages。
+ *
+ * `internal`（程序生成的提示）、`_providerId`（跨提供商剥离用）都是回合内部语义，
+ * 发出去就是给模型塞了几个它看不懂的字段——有些端点会直接参数校验报错。
+ * 返回**新数组**（浅拷贝每条消息），不改动 Agent 自己维护的 messages。
+ */
+function stripLocalMarkers(messages) {
+  if (!Array.isArray(messages)) return messages
+  return messages.map((message) => {
+    if (message === null || typeof message !== 'object') return message
+    if (message.internal === undefined && message._providerId === undefined) return message
+    const copy = { ...message }
+    delete copy.internal
+    delete copy._providerId
+    return copy
+  })
 }

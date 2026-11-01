@@ -21,6 +21,12 @@
  *
  * 压缩策略刻意保持简单：**不额外请求模型做摘要**（那会明显加延迟），
  * 只按"协议完整的交互单元"从最老的开始整体移除，并用一行摘要记住被折叠的用户目标。
+ *
+ * 两条容易写错、这里专门处理的规则：
+ *  - **内部提示不是用户回合**：loop 生成的"（参数不完整，请重新生成）"也占 user 角色，
+ *    但它属于当前任务。压缩若把它当成较新的用户回合，就会先删掉真实用户目标。
+ *  - **装不下要说明白**：压完仍超硬上限时返回 overLimit，调用方据此明确告知用户，
+ *    绝不把注定失败的请求照常发出去、更不能静默截断用户任务后假装正常完成。
  */
 
 /** 默认上下文窗口：1M tokens（MiMo V2.6 / DeepSeek V4 官方均为 1M） */
@@ -34,6 +40,11 @@ const MIN_OUTPUT_RESERVE = 1_024
 const MESSAGE_OVERHEAD = 4
 /** 折叠摘要最长多少字（宁可短，它每次请求都要发） */
 const DIGEST_MAX_CHARS = 300
+/**
+ * 单条工具结果多长才算"明显过大"，值得按预算截断。
+ * 这个值只是"别去动小结果"的下限，不是硬性截断线：真正留多少由剩余预算决定。
+ */
+const TOOL_SHRINK_MIN_CHARS = 4_000
 
 /**
  * 估算一段文本的 token 数。
@@ -168,11 +179,38 @@ export function resolveContextPolicy(source = {}) {
 }
 
 function isPlainUserText(message) {
-  return message?.role === 'user' && typeof message.content === 'string'
+  return message?.role === 'user' && typeof message.content === 'string' && !isInternalUserMessage(message)
 }
 
 function isAttachmentUser(message) {
   return message?.role === 'user' && Array.isArray(message.content)
+}
+
+/**
+ * 程序生成的内部提示（不是用户说的话）。
+ *
+ * 为什么必须认出来：loop 会往上下文里塞几条"（上一步的工具调用参数不完整，请重新生成）"
+ * 这样的 user 消息。它们在协议上必须占 user 角色，但**语义上不是用户的新指令**。
+ * 不区分的话，压缩会把它当成"较新的用户回合"，于是更早但更真实的用户目标
+ * （"把页面滚到底部"）反而被当成旧历史删掉——用户看到的就是"它忘了我要干什么"。
+ *
+ * 识别方式以显式标记为准（`internal: true`）。另外兼容**旧版本已经落进会话历史里的**
+ * 内部提示（升级前的回合把它们当普通字符串存着，没有标记），按它们固定的措辞前缀识别——
+ * 这些文本全部由 loop/context 自己生成，不会与用户口语撞上。
+ */
+const INTERNAL_PROMPT_PREFIXES = [
+  '（上一步的工具调用参数不完整',
+  '（上一步的模型响应不完整',
+  '（已经用满 ',            // 步数用满时的收尾提示
+  '（为控制上下文长度',      // 压缩摘要
+  '（这一轮已经附了 ',      // 截图超上限的说明
+]
+
+export function isInternalUserMessage(message) {
+  if (message?.role !== 'user') return false
+  if (message.internal === true || message._internal === true) return true
+  if (typeof message.content !== 'string') return false
+  return INTERNAL_PROMPT_PREFIXES.some((prefix) => message.content.startsWith(prefix))
 }
 
 function declaredCallIds(message) {
@@ -198,11 +236,17 @@ function splitSegments(calls) {
   let current = null
   for (const message of calls) {
     if (message.role === 'assistant') {
-      current = { calls: [message], results: [], attachments: [] }
+      current = { calls: [message], results: [], attachments: [], notes: [] }
       segments.push(current)
       continue
     }
-    if (current === null) continue
+    if (current === null) {
+      /*
+       * 内部提示出现在第一条 assistant 之前：不丢，挂成"单元头之后的备注"
+       * （它不属于任何片段，删除片段时不该连带它）。
+       */
+      continue
+    }
     if (message.role === 'tool') {
       const ids = new Set(current.calls.flatMap((call) => declaredCallIds(call)))
       if (message.tool_call_id !== undefined && ids.has(String(message.tool_call_id))) current.results.push(message)
@@ -213,6 +257,12 @@ function splitSegments(calls) {
       current.attachments.push(message)
       continue
     }
+    /*
+     * 程序生成的内部提示（"工具参数不完整，请重新生成"）：跟着**它所属的片段**走。
+     * 片段被删掉时它一起删（它只是在解释那条残缺调用），片段保留时它也必须保留，
+     * 否则模型会以为上一次调用是完整成功的。
+     */
+    if (isInternalUserMessage(message)) current.notes.push(message)
   }
   // 片段完整性：声明的 id 必须有结果。缺结果的整段剔除（不补假结果、不执行半截调用）
   return segments.filter((segment) => {
@@ -225,7 +275,7 @@ function splitSegments(calls) {
 function flattenSegments(segments) {
   const out = []
   for (const segment of segments) {
-    out.push(...segment.calls, ...segment.results, ...segment.attachments)
+    out.push(...segment.calls, ...segment.results, ...segment.attachments, ...segment.notes)
   }
   return out
 }
@@ -233,6 +283,9 @@ function flattenSegments(segments) {
 /**
  * 把消息拆成「交互单元」：普通文本 user 开头，后面跟若干片段。
  * 截图（content 是数组的 user 消息）归入它所属片段，绝不开启新单元。
+ *
+ * 程序生成的内部提示同样**不开启新单元**：它属于当前单元（当前这轮任务），
+ * 否则压缩会把真实用户目标判成"更老的回合"先删掉。
  */
 export function splitInteractionUnits(messages) {
   const units = []
@@ -272,15 +325,22 @@ function clip(text, max) {
  *  - system（含 PR3 自定义提示词）永远保留，且必须是请求头部；
  *  - 当前回合的 user 消息永远保留（那是用户此刻的要求）；
  *  - 只按完整片段删除，删完剩下的序列仍然合法（tool_calls 与结果始终配对）；
- *  - 被折叠掉的用户目标会记成一行摘要，模型不会"忘了原本要干什么"。
+ *  - 被折叠掉的用户目标会记成一行摘要，模型不会"忘了原本要干什么"；
+ *  - 内部提示不开启新回合（见 isInternalUserMessage），不会把真实用户目标挤成"旧历史"。
+ *
+ * **压完仍超硬上限时绝不假装没事**：结果里的 `overLimit` 为 true 并带上
+ * `overLimitTokens`，调用方必须据此明确告知用户"这一轮装不下"，而不是把
+ * 一个注定被服务端拒绝（或注定被静默截断）的请求照常发出去。
  *
  * @param {object[]} messages 会被原地修改
  * @param {object} policy resolveContextPolicy 的结果
  * @param {{tools?:object[]}} [options]
  * @returns {{compressed:boolean, before:number, after:number, droppedUnits:number,
- *            droppedSegments:number, droppedImages:number, truncated:boolean}}
+ *            droppedSegments:number, droppedImages:number, truncated:boolean,
+ *            overLimit:boolean, hardLimitTokens:number}}
  */
 export function compressMessages(messages, policy, { tools = [] } = {}) {
+  const budget = policy ?? resolveContextPolicy({})
   const result = {
     compressed: false,
     before: 0,
@@ -289,9 +349,10 @@ export function compressMessages(messages, policy, { tools = [] } = {}) {
     droppedSegments: 0,
     droppedImages: 0,
     truncated: false,
+    overLimit: false,
+    hardLimitTokens: budget.hardLimitTokens,
   }
   if (!Array.isArray(messages) || messages.length === 0) return result
-  const budget = policy ?? resolveContextPolicy({})
   const totalOf = (system, units, digest) => estimateRequestTokens({
     messages: [...system, ...(digest === null ? [] : [digest]), ...flattenUnits(units)],
     tools,
@@ -359,6 +420,42 @@ export function compressMessages(messages, policy, { tools = [] } = {}) {
     if (!dropped) break
   }
 
+  /*
+   * 3b) 仍然超预算：压缩**单条超大工具结果**。
+   *
+   * 为什么放在这里而不是在 loop 里按固定字符数砍：工具结果该留多少，
+   * 取决于这次请求还剩多少预算，跟"1200 字"这种人拍的数字无关。
+   * 只有真的装不下时才动手，而且**告诉模型自己看到的是截断版**
+   * （结果里带"已截断"字样），不让它把半截输出当完整结果用。
+   *
+   * 只在段落内部截文本，不动 tool_calls / tool 配对，所以协议仍然合法。
+   */
+  for (;;) {
+    if (totalOf(system, units, null) <= budget.targetTokens) break
+    const over = totalOf(system, units, null)
+    // 还差多少就砍多少，砍到目标即可；不一次砍光，尽量多留
+    const need = Math.max(2_000, over - budget.targetTokens)
+    let shrunk = false
+    for (const unit of units) {
+      for (const segment of unit.segments) {
+        for (const message of [...segment.results, ...segment.calls]) {
+          const text = typeof message.content === 'string' ? message.content : ''
+          // 只碰"明显过大"的单条：小结果留着（它们往往是关键状态）
+          if (text.length < TOOL_SHRINK_MIN_CHARS) continue
+          const keep = Math.max(1_000, text.length - need * 4)
+          if (keep >= text.length) continue
+          message.content = `${text.slice(0, keep)}…（结果过长，已按上下文预算截断，只保留前 ${keep} 字）`
+          result.shrunkToolResults = (result.shrunkToolResults ?? 0) + 1
+          shrunk = true
+          break
+        }
+        if (shrunk) break
+      }
+      if (shrunk) break
+    }
+    if (!shrunk) break
+  }
+
   // 4) 逼近/超过模型硬上限：继续丢整轮，直到只剩当前这一轮
   while (units.length > 1 && totalOf(system, units, null) > budget.hardLimitTokens) {
     noteDropped(units[0])
@@ -380,12 +477,16 @@ export function compressMessages(messages, policy, { tools = [] } = {}) {
   let digest = null
   if (droppedGoals.length > 0) {
     const text = `（为控制上下文长度，已折叠较早的 ${droppedGoals.length} 段对话。此前用户先后提过：${droppedGoals.join(' / ')}）`
-    digest = { role: 'user', content: clip(text, DIGEST_MAX_CHARS) }
+    // 带上内部标记：它是程序生成的说明，不是用户刚发出的新指令
+    digest = { role: 'user', content: clip(text, DIGEST_MAX_CHARS), internal: true }
   }
 
   messages.splice(0, messages.length, ...system, ...(digest === null ? [] : [digest]), ...flattenUnits(units))
   result.after = estimateRequestTokens({ messages, tools })
   result.compressed = true
+  // 压完再查一次：装不下就如实报告，由调用方决定怎么告诉用户
+  result.overLimit = result.after > budget.hardLimitTokens
+  result.overLimitTokens = result.overLimit ? result.after : 0
   return result
 }
 

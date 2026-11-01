@@ -232,6 +232,11 @@ export class LLMClient {
         signal: composed,
       })
     } catch (error) {
+      /*
+       * 用户主动打断（收起/新指令/打断词）：这不是"模型服务坏了"。
+       * 原样抛出 AbortError，让上层走正常的取消流程，不要弹"无法连接模型服务"的红字。
+       */
+      if (signal?.aborted === true) throw error
       const reason = error?.name === 'TimeoutError' ? `请求超时（${this.#timeoutMs}ms）` : error.message
       throw new LLMError(`无法连接模型服务：${reason}`, { baseURL: this.#baseURL })
     }

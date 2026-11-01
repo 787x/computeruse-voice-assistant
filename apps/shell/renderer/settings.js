@@ -629,8 +629,12 @@ function renderProfileRows(profiles) {
     /*
      * 这一行两个下拉的记忆键。用行 id 而不是数组下标：
      * 删掉一行之后下标会整体前移，按下标记会把上一行的选择搬到下一行。
+     *
+     * 推理档位**按协议分开记**（`:mimo` / `:deepseek`）：两家档位集合不重叠，
+     * 共用一个键时，切到 MiMo 会因为 'low' 不在 MiMo 选项里而落到 default，
+     * 并把记忆覆盖成 default——切回 DeepSeek 时用户刚选的 low 就没了。
      */
-    const reasoningKey = `profile:${row.dataset.id}:reasoning`
+    const reasoningKeyFor = (kind) => `profile:${row.dataset.id}:reasoning:${kind}`
     const hintKey = `profile:${row.dataset.id}:providerHint`
     const applyProfileReasoningUI = () => {
       const matched = providerList.find((item) => item.id === provider.value)
@@ -639,13 +643,16 @@ function renderProfileRows(profiles) {
       const stored = kind === 'mimo'
         ? (profile.mimoThinking ?? 'default')
         : kind === 'deepseek' ? (profile.deepseekReasoningEffort ?? 'default') : 'default'
-      fillSelect(reasoningSelect, options, stored, reasoningKey)
+      fillSelect(reasoningSelect, options, stored, kind === 'none' ? undefined : reasoningKeyFor(kind))
       reasoningSelect.hidden = options.length === 0
       fillSelect(hintSelect, (state?.reasoning?.hints ?? [{ id: 'auto', name: '自动' }]).map((item) => ({ value: item.id, label: item.name })), profile.providerHint ?? 'auto', hintKey)
       hintSelect.hidden = matched?.id !== 'openai-compatible'
     }
     // 用户手动改这两个下拉时要先记住，再重画（否则会被磁盘里的旧值顶回去）
-    reasoningSelect.addEventListener('change', () => rememberChoice(reasoningKey, reasoningSelect.value))
+    reasoningSelect.addEventListener('change', () => {
+      const kind = reasoningKindForProvider(provider.value, hintSelect.value)
+      if (kind !== 'none') rememberChoice(reasoningKeyFor(kind), reasoningSelect.value)
+    })
     hintSelect.addEventListener('change', () => {
       rememberChoice(hintKey, hintSelect.value)
       applyProfileReasoningUI()
@@ -849,6 +856,8 @@ function fillForm() {
   const savedForKey = config.providerKeys?.[providerId]
   const draft = apiKeyDrafts[providerId]
   $('apiKey').value = typeof draft === 'string' ? draft : ''
+  // 记下"此刻界面显示的是哪一家"：切提供商的 change 事件用它当草稿归属
+  lastRenderedProviderId = providerId
   $('apiKey').placeholder = (typeof savedForKey === 'string' && savedForKey !== '')
     ? `已保存（${savedForKey}），留空不修改`
     : (typeof draft === 'string' && draft !== '' ? '未保存的草稿（保存后生效）' : '未配置（可在控制台获取）')
@@ -1001,8 +1010,15 @@ $('restoreDefaultPrompt').addEventListener('click', () => {
 })
 
 $('provider').addEventListener('change', async () => {
-  // 先把当前输入框里未保存的 Key 草稿按「当前提供商」存起来，切回来时还能恢复
-  rememberApiKeyDraft()
+  /*
+   * 先把当前输入框里未保存的 Key 草稿按**切换前**的提供商存起来，切回来时还能恢复。
+   *
+   * 顺序是关键：change 事件触发时 `$('provider').value` 已经是新提供商了，
+   * 直接读它就会把 MiMo 的 Key 记到 DeepSeek 名下——切到 DeepSeek 后那颗 Key
+   * 会被当成 DeepSeek 的草稿用于取模型列表/保存，等于把 A 家的凭据发给 B 家。
+   * 所以记忆目标必须是「上一帧真正显示的那个提供商」。
+   */
+  rememberApiKeyDraft(lastRenderedProviderId)
   const provider = currentProvider()
   if (provider) {
     $('baseURL').value = provider.baseURL
@@ -1010,6 +1026,7 @@ $('provider').addEventListener('change', async () => {
     const suggested = provider.defaultModel ?? provider.models?.[0] ?? ''
     if (suggested !== '') $('model').value = suggested
   }
+  lastRenderedProviderId = provider?.id ?? ''
   // 换提供商后：恢复该提供商之前留下的 Key 草稿（没有则是空白，暗示需填写）
   restoreApiKeyDraft()
   // 在线列表按提供商各自取：清掉上一家的结果，避免拿 MiMo 的目录去填 DeepSeek
@@ -1023,6 +1040,9 @@ $('provider').addEventListener('change', async () => {
 
 /** Base URL 修改不改变"这是哪个提供商"，Key 与草稿都保持不动（常规切换不需要重填） */
 $('baseURL').addEventListener('change', () => {
+  // 先把刚敲进框里的（还没保存的）Key 记到当前提供商名下，再恢复——
+  // 直接 restore 会把它清空，用户就得重填一遍
+  rememberApiKeyDraft()
   restoreApiKeyDraft()
   fetchModels({ force: true })
 })
@@ -1036,12 +1056,20 @@ $('baseURL').addEventListener('change', () => {
  * 按量付费 → Token Plan）是常规操作，拆成不同槽位会让用户以为 Key 丢了。
  */
 const apiKeyDrafts = {}
+/**
+ * 上一次真正渲染到界面上的提供商 id。
+ *
+ * 存在的唯一原因：`change` 事件里 `$('provider').value` 已经变成新值，
+ * 拿它当"草稿属于谁"会把旧提供商的 Key 记到新提供商名下。
+ */
+let lastRenderedProviderId = ''
 function draftKeyForUI() {
   return currentProvider()?.id ?? ''
 }
-function rememberApiKeyDraft() {
+/** @param {string} [providerId] 草稿归属；缺省 = 界面上当前选中的提供商 */
+function rememberApiKeyDraft(providerId = draftKeyForUI()) {
   const value = $('apiKey').value.trim()
-  const key = draftKeyForUI()
+  const key = typeof providerId === 'string' ? providerId : ''
   if (value === '' || key === '') return
   apiKeyDrafts[key] = value
 }
