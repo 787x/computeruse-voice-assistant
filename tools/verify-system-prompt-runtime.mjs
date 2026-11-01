@@ -85,6 +85,8 @@ function fixture({ gateVerdicts = [] } = {}) {
     resolveSearchKey: async () => store.resolveSearchKey(),
     saveConfig: async (...args) => store.saveConfig(...args),
     listProviders: () => store.listProviders(),
+    // 主进程现在用 store 的上下文预算解析器（默认 1M / 90%），替身也要转发
+    resolveContextPolicyFor: (...args) => store.resolveContextPolicyFor(...args),
     CONFIG_FILE: store.CONFIG_FILE,
   }
 

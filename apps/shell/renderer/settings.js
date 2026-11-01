@@ -37,6 +37,34 @@ let modelsError = ''
  */
 let restoredDefault = false
 
+/* ---------------- 下拉框选择保持（修复"改了就弹回旧值"） ---------------- */
+
+/**
+ * 为什么需要这张表：`fillSelect()` 每次都会重建 `<option>` 列表，
+ * 而重建后 `select.value = 某个不在列表里的值` 会让浏览器把选择**静默重置成第一项**。
+ * 之前 providerHint / 方案行推理档位 等下拉在每次 render 时都会被重填一遍，
+ * 用户刚选的值就这么"弹回旧值"，看起来像界面不认他的操作。
+ *
+ * 现在统一规则：
+ *  1. 用户**手动选过**的值记进 `choiceMemory`（键 = 控件标识），这是最高优先级；
+ *  2. 重建选项后按「记忆 → 传入的 selected」顺序恢复，两者都不在列表里才落到第一项；
+ *  3. 保存成功/重新加载时清空记忆（以磁盘为准）。
+ */
+const choiceMemory = new Map()
+
+function rememberChoice(key, value) {
+  if (typeof key !== 'string' || key === '' || typeof value !== 'string') return
+  choiceMemory.set(key, value)
+}
+
+function recallChoice(key) {
+  return choiceMemory.get(key)
+}
+
+function clearChoices() {
+  choiceMemory.clear()
+}
+
 /* ---------------- 系统提示词 ---------------- */
 function promptModeIsCustom() {
   return $('promptModeCustom').checked
@@ -107,6 +135,23 @@ async function copyText(text, feedbackTarget) {
 function setStatus(text, kind = '') {
   $('status').textContent = text
   $('status').className = kind
+}
+
+/**
+ * 上下文预算的说明文字：把"窗口 × 百分比 = 多少 tokens 才开始压"算给用户看。
+ * 规则本体在主进程（agent/context.mjs），界面只做换算与提示，不自己定阈值。
+ */
+function renderContextHint() {
+  const hint = $('contextHint')
+  if (hint === null) return
+  const window = Number($('contextWindow').value)
+  const percent = Number($('contextPercent').value)
+  if (!Number.isFinite(window) || window <= 0 || !Number.isFinite(percent) || percent <= 0) {
+    hint.textContent = '窗口与百分比都要是正数；填错会回退到默认 1,000,000 tokens / 90%'
+    return
+  }
+  const trigger = Math.floor(window * Math.min(99, Math.max(1, percent)) / 100)
+  hint.textContent = `窗口 ${window.toLocaleString('zh-CN')} tokens，到 ${trigger.toLocaleString('zh-CN')} tokens（${percent}%）才开始压缩；低于这个量不丢历史。`
 }
 
 function fillProviderNote() {
@@ -208,7 +253,7 @@ function renderReasoning() {
   // 兼容协议提示：只在自定义端点上出现
   $('providerHintField').hidden = provider?.id !== 'openai-compatible'
   fillSelect($('providerHint'), hintList.map((item) => ({ value: item.id, label: item.name })),
-    state?.config?.providerHint ?? 'auto')
+    state?.config?.providerHint ?? 'auto', 'providerHint')
 
   const mimo = control?.kind === 'mimo-thinking'
   const deepseek = control?.kind === 'deepseek-effort'
@@ -221,8 +266,8 @@ function renderReasoning() {
    * 藏起来不等于清空：collect() 两个字段都要交，隐藏的那个继续交出原值，
    * 否则改 MiMo 会顺手把 DeepSeek 存好的档位冲成 default。
    */
-  fillSelect($('mimoThinking'), mimoOptions(), reasoningValue('mimoThinking'))
-  fillSelect($('deepseekEffort'), deepseekOptions(), reasoningValue('deepseekReasoningEffort'))
+  fillSelect($('mimoThinking'), mimoOptions(), reasoningValue('mimoThinking'), 'mimoThinking')
+  fillSelect($('deepseekEffort'), deepseekOptions(), reasoningValue('deepseekReasoningEffort'), 'deepseekReasoningEffort')
 
   const notes = []
   if (control?.note) notes.push(control.note)
@@ -248,8 +293,10 @@ function renderReasoning() {
   syncEffortAvailability()
 }
 
-/** 取某一档的界面值：草稿优先，其次磁盘配置，都没有才 default */
+/** 取某一档的界面值：用户刚选过的优先，其次草稿，最后磁盘配置 */
 function reasoningValue(field) {
+  const remembered = recallChoice(field)
+  if (typeof remembered === 'string' && remembered !== '') return remembered
   const draft = reasoningDraft[field]
   if (typeof draft === 'string' && draft !== '') return draft
   return state?.config?.[field] ?? 'default'
@@ -295,9 +342,12 @@ function syncEffortAvailability() {
   }
   if (downgraded) {
     /*
-     * 只在界面上降到该模型真支持的档位，并把选择记进草稿：
+     * 只在界面上降到该模型真支持的档位，并把选择记进草稿**与记忆**：
      * 请求组装时主进程也会做一次同样的就近降级，两边算出同一个结果，
      * 界面才不会"显示 max、实际发 low"。磁盘上用户原本选的档位不动。
+     *
+     * 必须同时写记忆：否则下一次 render 时记忆里的旧值（比如 high）会把
+     * 刚降下来的 low 又顶回去，界面与实际请求就对不上了。
      */
     const list = [...$('deepseekEffort').options].filter((option) => !option.disabled).map((option) => option.value)
     const next = list.includes(reasoningValue('deepseekReasoningEffort'))
@@ -305,12 +355,27 @@ function syncEffortAvailability() {
       : (list.includes('low') ? 'low' : (list.at(-1) ?? 'default'))
     $('deepseekEffort').value = next
     reasoningDraft.deepseekReasoningEffort = next
+    rememberChoice('deepseekReasoningEffort', next)
     $('reasoningNote').textContent = `${$('reasoningNote').textContent} ${entry.id} 只支持 ${supported.join('/')}，已按此选择。`.trim()
   }
 }
 
-function fillSelect(select, items, selected) {
+/**
+ * 重建一个 select 的选项并恢复选择。
+ *
+ * 恢复顺序：用户手动选过的（choiceMemory）→ 传入的 selected → 第一项。
+ * 这个顺序是修 bug 的关键：以前只用 selected（来自磁盘配置），
+ * 于是"用户刚改、还没保存"的选择会在下一次 render 时被磁盘值顶掉。
+ *
+ * @param {HTMLSelectElement} select
+ * @param {Array<{value:string,label:string,note?:string}>} items
+ * @param {string} selected 期望选中的值（通常是磁盘配置里的值）
+ * @param {string} [memoryKey] 记忆键（不给就不记，比如权限级别下拉）
+ */
+function fillSelect(select, items, selected, memoryKey) {
   if (select === null || select === undefined) return
+  const remembered = memoryKey === undefined ? undefined : recallChoice(memoryKey)
+  const wanted = remembered ?? selected
   select.innerHTML = ''
   for (const item of items) {
     const option = document.createElement('option')
@@ -319,7 +384,10 @@ function fillSelect(select, items, selected) {
     if (item.note) option.title = item.note
     select.append(option)
   }
-  select.value = items.some((item) => item.value === selected) ? selected : (items[0]?.value ?? '')
+  const values = items.map((item) => item.value)
+  const next = values.includes(wanted) ? wanted : (values.includes(selected) ? selected : (values[0] ?? ''))
+  select.value = next
+  if (memoryKey !== undefined) rememberChoice(memoryKey, next)
 }
 
 /* ---------------- 在线模型列表 ---------------- */
@@ -461,7 +529,12 @@ function renderDefaultProfileOptions(selectedId) {
     option.textContent = profile.name !== '' ? profile.name : (profile.model !== '' ? profile.model : profile.id)
     select.append(option)
   }
-  select.value = typeof selectedId === 'string' ? selectedId : ''
+  // 用户可能刚在这个下拉里选过（还没保存），不能被磁盘值顶回去
+  const remembered = recallChoice('defaultProfile')
+  const wanted = remembered ?? (typeof selectedId === 'string' ? selectedId : '')
+  const values = [...select.options].map((option) => option.value)
+  select.value = values.includes(wanted) ? wanted : ''
+  rememberChoice('defaultProfile', select.value)
 }
 function renderProfileRows(profiles) {
   const body = $('profileRows')
@@ -490,10 +563,9 @@ function renderProfileRows(profiles) {
     provider.addEventListener('change', () => {
       const matched = providerList.find((item) => item.id === provider.value)
       if (matched !== undefined) {
-        row.querySelector('[data-field="baseURL"]').value = matched.baseURL
         const modelInput = row.querySelector('[data-field="model"]')
-        const urlInput = row.querySelector('[data-field="baseURL"]')
         const keyInput = row.querySelector('[data-field="apiKey"]')
+        row.querySelector('[data-field="baseURL"]').value = matched.baseURL
         // 推荐初始模型：只有空值或「上一家推荐值」才替换；用户手填的自定义模型保留
         const suggested = matched.defaultModel ?? matched.models?.[0] ?? ''
         const currentModel = modelInput.value.trim()
@@ -503,15 +575,12 @@ function renderProfileRows(profiles) {
         } else {
           modelInput.title = `当前填写的 «${currentModel}» 可能不属于 ${matched.name}，保存前请确认`
         }
-        // Key 提示按「新提供商 + 新地址」的实际目标判断，避免误以为旧 Key 仍有效
-        const keyForTarget = state?.config?.targetKeys?.[`${provider.value}|${urlInput.value}`]
-        const hasForTarget = typeof keyForTarget === 'string' && keyForTarget !== ''
-        keyInput.placeholder = hasForTarget ? '已保存，留空不修改' : (matched.apiKeyRequired === false ? '本地端点可留空' : '未配置（可在控制台获取）')
-        if (!hasForTarget && keyInput.value === '') {
-          keyInput.title = `该认证目标尚未保存 Key${matched.apiKeyRequired === false ? '' : '，需要填写后该方案才能使用'}`
-        } else {
-          keyInput.title = ''
-        }
+        // Key 提示按「该提供商」判断：换提供商才需要重填，改地址不用
+        const hasForProvider = state?.config?.hasProviderKey?.[provider.value] === true
+        keyInput.placeholder = hasForProvider ? '已保存，留空不修改' : (matched.apiKeyRequired === false ? '本地端点可留空' : '未配置（可在控制台获取）')
+        keyInput.title = hasForProvider || matched.apiKeyRequired === false
+          ? ''
+          : '该提供商还没保存过 Key，需要填写后这套方案才能使用'
       }
     })
     providerCell.append(provider)
@@ -528,19 +597,17 @@ function renderProfileRows(profiles) {
     const key = document.createElement('input')
     key.type = 'password'
     key.value = ''
-    // 按「该方案当前认证目标」提示是否已有 Key：profile.hasApiKey 来自旧 provider/baseURL，
-    // 若目标已变化，不能继续暗示旧 Key 有效。
-    const targetKeyValue = state?.config?.targetKeys?.[`${profile.providerId ?? ''}|${profile.baseURL ?? ''}`]
-    const profileTargetHasKey = typeof targetKeyValue === 'string' && targetKeyValue !== ''
-    key.placeholder = profileTargetHasKey ? `已保存（${targetKeyValue}），留空不修改`
-      : (profile.apiKeyRequired === false ? '本地端点可留空' : (profile.hasApiKey === true ? `已保存（${profile.apiKey}），留空不修改` : 'sk-…'))
+    // Key 按提供商判断（不再按 providerId|baseURL 的认证目标）：同一个提供商换地址不用重填
+    const providerHasKey = state?.config?.hasProviderKey?.[profile.providerId ?? ''] === true
+    key.placeholder = providerHasKey ? '已保存，留空不修改'
+      : (profile.hasApiKey === true ? `已保存（${profile.apiKey}），留空不修改` : 'sk-…')
     key.dataset.field = 'apiKey'
     keyCell.append(key)
 
     const modelCell = document.createElement('td')
     const model = document.createElement('input')
     model.value = profile.model ?? ''
-    model.placeholder = 'deepseek-flash'
+    model.placeholder = 'mimo-v2.6-flash'
     model.spellcheck = false
     model.dataset.field = 'model'
     modelCell.append(model)
@@ -559,6 +626,12 @@ function renderProfileRows(profiles) {
     hintSelect.dataset.field = 'providerHint'
     hintSelect.className = 'hint-select'
     reasoningCell.append(hintSelect)
+    /*
+     * 这一行两个下拉的记忆键。用行 id 而不是数组下标：
+     * 删掉一行之后下标会整体前移，按下标记会把上一行的选择搬到下一行。
+     */
+    const reasoningKey = `profile:${row.dataset.id}:reasoning`
+    const hintKey = `profile:${row.dataset.id}:providerHint`
     const applyProfileReasoningUI = () => {
       const matched = providerList.find((item) => item.id === provider.value)
       const kind = reasoningKindForProvider(matched?.id, hintSelect.value)
@@ -566,14 +639,18 @@ function renderProfileRows(profiles) {
       const stored = kind === 'mimo'
         ? (profile.mimoThinking ?? 'default')
         : kind === 'deepseek' ? (profile.deepseekReasoningEffort ?? 'default') : 'default'
-      fillSelect(reasoningSelect, options, stored)
+      fillSelect(reasoningSelect, options, stored, reasoningKey)
       reasoningSelect.hidden = options.length === 0
-      fillSelect(hintSelect, (state?.reasoning?.hints ?? [{ id: 'auto', name: '自动' }]).map((item) => ({ value: item.id, label: item.name })), profile.providerHint ?? 'auto')
+      fillSelect(hintSelect, (state?.reasoning?.hints ?? [{ id: 'auto', name: '自动' }]).map((item) => ({ value: item.id, label: item.name })), profile.providerHint ?? 'auto', hintKey)
       hintSelect.hidden = matched?.id !== 'openai-compatible'
     }
+    // 用户手动改这两个下拉时要先记住，再重画（否则会被磁盘里的旧值顶回去）
+    reasoningSelect.addEventListener('change', () => rememberChoice(reasoningKey, reasoningSelect.value))
+    hintSelect.addEventListener('change', () => {
+      rememberChoice(hintKey, hintSelect.value)
+      applyProfileReasoningUI()
+    })
     provider.addEventListener('change', applyProfileReasoningUI)
-    hintSelect.addEventListener('change', applyProfileReasoningUI)
-    fillSelect(hintSelect, (state?.reasoning?.hints ?? [{ id: 'auto', name: '自动' }]).map((item) => ({ value: item.id, label: item.name })), profile.providerHint ?? 'auto')
     applyProfileReasoningUI()
 
     const delCell = document.createElement('td')
@@ -636,6 +713,8 @@ $('addProfile').addEventListener('click', () => {
     apiKey: '',
   })
   renderProfileRows(current)
+  // 方案列表变了，默认方案下拉也要跟着出现新条目
+  renderDefaultProfileOptions(recallChoice('defaultProfile') ?? $('defaultProfile').value)
 })
 /* ---------------- 按时间段切换模型 ---------------- */
 /** "1-5" / "1,3" → 数字数组（老配置回显用） */
@@ -676,13 +755,20 @@ function renderScheduleRows(rules) {
     if (profileList.length > 0) {
       const select = document.createElement('select')
       select.dataset.field = 'profileId'
+      const scheduleKey = `schedule:${index}:profileId`
       for (const profile of profileList) {
         const option = document.createElement('option')
         option.value = profile.id
         option.textContent = profile.name !== '' ? profile.name : (profile.model !== '' ? profile.model : profile.id)
         select.append(option)
       }
-      select.value = typeof rule.profileId === 'string' && rule.profileId !== '' ? rule.profileId : profileList[0].id
+      // 用户刚选过就按记忆恢复，否则按规则里存着的方案；都没有才落到第一项
+      const remembered = recallChoice(scheduleKey)
+      const wanted = remembered ?? (typeof rule.profileId === 'string' && rule.profileId !== '' ? rule.profileId : '')
+      const values = [...select.options].map((option) => option.value)
+      select.value = values.includes(wanted) ? wanted : (values[0] ?? '')
+      rememberChoice(scheduleKey, select.value)
+      select.addEventListener('change', () => rememberChoice(scheduleKey, select.value))
       modelCell.append(select)
     } else {
       const model = document.createElement('input')
@@ -754,19 +840,23 @@ function fillForm() {
   $('provider').value = config.providerId
   $('baseURL').value = config.baseURL
   $('model').value = config.model
-  // API Key 输入框：初始无值，占位按「当前认证目标」是否已有凭据显示；
-  // 若目标有未保存草稿则恢复（切回原目标不用重填）
-  const t = `${config.providerId ?? ''}|${config.baseURL ?? ''}`
-  const savedForKey = config.targetKeys?.[t]
-  $('apiKey').value = apiKeyDrafts[t] ?? ''
+  /*
+   * API Key 输入框：初始无值，占位按「该提供商是否已存过 Key」显示。
+   * 草稿只按**提供商**记（不再按 providerId|baseURL 的认证目标）：
+   * 同一个提供商换地址是常规操作，不该让用户以为 Key 丢了、还要重填一遍。
+   */
+  const providerId = config.providerId ?? ''
+  const savedForKey = config.providerKeys?.[providerId]
+  const draft = apiKeyDrafts[providerId]
+  $('apiKey').value = typeof draft === 'string' ? draft : ''
   $('apiKey').placeholder = (typeof savedForKey === 'string' && savedForKey !== '')
     ? `已保存（${savedForKey}），留空不修改`
-    : (apiKeyDrafts[t] !== undefined && apiKeyDrafts[t] !== '' ? '未保存的草稿（保存后生效）' : '未配置（可在控制台获取）')
+    : (typeof draft === 'string' && draft !== '' ? '未保存的草稿（保存后生效）' : '未配置（可在控制台获取）')
   $('maxSteps').value = config.maxSteps
   $('temperature').value = config.temperature
-  $('mimoThinking').value = config.mimoThinking ?? 'default'
-  $('deepseekEffort').value = config.deepseekReasoningEffort ?? 'default'
-  $('providerHint').value = config.providerHint ?? 'auto'
+  $('contextWindow').value = String(config.contextWindow ?? 1000000)
+  $('contextPercent').value = String(config.contextCompressPercent ?? 90)
+  renderContextHint()
 
   $('searchKey').value = ''
   $('searchKey').placeholder = config.search?.hasApiKey ? `已保存（${config.search.apiKey}），留空不修改` : '未配置（可选）'
@@ -813,6 +903,9 @@ function collect() {
     model: $('model').value.trim(),
     maxSteps: Number($('maxSteps').value),
     temperature: Number($('temperature').value),
+    // 上下文预算（tokens）：默认 1M 窗口、到 90% 才压缩
+    contextWindow: Number($('contextWindow').value),
+    contextCompressPercent: Number($('contextPercent').value),
     // 推理档位：两家的字段都交（主进程按当前提供商取用，另一个字段原样留着）
     mimoThinking: reasoningValue('mimoThinking'),
     deepseekReasoningEffort: reasoningValue('deepseekReasoningEffort'),
@@ -835,7 +928,7 @@ function collect() {
       rules: collectSchedule(),
     },
   }
-  // 提交前把当前输入框的草稿按目标记下（为切回恢复）；payload 只带当前输入框的值
+  // 提交前把当前输入框的草稿按提供商记下（为切回恢复）；payload 只带当前输入框的值
   commitApiKeyDraft()
   if ($('apiKey').value.trim() !== '') payload.apiKey = $('apiKey').value.trim()
   if ($('searchKey').value.trim() !== '') payload.search = { provider: 'tavily', apiKey: $('searchKey').value.trim() }
@@ -873,9 +966,10 @@ async function load() {
   capabilityList = data.capabilities ?? []
   voices = data.voices ?? []
   defaultPrompt = typeof data.defaultSystemPrompt === 'string' ? data.defaultSystemPrompt : ''
-  // 重新加载 = 一切以磁盘为准：清掉未保存的草稿和上一轮的在线列表
+  // 重新加载 = 一切以磁盘为准：清掉未保存的草稿、下拉记忆和上一轮的在线列表
   reasoningDraft.mimoThinking = null
   reasoningDraft.deepseekReasoningEffort = null
+  clearChoices()
   discoveredModels = null
   modelsError = ''
   modelsFetchedAt = ''
@@ -907,7 +1001,7 @@ $('restoreDefaultPrompt').addEventListener('click', () => {
 })
 
 $('provider').addEventListener('change', async () => {
-  // 先把当前输入框里未保存的 Key 草稿按「当前认证目标」存起来，避免切目标后误发给新端点
+  // 先把当前输入框里未保存的 Key 草稿按「当前提供商」存起来，切回来时还能恢复
   rememberApiKeyDraft()
   const provider = currentProvider()
   if (provider) {
@@ -916,7 +1010,7 @@ $('provider').addEventListener('change', async () => {
     const suggested = provider.defaultModel ?? provider.models?.[0] ?? ''
     if (suggested !== '') $('model').value = suggested
   }
-  // 换目标后：恢复该目标之前留下的 Key 草稿（没有则是空白，暗示需填写）
+  // 换提供商后：恢复该提供商之前留下的 Key 草稿（没有则是空白，暗示需填写）
   restoreApiKeyDraft()
   // 在线列表按提供商各自取：清掉上一家的结果，避免拿 MiMo 的目录去填 DeepSeek
   discoveredModels = null
@@ -927,48 +1021,51 @@ $('provider').addEventListener('change', async () => {
   await maybeFetchModels()
 })
 
-/** Base URL 修改也会改变认证目标：同样先存草稿再恢复新目标的草稿 */
+/** Base URL 修改不改变"这是哪个提供商"，Key 与草稿都保持不动（常规切换不需要重填） */
 $('baseURL').addEventListener('change', () => {
-  rememberApiKeyDraft()
   restoreApiKeyDraft()
   fetchModels({ force: true })
 })
 /**
- * 未保存的 API Key 草稿，按「providerId|baseURL」隔离。
+ * 未保存的 API Key 草稿，按**提供商**记。
  *
- * 目的：用户在 MiMo 输入 Key（还没点保存）后切换到 DeepSeek 或改 Base URL，
- * 这颗 Key 只能留在原目标，不能被自动用于新目标的模型发现/测试/保存；
- * 切回原目标时则自动恢复，避免牺牲便利性。
+ * 目的只有一个：用户在 MiMo 输入 Key（还没点保存）后切到 DeepSeek，
+ * 那颗 Key 不能被自动用于 DeepSeek 的模型发现/测试/保存；切回 MiMo 时自动恢复。
+ *
+ * 刻意**不**按 `providerId|baseURL` 拆：同一个提供商换地址（官方 → 自建代理、
+ * 按量付费 → Token Plan）是常规操作，拆成不同槽位会让用户以为 Key 丢了。
  */
 const apiKeyDrafts = {}
-function targetKeyForUI() {
-  const provider = currentProvider()
-  return `${provider?.id ?? ''}|${$('baseURL').value.trim()}`
+function draftKeyForUI() {
+  return currentProvider()?.id ?? ''
 }
 function rememberApiKeyDraft() {
   const value = $('apiKey').value.trim()
-  if (value === '') return
-  apiKeyDrafts[targetKeyForUI()] = value
+  const key = draftKeyForUI()
+  if (value === '' || key === '') return
+  apiKeyDrafts[key] = value
 }
 function restoreApiKeyDraft() {
-  const t = targetKeyForUI()
-  const draft = apiKeyDrafts[t]
+  const key = draftKeyForUI()
+  const draft = apiKeyDrafts[key]
   $('apiKey').value = typeof draft === 'string' ? draft : ''
-  // 占位提示随目标是否有凭据/草稿变化
+  // 占位提示随该提供商是否有已保存凭据/草稿变化
   const provider = currentProvider()
-  const savedForKey = state?.config?.targetKeys?.[t]
+  const savedForKey = state?.config?.providerKeys?.[key]
   $('apiKey').placeholder = (typeof savedForKey === 'string' && savedForKey !== '')
     ? '已保存，留空不修改'
-    : (provider?.apiKeyRequired === false ? '本地端点可留空' : (draft !== '' ? '未保存的草稿（保存后生效）' : '未配置（可在控制台获取）'))
+    : (provider?.apiKeyRequired === false ? '本地端点可留空' : (typeof draft === 'string' && draft !== '' ? '未保存的草稿（保存后生效）' : '未配置（可在控制台获取）'))
 }
-/** 提交前把当前草稿也按目标存好（用户点保存时） */
+/** 提交前把当前草稿也存好（用户点保存时） */
 function commitApiKeyDraft() {
   rememberApiKeyDraft()
 }
 
-/* 推理下拉一改就记进草稿，并重算提示与温度可用性 */
+/* 推理下拉一改就记进草稿与记忆，并重算提示与温度可用性 */
 for (const [id, field] of [['mimoThinking', 'mimoThinking'], ['deepseekEffort', 'deepseekReasoningEffort'], ['providerHint', 'providerHint']]) {
   $(id).addEventListener('change', () => {
+    // 用户的手动选择必须先落进记忆，否则下一次 render 会被磁盘值顶回去（就是这个 bug）
+    rememberChoice(field, $(id).value)
     if (field === 'providerHint') {
       if (state !== null) state.config.providerHint = $(id).value
     } else {
@@ -981,6 +1078,10 @@ $('model').addEventListener('change', () => {
   renderReasoning()
   syncEffortAvailability()
 })
+for (const id of ['contextWindow', 'contextPercent']) {
+  const element = $(id)
+  if (element !== null) element.addEventListener('input', renderContextHint)
+}
 let keyFetchTimer = null
 $('apiKey').addEventListener('input', () => {
   /*
@@ -1020,12 +1121,13 @@ $('save').addEventListener('click', async () => {
   $('save').disabled = false
   if (result.ok) {
     state.config = result.config
-    // 已落盘：档位与 Key 草稿作废（磁盘为准）；但保留其它目标的草稿供切回恢复
+    // 已落盘：档位、下拉记忆与 Key 草稿作废（磁盘为准）；其它提供商的草稿保留供切回恢复
     reasoningDraft.mimoThinking = null
     reasoningDraft.deepseekReasoningEffort = null
+    clearChoices()
     if (typeof state.config.providerHint !== 'string') state.config.providerHint = 'auto'
-    const savedTarget = targetKeyForUI()
-    if (apiKeyDrafts[savedTarget] !== undefined && payload.apiKey !== undefined) delete apiKeyDrafts[savedTarget]
+    const savedProvider = draftKeyForUI()
+    if (payload.apiKey !== undefined) delete apiKeyDrafts[savedProvider]
     fillForm()
     // 保存成功后再标记：如果这次保存是"恢复默认"，
     // 用户切回自定义时应看到完整默认提示词（fillForm 已清空框，applyPromptModeUI 会填默认）

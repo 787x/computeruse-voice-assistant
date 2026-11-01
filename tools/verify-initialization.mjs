@@ -15,7 +15,7 @@ function fixture(stage, failure=false, initializer=code) {
  let paused=false
  const wait=async name=>{if(stage===name && !paused){paused=true;entered.resolve();await pause.promise;if(failure)throw Error(`failed ${name}`)}}
  let cachedConfig={netease:{appId:'test'},model:'test'}
- const store={loadConfig:async()=>{await wait('config');return cachedConfig},resolveApiKey:async()=>{await wait('key');return 'test'},resolveSearchKey:async()=>{await wait('search');return ''},saveConfig:async patch=>{counts.save++;cachedConfig={...cachedConfig,...patch}}}
+ const store={loadConfig:async()=>{await wait('config');return cachedConfig},resolveApiKey:async()=>{await wait('key');return 'test'},resolveSearchKey:async()=>{await wait('search');return ''},saveConfig:async patch=>{counts.save++;cachedConfig={...cachedConfig,...patch}},resolveContextPolicyFor:()=>({contextWindow:1000000,compressPercent:90,compressAtTokens:900000,hardLimitTokens:967232,targetTokens:675000,outputReserve:32768})}
  class Toolkit {
   constructor(){counts.bridge++;counts.active++;resources.push(this)}
   async warmup(){await wait('warmup')}

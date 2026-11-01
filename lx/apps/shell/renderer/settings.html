@@ -112,6 +112,23 @@
       </div>
     </div>
     <!--
+      上下文预算：按 tokens 算，默认 1M 窗口、到 90% 才压缩。
+      以前那套"最多 N 条消息 / 多少字符"的阈值已删除，这里只暴露这两个数。
+    -->
+    <div class="row">
+      <div class="field">
+        <label for="contextWindow">上下文窗口（tokens）</label>
+        <input id="contextWindow" type="number" min="1024" max="10000000" step="1024" />
+        <span class="hint">默认 1,000,000。模型有更小的可信窗口时按模型实际容量算。</span>
+      </div>
+      <div class="field">
+        <label for="contextPercent">压缩触发点（%）</label>
+        <input id="contextPercent" type="number" min="1" max="99" step="1" />
+        <span class="hint">默认 90：达到窗口的这个比例才开始压缩。</span>
+      </div>
+    </div>
+    <div class="hint" id="contextHint" style="margin-bottom:8px"></div>
+    <!--
       推理控制：按当前提供商显示对应的一套。
       MiMo 只有思考开关（官方 Chat Completions 没有强度档位，绝不伪造）；
       DeepSeek 是 none/low/high/max（官方把 medium 映射为 high，所以不单独列）。

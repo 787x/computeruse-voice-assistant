@@ -7,8 +7,10 @@
  *    **没有** `reasoning_effort`（强度档位只在 Responses API 上有，而且除 none 外
  *    全部映射到同一个实际强度），所以这里绝不伪造 MiMo 的强度档位。
  *  - DeepSeek：`thinking.type` 决定开关，且官方明确「提供 thinking 时其模式设置优先于
- *    reasoning_effort」；`reasoning_effort` 决定强度。官方把 medium 映射成 high、
- *    minimal 映射成 low、ultra 映射成 max，所以界面只展示有实际差别的 none/low/high/max。
+ *    reasoning_effort」；`reasoning_effort` 决定强度（none 就是关闭思考）。官方把 medium
+ *    映射成 high、minimal 映射成 low、ultra 映射成 max，所以界面只展示有实际差别的
+ *    none/low/high/max。**实际请求只发 reasoning_effort 一个字段**——官方协议里省略
+ *    thinking 时模式由 reasoning_effort 决定，两个都发只会引入优先级歧义。
  *  - 其它 OpenAI 兼容端点 / 本地 llama.cpp / mock：一个提供商专属字段都不发。
  *    给它们发 MiMo 或 DeepSeek 专属参数，轻则被忽略，重则参数校验报错（假失败）。
  *
@@ -233,44 +235,51 @@ export function buildRequestFields(options = {}, sampling = {}) {
   if (capability === DEEPSEEK_CAPABILITY) {
     const level = normalizeReasoningEffort(options.reasoningEffort, capability)
     const cap = options.modelCapabilities ? effortCapability(options.modelCapabilities) : null
+    /*
+     * 官方协议（Chat Completions）：
+     *  - 省略 thinking 时，模式由 reasoning_effort 决定；两个都不给就默认开思考、强度 high。
+     *  - thinking.type 的优先级高于 reasoning_effort。
+     *
+     * 所以这里**只发一个字段**（reasoning_effort），永远不发 thinking：
+     *   - 默认   → 两个都不发，完全跟随服务端默认；
+     *   - 关闭   → reasoning_effort: 'none'；
+     *   - 低/高/极高 → reasoning_effort: 'low' | 'high' | 'max'。
+     * 同时发 thinking:{type:enabled} + reasoning_effort 虽然官方示例里能跑，
+     * 但那等于让两个字段互相解释一遍，还给了"thinking 覆盖 effort"的歧义空间——
+     * 按需求要求，不发送互相矛盾的参数，能少一个就少一个。
+     */
     if (level === 'default') {
-      // 两个字段都不发：完全跟随服务端默认（官方当前是开思考 + high）
       out.thinkingActive = true
-    } else if (level === 'none') {
-      // 关闭思考只发 thinking:{type:'disabled'}：
-      // 官方说 thinking 的模式设置优先于 reasoning_effort，再发一个 effort 只是自找冲突。
-      out.fields.thinking = { type: 'disabled' }
-      out.thinkingActive = false
-    } else {
-      let applied = level
-      if (cap !== null && !cap.levels.includes(level)) {
-        // 模型声明了可选档位，用户选的档位不在其中 → 就近取较低的可用档，不硬发
-        const ordered = EFFORT_ORDER.filter((item) => cap.levels.includes(item))
-        const wanted = EFFORT_ORDER.indexOf(level)
-        applied = ordered.filter((item) => EFFORT_ORDER.indexOf(item) <= wanted).pop() ?? ordered[0] ?? null
-        out.effortDowngraded = applied !== null && applied !== level
-        if (applied === null) {
-          // 该模型只支持关闭思考
-          out.fields.thinking = { type: 'disabled' }
-          out.thinkingActive = false
-          out.temperature = finiteClamped(sampling.temperature, 0, 2)
-          return out
-        }
-      }
-      out.effortApplied = applied
-      // 官方示例就是 thinking:{type:'enabled'} + reasoning_effort 同时给（不冲突）
-      out.fields.thinking = { type: 'enabled' }
-      out.fields.reasoning_effort = applied
-      out.thinkingActive = true
-    }
-    if (out.thinkingActive) {
-      // 官方：思考模式不支持 temperature / presence_penalty / frequency_penalty，
-      // 传了不报错但也不生效；top_p 行为按型号而异（flash 只在 0.95~1.0 有效、
-      // v4-pro 思考下直接忽略传入值）。所以这里不发，而不是发个无效的。
       out.ignoredSampling = ['temperature', 'top_p']
-    } else {
-      out.temperature = finiteClamped(sampling.temperature, 0, 2)
+      return out
     }
+    if (level === 'none') {
+      out.fields.reasoning_effort = 'none'
+      out.thinkingActive = false
+      out.temperature = finiteClamped(sampling.temperature, 0, 2)
+      return out
+    }
+    let applied = level
+    if (cap !== null && !cap.levels.includes(level)) {
+      // 模型声明了可选档位，用户选的档位不在其中 → 就近取较低的可用档，不硬发
+      const ordered = EFFORT_ORDER.filter((item) => cap.levels.includes(item))
+      const wanted = EFFORT_ORDER.indexOf(level)
+      applied = ordered.filter((item) => EFFORT_ORDER.indexOf(item) <= wanted).pop() ?? ordered[0] ?? null
+      if (applied === null) {
+        // 该模型只支持关闭思考
+        out.fields.reasoning_effort = 'none'
+        out.thinkingActive = false
+        out.temperature = finiteClamped(sampling.temperature, 0, 2)
+        return out
+      }
+      out.effortDowngraded = applied !== level
+    }
+    out.effortApplied = applied
+    out.fields.reasoning_effort = applied
+    out.thinkingActive = true
+    // 官方：思考模式不支持 temperature / presence_penalty / frequency_penalty，
+    // 传了不报错但也不生效；top_p 行为按型号而异。所以这里不发，而不是发个无效的。
+    out.ignoredSampling = ['temperature', 'top_p']
     return out
   }
 
@@ -320,7 +329,7 @@ export const MIMO_THINKING_OPTIONS = [
 ]
 export const DEEPSEEK_EFFORT_OPTIONS = [
   { value: 'default', label: '默认（跟随服务端）', note: '官方当前默认开启思考、强度 high' },
-  { value: 'none', label: '关闭思考', note: '发送 thinking:{type:"disabled"}，不再同时发 reasoning_effort' },
+  { value: 'none', label: '关闭思考', note: '发送 reasoning_effort="none"，不额外发送 thinking' },
   { value: 'low', label: '低', note: 'reasoning_effort=low' },
   { value: 'high', label: '高', note: 'reasoning_effort=high（官方把 medium 也映射到这一档）' },
   { value: 'max', label: '极高', note: 'reasoning_effort=max' },

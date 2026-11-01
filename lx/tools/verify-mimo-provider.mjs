@@ -78,9 +78,9 @@ async function withMock(handler, run) {
     upgraded.providerId === 'deepseek' && upgraded.baseURL === 'https://api.deepseek.com/v1'
       && upgraded.model === 'deepseek-flash' && upgraded.apiKey === 'sk-legacy-deepseek-key',
     `${upgraded.providerId}/${upgraded.model}`)
-  check('A7 旧配置的 Key 迁移到原认证目标（回切便利）',
-    upgraded.providerTargets?.['deepseek|https://api.deepseek.com/v1'] === 'sk-legacy-deepseek-key',
-    JSON.stringify(Object.keys(upgraded.providerTargets ?? {})))
+  check('A7 旧配置的 Key 迁移到 providerKeys（按提供商保存，切回不用重填）',
+    upgraded.providerKeys?.deepseek === 'sk-legacy-deepseek-key',
+    JSON.stringify(Object.keys(upgraded.providerKeys ?? {})))
 
   // 自定义端点同样不动
   const custom = {
@@ -254,25 +254,28 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
   check('C6 DeepSeek 默认档：thinking 与 reasoning_effort 都不发',
     g?.thinking === undefined && g?.reasoning_effort === undefined, JSON.stringify(Object.keys(g ?? {})))
   const h = await captureBody({ ...dsBase, deepseekReasoningEffort: 'none' })
-  check('C7 DeepSeek 关闭：thinking=disabled 且不冲突',
-    JSON.stringify(h?.thinking) === '{"type":"disabled"}' && h?.reasoning_effort === undefined, JSON.stringify(h?.thinking))
+  // 官方协议：省略 thinking 时模式由 reasoning_effort 决定，none 就是关闭思考。
+  // 所以关闭档只发 reasoning_effort:'none'，不再额外发 thinking:{type:disabled}（避免两个字段互相解释）。
+  check('C7 DeepSeek 关闭：只发 reasoning_effort=none，不发 thinking',
+    h?.reasoning_effort === 'none' && h?.thinking === undefined,
+    JSON.stringify({ thinking: h?.thinking, effort: h?.reasoning_effort }))
   for (const [level, expected] of [['low', 'low'], ['high', 'high'], ['max', 'max']]) {
     const body = await captureBody({ ...dsBase, deepseekReasoningEffort: level })
-    check(`C8 DeepSeek ${level}：reasoning_effort=${expected} + thinking enabled`,
-      body?.reasoning_effort === expected && JSON.stringify(body?.thinking) === '{"type":"enabled"}',
+    check(`C8 DeepSeek ${level}：只发 reasoning_effort=${expected}（不发 thinking）`,
+      body?.reasoning_effort === expected && body?.thinking === undefined,
       `effort=${body?.reasoning_effort} thinking=${JSON.stringify(body?.thinking)}`)
   }
   const medium = await captureBody({ ...dsBase, deepseekReasoningEffort: 'medium' })
   check('C9 medium 不当独立档位（官方映射为 high）→ 回 default 不伪造',
     medium?.reasoning_effort === undefined, medium?.reasoning_effort)
 
-  // 互斥：绝不同时发相互冲突的字段
+  // 互斥：绝不同时发相互冲突的字段（thinking 与 reasoning_effort 只能出现一个）
   for (const level of ['default', 'none', 'low', 'high', 'max']) {
     const body = await captureBody({ ...dsBase, deepseekReasoningEffort: level })
-    const conflict = body?.thinking !== undefined && body?.reasoning_effort === 'none'
+    const conflict = body?.thinking !== undefined && body?.reasoning_effort !== undefined
     if (conflict) check(`C10 DeepSeek ${level} 不冲突`, false, JSON.stringify(body))
   }
-  check('C10 DeepSeek 各档都不会 thinking:enabled + effort:none 同时发', true)
+  check('C10 DeepSeek 各档都不会同时发 thinking 与 reasoning_effort', true)
 
   // 普通端点不发提供商专属字段
   const plain = await captureBody({ providerId: 'openai-compatible', baseURL: 'https://api.openai.com/v1', model: 'gpt-4o-mini', temperature: 0.7, mimoThinking: 'enabled', deepseekReasoningEffort: 'max' })
@@ -298,8 +301,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     providerHint: 'mimo', mimoThinking: 'enabled', deepseekReasoningEffort: 'max', temperature: 0.3,
   })
   check('C12c 官方 DeepSeek 不受旧 MiMo hint 干扰（不带 MiMo-only 假设）',
-    deepseekWithMimoHint?.reasoning_effort === 'max'
-      && JSON.stringify(deepseekWithMimoHint?.thinking) === '{"type":"enabled"}',
+    deepseekWithMimoHint?.reasoning_effort === 'max' && deepseekWithMimoHint?.thinking === undefined,
     JSON.stringify({ thinking: deepseekWithMimoHint?.thinking, effort: deepseekWithMimoHint?.reasoning_effort, temperature: deepseekWithMimoHint?.temperature }))
 
   // 按提供商判断，不按模型名
@@ -318,7 +320,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     const customId = { providerId: 'oneapi-forward-ds', baseURL: 'https://oneapi.example.com/v1', model: 'x', capability: 'deepseek', deepseekReasoningEffort: 'high' }
     const body = await captureBody(customId)
     check('C18 注册表声明 capabilities 的其它 id 也能拿到对应参数',
-      body?.reasoning_effort === 'high' && JSON.stringify(body?.thinking) === '{"type":"enabled"}', JSON.stringify(body?.thinking))
+      body?.reasoning_effort === 'high' && body?.thinking === undefined, JSON.stringify(body?.thinking))
     check('C19 认不出的 providerId 一律按标准兼容（宁可不发专属参数）',
       params.resolveCapability({ providerId: 'totally-new-provider' }) === 'openai-compatible'
         && params.resolveCapability({ providerId: '' }) === 'openai-compatible',
@@ -879,7 +881,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
 
       const second = bodies.at(-1)
       check('F13b 切换提供商后新请求只带新提供商的参数',
-        JSON.stringify(second.thinking) === '{"type":"enabled"}' && second.reasoning_effort === 'low'
+        second.thinking === undefined && second.reasoning_effort === 'low'
           && second.model === 'deepseek-flash',
         JSON.stringify({ thinking: second.thinking, effort: second.reasoning_effort, model: second.model }))
       check('F13c 新请求的历史里不出现旧提供商的 reasoning_content',
@@ -1092,22 +1094,24 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     check('G31 修回合法提供商后 MiMo 自己的 Key 还在', healed.apiKey === 'sk-mimo-real', healed.apiKey)
   }
 
-  // G32：resolveApiKeyFor 是凭据隔离的执行点（测试模型 / 取列表都走它）
+  // G32：resolveApiKeyFor 是"按提供商取 Key"的执行点（测试模型 / 取列表都走它）
   {
     await store.saveConfig({ providerId: 'mimo', apiKey: 'sk-mimo-only' })
     await store.saveConfig({ providerId: 'deepseek', apiKey: 'sk-deep-only' })
     const cfg = await store.loadConfig()
     check('G32a 目标=当前提供商 → 用生效 Key', await store.resolveApiKeyFor('deepseek', { config: cfg }) === 'sk-deep-only',
       await store.resolveApiKeyFor('deepseek', { config: cfg }))
-    check('G32b 目标=别家（指定其 baseURL）→ 用它自己目标槽位那份',
+    check('G32b 目标=别家 → 用它自己那一份 Key',
       await store.resolveApiKeyFor('mimo', { config: cfg, baseURL: 'https://api.xiaomimimo.com/v1' }) === 'sk-mimo-only',
       await store.resolveApiKeyFor('mimo', { config: cfg, baseURL: 'https://api.xiaomimimo.com/v1' }))
     check('G32c 别家没存过 Key → 空（绝不回落到当前凭据）',
       await store.resolveApiKeyFor('openai-compatible', { config: cfg, baseURL: 'https://api.openai.com/v1' }) === '',
       `[${await store.resolveApiKeyFor('openai-compatible', { config: cfg, baseURL: 'https://api.openai.com/v1' })}]`)
-    check('G32d 目标不同地址不越境（未给地址时也不回退到 providerKeys）',
-      await store.resolveApiKeyFor('mimo', { config: cfg }) === '',
-      `[${await store.resolveApiKeyFor('mimo', { config: cfg })}]`)
+    // 便利性：同一个提供商换地址属于常规切换，Key 必须还在（PR#4 的按地址隔离已撤回）
+    check('G32d 同一提供商换地址仍复用同一份 Key（不需要重填）',
+      await store.resolveApiKeyFor('mimo', { config: cfg }) === 'sk-mimo-only'
+        && await store.resolveApiKeyFor('mimo', { config: cfg, baseURL: 'https://proxy.example.com/v1' }) === 'sk-mimo-only',
+      `[${await store.resolveApiKeyFor('mimo', { config: cfg, baseURL: 'https://proxy.example.com/v1' })}]`)
   }
 
   // 非法档位回 default，而不是"关闭思考"
@@ -1168,18 +1172,23 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     built.capability === 'mimo' && JSON.stringify(built.fields.thinking) === '{"type":"disabled"}' && built.fields.reasoning_effort === undefined,
     JSON.stringify(built.fields))
 
-  // ============ 方案凭据边界：同 ID 换认证目标不得沿用旧 Key；同源仅改模型保留 Key ============
-  // 先把 pm 方案的 Key 清掉，构造"改目标"场景
+  // ============ 方案凭据语义：改地址/换提供商都保留用户填过的 Key ============
   await store.saveConfig({
     modelProfiles: [
+      { id: 'pm', name: 'MiMo 白天', providerId: 'mimo', baseURL: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.6-flash', apiKey: 'sk-profile-keep' },
+    ],
+  })
+  await store.saveConfig({
+    modelProfiles: [
+      // 同一条方案改了提供商与地址，但没重新填 Key → 沿用方案原来那份（用户不必重填）
       { id: 'pm', name: 'MiMo 白天', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', apiKey: '' },
     ],
   })
   const swappedAuth = await store.loadConfig()
   const pmSwapped = swappedAuth.modelProfiles.find((p) => p.id === 'pm')
-  check('G33 方案 ID 不变但换了提供商/地址 → 不沿用旧 Key',
-    pmSwapped?.apiKey === '' || pmSwapped?.apiKey === undefined,
-    `apiKey=${JSON.stringify(pmSwapped?.apiKey)} (应清空)`)
+  check('G33 方案改地址/提供商后仍沿用已保存的 Key（不意外清空）',
+    pmSwapped?.apiKey === 'sk-profile-keep',
+    `apiKey=${JSON.stringify(pmSwapped?.apiKey)}`)
 
   // 同源仅改模型 → 保留 Key
   await store.saveConfig({
@@ -1294,7 +1303,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     await next.run('第二问')
     check('H3 下一轮立刻用上新的提供商与推理参数',
       nextRequests.length > 0 && nextRequests[0].reasoning_effort === 'max'
-        && JSON.stringify(nextRequests[0].thinking) === '{"type":"enabled"}',
+        && nextRequests[0].thinking === undefined,
       JSON.stringify({ thinking: nextRequests[0]?.thinking, effort: nextRequests[0]?.reasoning_effort }))
 
     // 回合快照本身不受后续改动影响
@@ -1422,7 +1431,7 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
   })
 }
 
-// J6-J9：认证目标凭据隔离——同一 providerId 改 baseURL 不越境；切回原目标复用
+// J6-J9：按提供商的凭据语义——同一 providerId 改 baseURL 不丢 Key；换提供商不越境
 {
   const srv = await startMockServer({ port: 0, handler: ({ headers, url }) => {
     const auth = headers.authorization ?? ''
@@ -1438,39 +1447,43 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     await store.saveConfig({ providerId: 'mimo', baseURL: srv.url, model: 'mimo-v2.6-flash', apiKey: 'sk-target-a' })
     const cfgA = await store.loadConfig()
     const resolvedA = await store.resolveApiKeyFor('mimo', { config: cfgA, baseURL: srv.url })
-    check('J6 保存后当前目标持有自己的 Key',
+    check('J6 保存后当前提供商持有自己的 Key',
       cfgA.apiKey === 'sk-target-a' && resolvedA === 'sk-target-a',
       `apiKey=${cfgA.apiKey} resolved=${resolvedA}`)
 
-    // 换成不同认证目标（同一 providerId 但不同 baseURL）
+    // 同一提供商换地址（自建代理）：这是常规切换，Key 必须还在
     const srvB = await startMockServer({ port: 0, handler: () => ({}) })
     try {
       const srvBUrl = srvB.url
       const switched = await store.saveConfig({ providerId: 'mimo', baseURL: srvBUrl, model: 'mimo-v2.6-flash', apiKey: 'sk-target-b' })
-      check('J7 换目标后新 Key 存到新目标', (await store.loadConfig()).apiKey === 'sk-target-b')
+      check('J7 换地址后新 Key 生效（用户填的就该用）', (await store.loadConfig()).apiKey === 'sk-target-b',
+        switched.config?.apiKey)
 
-      // 切回目标 A：应复用 sk-target-a（不需要重填）
+      // 只改地址、不重填 Key：沿用同一份（不需要重填）
       const back = await store.saveConfig({ providerId: 'mimo', baseURL: srv.url })
-      check('J8 切回原目标自动复用已保存 Key', (await store.loadConfig()).apiKey === 'sk-target-a',
+      check('J8 改回原地址仍复用已保存 Key', (await store.loadConfig()).apiKey === 'sk-target-b',
         `apiKey=${back.config?.apiKey}`)
 
-      // 目标隔离：在目标 B 时，`resolveApiKeyFor('mimo', {baseURL: srv.url})` 应为 A 的 Key，绝不能是 B
-      const cfgB = await store.loadConfig()
-      check('J9 不同目标取 Key 互不越境（B 目标只取 B 的 Key）',
-        await store.resolveApiKeyFor('mimo', { config: cfgB, baseURL: srvBUrl }) === 'sk-target-b',
-        await store.resolveApiKeyFor('mimo', { config: cfgB, baseURL: srvBUrl }))
+      // 换提供商：只用那一家自己的 Key，绝不把 MiMo 的 Key 发给 DeepSeek
+      await store.saveConfig({ providerId: 'deepseek', apiKey: 'sk-deep-own' })
+      const cfgDeep = await store.loadConfig()
+      check('J9 换提供商后各自用自己的 Key（互不越境）',
+        cfgDeep.apiKey === 'sk-deep-own'
+          && await store.resolveApiKeyFor('mimo', { config: cfgDeep, baseURL: srvBUrl }) === 'sk-target-b',
+        `${cfgDeep.apiKey} / ${await store.resolveApiKeyFor('mimo', { config: cfgDeep, baseURL: srvBUrl })}`)
     } finally {
       srvB.server.close()
     }
 
-    // 模型发现也用目标 Key：目标 A 的列表请求带 sk-target-a
+    // 模型发现也用该提供商自己的 Key（切回 MiMo 并恢复它自己的那份）
+    await store.saveConfig({ providerId: 'mimo', baseURL: srv.url, model: 'mimo-v2.6-flash', apiKey: 'sk-target-a' })
     const { fetchChatModels } = await import('../packages/config/model-discovery.mjs')
     const fetched = await fetchChatModels({
       providerId: 'mimo', baseURL: srv.url,
       apiKey: await store.resolveApiKeyFor('mimo', { config: await store.loadConfig(), baseURL: srv.url }),
       cache: new Map(), apiKeyRequired: true,
     })
-    check('J10 模型发现使用目标对应 Key 且拿到该目标目录',
+    check('J10 模型发现使用该提供商的 Key 且拿到对应目录',
       fetched.ok === true && fetched.models.some((m) => m.id === 'mimo-v2.6-pro'),
       JSON.stringify(fetched.models?.map((m) => m.id)))
   } finally {

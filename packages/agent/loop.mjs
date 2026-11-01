@@ -6,11 +6,14 @@
  *
  * 关键设计：
  *  - 工具结果是文本信封（上游 format.js 生成），模型只读文本，不直接吃图片
- *  - 上下文只保留最近 2 条完整工具结果，更早的压成一行摘要（截图会撑爆上下文）
+ *  - **上下文按 tokens 预算管理**（见 agent/context.mjs）：默认 1M 窗口、到 90% 才压缩。
+ *    以前那套"最多 10 条消息 / 3,000 字符 / 40,000 字符 / 12 条就开始压"的阈值全部删掉了——
+ *    它们与模型的真实容量无关，会在只用了 4% 窗口时就开始丢历史。
  *  - 每一步都可中断：所有 await 前都有 signal 检查
  *  - **思考内容（reasoning_content）与最终回答分开**：思考内容只放回上下文（MiMo /
  *    DeepSeek 在思考模式下做工具调用时不回传会 HTTP 400），绝不进字幕/TTS；
- *    裁剪历史时按"完整消息组"下手，不留孤立的工具结果或缺 thinking 字段的工具调用
+ *    压缩时按"完整消息片段"下手，不留孤立的工具结果或缺 thinking 字段的工具调用，
+ *    也绝不把 reasoning_content 截断后继续配对回传。
  *  - 参数不完整/解析失败的工具调用**不执行**，只把失败原因回给模型
  */
 
@@ -18,167 +21,86 @@
 import { DEFAULT_SYSTEM_PROMPT, turnSystemPrompt } from './system-prompt.mjs'
 import { assistantMessageFrom } from './llm.mjs'
 import { resolveCapability, requiresReasoningEcho } from './ll-params.mjs'
+import {
+  compressMessages,
+  estimateRequestTokens,
+  resolveContextPolicy,
+  splitInteractionUnits,
+} from './context.mjs'
 
 const TOOL_RESULT_MAX_CHARS = 1200
-/** 一轮里最多把几张图塞给模型（截图多的任务很容易把上下文挤爆） */
-const MAX_IMAGES_PER_RUN = 4
-const COMPRESS_AFTER_MESSAGES = 12
 /**
- * 会话记忆：最多带几轮、多少字。
+ * 一轮里最多把几张图塞给模型。
  *
- * 注意这里不是"把历史压短"，而是**按完整交互单元裁剪**：一旦裁剪掉某个早期用户回合，
- * 连同它的 assistant 回答、reasoning_content、工具调用和 tool 结果一起丢弃，
- * 绝不对保留的 `reasoning_content` 做任何截断/改写/占位。
+ * 以前是 4——那是"字符预算"时代的产物（一张截图 16 万字符，四张就"撑爆"了）。
+ * 现在图片按 token 计价（见 context.mjs 的 estimateImageTokens），预算自己会管住用量，
+ * 所以这里只留一个防跑飞的硬上限，不再把长 CUA 任务的截图提前砍掉。
  */
-const HISTORY_MAX_MESSAGES = 10
-const HISTORY_MAX_CHARS = 3000
-/** 单回合上下文总字符预算（超出时同样按完整交互单元丢弃最老的单元，不截断思考内容） */
-const CONTEXT_BUDGET_CHARS = 40000
+const MAX_IMAGES_PER_RUN = 16
 
 /**
- * 底部“裁剪历史交给模型”时，按**完整交互单元**保留最近若干条 user/assistant/tool。
+ * 会话历史整理：只做**协议安全**的整理，不做预算裁剪。
  *
- * 与旧实现的关键差异：
- *  - 不再把 messages 剥成只有 role/content 两个字段——保留工具调用和配对 tool 结果，
- *    也保留 `reasoning_content`（完整、不截断、不改写）。
- *  - 只保留“完整单元”：user 开头，其后的 assistant/tool 全部配对（tool 有对应 tool_calls，
- *    有 tool_calls 的 assistant 有对应 tool 结果）。残缺单元整组剔除，绝不留孤立 tool 或
+ * 预算裁剪统一交给 compressMessages（到 90% 才动手），所以这里不再有
+ * "最多 10 条 / 3,000 字符"这种与模型容量无关的丢历史逻辑。
+ *
+ * 仍然必须做的事：
+ *  - 只保留"完整片段"：user 开头，其后的 assistant/tool 全部配对（tool 有对应 tool_calls，
+ *    有 tool_calls 的 assistant 有对应 tool 结果）。残缺片段整组剔除，绝不留孤立 tool 或
  *    缺失工具调用的 assistant。
- *  - `providerCapability` 用于跨提供商：旧提供商（MiMo/DeepSeek）的 reasoning_content 是
- *    新提供商不认识的私有字段，发过去会污染请求；此时剥掉该字段但保留普通 content。
- *
- * 返回的数组可以直接塞进请求体（不重新按 role/content 重建）。
+ *  - `providerCapability` / `providerId` 用于跨提供商：旧提供商（MiMo/DeepSeek）的
+ *    reasoning_content 与新端点的工具链是私有协议上下文，发给别家会污染请求；
+ *    此时剥掉这些字段，但保留普通对话记忆。
  */
 function trimHistory(history, { providerCapability = '', providerId = '' } = {}) {
   if (!Array.isArray(history) || history.length === 0) return []
-  const messages = history.map((m) => ({ ...m }))
+  const units = splitInteractionUnits(history.map((message) => ({ ...message })))
 
-  // 1) 切分成完整交互单元：每个单元 = [user, assistant?, tool*]（assistant 与 tool 配对）
-  const units = []
-  let current = null
-  /** 当前单元的 assistant 声明的 tool_call ids */
-  let pendingIds = new Set()
-  for (const msg of messages) {
-    if (msg.role === 'user' && typeof msg.content === 'string') {
-      // 真正的用户指令：开启新单元
-      if (current !== null) { units.push(current); current = null }
-      current = { head: msg, calls: [] }
-      pendingIds = new Set()
-      continue
-    }
-    if (current === null) {
-      // 遇到 user 之前出现 assistant/tool/截图：残缺开头，跳过（不以这一条开始）
-      continue
-    }
-    if (msg.role === 'assistant') {
-      current.calls.push(msg)
-      if (Array.isArray(msg.tool_calls)) {
-        for (const call of msg.tool_calls) {
-          if (call?.id !== undefined) pendingIds.add(String(call.id))
-        }
-      }
-      continue
-    }
-    if (msg.role === 'tool') {
-      if (msg.tool_call_id !== undefined && pendingIds.has(String(msg.tool_call_id))) {
-        current.calls.push(msg)
-        // 匹配到结果后可继续，但不需要从 pendingIds 删除：一个 call 允许多个 tool 结果（不太规范但安全）
-      } else {
-        // 孤立 tool 结果：没有对应的 assistant tool_calls，整组不保留
-        current.calls.length = 0
-        current = null
-        pendingIds = new Set()
-      }
-      continue
-    }
-    if (msg.role === 'user' && Array.isArray(msg.content)) {
-      // 工具返回的截图附件：归入当前单元（不开启新用户回合）
-      current.calls.push(msg)
-      continue
-    }
-    // 其它角色（system 等）不属于交互单元，忽略
-  }
-  if (current !== null) units.push(current)
-
-  // 剔除缺失工具结果的 assistant 单元：assistant 声明了 tool_calls 但单元内没有对应 tool
-  const complete = units.filter((unit) => {
-    const ids = new Set()
-    for (const m of unit.calls) {
-      if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
-        for (const call of m.tool_calls) {
-          if (call?.id !== undefined) ids.add(String(call.id))
-        }
-      }
-    }
-    const results = new Set(unit.calls.filter((m) => m.role === 'tool').map((m) => String(m.tool_call_id)))
-    // 每个声明的 id 都必须有结果（允许结果多于声明，那是冗余但无害）
-    for (const id of ids) {
-      if (!results.has(id)) return false
-    }
-    return true
-  })
-
-  // 3) 跨提供商：旧提供商的工具链（assistant tool_calls + 配对 tool 结果 + 截图附件）是
-//    私有协议上下文，发给新端点既不兼容也没意义。
-//    但**普通对话记忆要保留**：旧单元里的用户问题与纯文本 assistant 最终回复
-//    （content 字符串的 assistant，没有 tool_calls）仍可安全发给新提供商。
-//    判断依据：单元内**任一**消息的 `_providerId` 与当前 providerId 不同 → 该单元属于旧家。
-//    无标记（老会话/外部构造）视为当前提供商，保留完整内容。
-const providersDiffer = providerId !== ''
+  const providersDiffer = providerId !== ''
     ? (unit) => {
-        const all = [unit.head, ...unit.calls]
-        return all.some((m) => m._providerId !== undefined && String(m._providerId) !== String(providerId))
+        const all = [unit.head, ...unit.segments.flatMap((segment) => [
+          ...segment.calls, ...segment.results, ...segment.attachments,
+        ])]
+        return all.some((message) => message._providerId !== undefined && String(message._providerId) !== String(providerId))
       }
     : () => false
-const compatible = complete
-  .filter((unit) => {
-    if (!providersDiffer(unit)) return true
-    // 旧提供商单元：只保留「用户问题 + 纯文本回复」，工具链与截图整段去除
-    const plain = unit.calls.filter((m) => m.role === 'assistant' && !Array.isArray(m.tool_calls))
-    unit.calls = plain
-    // 至少要有内容可保留（用户问题 + 纯文本回复），否则整段丢弃
-    return unit.calls.length > 0
-  })
-// 兼容性过滤后统一处理 reasoning_content：
-//  - 旧提供商的纯文本单元（providersDiffer）必然剥掉；
-//  - 当前端点不要求回传（非 MiMo/DeepSeek，比如普通 OpenAI 兼容）时，
-//    无标记/同提供商历史的 reasoning 也不该带出去——它是私有字段。
-const needEcho = requiresReasoningEcho(providerCapability)
-for (const unit of compatible) {
-    const old = providersDiffer(unit)
-    for (const m of unit.calls) {
-      if (m.role !== 'assistant' || typeof m.reasoning_content !== 'string') continue
-      if (old || !needEcho) delete m.reasoning_content
-    }
-    delete unit.head._providerId
-  }
 
-  // 2) 从最老开始丢弃单元，直到不超过消息数与字符预算
-  let kept = compatible.slice(-HISTORY_MAX_MESSAGES)
-  const totalChars = () => kept.reduce((sum, u) => sum + unitChars(u), 0)
-  while (kept.length > 1 && totalChars() > HISTORY_MAX_CHARS) {
-    kept = kept.slice(1)
-  }
-  // 单回合上下文预算：保留最近的完整单元（不截断任何一条消息）
-  if (kept.length > 1 && totalChars() > CONTEXT_BUDGET_CHARS) {
-    kept = kept.slice(-1)
-  }
-
-  // 4) 重组为平铺消息，并统一剥离内部 `_providerId` 标记（绝不发往模型）
+  const needEcho = requiresReasoningEcho(providerCapability)
   const flat = []
-  for (const unit of kept) {
-    flat.push(unit.head)
-    for (const m of unit.calls) flat.push(m)
+  for (const unit of units) {
+    const foreign = providersDiffer(unit)
+    if (foreign) {
+      /*
+       * 旧提供商：只保留「用户问题 + 纯文本回复」，工具链与截图整段去除。
+       * reasoning_content 是旧端点的私有字段（新端点可能直接参数校验报错），
+       * 所以这里**必须一起剥掉**——保留纯文本记忆就够了。
+       */
+      const plain = unit.segments
+        .flatMap((segment) => segment.calls)
+        .filter((message) => message.role === 'assistant' && !Array.isArray(message.tool_calls))
+      if (plain.length === 0) continue
+      flat.push({ ...unit.head })
+      for (const message of plain) {
+        const copy = { ...message }
+        delete copy.reasoning_content
+        flat.push(copy)
+      }
+      continue
+    }
+    flat.push({ ...unit.head })
+    for (const segment of unit.segments) {
+      for (const message of [...segment.calls, ...segment.results, ...segment.attachments]) {
+        const copy = { ...message }
+        if (copy.role === 'assistant' && typeof copy.reasoning_content === 'string' && !needEcho) {
+          delete copy.reasoning_content
+        }
+        flat.push(copy)
+      }
+    }
   }
-  for (const m of flat) {
-    if ('_providerId' in m && typeof m._providerId !== 'undefined') delete m._providerId
-  }
+  // 内部标记绝不发往模型
+  for (const message of flat) delete message._providerId
   return flat
-}
-
-/** 一个交互单元的字符数（含 reasoning/tool 字段，与 messageLength 同口径） */
-function unitChars(unit) {
-  return messageLength([unit.head, ...unit.calls])
 }
 
 export class Agent {
@@ -189,6 +111,7 @@ export class Agent {
   #maxSteps
   #onEvent
   #gate
+  #contextPolicy
 
   /**
    * @param {object} options
@@ -199,14 +122,16 @@ export class Agent {
    * @param {number} [options.maxSteps]
    * @param {(event:{type:string,[k:string]:unknown})=>void} [options.onEvent]
    * @param {(ctx:{tool:string,args:unknown})=>Promise<{allow:boolean,reason?:string}>} [options.gate]
+   * @param {object} [options.contextPolicy] resolveContextPolicy 的结果（窗口 / 压缩触发点）
    */
-  constructor({ llm, tools, systemPrompt = DEFAULT_SYSTEM_PROMPT, maxSteps = 8, onEvent, gate }) {
+  constructor({ llm, tools, systemPrompt = DEFAULT_SYSTEM_PROMPT, maxSteps = 8, onEvent, gate, contextPolicy }) {
     this.#llm = llm
     this.#tools = tools
     this.#systemPrompt = systemPrompt
     this.#maxSteps = maxSteps
     this.#onEvent = onEvent ?? (() => {})
     this.#gate = gate ?? (async () => ({ allow: true }))
+    this.#contextPolicy = contextPolicy ?? resolveContextPolicy({})
   }
 
   /** 此刻会生效的提示词（诊断/验收用；不代表正在跑的回合，回合用开始时的快照） */
@@ -219,6 +144,11 @@ export class Agent {
     return this.#maxSteps
   }
 
+  /** 此刻会生效的上下文预算（诊断/验收用） */
+  get contextPolicy() {
+    return { ...this.#contextPolicy }
+  }
+
   /**
    * 运行中改步数上限（保存设置后下一轮生效，不重建 Agent）。
    * 正在跑的回合已经按旧上限在走循环，不受影响——上限只在循环开始时比较。
@@ -229,14 +159,29 @@ export class Agent {
   }
 
   /**
+   * 运行中改上下文预算（保存设置后下一轮生效）。
+   * 只影响下一轮开始时的快照，正在跑的回合仍用它开始时的预算。
+   */
+  setContextPolicy(policy) {
+    if (policy !== null && typeof policy === 'object') this.#contextPolicy = policy
+  }
+
+  /**
    * 跑一个用户回合。
    * @param {string} input 用户说的话（已由 ASR 转成文本）
-   * @param {{signal?:AbortSignal, history?:Array<object>, systemPrompt?:string|(()=>unknown)}} [options]
+   * @param {{signal?:AbortSignal, history?:Array<object>, systemPrompt?:string|(()=>unknown),
+   *          contextPolicy?:object}} [options]
    *   history 是**同一个会话**里之前几轮的消息（可含 reasoning_content / tool_calls / tool 结果）。
    *   每次唤醒由调用方清空，于是"一次唤醒 = 一次会话"。
    *   systemPrompt 覆盖构造函数的来源（**本轮快照**）。
    */
-  async run(input, { signal, history = [], onEvent = this.#onEvent, systemPrompt = this.#systemPrompt } = {}) {
+  async run(input, {
+    signal,
+    history = [],
+    onEvent = this.#onEvent,
+    systemPrompt = this.#systemPrompt,
+    contextPolicy = this.#contextPolicy,
+  } = {}) {
     const emit = (event) => { if (!signal?.aborted) onEvent(event) }
     /*
      * 端点快照：整回合用同一套「地址 + Key + 模型 + 推理档位」。
@@ -251,6 +196,11 @@ export class Agent {
      */
     const maxSteps = this.#maxSteps
     /*
+     * 上下文预算也是回合快照：中途改窗口/触发点，只对**下一轮**生效，
+     * 免得一次任务跑到一半突然换了一套压缩尺度。
+     */
+    const policy = contextPolicy ?? resolveContextPolicy({})
+    /*
      * 提示词在回合开始时求值一次，整个回合（含后续多步工具调用和收尾往返）都用这一份。
      * 中途改设置不能把人设换掉——用户会看到"前后两半不像同一个人"，
      * 而且工具调用序列里混进新的 system 消息很容易让模型重新解释任务。
@@ -261,6 +211,7 @@ export class Agent {
       ? resolveCapability(llm.profile)
       : (typeof llm.capability === 'string' ? llm.capability : '')
     const providerId = typeof llm.profile?.providerId === 'string' ? llm.profile.providerId : ''
+    const availableTools = this.#tools.listTools()
     const messages = [
       { role: 'system', content: turnPrompt },
       ...trimHistory(history, { providerCapability: capability, providerId }),
@@ -270,13 +221,23 @@ export class Agent {
      *
      * `compress(messages)` 会整体重建数组（splice 把旧单元从头部移除），
      * 用数字索引 `turnStart` 会在压缩后失效——可能把本轮 user / 工具结果 / 回复漏掉。
-     * 压缩总是保留“当前回合的 user”（见 compress/splitCompleteUnits），
+     * 压缩总是保留“当前回合的 user”（见 context.mjs 的 splitInteractionUnits），
      * 因此拿到本轮第一条 user 消息的对象引用，处理后按 `indexOf` 定位即可稳定切出本轮增量。
      */
     const turnUserMessage = { role: 'user', content: input }
     messages.push(turnUserMessage)
+    /**
+     * 每次发请求前压一次。**没到 90% 会立刻返回**（只花一次估算），
+     * 到了才按完整片段整体删除——所以"低于阈值不压缩"是结构上保证的。
+     */
+    const compress = () => compressMessages(messages, policy, { tools: availableTools })
+    /*
+     * 发第一枪之前先看一眼总预算：历史本身就可能已经很大（长时间 CUA 会话）。
+     * 没到触发点这一步什么都不做。
+     */
+    compress()
+
     const steps = []
-    const availableTools = this.#tools.listTools()
     let finalText = ''
     let hitStepLimit = false
     /** 本轮因流式异常/错误而未正常完成（上层不应把 finalText 当作成功回答） */
@@ -328,7 +289,7 @@ export class Agent {
             steps.push({ step, tool: call.name || '(未知工具)', ok: false, text: '响应不完整，未执行' })
             emit({ type: 'tool_end', name: call.name || '(未知工具)', ok: false, text: '响应不完整，未执行', step })
           }
-          compress(messages)
+          compress()
           if (step === maxSteps) hitStepLimit = true
           continue
         }
@@ -374,7 +335,7 @@ export class Agent {
           steps.push({ step, tool: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行' })
           emit({ type: 'tool_end', name: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行', step })
         }
-        compress(messages)
+        compress()
         if (step === maxSteps) hitStepLimit = true
         continue
       }
@@ -385,6 +346,12 @@ export class Agent {
       }
       messages.push(assistantMessageFrom(result))
 
+      /*
+       * 同一批工具调用的结果必须**连续**出现：协议要求 tool 消息紧跟声明它们的 assistant，
+       * 中间插一条 user（哪怕只是图片附件）就会被判成孤立工具结果。
+       * 所以截图先攒在 `pendingImages`，等这一批工具**全部**返回后再一次性补进消息。
+       */
+      const pendingImages = []
       for (const call of toolCalls) {
         throwIfAborted(signal)
         const args = safeParseArgs(call.arguments)
@@ -414,12 +381,12 @@ export class Agent {
           /*
            * 截图这类工具会带回一张图。**必须把图塞进对话**，否则模型只看到
            * "图存在某个路径"的文字——它对屏幕就是瞎的（这正是"任务做一半"的根因）。
-           * OpenAI 兼容协议里图片只能放在 user 消息的 content 数组上，所以单独补一条。
-           * 一轮最多带 4 张：再多既贵又容易把上下文挤爆。
+           * OpenAI 兼容协议里图片只能放在 user 消息的 content 数组上，所以单独补一条；
+           * 但补的时机是**这一批工具全部返回之后**（见上面的 pendingImages 说明）。
            */
           if (invoked?.image !== undefined && invoked.image !== null && imagesAttached < MAX_IMAGES_PER_RUN) {
             imagesAttached += 1
-            messages.push({
+            pendingImages.push({
               role: 'user',
               content: [
                 { type: 'text', text: `（这是 ${call.name} 刚返回的图，${invoked.image.width ?? '?'}x${invoked.image.height ?? '?'}）` },
@@ -435,8 +402,10 @@ export class Agent {
           emit({ type: 'tool_end', name: call.name, ok: false, text: message, step })
         }
       }
+      // 这一批工具结果已经齐了，截图附件现在才能进来（不会插在结果之间）
+      messages.push(...pendingImages)
 
-      compress(messages)
+      compress()
       // 这是最后一步，且这一步还在调工具 → 走完就撞上限，需要补一次交代
       if (step === maxSteps) hitStepLimit = true
     }
@@ -447,31 +416,41 @@ export class Agent {
      * 之前的行为是：最后一步工具执行完，往上下文塞一句"达到上限，先停下汇报"，
      * 然后循环直接结束——模型根本没机会说话，用户听到的就是"话说到一半停了"。
      * 现在多给一次不带工具的往返，让它用一句话说清楚做到哪、还差什么。
+     *
+     * 这条收尾回复**必须进消息历史**：用户听到的是这一轮的回答，
+     * 下一轮追问"那接下来呢"时模型得记得自己刚才说过什么。
      */
     throwIfAborted(signal)
     if (hitStepLimit && steps.length > 0) {
+      const noteIndex = messages.length
+      messages.push({
+        role: 'user',
+        content: `（已经用满 ${maxSteps} 步，不能再调工具了。用一句话告诉用户：你做到哪一步、还差什么、需要他怎么配合。）`,
+      })
       try {
         const closing = await llm.chat({
-          messages: [
-            ...messages,
-            {
-              role: 'user',
-              content: `（已经用满 ${maxSteps} 步，不能再调工具了。用一句话告诉用户：你做到哪一步、还差什么、需要他怎么配合。）`,
-            },
-          ],
+          messages,
           tools: [],
           signal,
           stream: true,
           onDelta: (text) => emit({ type: 'text_delta', text }),
         })
         throwIfAborted(signal)
+        // 这条"用满步数"的内部提示不属于对话内容，拿到回复后就撤掉（保持历史干净且协议合法）
+        messages.splice(noteIndex, 1)
         if (closing.text) {
           finalText += closing.text
+          messages.push(assistantMessageFrom(closing))
           emit({ type: 'assistant', text: closing.text, step: maxSteps + 1, limited: true })
         }
+        if (closing.toolCallsIncomplete === true && closing.text === '') turnFailed = true
       } catch (error) {
         throwIfAborted(signal)
-        emit({ type: 'assistant', text: `（步数用完了，没能收尾：${error.message}）`, step: maxSteps + 1, limited: true })
+        messages.splice(noteIndex, 1)
+        const fallback = `（步数用完了，没能收尾：${error.message}）`
+        messages.push({ role: 'assistant', content: fallback })
+        emit({ type: 'assistant', text: fallback, step: maxSteps + 1, limited: true })
+        turnFailed = true
       }
     }
 
@@ -501,7 +480,18 @@ export class Agent {
       ...(m.reasoning_content !== undefined ? { reasoning_content: m.reasoning_content } : {}),
       ...(m.tool_call_id !== undefined ? { tool_call_id: m.tool_call_id } : {}),
     }))
-    return { text: finalText, steps, limited: hitStepLimit, reasoningChars, llm, turn, providerId, failed: turnFailed }
+    return {
+      text: finalText,
+      steps,
+      limited: hitStepLimit,
+      reasoningChars,
+      llm,
+      turn,
+      providerId,
+      failed: turnFailed,
+      contextTokens: estimateRequestTokens({ messages, tools: availableTools }),
+      contextWindow: policy.contextWindow,
+    }
   }
 }
 
@@ -518,141 +508,6 @@ function safeParseArgs(raw) {
 function clamp(text, max) {
   const value = String(text ?? '')
   return value.length <= max ? value : `${value.slice(0, max)}…（截断）`
-}
-
-/**
- * 回合内上下文压缩：只按**完整交互单元**移除最老的 user 轮。
- *
- * 旧实现会把较早的工具结果压成“（已压缩）首行”，并把 reasoning_content 截成 120 字——
- * 这不符合 MiMo/DeepSeek 回传要求：保留在上下文里的推理内容必须与原始响应一致。
- *
- * 新行为：
- *  - 不再截断/改写任何 `reasoning_content`。
- *  - **不会删除 system 消息**：system（含 PR3 自定义提示词）是每个请求的头部，永远保留。
- *  - 工具返回的截图（content 数组、含 image_url 的 user 消息）归入其所属 assistant
- *    工具单元，绝不会被当成新对话回合；压缩不会拆散 tool_calls 与配对结果。
- *  - 上下文超长时，从最老的 user 单元开始整体删除（user + assistant + tool 结果一起），
- *    不留下孤立 tool、不留下缺结果的 tool_calls。
- *  - 预算同时计入 reasoning_content、工具参数与截图数据，而不只统计 content 文本。
- */
-function compress(messages) {
-  if (messages.length <= COMPRESS_AFTER_MESSAGES) return
-  // 预算：按完整消息长度（含推理/工具/图片）
-  if (messageLength(messages) <= CONTEXT_BUDGET_CHARS) return
-
-  // 1) 分离 system（不可裁剪，必须是请求头部）
-  const systemMsgs = messages.filter((m) => m.role === 'system')
-  const rest = messages.filter((m) => m.role !== 'system')
-
-  // 2) 拆分完整交互单元（截图 user 归入所属工具单元）
-  const units = splitCompleteUnits(rest)
-  // 3) 从最老开始丢弃完整单元，直到不超过预算；至少保留一个用户回合
-  let kept = units
-  while (kept.length > 1 && messageLength(flattenUnits(kept)) > CONTEXT_BUDGET_CHARS) {
-    kept = kept.slice(1)
-  }
-  const flat = flattenUnits(kept.length > 0 ? kept : rest.slice(-1))
-  // 4) 原地替换 messages：system 在前，后跟保留下来的单元
-  messages.splice(0, messages.length, ...systemMsgs, ...flat)
-}
-
-/**
- * 回合内完整交互单元拆分：user 开头，assistant/tool 配对，残缺单元整体剔除。
- *
- * “用户回合”只有**普通文本 user 消息**（content 为字符串）才会开启新单元；
- * 工具返回的截图是 `{role:'user', content:[{type:'image_url',...}]}`，
- * 它会归入**当前正在进行**的 assistant 工具单元（作为工具结果的附件），
- * 不会拆散 tool_calls 与截图之间的关联。
- */
-function splitCompleteUnits(messages) {
-  const units = []
-  let current = null
-  let pendingIds = new Set()
-  const flush = (unit) => { if (unit !== null && unitComplete(unit)) units.push(unit) }
-  for (const msg of messages) {
-    if (msg.role === 'user' && typeof msg.content === 'string') {
-      // 真正的用户指令：开启新单元
-      flush(current)
-      current = { head: msg, calls: [] }
-      pendingIds = new Set()
-      continue
-    }
-    if (current === null) {
-      // 没有用户开头就出现 assistant/tool/图片：残缺开头，跳过
-      continue
-    }
-    if (msg.role === 'assistant') {
-      current.calls.push(msg)
-      if (Array.isArray(msg.tool_calls)) {
-        for (const c of msg.tool_calls) {
-          if (c?.id !== undefined) pendingIds.add(String(c.id))
-        }
-      }
-      continue
-    }
-    if (msg.role === 'tool') {
-      if (msg.tool_call_id !== undefined && pendingIds.has(String(msg.tool_call_id))) {
-        current.calls.push(msg)
-      } else {
-        current = null
-        pendingIds = new Set()
-      }
-      continue
-    }
-    if (msg.role === 'user' && Array.isArray(msg.content)) {
-      // 工具返回的截图附件：归入当前单元（若当前确实有正在进行的工具调用）
-      current.calls.push(msg)
-      continue
-    }
-  }
-  flush(current)
-  const kept = units.filter((u) => u.calls.length > 0)
-  if (kept.length === 0 && messages.some((m) => m.role === 'user' && typeof m.content === 'string')) {
-    // 至少保住当前回合的 user（避免裁空）
-    const lastUser = [...messages].reverse().find((m) => m.role === 'user' && typeof m.content === 'string')
-    return [{ head: lastUser, calls: [] }]
-  }
-  return kept
-}
-
-function unitComplete(unit) {
-  const ids = new Set()
-  for (const m of unit.calls) {
-    if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
-      for (const c of m.tool_calls) if (c?.id !== undefined) ids.add(String(c.id))
-    }
-  }
-  const results = new Set(unit.calls.filter((m) => m.role === 'tool').map((m) => String(m.tool_call_id)))
-  return [...ids].every((id) => results.has(id))
-}
-
-function flattenUnits(units) {
-  const out = []
-  for (const u of units) {
-    out.push(u.head)
-    for (const m of u.calls) out.push(m)
-  }
-  return out
-}
-
-/**
- * 字符长度：除 content 外，还计入 reasoning_content、tool_calls 参数等，
- * 因为 MiMo/DeepSeek 回传要求保留这些字段，它们同样占用上下文预算。
- */
-function messageLength(list) {
-  let total = 0
-  for (const m of list) {
-    const c = m.content
-    total += typeof c === 'string' ? c.length : JSON.stringify(c ?? '').length
-    if (typeof m.reasoning_content === 'string') total += m.reasoning_content.length
-    if (Array.isArray(m.tool_calls)) total += JSON.stringify(m.tool_calls).length
-    if (Array.isArray(m.tool_calls)) {
-      for (const t of m.tool_calls) {
-        if (t?.function?.arguments) total += String(t.function.arguments).length
-      }
-    }
-  }
-  return total
 }
 
 function throwIfAborted(signal) {

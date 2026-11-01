@@ -156,12 +156,20 @@ function scriptedPlan(body) {
   }
 }
 
+/**
+ * 读完整个请求体。
+ *
+ * 必须先拼 **Buffer** 再一次性 decode：`raw += chunk` 会把每个 TCP 分片各自
+ * 按 UTF-8 解一遍，而中文的一个字符占 3 字节，正好跨分片时就会被解成
+ * 两三个 U+FFFD——验收脚本拿到的"请求体"于是和客户端真正发出的字节不一样
+ * （实测表现为"reasoning_content 少了一个字"这类假失败）。
+ */
 function readRaw(req) {
   return new Promise((resolve) => {
-    let raw = ''
-    req.on('data', (chunk) => { raw += chunk })
-    req.on('end', () => resolve(raw))
-    req.on('error', () => resolve(raw))
+    const chunks = []
+    req.on('data', (chunk) => { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)) })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', () => resolve(Buffer.concat(chunks).toString('utf8')))
   })
 }
 

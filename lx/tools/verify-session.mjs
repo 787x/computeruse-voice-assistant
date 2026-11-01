@@ -52,7 +52,7 @@ function check(name, pass, detail) {
     && messages[2].content.includes('预算表'), roles)
 }
 
-// 3. 历史被裁剪：超过 10 条只留最近的
+// 3. 历史**不按条数**裁剪：默认 1M 窗口、到 90% 才压（旧实现的 10 条上限已删除）
 {
   const llm = makeLlm('ok')
   const agent = new Agent({ llm, tools })
@@ -64,8 +64,37 @@ function check(name, pass, detail) {
   await agent.run('最后一问', { history })
   const messages = llm.calls[0]
   const historyPart = messages.slice(1, -1)
-  check('裁剪：最多 10 条历史', historyPart.length <= 10, `${historyPart.length} 条`)
-  check('裁剪：保留最近的', historyPart.at(-1).content.includes('答案19'), historyPart.at(-1).content.slice(0, 12))
+  // 20 轮短对话 ≈ 几百 tokens，占 1M 的 0.05%——按新规则一条都不该丢
+  check('低于 90% 不压缩：20 轮历史全部保留', historyPart.length === history.length,
+    `${historyPart.length}/${history.length} 条`)
+  check('保留最早的（没有从头部砍掉）', historyPart[0].content === '问题0', historyPart[0].content.slice(0, 8))
+  check('保留最近的', historyPart.at(-1).content.includes('答案19'), historyPart.at(-1).content.slice(0, 12))
+}
+
+// 3b. 真到预算时才裁剪，且仍以 user 开头、保留最近的
+{
+  const llm = makeLlm('ok')
+  // 小窗口（4K @ 90% = 3.6K 触发），历史 20 轮 × 每条 200 字 ≈ 4K+ tokens
+  const agent = new Agent({
+    llm,
+    tools,
+    contextPolicy: { contextWindow: 4_000, compressPercent: 90, compressAtTokens: 3_600, hardLimitTokens: 3_800, targetTokens: 2_700, outputReserve: 200 },
+  })
+  const history = []
+  for (let i = 0; i < 20; i += 1) {
+    history.push({ role: 'user', content: `问题${i}：${'问'.repeat(200)}` })
+    history.push({ role: 'assistant', content: `答案${i}：${'答'.repeat(200)}` })
+  }
+  await agent.run('最后一问', { history })
+  const messages = llm.calls[0]
+  const historyPart = messages.slice(1, -1)
+  check('超预算时按完整单元裁剪（不是全丢）',
+    historyPart.length < history.length && historyPart.length > 0,
+    `${history.length} → ${historyPart.length} 条`)
+  check('裁剪后仍以 user 开头（协议安全）', historyPart[0].role === 'user', historyPart[0].role)
+  check('裁剪后保留最近一轮内容',
+    historyPart.some((m) => String(m.content).includes('答案19')),
+    historyPart.at(-1)?.content?.slice?.(0, 12) ?? '')
 }
 
 // 4. 历史以 assistant 开头时要被丢掉（模型对消息顺序很敏感）

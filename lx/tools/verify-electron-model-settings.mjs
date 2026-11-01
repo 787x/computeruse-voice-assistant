@@ -177,11 +177,12 @@ async function main() {
         .filter((s) => serialized.includes(s))
       record('C0b 公开配置不含任何明文 API Key（含 providerTargets/方案/search）',
         leakedSecrets.length === 0, `leaked=${leakedSecrets.join(',')}`)
-      record('C0c 公开配置含目标 Key 掩码与是否有标记',
-        typeof pub.targetKeys?.['mimo|https://api.xiaomimimo.com/v1'] === 'string'
-          && pub.targetKeys['mimo|https://api.xiaomimimo.com/v1'].includes('*')
-          && pub.hasTargetKey?.['mimo|https://api.xiaomimimo.com/v1'] === true,
-        JSON.stringify(pub.targetKeys))
+      record('C0c 公开配置含每个提供商的 Key 掩码与是否有标记',
+        typeof pub.providerKeys?.mimo === 'string'
+          && pub.providerKeys.mimo.includes('*')
+          && pub.hasProviderKey?.mimo === true
+          && pub.hasProviderKey?.deepseek === true,
+        JSON.stringify(pub.providerKeys))
       store.setCryptoHooks(null)
     }
 
@@ -517,8 +518,10 @@ async function main() {
     record('12b 方案换提供商：模型自动换成新推荐值',
       profileSwitch.afterMimo.provider === 'mimo' && profileSwitch.afterMimo.model === 'mimo-v2.6-flash',
       JSON.stringify({ before: profileSwitch.before.model, after: profileSwitch.afterMimo.model }))
-    record('12b2 新提供商（无 Key 目标）不再暗示旧 Key 有效',
-      profileSwitch.afterMimo.keyPlaceholder.includes('未配置') && profileSwitch.afterMimo.keyTitle.includes('尚未保存'),
+    record('12b2 方案换提供商：Key 提示按该提供商判断（换地址不丢 Key）',
+      // 两家都存过 Key（见上面 configState），所以切到 MiMo 也应显示"已保存"——
+      // 这就是"按提供商"的简单语义：换提供商才需要确认 Key，改地址不用
+      profileSwitch.afterMimo.keyPlaceholder.includes('已保存'),
       JSON.stringify({ ph: profileSwitch.afterMimo.keyPlaceholder, title: profileSwitch.afterMimo.keyTitle }))
     record('12b3 切回有 Key 目标时提示已保存',
       profileSwitch.backDs.provider === 'deepseek' && profileSwitch.backDs.keyPlaceholder.includes('已保存'),
@@ -587,6 +590,98 @@ async function main() {
         && !afterRelease.candidates.includes('mimo-v2.6-pro'),
       JSON.stringify({ p: afterRelease.provider, cands: afterRelease.candidates, hint: afterRelease.hint }))
     releaseModels()
+
+    /* ---------------- 16. 下拉框选择不被重绘弹回旧值（本次修的 bug） ---------------- */
+    /*
+     * 复现路径：用户在下拉里选了新值 → 之后任意一次 render（切提供商、改模型、
+     * 拉完模型列表、保存回填）都会重建 <option>，旧实现只按磁盘值恢复，
+     * 于是"刚选的档位弹回旧值"。这里逐个把会触发重绘的动作走一遍，
+     * 断言选择在每一步之后都还是用户选的那个。
+     */
+    await js(win, `(async () => {
+      const p = document.getElementById('provider');
+      p.value = 'deepseek';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 500));
+    })()`)
+    const dropdown = await js(win, `(async () => {
+      const sel = document.getElementById('deepseekEffort');
+      sel.value = 'max';
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 60));
+      const afterChange = sel.value;
+
+      // 触发一次重绘：改模型名（会走 renderReasoning）
+      const m = document.getElementById('model');
+      m.value = 'deepseek-flash';
+      m.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 80));
+      const afterModelChange = document.getElementById('deepseekEffort').value;
+
+      // 再触发一次：刷新模型列表（失败也会重绘提示）
+      document.getElementById('refreshModels').click();
+      await new Promise((r) => setTimeout(r, 500));
+      const afterRefresh = document.getElementById('deepseekEffort').value;
+
+      // 切走再切回同一家（重新取列表 + 重绘）
+      const p = document.getElementById('provider');
+      p.value = 'mimo';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 400));
+      p.value = 'deepseek';
+      p.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 500));
+      const afterRoundTrip = document.getElementById('deepseekEffort').value;
+
+      return { afterChange, afterModelChange, afterRefresh, afterRoundTrip };
+    })()`)
+    record('16a 改下拉后立即保持用户的选择', dropdown.afterChange === 'max', dropdown.afterChange)
+    record('16b 改模型触发的重绘不把选择弹回旧值', dropdown.afterModelChange === 'max', dropdown.afterModelChange)
+    record('16c 刷新模型列表后选择仍在', dropdown.afterRefresh === 'max', dropdown.afterRefresh)
+    record('16d 切走再切回，用户的选择恢复', dropdown.afterRoundTrip === 'max', dropdown.afterRoundTrip)
+
+    // 提交值必须等于用户实际选的那个（不是磁盘里的旧值）
+    const submitted = await js(win, `(async () => {
+      document.getElementById('save').click();
+      await new Promise((r) => setTimeout(r, 500));
+      return null;
+    })()`)
+    void submitted
+    const submittedPayload = savedPayloads.at(-1)
+    record('16e 提交给主进程的推理档位就是用户选的值',
+      submittedPayload?.deepseekReasoningEffort === 'max', submittedPayload?.deepseekReasoningEffort)
+
+    /* ---------------- 17. 上下文预算设置 ---------------- */
+    const contextUi = await js(win, `(() => ({
+      window: document.getElementById('contextWindow').value,
+      percent: document.getElementById('contextPercent').value,
+      hint: document.getElementById('contextHint').textContent,
+    }))()`)
+    record('17a 设置页显示默认 1,000,000 / 90%',
+      contextUi.window === '1000000' && contextUi.percent === '90',
+      `${contextUi.window}/${contextUi.percent}`)
+    record('17b 说明文字给出实际触发阈值（900,000）',
+      contextUi.hint.includes('900,000'), contextUi.hint.slice(0, 60))
+
+    const contextEdited = await js(win, `(async () => {
+      const w = document.getElementById('contextWindow');
+      w.value = '200000';
+      w.dispatchEvent(new Event('input', { bubbles: true }));
+      const p = document.getElementById('contextPercent');
+      p.value = '75';
+      p.dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 60));
+      const hint = document.getElementById('contextHint').textContent;
+      document.getElementById('save').click();
+      await new Promise((r) => setTimeout(r, 500));
+      return { hint };
+    })()`)
+    record('17c 改窗口/百分比后提示跟着重算（200K @ 75% → 150,000）',
+      contextEdited.hint.includes('150,000'), contextEdited.hint.slice(0, 70))
+    const contextPayload = savedPayloads.at(-1)
+    record('17d 上下文设置随保存提交',
+      contextPayload?.contextWindow === 200000 && contextPayload?.contextCompressPercent === 75,
+      `${contextPayload?.contextWindow}/${contextPayload?.contextCompressPercent}`)
 
     clearTimeout(watchdog)
     const failed = results.filter((r) => !r.pass).length

@@ -1,0 +1,443 @@
+/**
+ * 上下文预算验收：**证明压缩真的在 90% 触发**，而不是只检查代码里有阈值。
+ *
+ * 为什么必须这样测：旧实现用的是"最多 10 条消息 / 3,000 字符 / 40,000 字符 / 12 条"，
+ * 这些数字与模型真实容量无关，任何"读一眼代码里的常量"的测试都会通过，
+ * 而用户实际遇到的仍是"才用了 4% 上下文就开始忘事"。
+ *
+ * 这里的做法是：
+ *  1. 用 Mock 端点跑**真实 Agent 回合**，把每一次请求体都记下来；
+ *  2. 用**实际发出的 messages** 反算 token（与实现同一套估算器），
+ *     证明"未达阈值时请求里的历史一条没少"、"达到阈值后确实开始丢历史"；
+ *  3. 压缩后逐条校验协议完整性：tool_calls 与 tool 结果必须成对、
+ *     没有孤立 tool、reasoning_content 要么整条在要么整条不在（绝不截断后继续配对）。
+ *
+ * 全程不联网、不用真实 Key：Mock 服务在 127.0.0.1 上，配置目录是临时目录。
+ *
+ * 用法：node tools/verify-context-budget.mjs
+ */
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const configDir = await mkdtemp(join(tmpdir(), 'cua-context-'))
+process.env.CUA_VA_CONFIG_DIR = configDir
+delete process.env.CUA_VA_API_KEY
+delete process.env.TAVILY_API_KEY
+
+const { startMockServer } = await import('./mock-openai.mjs')
+const { Agent } = await import('../packages/agent/loop.mjs')
+const { LLMClient, profileFromConfig } = await import('../packages/agent/llm.mjs')
+const context = await import('../packages/agent/context.mjs')
+const store = await import('../packages/config/store.mjs')
+const registry = await import('../packages/config/registry.mjs')
+
+const results = []
+function check(name, pass, detail = '') {
+  results.push({ name, pass: pass === true, detail })
+  const mark = pass === true ? '✓' : '✗'
+  console.log(`${mark} ${name}${detail === '' ? '' : `\t${typeof detail === 'string' ? detail : JSON.stringify(detail)}`}`)
+}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 起一个 Mock，回调里能拿到每次请求体 */
+async function withMock(handler, run) {
+  const mock = await startMockServer({ port: 0, handler })
+  try {
+    return await run(mock)
+  } finally {
+    await sleep(20)
+    mock.server.close()
+  }
+}
+
+// ============================================================ 0 默认值与策略
+
+{
+  const def = registry.defaultConfig()
+  check('K1 默认上下文窗口 1,000,000 tokens', def.contextWindow === 1_000_000, def.contextWindow)
+  check('K2 默认压缩触发点 90%', def.contextCompressPercent === 90, def.contextCompressPercent)
+
+  const policy = context.resolveContextPolicy({})
+  check('K3 默认触发阈值 = 900,000 tokens',
+    policy.contextWindow === 1_000_000 && policy.compressAtTokens === 900_000,
+    `${policy.contextWindow}/${policy.compressAtTokens}`)
+  check('K4 预留输出空间（输入硬上限 < 窗口）',
+    policy.hardLimitTokens < policy.contextWindow && policy.hardLimitTokens > 900_000,
+    `${policy.hardLimitTokens} (reserve=${policy.outputReserve})`)
+  check('K5 压缩目标低于触发点（压完能继续跑几步）',
+    policy.targetTokens < policy.compressAtTokens, `${policy.targetTokens} < ${policy.compressAtTokens}`)
+
+  // 模型有更小窗口时按模型实际容量算
+  const small = context.resolveContextPolicy({ contextWindow: 1_000_000, modelContextWindow: 128_000 })
+  check('K6 模型窗口更小时按模型算（128K → 触发 115.2K）',
+    small.contextWindow === 128_000 && small.compressAtTokens === 115_200, JSON.stringify(small))
+  const userSmaller = context.resolveContextPolicy({ contextWindow: 200_000, modelContextWindow: 1_000_000 })
+  check('K7 用户设了更小窗口时以用户为准（元数据不能放宽）',
+    userSmaller.contextWindow === 200_000, userSmaller.contextWindow)
+  const custom = context.resolveContextPolicy({ contextWindow: 100_000, compressPercent: 50 })
+  check('K8 百分比可自定义（100K @ 50% → 50K 触发）',
+    custom.compressAtTokens === 50_000, custom.compressAtTokens)
+
+  // 注册表里 local 端点声明 32K（可信的明确不同容量）
+  const localPolicy = store.resolveContextPolicyFor({ providerId: 'local', contextWindow: 1_000_000, contextCompressPercent: 90 })
+  check('K9 本地 llama.cpp 按 32K 实际窗口算 90%',
+    localPolicy.contextWindow === 32_768, localPolicy.contextWindow)
+  const mimoPolicy = store.resolveContextPolicyFor({ providerId: 'mimo', contextWindow: 1_000_000, contextCompressPercent: 90 })
+  check('K10 MiMo 官方端点按 1M 算', mimoPolicy.contextWindow === 1_000_000, mimoPolicy.contextWindow)
+  const unknownPolicy = store.resolveContextPolicyFor({ providerId: 'openai-compatible', contextWindow: 1_000_000 })
+  check('K11 未知模型默认按 1M 处理', unknownPolicy.contextWindow === 1_000_000, unknownPolicy.contextWindow)
+}
+
+// ============================================================ 1 估算器：字符数 ≠ tokens
+
+{
+  const cjk = context.estimateTextTokens('你好世界')
+  const ascii = context.estimateTextTokens('hello world')
+  check('K12 中文按 ~1 token/字', cjk === 4, cjk)
+  check('K13 英文按 ~4 字符/token（不是 1 字符 = 1 token）',
+    ascii === 3, ascii)
+  const long = '这是一段比较长的中文，用来确认估算器不会把字符数直接当 token 数。'.repeat(20)
+  const estimated = context.estimateTextTokens(long)
+  check('K14 长文本估算远小于字符数（没把字符数当 token）',
+    estimated < long.length && estimated > long.length * 0.5,
+    `chars=${long.length} tokens=${estimated}`)
+
+  // 图片按分辨率（瓦片）而不是文件大小
+  const imgSmall = context.estimateImageTokens([{ type: 'image_url', image_url: { url: `data:image/png;base64,${'A'.repeat(1000)}` } }])
+  const imgWithDims = context.estimateImageTokens([
+    { type: 'text', text: '（这是 screenshot 刚返回的图，1280x720）' },
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${'A'.repeat(1000)}` } },
+  ])
+  check('K15 图片按分辨率计价（1280x720 → 多瓦片）',
+    imgWithDims > 85 && imgWithDims > imgSmall, `small=${imgSmall} dims=${imgWithDims}`)
+  check('K16 图片不会被当成几十万 token（不是按 base64 字符数算）',
+    imgWithDims < 2000, imgWithDims)
+
+  // 工具定义计入预算
+  const tools = [{ type: 'function', function: { name: 'screenshot', description: '截屏', parameters: { type: 'object', properties: { x: { type: 'number' } } } } }]
+  const toolTokens = context.estimateToolsTokens(tools)
+  check('K17 工具定义计入 token 预算', toolTokens > 10, toolTokens)
+}
+
+// ============================================================ 2 低于 90% 不压缩（真跑回合）
+
+/**
+ * 造一段"很长但离 90% 还很远"的历史：默认 1M 窗口下，
+ * 30 个用户回合 × 约 2K tokens ≈ 6 万 tokens，只有 6%。
+ * 旧实现（10 条消息 / 3,000 字符）在这种历史下会砍到只剩最后两条。
+ */
+function makeHistory(turns, charsPerTurn) {
+  const history = []
+  for (let i = 1; i <= turns; i += 1) {
+    history.push({ role: 'user', content: `第 ${i} 个问题：${'问'.repeat(charsPerTurn)}` })
+    history.push({ role: 'assistant', content: `第 ${i} 个回答：${'答'.repeat(charsPerTurn)}` })
+  }
+  return history
+}
+
+{
+  const bodies = []
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    return { sse: [{ choices: [{ index: 0, delta: { content: '收到' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({
+      baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash',
+      profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }),
+    })
+    const agent = new Agent({ llm: client, tools: { listTools: () => [], invoke: async () => ({ text: '' }) }, maxSteps: 2 })
+    const history = makeHistory(30, 2000)
+    const before = context.estimateRequestTokens({ messages: history })
+    await agent.run('最后再问一句', { history })
+    const sent = bodies[0].messages
+    // system + 30 轮历史 + 本轮 user
+    const historyMessages = sent.filter((m) => m.role !== 'system')
+    check('K18 远低于 90%（约 6%）时历史一条不丢',
+      historyMessages.length === history.length + 1,
+      `sent=${historyMessages.length} expect=${history.length + 1} tokens≈${before}`)
+    check('K19 第一条历史仍是最早那一轮（没有被从头部砍掉）',
+      historyMessages[0].content === history[0].content,
+      String(historyMessages[0]?.content ?? '').slice(0, 20))
+    check('K20 本轮 user 在最后（顺序没被打乱）',
+      historyMessages.at(-1).content === '最后再问一句',
+      historyMessages.at(-1)?.content)
+  })
+}
+
+// 旧阈值下必然被砍的场景：超过 12 条消息、超过 40,000 字符
+{
+  const bodies = []
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    return { sse: [{ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({
+      baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash',
+      profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }),
+    })
+    const agent = new Agent({ llm: client, tools: { listTools: () => [], invoke: async () => ({ text: '' }) }, maxSteps: 2 })
+    // 20 轮 × 3,000 字 = 60,000 字符（旧实现的两道阈值都会触发）
+    const history = makeHistory(20, 3000)
+    const chars = history.reduce((sum, m) => sum + m.content.length, 0)
+    const tokens = context.estimateRequestTokens({ messages: history })
+    await agent.run('继续', { history })
+    const sent = bodies[0].messages.filter((m) => m.role !== 'system')
+    check('K21 超过旧的 3,000 字符 / 40,000 字符 / 12 条阈值也不提前压缩',
+      sent.length === history.length + 1,
+      `chars=${chars} tokens≈${tokens}（占 1M 的 ${(tokens / 1e6 * 100).toFixed(1)}%）sent=${sent.length}`)
+  })
+}
+
+// ============================================================ 3 达到 90% 必须真的压缩
+
+{
+  const bodies = []
+  let call = 0
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    call += 1
+    // 每步返回一大段工具结果与思考，让上下文快速膨胀
+    if (call <= 3) {
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { reasoning_content: `第${call}步思考。${'想'.repeat(200)}` } }] },
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `t${call}`, function: { name: 'scroll', arguments: '{"n":1}' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+        ],
+      }
+    }
+    return { sse: [{ choices: [{ index: 0, delta: { content: '完成' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({
+      baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash',
+      profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }),
+    })
+    /*
+     * 用**小窗口**触发压缩：窗口 8,000 tokens、90% → 7,200 就压。
+     * 这样一条 3,000 字的历史（≈3,000 tokens）× 4 轮就够撞线，
+     * 又不必真的造 90 万 token 的请求（那要跑几十秒）。
+     * 阈值本身来自同一个 resolveContextPolicy，所以"90%"这个比例是被真实验证的。
+     */
+    const policy = context.resolveContextPolicy({ contextWindow: 8_000, compressPercent: 90 })
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [], invoke: async () => ({ text: '滚动结果'.repeat(300) }) },
+      maxSteps: 6,
+      contextPolicy: policy,
+    })
+    const history = makeHistory(6, 1200)
+    const before = context.estimateRequestTokens({ messages: history })
+    const result = await agent.run('把页面滚到底', { history })
+    const firstSent = bodies[0].messages
+    const lastSent = bodies.at(-1).messages
+    const firstTokens = context.estimateRequestTokens({ messages: firstSent })
+    const lastTokens = context.estimateRequestTokens({ messages: lastSent })
+
+    check('K22 构造的历史确实超过了触发阈值（否则这条测试没意义）',
+      before > policy.compressAtTokens,
+      `history≈${before} > trigger=${policy.compressAtTokens}`)
+    // 第一次请求就已经把超预算的历史压掉了（历史本身 17 条 → 请求里只剩少数几条）
+    check('K23 压缩真的发生了：第一次请求的历史就比传入的短',
+      firstSent.length < history.length + 2,
+      `${history.length + 2} → ${firstSent.length} msgs`)
+    check('K23b 压缩后回到预算内（≤ 触发阈值）',
+      firstTokens <= policy.compressAtTokens,
+      `${firstTokens} <= ${policy.compressAtTokens}`)
+    check('K24 压缩后回到预算内（≤ 触发阈值）',
+      lastTokens <= policy.compressAtTokens,
+      `${lastTokens} <= ${policy.compressAtTokens}`)
+    check('K25 压缩保留了当前用户目标',
+      lastSent.some((m) => m.role === 'user' && m.content === '把页面滚到底'),
+      JSON.stringify(lastSent.filter((m) => m.role === 'user').map((m) => String(m.content).slice(0, 12))))
+    check('K26 压缩保留了 system（自定义提示词不会被压掉）',
+      lastSent[0].role === 'system' && lastSent.filter((m) => m.role === 'system').length === 1,
+      lastSent[0]?.role)
+    check('K27 被折叠的早期目标有摘要，模型不会"忘了原本要干什么"',
+      lastSent.some((m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('已折叠')),
+      lastSent.filter((m) => m.role === 'user').map((m) => String(m.content).slice(0, 24)))
+
+    // 协议完整性：整条请求序列里 tool_calls 与 tool 结果必须严格成对
+    const problems = []
+    for (const [index, message] of lastSent.entries()) {
+      if (message.role === 'tool') {
+        const declared = new Set()
+        for (const prev of lastSent.slice(0, index)) {
+          if (prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
+            for (const c of prev.tool_calls) declared.add(String(c.id))
+          }
+        }
+        if (!declared.has(String(message.tool_call_id))) problems.push(`孤立 tool@${index}`)
+      }
+      if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+        const later = lastSent.slice(index + 1)
+        for (const c of message.tool_calls) {
+          if (!later.some((m) => m.role === 'tool' && String(m.tool_call_id) === String(c.id))) {
+            problems.push(`缺结果的 tool_calls ${c.id}@${index}`)
+          }
+        }
+      }
+    }
+    check('K28 压缩后没有孤立 tool / 缺结果的 tool_calls', problems.length === 0, problems.join(','))
+    // reasoning 只允许整条在或整条不在
+    const truncated = lastSent.filter((m) => m.role === 'assistant' && typeof m.reasoning_content === 'string'
+      && m.reasoning_content.endsWith('…'))
+    check('K29 reasoning_content 绝不被截断后继续配对', truncated.length === 0, truncated.length)
+    check('K30 回合正常收尾（压缩没把任务打断）', result.text.includes('完成'), result.text)
+  })
+}
+
+// ============================================================ 4 接近硬上限时的处理
+
+{
+  const messages = []
+  messages.push({ role: 'system', content: '系统提示词' })
+  for (let i = 1; i <= 40; i += 1) {
+    messages.push({ role: 'user', content: `目标 ${i}：${'做'.repeat(500)}` })
+    messages.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: `c${i}`, type: 'function', function: { name: 'scroll', arguments: '{"n":1}' } }],
+      reasoning_content: `第 ${i} 步的完整思考`.repeat(40),
+    })
+    messages.push({ role: 'tool', tool_call_id: `c${i}`, content: '结果'.repeat(200) })
+  }
+  messages.push({ role: 'user', content: '最后的目标' })
+  const policy = context.resolveContextPolicy({ contextWindow: 20_000, compressPercent: 90 })
+  const before = context.estimateRequestTokens({ messages })
+  const outcome = context.compressMessages(messages, policy, { tools: [] })
+  const after = context.estimateRequestTokens({ messages })
+  check('K31 超过触发点时压缩生效', outcome.compressed === true && after < before, `${before} → ${after}`)
+  check('K32 压缩后不超过模型硬上限', after <= policy.hardLimitTokens, `${after} <= ${policy.hardLimitTokens}`)
+  check('K33 system 仍在头部', messages[0].role === 'system', messages[0]?.role)
+  check('K34 当前用户目标保留', messages.some((m) => m.role === 'user' && m.content === '最后的目标'))
+
+  // 单轮自身就超大：只允许截短用户目标文本，绝不截断 reasoning
+  const huge = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: '目标'.repeat(5000) },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'z', type: 'function', function: { name: 'x', arguments: '{}' } }], reasoning_content: '思'.repeat(20000) },
+    { role: 'tool', tool_call_id: 'z', content: '果'.repeat(20000) },
+  ]
+  const tiny = context.resolveContextPolicy({ contextWindow: 5_000, compressPercent: 90 })
+  context.compressMessages(huge, tiny, { tools: [] })
+  const reasoningKept = huge.find((m) => m.role === 'assistant')?.reasoning_content ?? ''
+  check('K35 单轮超大时 reasoning 整条保留（不截断）',
+    reasoningKept.length === 20000, reasoningKept.length)
+  check('K36 单轮超大时工具配对仍完整（tool_calls 与 tool 同时存在）',
+    huge.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))
+      === huge.some((m) => m.role === 'tool'),
+    JSON.stringify(huge.map((m) => m.role)))
+}
+
+// ============================================================ 5 会话历史跨回合
+
+{
+  const history = []
+  for (let i = 1; i <= 50; i += 1) {
+    history.push({ role: 'user', content: `问题 ${i}：${'问'.repeat(300)}` })
+    history.push({ role: 'assistant', content: `回答 ${i}：${'答'.repeat(300)}` })
+  }
+  const policy = context.resolveContextPolicy({ contextWindow: 1_000_000, compressPercent: 90 })
+  const kept = context.compressHistory(history, policy)
+  check('K37 低于 90% 的跨回合历史原样保留',
+    kept.length === history.length, `${kept.length}/${history.length}`)
+  check('K38 原历史未被就地修改（返回新数组）',
+    history.length === 100 && history[0].content.startsWith('问题 1'),
+    `${history.length}`)
+
+  // 真超预算时按完整单元裁剪
+  const bigPolicy = context.resolveContextPolicy({ contextWindow: 12_000, compressPercent: 90 })
+  const trimmed = context.compressHistory(history, bigPolicy)
+  // 折叠摘要是一条额外的 user 消息，所以 user 比 assistant 多一条是预期的
+  const userCount = trimmed.filter((m) => m.role === 'user').length
+  const assistantCount = trimmed.filter((m) => m.role === 'assistant').length
+  check('K39 超预算时按完整单元裁剪（user/assistant 成对，不会只剩半条）',
+    trimmed.length < history.length && trimmed.length > 0
+      && (userCount === assistantCount || userCount === assistantCount + 1),
+    `${history.length} → ${trimmed.length} (user=${userCount} assistant=${assistantCount})`)
+  check('K40 裁剪保留的是最近的目标（不是最早的）',
+    trimmed.some((m) => m.role === 'user' && String(m.content).startsWith('问题 50')),
+    trimmed.filter((m) => m.role === 'user').map((m) => String(m.content).slice(0, 6)))
+}
+
+// ============================================================ 6 与 store / 设置联动
+
+{
+  await store.saveConfig({ providerId: 'mimo', contextWindow: 250_000, contextCompressPercent: 80 })
+  const config = await store.loadConfig()
+  check('K41 上下文窗口可保存', config.contextWindow === 250_000, config.contextWindow)
+  check('K42 压缩百分比可保存', config.contextCompressPercent === 80, config.contextCompressPercent)
+  const policy = store.resolveContextPolicyFor(config)
+  check('K43 自定义窗口与百分比一起生效（250K @ 80% → 200K 触发）',
+    policy.compressAtTokens === 200_000, policy.compressAtTokens)
+
+  // 保存无关设置不得重置这两个值
+  await store.saveConfig({ temperature: 0.5 })
+  const after = await store.loadConfig()
+  check('K44 保存其它设置不会重置上下文设置',
+    after.contextWindow === 250_000 && after.contextCompressPercent === 80,
+    `${after.contextWindow}/${after.contextCompressPercent}`)
+
+  // 显式给非法值（0 / 空 / 非数字）→ 回默认 1M / 90%，绝不清成 0
+  await store.saveConfig({ contextWindow: 0, contextCompressPercent: 0 })
+  const fallback = await store.loadConfig()
+  check('K45 显式非法值回退默认（不会把窗口清成 0）',
+    fallback.contextWindow === 1_000_000 && fallback.contextCompressPercent === 90,
+    `${fallback.contextWindow}/${fallback.contextCompressPercent}`)
+  check('K45b 全新配置默认 1M / 90%（不是 0 或 undefined）',
+    registry.defaultConfig().contextWindow === 1_000_000 && registry.defaultConfig().contextCompressPercent === 90,
+    `${registry.defaultConfig().contextWindow}/${registry.defaultConfig().contextCompressPercent}`)
+  await store.saveConfig({ contextCompressPercent: 150 })
+  check('K46 百分比上限 99（不允许"永不压缩"）',
+    (await store.loadConfig()).contextCompressPercent === 99,
+    (await store.loadConfig()).contextCompressPercent)
+
+  // 公开配置要带上这两个字段（设置页回显）
+  await store.saveConfig({ contextWindow: 1_000_000, contextCompressPercent: 90 })
+  const pub = await store.loadPublicConfig()
+  check('K47 设置页能读到上下文设置',
+    pub.contextWindow === 1_000_000 && pub.contextCompressPercent === 90,
+    `${pub.contextWindow}/${pub.contextCompressPercent}`)
+}
+
+// ============================================================ 7 历史清理不影响协议（Agent 层）
+
+{
+  const bodies = []
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    return { sse: [{ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({
+      baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash',
+      profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash', mimoThinking: 'enabled' }),
+    })
+    const agent = new Agent({ llm: client, tools: { listTools: () => [], invoke: async () => ({ text: '' }) }, maxSteps: 2 })
+    // 完整单元（带配对工具结果 + reasoning）+ 残缺单元（缺结果）
+    const history = [
+      { role: 'user', content: '完整问' },
+      { role: 'assistant', content: '完整答', tool_calls: [{ id: 'a1', type: 'function', function: { name: 'x', arguments: '{}' } }], reasoning_content: '完整的思考' },
+      { role: 'tool', tool_call_id: 'a1', content: '完整结果' },
+      { role: 'user', content: '残缺问' },
+      { role: 'assistant', content: '残缺答', tool_calls: [{ id: 'a2', type: 'function', function: { name: 'y', arguments: '{}' } }], reasoning_content: '残缺思考' },
+    ]
+    await agent.run('新问题', { history })
+    const sent = bodies[0].messages
+    check('K48 完整单元的工具链与 reasoning 保留',
+      sent.some((m) => m.role === 'assistant' && typeof m.reasoning_content === 'string' && m.reasoning_content === '完整的思考')
+        && sent.some((m) => m.role === 'tool' && m.tool_call_id === 'a1'),
+      JSON.stringify(sent.map((m) => m.role)))
+    check('K49 残缺单元的 tool_calls 被整体剔除（不留孤立调用）',
+      !sent.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => c.id === 'a2')),
+      JSON.stringify(sent.filter((m) => m.role === 'assistant').map((m) => m.tool_calls?.map((c) => c.id))))
+  })
+}
+
+// ============================================================ 汇总
+
+const failed = results.filter((r) => !r.pass)
+console.log('='.repeat(72))
+console.log(JSON.stringify({ suite: 'context budget (90% of 1M)', cases: results.length, failed: failed.length, failedNames: failed.map((r) => r.name) }))
+console.log(failed.length === 0 ? '判定：全部通过' : '判定：存在未通过项')
+process.exit(failed.length === 0 ? 0 : 1)

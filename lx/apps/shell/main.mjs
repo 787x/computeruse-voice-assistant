@@ -26,6 +26,7 @@ import { DEFAULT_WAKE_WORD } from '../../packages/voice/keywords.mjs'
 import { resolveModel } from '../../packages/config/schedule.mjs'
 import { profileFromConfig, LLMClient } from '../../packages/agent/llm.mjs'
 import { buildReasoningMeta } from '../../packages/agent/ll-params.mjs'
+import { compressHistory, resolveContextPolicy } from '../../packages/agent/context.mjs'
 import { getProvider, defaultModelFor, PROVIDERS } from '../../packages/config/registry.mjs'
 import { modelCacheKey } from '../../packages/config/model-discovery.mjs'
 import { LAUNCH_APP_TOOL } from '../../packages/tools/app-launch.mjs'
@@ -645,14 +646,16 @@ if (!manual && ((settingsWin !== null && !settingsWin.isDestroyed() && settingsW
 
 // ---------------------------------------------------------------- 会话记忆
 
-/** 会话条数上限（一轮 = user + assistant 两条） */
-const SESSION_MAX_TURNS = 6
-
 /**
  * 开始一段新会话。
  *
  * 触发点：唤醒、关麦。为什么要清：用户按下唤醒词的意思是"这事儿重新说"，
  * 而不是"接着上一件事"；留着旧记忆会让"帮我打开浏览器"变成"再开一个"。
+ *
+ * 注意这里是**整个会话**的生命周期，不是"永久记忆"：
+ * 唤醒 → 对话（可含多轮追问与几十步 CUA）→ 关麦/再唤醒时清空。
+ * 会话内部的长度由 token 预算管理（见 trimSessionHistory），
+ * 不再有"最多 6 轮"这种与模型容量无关的硬上限。
  */
 function resetSession(reason) {
   if (sessionHistory.length > 0) log(`session reset (${reason}), dropped ${sessionHistory.length} msgs`)
@@ -662,14 +665,11 @@ function resetSession(reason) {
 /**
  * 记下一轮对话：把 `Agent.run` 返回的**本轮增量** `result.turn` 追加到会话历史。
  *
- * 为什么是增量而不是全量：`Agent.run` 的 messages 是「旧历史(trimHistory 后) + 本轮」，
+ * 为什么是增量而不是全量：`Agent.run` 的 messages 是「旧历史(整理后) + 本轮」，
  * 若把整段 conversation 再 push 一次，旧历史就会重复。现在 Agent 只回 `turn`
  * （本轮 user + assistant + tool + 截图），这里直接追加即得到不重复的完整历史。
  *
  * 只在内存里保留，不落盘、不打日志、不进字幕/TTS（推理内容不默认持久化）。
- *
- * 裁剪按**真实用户回合**数量管理：单轮长工具任务会生成几十条内部消息，
- * 不能因消息数超过 `SESSION_MAX_TURNS * 4` 就把仅有的最新用户回合一起删除。
  */
 function rememberTurn(userText, resultOrText, toolNames = []) {
   if (resultOrText !== null && typeof resultOrText === 'object' && Array.isArray(resultOrText.turn)) {
@@ -684,23 +684,31 @@ function rememberTurn(userText, resultOrText, toolNames = []) {
 }
 
 /**
- * 会话历史裁剪：按「真实用户回合」计数（普通文本 user 消息才算一轮），
- * 保留最多 SESSION_MAX_TURNS 轮；对超出的最老轮次，按完整交互单元整体删除。
- * 工具消息（assistant tool_calls / tool 结果 / 截图 user）不计入轮次，绝不被误删。
+ * 会话历史整理：**按 token 预算**（默认 1M 窗口、到 90% 才动手）。
+ *
+ * 以前这里按"最多 6 个用户回合"删历史，长时间 CUA 任务做到一半就会被砍掉
+ * 前面几步的结论；而 6 轮对 1M 窗口来说连 1% 都用不到。
+ * 现在统一交给 agent/context.mjs：低于阈值原样保留，到了才按**完整片段**
+ * 从最老的开始整体移除（tool_calls 与结果始终配对，reasoning 不截断）。
  */
 function trimSessionHistory() {
-  const userIndexes = []
-  for (let i = 0; i < sessionHistory.length; i += 1) {
-    if (sessionHistory[i].role === 'user' && typeof sessionHistory[i].content === 'string') userIndexes.push(i)
+  if (sessionHistory.length === 0) return
+  try {
+    const policy = currentContextPolicy()
+    const before = sessionHistory.length
+    const next = compressHistory(sessionHistory, policy)
+    if (next.length !== before) {
+      sessionHistory = next
+      log(`session history compressed: ${before} → ${next.length} msgs (budget ${policy.compressAtTokens}/${policy.contextWindow} tokens)`)
+    }
+  } catch (error) {
+    log(`session history compression failed: ${error.message}`)
   }
-  while (userIndexes.length > SESSION_MAX_TURNS) {
-    // 删除最老一个完整用户回合：该 user 起，直到下一个 user 前
-    const start = userIndexes.shift()
-    const end = userIndexes.length > 0 ? userIndexes[0] : sessionHistory.length
-    sessionHistory.splice(start, end - start)
-    // 删除后索引前移，重新对剩余 user 索引修正
-    for (let i = 0; i < userIndexes.length; i += 1) userIndexes[i] -= end - start
-  }
+}
+
+/** 当前生效的上下文预算（来自配置；模型有更小窗口时按模型算） */
+function currentContextPolicy() {
+  return agentRuntime?.contextPolicy ?? resolveContextPolicy({})
 }
 
 // ---------------------------------------------------------------- 识别（ASR）
@@ -1886,12 +1894,18 @@ async function ensureAgent(signal) {
      * 缓存里这套端点的"出处"要记清楚：定时切换与保存设置都按 profileId 判断
      * 该不该换整套端点（含 Key）。apiKey 单独存一份是为了切回默认时能拿回来。
      */
+    /*
+     * 上下文预算：默认 1M 窗口、到 90% 才压缩（见 packages/agent/context.mjs）。
+     * 模型有更小窗口时按模型实际容量算，未知模型按 1M。
+     */
+    const contextPolicy = store.resolveContextPolicyFor(config)
     const agent = new loopModule.Agent({
       llm,
       tools,
       // 提示词按"当前配置"取，而不是初始化时定死：改设置不需要重建 Agent
       systemPrompt: () => agentSystemPrompt,
       maxSteps: config.maxSteps,
+      contextPolicy,
       onEvent: handleAgentEvent,
       // 所有工具调用都要过权限门，拒绝时把原因回填给模型（它会改用别的办法或告诉用户）
       gate: async ({ tool, args, signal }) => {
@@ -1918,7 +1932,7 @@ async function ensureAgent(signal) {
     })
 
     checkpoint()
-    return { agent, toolkit, config, webSearch, llm, apiKey, readyMs: Date.now() - startedAt }
+    return { agent, toolkit, config, webSearch, llm, apiKey, contextPolicy, readyMs: Date.now() - startedAt }
   })
   signal?.throwIfAborted()
   if (shuttingDown) throw new DOMException('Application exiting', 'AbortError')
@@ -1967,6 +1981,8 @@ function endpointSignature(config) {
     mimoThinking: config?.mimoThinking,
     deepseekReasoningEffort: config?.deepseekReasoningEffort,
     providerHint: config?.providerHint,
+    contextWindow: config?.contextWindow,
+    contextCompressPercent: config?.contextCompressPercent,
     modelSchedule: config?.modelSchedule,
     modelProfiles: (config?.modelProfiles ?? []).map((p) => ({
       id: p?.id, name: p?.name, providerId: p?.providerId, baseURL: p?.baseURL, model: p?.model,
@@ -2495,6 +2511,18 @@ function applyModelSchedule(reason) {
       llm.setEndpoint({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model: target })
     }
     llm.setProfile(profileFromConfig({ ...endpoint, model: target }))
+    /*
+     * 上下文预算也跟着端点走：定时切到本地 32K 模型后，仍按 1M 窗口算 90%
+     * 就会把远超模型容量的请求硬发过去。切回官方端点时再按 1M 恢复。
+     */
+    const providerWindow = getProvider(String(endpoint.providerId ?? '').trim())?.contextWindow
+    const scheduleContext = resolveContextPolicy({
+      contextWindow: config.contextWindow,
+      compressPercent: config.contextCompressPercent,
+      modelContextWindow: Number.isFinite(Number(providerWindow)) && Number(providerWindow) > 0 ? Number(providerWindow) : null,
+    })
+    agentRuntime.contextPolicy = scheduleContext
+    if (agentRuntime.agent?.setContextPolicy !== undefined) agentRuntime.agent.setContextPolicy(scheduleContext)
     lastAppliedProfileId = decisionKey
 
     const rule = decided.rule
@@ -2531,7 +2559,8 @@ function syncAgentSystemPrompt(config) {
 function touchesModelSettings(payload) {
   if (payload === null || typeof payload !== 'object') return false
   for (const key of ['providerId', 'baseURL', 'model', 'apiKey', 'temperature',
-    'mimoThinking', 'deepseekReasoningEffort', 'providerHint', 'timeoutMs', 'modelProfiles', 'maxSteps']) {
+    'mimoThinking', 'deepseekReasoningEffort', 'providerHint', 'timeoutMs', 'modelProfiles', 'maxSteps',
+    'contextWindow', 'contextCompressPercent']) {
     if (payload[key] !== undefined) return true
   }
   return false
@@ -2552,18 +2581,26 @@ async function syncAgentEndpoint(store, preloaded) {
   agentRuntime.config = config
   const apiKey = await store.resolveApiKey()
   agentRuntime.apiKey = apiKey
+  /*
+   * 上下文预算跟着配置走：窗口/触发点改了，**下一轮**就用新的。
+   * 正在跑的回合用它开始时的快照（见 Agent.run 的 policy），不会被中途换尺度。
+   */
+  const contextPolicy = store.resolveContextPolicyFor(config)
+  agentRuntime.contextPolicy = contextPolicy
   const llm = agentRuntime.llm
   if (llm === undefined) return
   llm.setEndpoint({ baseURL: config.baseURL, apiKey, model: config.model })
   llm.setProfile(profileFromConfig(config))
   llm.setTemperature(config.temperature)
   if (Number.isFinite(Number(config.timeoutMs)) && Number(config.timeoutMs) > 0) llm.setTimeout(config.timeoutMs)
-  // 步数上限：下一轮生效（正在跑的回合用它开始时的快照）
+  // 步数上限与上下文预算：下一轮生效（正在跑的回合用它开始时的快照）
   if (agentRuntime.agent?.setMaxSteps !== undefined) agentRuntime.agent.setMaxSteps(config.maxSteps)
+  if (agentRuntime.agent?.setContextPolicy !== undefined) agentRuntime.agent.setContextPolicy(contextPolicy)
   // 方案/规则可能在本次保存里改了：重算一次，让"此刻该用哪套"和磁盘一致
   lastAppliedProfileId = null
   applyModelSchedule('settings-model')
-  log(`model runtime synced: ${config.providerId} @ ${config.baseURL} model=${config.model} thinking=${config.mimoThinking} effort=${config.deepseekReasoningEffort}`)
+  log(`model runtime synced: ${config.providerId} @ ${config.baseURL} model=${config.model} thinking=${config.mimoThinking} effort=${config.deepseekReasoningEffort}`
+    + ` context=${contextPolicy.contextWindow}@${contextPolicy.compressPercent}%`)
 }
 
 /** 从配置文件读界面开关（以前这些只活在内存里，重启就丢） */
@@ -2754,7 +2791,7 @@ function registerSettingsIpc() {
     const typedKey = typeof payload?.apiKey === 'string' && payload.apiKey.trim() !== '' && !payload.apiKey.includes('*')
       ? payload.apiKey.trim() : ''
     // 按真实认证目标（providerId + baseURL）取 Key：否则换地址后仍会拿旧地址的 Key
-    const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(providerId, { config: stored, baseURL }).catch(() => '')
+    const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(providerId, { config: stored }).catch(() => '')
     return await discovery.fetchChatModels({
       providerId,
       baseURL,
@@ -2914,7 +2951,7 @@ function registerSettingsIpc() {
       // 测试必须用**那一家 + 该地址**对应的 Key（认证目标隔离）：
       // 用当前生效的 Key 去打它，结果只会是假的 401（或假的成功）。
       const apiKey = typedKey !== '' ? typedKey
-        : await store.resolveApiKeyFor(targetProviderId, { config: stored, baseURL: mergedBaseURL })
+        : await store.resolveApiKeyFor(targetProviderId, { config: stored })
       if (!apiKey) return { ok: false, error: '还没配置该提供商的 API Key' }
       const merged = {
         ...stored,
