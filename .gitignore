@@ -30,3 +30,6 @@ tmp/
 # Electron 壳运行期产物
 apps/shell/shell.log
 tools/__pycache__/
+
+# Rust 新版（PR5）构建产物
+rust/target/
