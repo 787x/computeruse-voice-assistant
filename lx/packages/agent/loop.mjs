@@ -59,14 +59,15 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
   /** 当前单元的 assistant 声明的 tool_call ids */
   let pendingIds = new Set()
   for (const msg of messages) {
-    if (msg.role === 'user') {
+    if (msg.role === 'user' && typeof msg.content === 'string') {
+      // 真正的用户指令：开启新单元
       if (current !== null) { units.push(current); current = null }
       current = { head: msg, calls: [] }
       pendingIds = new Set()
       continue
     }
     if (current === null) {
-      // 遇到 user 之前出现 assistant/tool：残缺开头，跳过（不以这一条开始）
+      // 遇到 user 之前出现 assistant/tool/截图：残缺开头，跳过（不以这一条开始）
       continue
     }
     if (msg.role === 'assistant') {
@@ -88,6 +89,11 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
         current = null
         pendingIds = new Set()
       }
+      continue
+    }
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      // 工具返回的截图附件：归入当前单元（不开启新用户回合）
+      current.calls.push(msg)
       continue
     }
     // 其它角色（system 等）不属于交互单元，忽略
@@ -112,29 +118,33 @@ function trimHistory(history, { providerCapability = '', providerId = '' } = {})
     return true
   })
 
-  // 3) 跨提供商：旧提供商的工具链（assistant tool_calls + 配对 tool 结果）是
-  //    私有协议上下文，发给新端点既不兼容也没意义；只保留纯文本(user/assistant content)单元。
-  //    判断依据：单元内**任一**消息的 `_providerId` 与当前 providerId 不同 → 该单元属于旧家。
-  //    无标记（老会话/外部构造）视为当前提供商，保留完整内容。
-  const providersDiffer = providerId !== ''
+  // 3) 跨提供商：旧提供商的工具链（assistant tool_calls + 配对 tool 结果 + 截图附件）是
+//    私有协议上下文，发给新端点既不兼容也没意义。
+//    但**普通对话记忆要保留**：旧单元里的用户问题与纯文本 assistant 最终回复
+//    （content 字符串的 assistant，没有 tool_calls）仍可安全发给新提供商。
+//    判断依据：单元内**任一**消息的 `_providerId` 与当前 providerId 不同 → 该单元属于旧家。
+//    无标记（老会话/外部构造）视为当前提供商，保留完整内容。
+const providersDiffer = providerId !== ''
     ? (unit) => {
         const all = [unit.head, ...unit.calls]
         return all.some((m) => m._providerId !== undefined && String(m._providerId) !== String(providerId))
       }
     : () => false
-  const compatible = complete.filter((unit) => {
+const compatible = complete
+  .filter((unit) => {
     if (!providersDiffer(unit)) return true
-    // 旧提供商单元：含工具链的整组剔除；纯文本单元剥掉 reasoning 后保留
-    const hasToolchain = unit.calls.some((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))
-      || unit.calls.some((m) => m.role === 'tool')
-    return !hasToolchain
+    // 旧提供商单元：只保留「用户问题 + 纯文本回复」，工具链与截图整段去除
+    const plain = unit.calls.filter((m) => m.role === 'assistant' && !Array.isArray(m.tool_calls))
+    unit.calls = plain
+    // 至少要有内容可保留（用户问题 + 纯文本回复），否则整段丢弃
+    return unit.calls.length > 0
   })
-  // 兼容性过滤后统一处理 reasoning_content：
-  //  - 旧提供商的纯文本单元（providersDiffer）必然剥掉；
-  //  - 当前端点不要求回传（非 MiMo/DeepSeek，比如普通 OpenAI 兼容）时，
-  //    无标记/同提供商历史的 reasoning 也不该带出去——它是私有字段。
-  const needEcho = requiresReasoningEcho(providerCapability)
-  for (const unit of compatible) {
+// 兼容性过滤后统一处理 reasoning_content：
+//  - 旧提供商的纯文本单元（providersDiffer）必然剥掉；
+//  - 当前端点不要求回传（非 MiMo/DeepSeek，比如普通 OpenAI 兼容）时，
+//    无标记/同提供商历史的 reasoning 也不该带出去——它是私有字段。
+const needEcho = requiresReasoningEcho(providerCapability)
+for (const unit of compatible) {
     const old = providersDiffer(unit)
     for (const m of unit.calls) {
       if (m.role !== 'assistant' || typeof m.reasoning_content !== 'string') continue
@@ -256,16 +266,21 @@ export class Agent {
       ...trimHistory(history, { providerCapability: capability, providerId }),
     ]
     /*
-     * 本轮增量起点：之后 push 到 messages 的都是「本轮产生的消息」
-     * （本轮 user + assistant/toool/截图）。返回时只切这一段，绝不把
-     * trimHistory 之后的旧历史带回去，避免保存方重复追加。
+     * 本轮增量边界：用**对象引用**而不是数字索引。
+     *
+     * `compress(messages)` 会整体重建数组（splice 把旧单元从头部移除），
+     * 用数字索引 `turnStart` 会在压缩后失效——可能把本轮 user / 工具结果 / 回复漏掉。
+     * 压缩总是保留“当前回合的 user”（见 compress/splitCompleteUnits），
+     * 因此拿到本轮第一条 user 消息的对象引用，处理后按 `indexOf` 定位即可稳定切出本轮增量。
      */
-    const turnStart = messages.length
-    messages.push({ role: 'user', content: input })
+    const turnUserMessage = { role: 'user', content: input }
+    messages.push(turnUserMessage)
     const steps = []
     const availableTools = this.#tools.listTools()
     let finalText = ''
     let hitStepLimit = false
+    /** 本轮因流式异常/错误而未正常完成（上层不应把 finalText 当作成功回答） */
+    let turnFailed = false
     /** 本轮已经塞给模型多少张图 */
     let imagesAttached = 0
     /** 本轮累计的思考内容字数（只记长度，不落盘、不播报） */
@@ -297,6 +312,9 @@ export class Agent {
        * 服务端错误事件 / 打断），`toolCallsIncomplete` 就会为 true —— 此时**一个工具都不执行**，
        * 即使个别调用参数已经是合法 JSON（"模型说到一半"并不是可安全执行的指令）。
        * 已流出的普通文字仍然保留；不重复执行已完成的工具（本轮没有执行任何工具）。
+       *
+       * 即使没有工具调用（纯文本错误流），也不能当成正常成功回答结束：
+       * 服务端错误/异常断流必须让上层明确感知失败。
        */
       if (result.toolCallsIncomplete === true) {
         if (toolCalls.length > 0 || broken.length > 0) {
@@ -315,8 +333,21 @@ export class Agent {
           continue
         }
       }
-
+      // 纯文本回复但也可能是错误流（finishReason 非正常 / sawError / incomplete）
       if (toolCalls.length === 0 && broken.length === 0) {
+        const streamFailed = result.toolCallsIncomplete === true
+          || result.finishReason === 'incomplete'
+          || result.finishReason === 'length'
+          || result.finishReason === 'content_filter'
+          || result.finishReason === 'repetition_truncation'
+        if (streamFailed) {
+          // 保留已流出的文字，但明确标记本轮失败（不当作成功回答结束）
+          finalText = finalText || '（模型响应异常，未能完成回答）'
+          if (result.text) messages.push(assistantMessageFrom(result))
+          emit({ type: 'stream_error', text: result.text ?? '', finishReason: result.finishReason })
+          turnFailed = true
+          break
+        }
         // 纯文本回复也要进消息历史：后续同一会话的提问需要带着这条回复，
         // 且如果是思考模式下，reasoning_content 也要如实回传。
         messages.push(assistantMessageFrom(result))
@@ -444,20 +475,25 @@ export class Agent {
       }
     }
 
-    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit, reasoningChars })
+    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit, reasoningChars, failed: turnFailed })
     /*
      * 把这一回合用的端点快照一起返回：回合之后的旁路请求（比如"还要不要继续听"的判定）
      * 必须用**同一套**提供商与推理参数，否则中途改了设置会让那次判定换个模型、
      * 甚至换个提供商，判出来的东西和刚说的这段话不是一套。
      */
     /*
-     * 返回**本轮增量** `turn`（turnStart 之后的 messages）：本轮 user + 全部 assistant
-     * （含 reasoning_content / tool_calls） + tool 结果 + 截图消息。**不包含**传入 history
-     * 里的旧消息——旧历史由保存方自行维护，不能由 Agent 反复带出造成重复。
+     * 返回**本轮增量** `turn`：本轮 user + 全部 assistant
+     * （含 reasoning_content / tool_calls） + tool 结果 + 截图消息。
+     *
+     * 用本轮 user 消息的对象引用定位边界（compress 重建数组、删除旧单元后，
+     * 数字索引会失效；对象引用不受影响，且压缩保证不会删掉当前回合 user）。
+     * **不包含**传入 history 里的旧消息——旧历史由保存方自行维护，不能由 Agent 反复带出造成重复。
      *
      * 每条消息打 `_providerId` 标记供跨提供商剥离，但该字段绝不会进请求体（trimHistory 会删）。
      */
-    const turn = messages.slice(turnStart).map((m) => ({
+    const turnIndex = messages.indexOf(turnUserMessage)
+    const from = turnIndex === -1 ? messages.length : turnIndex
+    const turn = messages.slice(from).map((m) => ({
       ...m,
       _providerId: providerId,
       content: typeof m.content === 'string' ? m.content : (m.content === undefined || m.content === null ? null : JSON.parse(JSON.stringify(m.content))),
@@ -465,7 +501,7 @@ export class Agent {
       ...(m.reasoning_content !== undefined ? { reasoning_content: m.reasoning_content } : {}),
       ...(m.tool_call_id !== undefined ? { tool_call_id: m.tool_call_id } : {}),
     }))
-    return { text: finalText, steps, limited: hitStepLimit, reasoningChars, llm, turn, providerId }
+    return { text: finalText, steps, limited: hitStepLimit, reasoningChars, llm, turn, providerId, failed: turnFailed }
   }
 }
 

@@ -194,6 +194,12 @@ export function defaultConfig() {
     modelProfiles: [],    modelSchedule: {
       enabled: false,
       rules: [],
+    },    /** 网易云音乐：appId + RSA privateKey（ncm-cli 用它们做签名） */
+    netease: {
+      appId: '',
+      privateKey: '',
+      // 上次同步给 ncm-cli 的凭据哈希：没变就不重写，避免把登录态顶掉
+      syncedHash: '',
     },
     followup: {
       thresholds: { high: 0.7, low: 0.3 },

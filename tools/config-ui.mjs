@@ -53,11 +53,12 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req)
       const stored = await loadPublicConfig()
       const targetProviderId = body.providerId ?? stored.providerId
-      // 选了别家就用别家自己那份 Key：拿当前凭据去打陌生端点只会得到假的 401
+      const baseURL = body.baseURL || getProvider(targetProviderId)?.baseURL || stored.baseURL
+      // 选了别家就用该认证目标自己那份 Key：拿当前凭据去打陌生端点只会得到假的 401
+      // 必须同时传 baseURL，否则换了地址后会回退/越境取旧目标的 Key
       const apiKey = typeof body.apiKey === 'string' && body.apiKey !== '' && !body.apiKey.includes('*')
         ? body.apiKey
-        : await resolveApiKeyFor(targetProviderId, { config: await loadConfig() })
-      const baseURL = body.baseURL || getProvider(targetProviderId)?.baseURL || stored.baseURL
+        : await resolveApiKeyFor(targetProviderId, { config: await loadConfig(), baseURL })
       const model = body.model || stored.model
 
       const provider = getProvider(targetProviderId)

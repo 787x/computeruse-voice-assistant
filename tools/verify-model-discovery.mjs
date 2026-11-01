@@ -188,19 +188,23 @@ const MIMO_DATA = [
 {
   const srv = await startCatalogServer(() => ({ data: MIMO_DATA }))
   await store.saveConfig({ providerId: 'mimo', baseURL: srv.url, model: 'mimo-v2.6-flash', apiKey: 'sk-owned-mimo' })
-  await store.saveConfig({ providerId: 'deepseek', apiKey: 'sk-owned-deep' })
+  // deepseek 的 key 就存在 deepseek|srv.url 这个认证目标上（与下面取列表/请求使用同一地址）
+  await store.saveConfig({ providerId: 'deepseek', baseURL: srv.url, apiKey: 'sk-owned-deep' })
   await store.saveConfig({ providerId: 'mimo' })
   const cfg = await store.loadConfig()
   check('D20a 目标=当前提供商 → 生效的那份', await store.resolveApiKeyFor('mimo', { config: cfg }) === 'sk-owned-mimo',
     await store.resolveApiKeyFor('mimo', { config: cfg }))
-  check('D20b 目标=另一家 → 它自己槽位那份', await store.resolveApiKeyFor('deepseek', { config: cfg }) === 'sk-owned-deep')
+  check('D20b 目标=另一家 → 该家认证目标那份',
+    await store.resolveApiKeyFor('deepseek', { config: cfg, baseURL: srv.url }) === 'sk-owned-deep',
+    await store.resolveApiKeyFor('deepseek', { config: cfg, baseURL: srv.url }))
   check('D20c 另一家没存过 → 空串（绝不借用当前的）',
-    await store.resolveApiKeyFor('openai-compatible', { config: cfg }) === '')
-  check('D20d id 带空格也能对上槽位', await store.resolveApiKeyFor(' deepseek ', { config: cfg }) === 'sk-owned-deep')
+    await store.resolveApiKeyFor('openai-compatible', { config: cfg, baseURL: 'https://api.openai.com/v1' }) === '')
+  check('D20d id 带空格也能对上目标槽位',
+    await store.resolveApiKeyFor(' deepseek ', { config: cfg, baseURL: srv.url }) === 'sk-owned-deep')
   check('D20e 空 id 视为当前提供商', await store.resolveApiKeyFor('', { config: cfg }) === 'sk-owned-mimo')
 
-  // 串起来：界面选中"还没保存的另一家"时，取列表用的是它自己的 Key
-  const picked = await store.resolveApiKeyFor('deepseek', { config: cfg })
+  // 串起来：界面选中"还没保存的另一家"时，取列表用的是它自己认证目标的 Key
+  const picked = await store.resolveApiKeyFor('deepseek', { config: cfg, baseURL: srv.url })
   const fetched = await fetchChatModels({ providerId: 'deepseek', baseURL: srv.url, apiKey: picked, apiKeyRequired: true, cache: new Map() })
   check('D21 取另一家的列表用的是那一家的 Key',
     srv.requests.at(-1).headers.authorization === 'Bearer sk-owned-deep' && fetched.ok === true,
@@ -211,7 +215,9 @@ const MIMO_DATA = [
   // 环境变量优先只作用于"当前提供商"
   process.env.CUA_VA_API_KEY = 'sk-env-current'
   check('D23 环境变量只覆盖当前提供商', await store.resolveApiKeyFor('mimo') === 'sk-env-current')
-  check('D24 环境变量不会污染另一家的槽位', await store.resolveApiKeyFor('deepseek', { config: cfg }) === 'sk-owned-deep')
+  // D24 环境变量不会污染另一家目标槽位
+  check('D24 环境变量不会污染另一家的目标槽位',
+    await store.resolveApiKeyFor('deepseek', { config: cfg, baseURL: srv.url }) === 'sk-owned-deep')
   delete process.env.CUA_VA_API_KEY
   srv.server.close()
 }

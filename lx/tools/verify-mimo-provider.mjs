@@ -78,8 +78,9 @@ async function withMock(handler, run) {
     upgraded.providerId === 'deepseek' && upgraded.baseURL === 'https://api.deepseek.com/v1'
       && upgraded.model === 'deepseek-flash' && upgraded.apiKey === 'sk-legacy-deepseek-key',
     `${upgraded.providerId}/${upgraded.model}`)
-  check('A7 旧配置的 Key 落到该提供商槽位（回切便利）',
-    upgraded.providerKeys?.deepseek === 'sk-legacy-deepseek-key', Object.keys(upgraded.providerKeys ?? {}))
+  check('A7 旧配置的 Key 迁移到原认证目标（回切便利）',
+    upgraded.providerTargets?.['deepseek|https://api.deepseek.com/v1'] === 'sk-legacy-deepseek-key',
+    JSON.stringify(Object.keys(upgraded.providerTargets ?? {})))
 
   // 自定义端点同样不动
   const custom = {
@@ -445,6 +446,16 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'm' })
     const r = await client.chat({ messages: [{ role: 'user', content: 'x' }] })
     check('D11 流中的 error 对象不当正文，已到的正文保留', r.text === '半句', JSON.stringify(r.text))
+  })
+
+  // D11b：Agent 层——没有工具调用的纯文本错误流不能伪装成正常成功回答
+  await withMock(() => ({ sse: [{ error: { message: '上游模型炸了' } }, { choices: [{ index: 0, delta: { content: '半句回答' } }] }] }), async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'm' })
+    const agent = new Agent({ llm: client, tools: { listTools: () => [], invoke: async () => ({ text: '' }) }, maxSteps: 2 })
+    const result = await agent.run('问一下')
+    check('D11b 纯文本错误流会被标记失败（不伪装成功回答）',
+      result.failed === true && result.turn.some((m) => m.role === 'assistant'),
+      `failed=${result.failed} text=${JSON.stringify(result.text)}`)
   })
 
   // D12：截断（不发 [DONE] 就断连）+ 残缺参数
@@ -1088,12 +1099,15 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     const cfg = await store.loadConfig()
     check('G32a 目标=当前提供商 → 用生效 Key', await store.resolveApiKeyFor('deepseek', { config: cfg }) === 'sk-deep-only',
       await store.resolveApiKeyFor('deepseek', { config: cfg }))
-    check('G32b 目标=别家 → 用它自己槽位那份', await store.resolveApiKeyFor('mimo', { config: cfg }) === 'sk-mimo-only',
-      await store.resolveApiKeyFor('mimo', { config: cfg }))
+    check('G32b 目标=别家（指定其 baseURL）→ 用它自己目标槽位那份',
+      await store.resolveApiKeyFor('mimo', { config: cfg, baseURL: 'https://api.xiaomimimo.com/v1' }) === 'sk-mimo-only',
+      await store.resolveApiKeyFor('mimo', { config: cfg, baseURL: 'https://api.xiaomimimo.com/v1' }))
     check('G32c 别家没存过 Key → 空（绝不回落到当前凭据）',
-      await store.resolveApiKeyFor('openai-compatible', { config: cfg }) === '',
-      `[${await store.resolveApiKeyFor('openai-compatible', { config: cfg })}]`)
-    check('G32d id 带空格也能对上槽位', await store.resolveApiKeyFor(' mimo ', { config: cfg }) === 'sk-mimo-only')
+      await store.resolveApiKeyFor('openai-compatible', { config: cfg, baseURL: 'https://api.openai.com/v1' }) === '',
+      `[${await store.resolveApiKeyFor('openai-compatible', { config: cfg, baseURL: 'https://api.openai.com/v1' })}]`)
+    check('G32d 目标不同地址不越境（未给地址时也不回退到 providerKeys）',
+      await store.resolveApiKeyFor('mimo', { config: cfg }) === '',
+      `[${await store.resolveApiKeyFor('mimo', { config: cfg })}]`)
   }
 
   // 非法档位回 default，而不是"关闭思考"
@@ -1462,6 +1476,89 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
   } finally {
     srv.server.close()
   }
+}
+
+// J11：单用户回合超长触发压缩后，返回的 turn 仍是完整本轮（不因 compress 数组重建而丢失）
+{
+  const bodies = []
+  let callNum = 0
+  await withMock(({ body }) => {
+    bodies.push(JSON.parse(JSON.stringify(body)))
+    callNum += 1
+    if (callNum <= 8) {
+      // 8 步工具调用，每步 reasoning 超长 → 总长度远超预算，必触发 compress
+      return {
+        sse: [
+          { choices: [{ index: 0, delta: { reasoning_content: `步骤${callNum}的思考。${'填'.repeat(3000)}` } }] },
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `t${callNum}`, function: { name: 'scroll', arguments: '{"n":1}' } }] } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+        ],
+      }
+    }
+    return { sse: [{ choices: [{ index: 0, delta: { content: '最终答复' }, finish_reason: 'stop' }] }] }
+  }, async (mock) => {
+    const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'mimo-v2.6-flash', profile: profileFromConfig({ providerId: 'mimo', model: 'mimo-v2.6-flash' }) })
+    const agent = new Agent({
+      llm: client,
+      tools: { listTools: () => [], invoke: async () => ({ text: '结果' }) },
+      maxSteps: 10,
+    })
+    const result = await agent.run('一路滚下去')
+    // turn 必须是完整本轮：user 开头，包含全部 8 次工具调用与最终答复，且不带历史
+    const turn = result.turn
+    const userMsgs = turn.filter((m) => m.role === 'user' && typeof m.content === 'string')
+    const toolCalls = turn.filter((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))
+    const toolResults = turn.filter((m) => m.role === 'tool')
+    check('J11 压缩后 turn 仍完整（user 起点 + 全部工具 + 最终回复，无重复历史）',
+      turn.length >= 3
+        && userMsgs.length === 1 && userMsgs[0].content === '一路滚下去'
+        && toolCalls.length === 8 && toolResults.length === 8
+        && turn.some((m) => m.role === 'assistant' && m.content === '最终答复'),
+      JSON.stringify({ len: turn.length, users: userMsgs.map((m) => m.content), tools: toolCalls.length, results: toolResults.length }))
+    check('J11b 压缩发生在过程中（请求数 > 1）、最终请求带 system',
+      bodies.length >= 2 && bodies.at(-1).messages.some((m) => m.role === 'system' && typeof m.content === 'string' && m.content !== ''),
+      `requests=${bodies.length}`)
+    check('J11c turn 无内部 _providerId（仅 internal 用途）',
+      turn.every((m) => '_providerId' in m && m._providerId === 'mimo'),
+      'ok')
+  })
+}
+
+// J12：主进程式长工具会话裁剪——内部消息超 24 条，但最新用户回合不能被误删
+{
+  // 模拟主进程 rememberTurn：先把 5 轮历史（每轮含大量工具消息）push 进 sessionHistory
+  let sessionHistory = []
+  for (let t = 0; t < 6; t += 1) {
+    const turn = [{ role: 'user', content: `第${t + 1}问`, _providerId: 'mimo' }]
+    for (let k = 0; k < 6; k += 1) {
+      turn.push({ role: 'assistant', content: null, tool_calls: [{ id: `c${t}-${k}`, type: 'function', function: { name: 'x', arguments: '{}' } }], _providerId: 'mimo' })
+      turn.push({ role: 'tool', tool_call_id: `c${t}-${k}`, content: 'ok', _providerId: 'mimo' })
+    }
+    turn.push({ role: 'assistant', content: `第${t + 1}答`, _providerId: 'mimo' })
+    sessionHistory.push(...turn)
+  }
+  // 用主进程的同一套裁剪逻辑（复制语义）：按真实用户回合保留 SESSION_MAX_TURNS=6 轮
+  const SESSION_MAX_TURNS = 6
+  const userIndexes = []
+  for (let i = 0; i < sessionHistory.length; i += 1) {
+    if (sessionHistory[i].role === 'user' && typeof sessionHistory[i].content === 'string') userIndexes.push(i)
+  }
+  while (userIndexes.length > SESSION_MAX_TURNS) {
+    const start = userIndexes.shift()
+    const end = userIndexes.length > 0 ? userIndexes[0] : sessionHistory.length
+    sessionHistory.splice(start, end - start)
+    for (let i = 0; i < userIndexes.length; i += 1) userIndexes[i] -= end - start
+  }
+  check('J12 长工具会话按用户回合裁剪：最新用户回合保留、不因消息数超限被误删',
+    sessionHistory.some((m) => m.role === 'user' && typeof m.content === 'string' && m.content === '第6问')
+      && sessionHistory.filter((m) => m.role === 'user' && typeof m.content === 'string').length === SESSION_MAX_TURNS,
+    `len=${sessionHistory.length} users=${sessionHistory.filter((m) => m.role === 'user' && typeof m.content === 'string').length}`)
+  check('J12b 裁剪后无孤立 tool 结果 / 无缺失配对的 tool_calls',
+    sessionHistory.every((m, i) => {
+      if (m.role !== 'tool') return true
+      return sessionHistory.slice(0, i).some((a) => a.role === 'assistant' && Array.isArray(a.tool_calls) && a.tool_calls.some((c) => c.id === m.tool_call_id))
+    }),
+    'ok')
 }
 
 // ============================================================ 汇总

@@ -147,6 +147,44 @@ async function main() {
   let win = null
   try {
     await app.whenReady()
+
+    // ---------------- 0. 真实 loadPublicConfig 可被结构化克隆、且不含明文 Key ----------------
+    // 使用隔离配置目录的真实 store（非替身），验证问题 1：settings:load 返回值必须能过 IPC 克隆、
+    // providerTargets / providerKeys / modelProfiles / search 全部脱敏。
+    {
+      const store = await import('../packages/config/store.mjs')
+      store.setCryptoHooks({
+        encrypt: (value) => Buffer.from(value, 'utf8').toString('base64'),
+        decrypt: (value) => Buffer.from(value, 'base64').toString('utf8'),
+      })
+      await store.saveConfig({
+        providerId: 'mimo', baseURL: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.6-flash',
+        apiKey: 'sk-top-secret', mimoThinking: 'enabled',
+        providerKeys: { deepseek: 'sk-other-provider-secret' },
+        modelProfiles: [{ id: 'p1', providerId: 'deepseek', baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-flash', apiKey: 'sk-profile-secret' }],
+        search: { provider: 'tavily', apiKey: 'tvly-secret' },
+      })
+      const pub = await store.loadPublicConfig()
+      let clonedOk = false
+      try {
+        // 结构化克隆：无函数、无不可克隆值，设置页才能初始化
+        const cloned = structuredClone(pub)
+        clonedOk = cloned !== null && typeof cloned === 'object'
+      } catch { clonedOk = false }
+      record('C0 真实 loadPublicConfig 返回值可被结构化克隆（settings:load 可传输）', clonedOk)
+      const serialized = JSON.stringify(pub)
+      const leakedSecrets = ['sk-top-secret', 'sk-other-provider-secret', 'sk-profile-secret', 'tvly-secret']
+        .filter((s) => serialized.includes(s))
+      record('C0b 公开配置不含任何明文 API Key（含 providerTargets/方案/search）',
+        leakedSecrets.length === 0, `leaked=${leakedSecrets.join(',')}`)
+      record('C0c 公开配置含目标 Key 掩码与是否有标记',
+        typeof pub.targetKeys?.['mimo|https://api.xiaomimimo.com/v1'] === 'string'
+          && pub.targetKeys['mimo|https://api.xiaomimimo.com/v1'].includes('*')
+          && pub.hasTargetKey?.['mimo|https://api.xiaomimimo.com/v1'] === true,
+        JSON.stringify(pub.targetKeys))
+      store.setCryptoHooks(null)
+    }
+
     registerIpc()
     // 起始状态 = 全新安装：默认提供商 MiMo，没有任何 Key
     configState = { ...defaultConfig(), apiKey: '', hasApiKey: false, providerKeys: {}, hasProviderKey: {},

@@ -752,12 +752,14 @@ function fillForm() {
   $('provider').value = config.providerId
   $('baseURL').value = config.baseURL
   $('model').value = config.model
-  $('apiKey').value = ''
-  // 提供商各自的 Key 分开存：这一格显示的是**当前提供商**那份
-  const providerHasKey = config.hasProviderKey?.[config.providerId] === true
-  $('apiKey').placeholder = providerHasKey
-    ? `已保存（${config.providerKeys?.[config.providerId] ?? config.apiKey}），留空不修改`
-    : (config.hasApiKey ? `已保存（${config.apiKey}），留空不修改` : '未配置')
+  // API Key 输入框：初始无值，占位按「当前认证目标」是否已有凭据显示；
+  // 若目标有未保存草稿则恢复（切回原目标不用重填）
+  const t = `${config.providerId ?? ''}|${config.baseURL ?? ''}`
+  const savedForKey = config.targetKeys?.[t]
+  $('apiKey').value = apiKeyDrafts[t] ?? ''
+  $('apiKey').placeholder = (typeof savedForKey === 'string' && savedForKey !== '')
+    ? `已保存（${savedForKey}），留空不修改`
+    : (apiKeyDrafts[t] !== undefined && apiKeyDrafts[t] !== '' ? '未保存的草稿（保存后生效）' : '未配置（可在控制台获取）')
   $('maxSteps').value = config.maxSteps
   $('temperature').value = config.temperature
   $('mimoThinking').value = config.mimoThinking ?? 'default'
@@ -824,6 +826,8 @@ function collect() {
       rules: collectSchedule(),
     },
   }
+  // 提交前把当前输入框的草稿按目标记下（为切回恢复）；payload 只带当前输入框的值
+  commitApiKeyDraft()
   if ($('apiKey').value.trim() !== '') payload.apiKey = $('apiKey').value.trim()
   if ($('searchKey').value.trim() !== '') payload.search = { provider: 'tavily', apiKey: $('searchKey').value.trim() }
   /*
@@ -884,6 +888,8 @@ $('restoreDefaultPrompt').addEventListener('click', () => {
 })
 
 $('provider').addEventListener('change', async () => {
+  // 先把当前输入框里未保存的 Key 草稿按「当前认证目标」存起来，避免切目标后误发给新端点
+  rememberApiKeyDraft()
   const provider = currentProvider()
   if (provider) {
     $('baseURL').value = provider.baseURL
@@ -891,6 +897,8 @@ $('provider').addEventListener('change', async () => {
     const suggested = provider.defaultModel ?? provider.models?.[0] ?? ''
     if (suggested !== '') $('model').value = suggested
   }
+  // 换目标后：恢复该目标之前留下的 Key 草稿（没有则是空白，暗示需填写）
+  restoreApiKeyDraft()
   // 在线列表按提供商各自取：清掉上一家的结果，避免拿 MiMo 的目录去填 DeepSeek
   discoveredModels = null
   modelsError = ''
@@ -899,6 +907,45 @@ $('provider').addEventListener('change', async () => {
   fillProviderNote()
   await maybeFetchModels()
 })
+
+/** Base URL 修改也会改变认证目标：同样先存草稿再恢复新目标的草稿 */
+$('baseURL').addEventListener('change', () => {
+  rememberApiKeyDraft()
+  restoreApiKeyDraft()
+  fetchModels({ force: true })
+})
+/**
+ * 未保存的 API Key 草稿，按「providerId|baseURL」隔离。
+ *
+ * 目的：用户在 MiMo 输入 Key（还没点保存）后切换到 DeepSeek 或改 Base URL，
+ * 这颗 Key 只能留在原目标，不能被自动用于新目标的模型发现/测试/保存；
+ * 切回原目标时则自动恢复，避免牺牲便利性。
+ */
+const apiKeyDrafts = {}
+function targetKeyForUI() {
+  const provider = currentProvider()
+  return `${provider?.id ?? ''}|${$('baseURL').value.trim()}`
+}
+function rememberApiKeyDraft() {
+  const value = $('apiKey').value.trim()
+  if (value === '') return
+  apiKeyDrafts[targetKeyForUI()] = value
+}
+function restoreApiKeyDraft() {
+  const t = targetKeyForUI()
+  const draft = apiKeyDrafts[t]
+  $('apiKey').value = typeof draft === 'string' ? draft : ''
+  // 占位提示随目标是否有凭据/草稿变化
+  const provider = currentProvider()
+  const savedForKey = state?.config?.targetKeys?.[t]
+  $('apiKey').placeholder = (typeof savedForKey === 'string' && savedForKey !== '')
+    ? '已保存，留空不修改'
+    : (provider?.apiKeyRequired === false ? '本地端点可留空' : (draft !== '' ? '未保存的草稿（保存后生效）' : '未配置（可在控制台获取）'))
+}
+/** 提交前把当前草稿也按目标存好（用户点保存时） */
+function commitApiKeyDraft() {
+  rememberApiKeyDraft()
+}
 
 /* 推理下拉一改就记进草稿，并重算提示与温度可用性 */
 for (const [id, field] of [['mimoThinking', 'mimoThinking'], ['deepseekEffort', 'deepseekReasoningEffort'], ['providerHint', 'providerHint']]) {
@@ -958,6 +1005,8 @@ $('save').addEventListener('click', async () => {
     reasoningDraft.mimoThinking = null
     reasoningDraft.deepseekReasoningEffort = null
     if (typeof state.config.providerHint !== 'string') state.config.providerHint = 'auto'
+    const savedTarget = targetKeyForUI()
+    if (apiKeyDrafts[savedTarget] !== undefined && payload.apiKey !== undefined) delete apiKeyDrafts[savedTarget]
     fillForm()
     if (payload.systemPrompt === null) restoredDefault = true
     if (result.warnings && result.warnings.length > 0) {

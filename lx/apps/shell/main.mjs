@@ -667,6 +667,9 @@ function resetSession(reason) {
  * （本轮 user + assistant + tool + 截图），这里直接追加即得到不重复的完整历史。
  *
  * 只在内存里保留，不落盘、不打日志、不进字幕/TTS（推理内容不默认持久化）。
+ *
+ * 裁剪按**真实用户回合**数量管理：单轮长工具任务会生成几十条内部消息，
+ * 不能因消息数超过 `SESSION_MAX_TURNS * 4` 就把仅有的最新用户回合一起删除。
  */
 function rememberTurn(userText, resultOrText, toolNames = []) {
   if (resultOrText !== null && typeof resultOrText === 'object' && Array.isArray(resultOrText.turn)) {
@@ -677,14 +680,26 @@ function rememberTurn(userText, resultOrText, toolNames = []) {
     const note = (toolNames ?? []).length > 0 ? `\n（这一轮动过：${toolNames.join(', ')}）` : ''
     sessionHistory.push({ role: 'assistant', content: `${assistantText}${note}` })
   }
-  // 会话上限：按「完整交互单元」裁掉最老的轮次（普通文本 user 起，直到下一个普通文本 user 前）
-  while (sessionHistory.length > SESSION_MAX_TURNS * 4) {
-    const firstUser = sessionHistory.findIndex((m) => m.role === 'user' && typeof m.content === 'string')
-    if (firstUser === -1) break
-    let end = firstUser + 1
-    while (end < sessionHistory.length
-      && !(sessionHistory[end].role === 'user' && typeof sessionHistory[end].content === 'string')) end += 1
-    sessionHistory.splice(firstUser, end - firstUser)
+  trimSessionHistory()
+}
+
+/**
+ * 会话历史裁剪：按「真实用户回合」计数（普通文本 user 消息才算一轮），
+ * 保留最多 SESSION_MAX_TURNS 轮；对超出的最老轮次，按完整交互单元整体删除。
+ * 工具消息（assistant tool_calls / tool 结果 / 截图 user）不计入轮次，绝不被误删。
+ */
+function trimSessionHistory() {
+  const userIndexes = []
+  for (let i = 0; i < sessionHistory.length; i += 1) {
+    if (sessionHistory[i].role === 'user' && typeof sessionHistory[i].content === 'string') userIndexes.push(i)
+  }
+  while (userIndexes.length > SESSION_MAX_TURNS) {
+    // 删除最老一个完整用户回合：该 user 起，直到下一个 user 前
+    const start = userIndexes.shift()
+    const end = userIndexes.length > 0 ? userIndexes[0] : sessionHistory.length
+    sessionHistory.splice(start, end - start)
+    // 删除后索引前移，重新对剩余 user 索引修正
+    for (let i = 0; i < userIndexes.length; i += 1) userIndexes[i] -= end - start
   }
 }
 
@@ -2738,7 +2753,8 @@ function registerSettingsIpc() {
       ? payload.baseURL.trim() : (provider?.baseURL ?? stored.baseURL)
     const typedKey = typeof payload?.apiKey === 'string' && payload.apiKey.trim() !== '' && !payload.apiKey.includes('*')
       ? payload.apiKey.trim() : ''
-    const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(providerId, { config: stored }).catch(() => '')
+    // 按真实认证目标（providerId + baseURL）取 Key：否则换地址后仍会拿旧地址的 Key
+    const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(providerId, { config: stored, baseURL }).catch(() => '')
     return await discovery.fetchChatModels({
       providerId,
       baseURL,
@@ -2888,20 +2904,22 @@ function registerSettingsIpc() {
         ? payload.providerId.trim() : stored.providerId
       const typedKey = typeof payload?.apiKey === 'string' && payload.apiKey !== '' && !payload.apiKey.includes('*')
         ? payload.apiKey.trim() : ''
-      // 界面上选中的提供商可能还没保存：测试必须用**那一家**的 Key，
-      // 用当前生效的 Key 去打它，结果只会是假的 401（或假的成功）。
-      const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(targetProviderId, { config: stored })
-      if (!apiKey) return { ok: false, error: '还没配置该提供商的 API Key' }
       /*
        * 地址必须跟着"选中的那一家"走：没显式给地址时，切了提供商就不能再用
        * stored.baseURL——那还是上一家的端点，会把这一家的 Key 发错地方。
        */
+      const mergedBaseURL = typeof payload?.baseURL === 'string' && payload.baseURL.trim() !== ''
+        ? payload.baseURL.trim()
+        : (getProvider(targetProviderId)?.baseURL ?? stored.baseURL)
+      // 测试必须用**那一家 + 该地址**对应的 Key（认证目标隔离）：
+      // 用当前生效的 Key 去打它，结果只会是假的 401（或假的成功）。
+      const apiKey = typedKey !== '' ? typedKey
+        : await store.resolveApiKeyFor(targetProviderId, { config: stored, baseURL: mergedBaseURL })
+      if (!apiKey) return { ok: false, error: '还没配置该提供商的 API Key' }
       const merged = {
         ...stored,
         providerId: targetProviderId,
-        baseURL: typeof payload?.baseURL === 'string' && payload.baseURL.trim() !== ''
-          ? payload.baseURL.trim()
-          : (getProvider(targetProviderId)?.baseURL ?? stored.baseURL),
+        baseURL: mergedBaseURL,
         model: payload?.model ?? stored.model,
         temperature: payload?.temperature ?? stored.temperature,
         mimoThinking: payload?.mimoThinking ?? stored.mimoThinking,
