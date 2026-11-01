@@ -15,7 +15,7 @@ function fixture(stage, failure=false, initializer=code) {
  let paused=false
  const wait=async name=>{if(stage===name && !paused){paused=true;entered.resolve();await pause.promise;if(failure)throw Error(`failed ${name}`)}}
  let cachedConfig={netease:{appId:'test'},model:'test'}
- const store={loadConfig:async()=>{await wait('config');return cachedConfig},resolveApiKey:async()=>{await wait('key');return 'test'},resolveSearchKey:async()=>{await wait('search');return ''},saveConfig:async patch=>{counts.save++;cachedConfig={...cachedConfig,...patch}}}
+ const store={loadConfig:async()=>{await wait('config');return cachedConfig},resolveApiKey:async()=>{await wait('key');return 'test'},resolveSearchKey:async()=>{await wait('search');return ''},saveConfig:async patch=>{counts.save++;cachedConfig={...cachedConfig,...patch}},resolveContextPolicyFor:()=>({contextWindow:1000000,compressPercent:90,compressAtTokens:900000,hardLimitTokens:967232,targetTokens:675000,outputReserve:32768})}
  class Toolkit {
   constructor(){counts.bridge++;counts.active++;resources.push(this)}
   async warmup(){await wait('warmup')}
@@ -24,7 +24,8 @@ function fixture(stage, failure=false, initializer=code) {
  class Agent {constructor(options){this.tools=options.tools;counts.agent++;if(stage==='agent-failure')throw Error('agent construction failed')}}
  const modules={
   '../../packages/config/store.mjs':store,
-  '../../packages/agent/llm.mjs':{LLMClient:class{}},
+  // 壳子给 LLMClient 传提供商档案（决定推理参数），桩件必须提供同一个函数
+  '../../packages/agent/llm.mjs':{LLMClient:class{constructor(options){this.options=options}},profileFromConfig:(source)=>({ providerId:source?.providerId ?? '', capability:source?.providerId ?? '' })},
   '../../packages/agent/loop.mjs':{Agent},
   '../../packages/cua/adapter.mjs':{CuaToolkit:Toolkit},
   '../../packages/tools/web-search.mjs':{WebSearch:class{enabled=false}},

@@ -4,18 +4,46 @@
  * 只描述"有哪些可选"，不负责存储。存储见 store.mjs。
  * 所有提供商都按 OpenAI 兼容协议调用（/chat/completions），
  * 这样 agent loop 只写一套代码，切换提供商不改逻辑。
+ *
+ * `capabilities` 决定这个提供商能接受哪些推理参数（见 agent/ll-params.mjs）：
+ *  - `mimo`：只有 `thinking:{type:enabled|disabled}`，没有强度档位
+ *  - `deepseek`：`thinking` 开关 + `reasoning_effort` 强度
+ *  - 其它：标准 OpenAI 兼容，**不发送任何提供商专属字段**
+ * `modelDiscovery` 表示这个提供商的 `/v1/models` 是官方在线目录，设置页会自动拉取。
+ * `contextWindow` 是该端点**可信的**上下文窗口（tokens）；没有就是"未知，按 1M 处理"。
  */
 
-/** @typedef {{id:string,name:string,baseURL:string,models:string[],apiKeyRequired:boolean,notes:string}} Provider */
+/** @typedef {{id:string,name:string,baseURL:string,models:string[],apiKeyRequired:boolean,notes:string,capabilities?:string,modelDiscovery?:boolean,keyConsoleUrl?:string,defaultModel?:string,contextWindow?:number}} Provider */
 
 export const PROVIDERS = [
+  {
+    id: 'mimo',
+    name: 'Xiaomi MiMo',
+    // 按量付费的 OpenAI 兼容端点（Token Plan 是另一个地址 + tp-/ttp- 开头的 Key，不能混用）
+    baseURL: 'https://api.xiaomimimo.com/v1',
+    models: ['mimo-v2.6-flash', 'mimo-v2.6-pro', 'mimo-v2.6-pro-ultraspeed'],
+    defaultModel: 'mimo-v2.6-flash',
+    apiKeyRequired: true,
+    capabilities: 'mimo',
+    modelDiscovery: true,
+    // 官方模型规格：V2.6 系列上下文 1M、最大输出 128K
+    contextWindow: 1_000_000,
+    keyConsoleUrl: 'https://platform.xiaomimimo.com/#/console/api-keys',
+    notes: '按量付费地址。在线模型列表会自动获取；V2.6 系列默认开启思考，上下文 1M。ASR/TTS 模型已从选择器里排除。',
+  },
   {
     id: 'deepseek',
     name: 'DeepSeek 官方',
     baseURL: 'https://api.deepseek.com/v1',
     models: ['deepseek-flash', 'deepseek-v4-pro'],
+    defaultModel: 'deepseek-flash',
     apiKeyRequired: true,
-    notes: 'tool calling 稳定，作为默认云端选择',
+    capabilities: 'deepseek',
+    modelDiscovery: true,
+    // 官方模型细节：上下文长度 1M、输出最大 384K
+    contextWindow: 1_000_000,
+    keyConsoleUrl: 'https://platform.deepseek.com/api_keys',
+    notes: 'tool calling 稳定；可单独设置推理等级（none/low/high/max），上下文 1M',
   },
   {
     id: 'openai-compatible',
@@ -31,6 +59,8 @@ export const PROVIDERS = [
     baseURL: 'http://127.0.0.1:8080/v1',
     models: ['local-model'],
     apiKeyRequired: false,
+    // llama-server 的默认 --ctx-size 就是 32K；按实际窗口算 90% 比按 1M 硬发靠谱
+    contextWindow: 32_768,
     notes: 'llama-server 默认端口；模型名以 /v1/models 返回为准',
   },
   {
@@ -43,22 +73,60 @@ export const PROVIDERS = [
   },
 ]
 
-export const DEFAULT_PROVIDER_ID = 'deepseek'
+/**
+ * 新装默认提供商：MiMo。
+ * 注意这只影响**全新配置**（磁盘上还没有 providerId）。
+ * 已有 DeepSeek / 自定义端点的配置升级后保持原样，见 store.mjs 的迁移说明。
+ */
+export const DEFAULT_PROVIDER_ID = 'mimo'
 
 export function getProvider(id) {
   return PROVIDERS.find((provider) => provider.id === id)
+}
+
+/** 该提供商的推荐初始模型（新装/切提供商时用；在线列表优先于它） */
+export function defaultModelFor(provider) {
+  if (typeof provider?.defaultModel === 'string' && provider.defaultModel !== '') return provider.defaultModel
+  return provider?.models?.[0] ?? ''
 }
 
 /** 生成一份默认配置。 */
 export function defaultConfig() {
   const provider = getProvider(DEFAULT_PROVIDER_ID)
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     providerId: provider.id,
     baseURL: provider.baseURL,
-    model: provider.models[0],
+    model: defaultModelFor(provider),
     apiKey: '',
+    /**
+     * 每个提供商自己的 Key（`{deepseek: 'sk-…', mimo: 'sk-…'}`）。
+     * `apiKey` 是「当前提供商正在用的那一份」，由本表推导出来，不单独存意义。
+     * 这样切提供商不会把上一家的 Key 发到新端点，切回来又不用重填。
+     *
+     * 注意：这是**按提供商**的简单语义，不是按 baseURL 的认证目标隔离。
+     * PR#4 曾引入 providerTargets（`providerId|baseURL`）把同一个提供商的不同地址
+     * 也拆成不同凭据槽位，结果用户改一下地址 Key 就"消失"、切回来还要重填，
+     * 与"常规切换不需要额外确认"的便利性要求相冲突，因此撤回。
+     */
+    providerKeys: {},
     temperature: 0.3,
+    /*
+     * 推理控制（按提供商生效，互不冲突）：
+     *  - mimoThinking: default（跟随服务端；V2.6 官方默认开）| enabled | disabled
+     *  - deepseekReasoningEffort: default | none | low | high | max
+     * 存"档位"而不是存布尔：换提供商时另一个字段不会被误当成"用户表过态"。
+     * 未识别的取值一律回 default（详见 agent/ll-params.mjs）。
+     */
+    mimoThinking: 'default',
+    deepseekReasoningEffort: 'default',
+    /**
+     * 自定义端点上的协议提示（`openai-compatible` 这类没有内置能力的提供商用）：
+     *  - `auto`：什么都不发（默认，最安全）
+     *  - `deepseek` / `mimo`：按该协议的推理参数发
+     * 内置提供商会直接用注册表里的 capabilities，这个字段只对自定义端点起作用。
+     */
+    providerHint: 'auto',
     /**
      * 步数上限：一步 = 一次模型往返（可含多个工具调用）。
      * 8 步只够"看一眼+点一下"，开个程序经常用到第 9 步就被截断（实测无畏契约那轮 tools=10 还没点结果）。
@@ -66,6 +134,15 @@ export function defaultConfig() {
      */
     maxSteps: 16,
     timeoutMs: 60000,
+    /**
+     * 上下文预算（tokens）。
+     *  - contextWindow：模型上下文窗口。默认 1,000,000（MiMo V2.6 / DeepSeek V4 官方都是 1M）；
+     *    未知模型也按 1M 处理。模型有可信且更小的窗口元数据时按模型实际容量算（见 agent/context.mjs）。
+     *  - contextCompressPercent：到窗口的百分之多少才开始尝试压缩。默认 90。
+     * 低于这个百分比**绝不**压缩，也不再按消息条数/字符数提前丢历史。
+     */
+    contextWindow: 1_000_000,
+    contextCompressPercent: 90,
     /**
      * 系统提示词（人设与行为指引）。
      *  - null / 未设置：用 packages/agent/system-prompt.mjs 里的内置默认提示词

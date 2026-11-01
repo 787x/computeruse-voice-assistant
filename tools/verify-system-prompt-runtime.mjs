@@ -85,6 +85,8 @@ function fixture({ gateVerdicts = [] } = {}) {
     resolveSearchKey: async () => store.resolveSearchKey(),
     saveConfig: async (...args) => store.saveConfig(...args),
     listProviders: () => store.listProviders(),
+    // 主进程现在用 store 的上下文预算解析器（默认 1M / 90%），替身也要转发
+    resolveContextPolicyFor: (...args) => store.resolveContextPolicyFor(...args),
     CONFIG_FILE: store.CONFIG_FILE,
   }
 
@@ -104,6 +106,11 @@ function fixture({ gateVerdicts = [] } = {}) {
     constructor(options) { this.options = options }
     setModel() {}
     setEndpoint() {}
+    setProfile() {}
+    setTemperature() {}
+    setTimeout() {}
+    /** 回合快照：本用例关心的是提示词与调用顺序，返回自身即可 */
+    snapshot() { return this }
     async chat({ messages }) {
       llmCalls.push(messages.map((m) => ({
         role: m.role,
@@ -116,7 +123,8 @@ function fixture({ gateVerdicts = [] } = {}) {
   }
   const modules = {
     '../../packages/config/store.mjs': storeShim,
-    '../../packages/agent/llm.mjs': { LLMClient: FakeLLMClient },
+    // 壳子会给 LLMClient 传提供商档案（决定推理参数），桩件必须提供同一个函数
+    '../../packages/agent/llm.mjs': { LLMClient: FakeLLMClient, profileFromConfig: (source) => ({ providerId: source?.providerId ?? '', capability: source?.providerId ?? '' }) },
     '../../packages/agent/loop.mjs': { Agent: RealAgent },
     '../../packages/cua/adapter.mjs': { CuaToolkit: FakeToolkit },
     '../../packages/tools/web-search.mjs': { WebSearch: class { enabled = false }, WEB_SEARCH_TOOL: {} },
@@ -147,7 +155,10 @@ function fixture({ gateVerdicts = [] } = {}) {
     ensureLauncher: async () => ({ launch: async () => ({ text: '已启动' }) }),
     loadModule: async (path) => modules[path],
     LAUNCH_APP_TOOL: {}, SHELL_TOOL: {}, FILES_TOOL: {}, PROC_TOOL: {}, KILL_TOOL: {},
+    // 两套发行版各有一件音乐工具：根目录用 netease_music，lx 用 lx_music。
+    // 这份测试是共用的，两个都提供，哪一套主程序引用都能跑起来。
     SYSINFO_TOOL: {}, NETEASE_TOOL: { function: { name: 'netease_music' } },
+    LX_MUSIC_TOOL: { function: { name: 'lx_music' } },
     runShell: async () => ({ text: 'ok' }), runFiles: async () => ({ text: 'ok' }),
     runAppControl: async () => ({ text: 'ok' }), runKillApp: async () => ({ text: 'ok' }),
     runSystemInfo: async () => ({ text: 'ok' }),

@@ -6,46 +6,125 @@
  *
  * 关键设计：
  *  - 工具结果是文本信封（上游 format.js 生成），模型只读文本，不直接吃图片
- *  - 上下文只保留最近 2 条完整工具结果，更早的压成一行摘要（截图会撑爆上下文）
+ *  - **上下文按 tokens 预算管理**（见 agent/context.mjs）：默认 1M 窗口、到 90% 才压缩。
+ *    以前那套"最多 10 条消息 / 3,000 字符 / 40,000 字符 / 12 条就开始压"的阈值全部删掉了——
+ *    它们与模型的真实容量无关，会在只用了 4% 窗口时就开始丢历史。
  *  - 每一步都可中断：所有 await 前都有 signal 检查
+ *  - **思考内容（reasoning_content）与最终回答分开**：思考内容只放回上下文（MiMo /
+ *    DeepSeek 在思考模式下做工具调用时不回传会 HTTP 400），绝不进字幕/TTS；
+ *    压缩时按"完整消息片段"下手，不留孤立的工具结果或缺 thinking 字段的工具调用，
+ *    也绝不把 reasoning_content 截断后继续配对回传。
+ *  - 参数不完整/解析失败的工具调用**不执行**，只把失败原因回给模型
  */
 
 /** 默认系统提示词的唯一来源见 system-prompt.mjs（设置页显示的是同一份文本）。 */
 import { DEFAULT_SYSTEM_PROMPT, turnSystemPrompt } from './system-prompt.mjs'
-
-const TOOL_RESULT_KEEP = 2
-const TOOL_RESULT_MAX_CHARS = 1200
-/** 一轮里最多把几张图塞给模型（截图多的任务很容易把上下文挤爆） */
-const MAX_IMAGES_PER_RUN = 4
-const COMPRESS_AFTER_MESSAGES = 12
-/** 会话记忆：最多带几轮、多少字（多了既贵又容易跑偏） */
-const HISTORY_MAX_MESSAGES = 10
-const HISTORY_MAX_CHARS = 3000
+import { assistantMessageFrom } from './llm.mjs'
+import { resolveCapability, requiresReasoningEcho } from './ll-params.mjs'
+import {
+  compressMessages,
+  estimateRequestTokens,
+  resolveContextPolicy,
+  splitInteractionUnits,
+} from './context.mjs'
 
 /**
- * 整理会话记忆：只保留最近若干条，且必须以 user 开头。
+ * 一轮里最多把几张图塞给模型。
  *
- * 为什么必须以 user 开头：消息序列若从 assistant 开始，部分模型会认为
- * "上一条是我的发言，用户还没说话"，进而答非所问（不同厂商实现差异很大）。
+ * 以前是 4——那是"字符预算"时代的产物（一张截图 16 万字符，四张就"撑爆"了）。
+ * 现在图片按 token 计价（见 context.mjs 的 estimateImageTokens），预算自己会管住用量，
+ * 所以这里只留一个防跑飞的硬上限，不再把长 CUA 任务的截图提前砍掉。
+ *
+ * 这个值只防"模型自己陷入截图死循环"，正常 CUA 任务（几步到十几步）根本碰不到。
+ * 真的到了这里，会**明确告诉模型**"后面的截图没进来"，不让它以为屏幕上没变化。
  */
-function trimHistory(history) {
-  if (!Array.isArray(history) || history.length === 0) return []
-  const usable = history.filter((m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content !== '')
-  const recent = usable.slice(-HISTORY_MAX_MESSAGES)
-  // 从头去掉 assistant，直到第一条是 user
-  while (recent.length > 0 && recent[0].role !== 'user') recent.shift()
+const MAX_IMAGES_PER_RUN = 24
+/**
+ * 单条工具结果的长度上限。
+ *
+ * 为什么不再是一个 1,200 字的人拍数字：CUA / 文件 / 命令输出的前 1,200 字
+ * 经常只是表头或日志，模型据此做判断就会"看着半截结果瞎猜"。
+ * 现在只在**真的过长**时才截断，并且：
+ *  - 截断点之前的内容原样保留（不压缩空白，不打断结构）；
+ *  - 明确标注"已截断 + 原长"，模型知道自己看到的是片段，可以改用其它办法取全。
+ * 剩下的由上下文预算（context.mjs）按真实余量决定要不要进一步缩。
+ */
+const TOOL_RESULT_MAX_CHARS = 24_000
 
-  // 再从最老的开始丢，直到总字数达标
-  let total = recent.reduce((sum, m) => sum + m.content.length, 0)
-  while (recent.length > 1 && total > HISTORY_MAX_CHARS) {
-    total -= recent[0].content.length
-    recent.shift()
-    while (recent.length > 0 && recent[0].role !== 'user') {
-      total -= recent[0].content.length
-      recent.shift()
+/**
+ * 会话历史整理：只做**协议安全**的整理，不做预算裁剪。
+ *
+ * 预算裁剪统一交给 compressMessages（到 90% 才动手），所以这里不再有
+ * "最多 10 条 / 3,000 字符"这种与模型容量无关的丢历史逻辑。
+ *
+ * 仍然必须做的事：
+ *  - 只保留"完整片段"：user 开头，其后的 assistant/tool 全部配对（tool 有对应 tool_calls，
+ *    有 tool_calls 的 assistant 有对应 tool 结果）。残缺片段整组剔除，绝不留孤立 tool 或
+ *    缺失工具调用的 assistant。
+ *  - `providerCapability` / `providerId` 用于跨提供商：旧提供商（MiMo/DeepSeek）的
+ *    reasoning_content 与新端点的工具链是私有协议上下文，发给别家会污染请求；
+ *    此时剥掉这些字段，但保留普通对话记忆。
+ */
+function trimHistory(history, { providerCapability = '', providerId = '' } = {}) {
+  if (!Array.isArray(history) || history.length === 0) return []
+  const units = splitInteractionUnits(history.map((message) => ({ ...message })))
+
+  /** 一个片段里的全部消息（调用 + 结果 + 截图 + 内部说明），顺序与压缩时一致 */
+  const segmentMessages = (segment) => [
+    ...segment.calls, ...segment.results, ...segment.attachments, ...segment.notes,
+  ]
+
+  const providersDiffer = providerId !== ''
+    ? (unit) => {
+        const all = [unit.head, ...unit.segments.flatMap(segmentMessages)]
+        return all.some((message) => message._providerId !== undefined && String(message._providerId) !== String(providerId))
+      }
+    : () => false
+
+  const needEcho = requiresReasoningEcho(providerCapability)
+  const flat = []
+  for (const unit of units) {
+    const foreign = providersDiffer(unit)
+    if (foreign) {
+      /*
+       * 旧提供商：只保留「用户问题 + 纯文本回复」，工具链与截图整段去除。
+       * reasoning_content 是旧端点的私有字段（新端点可能直接参数校验报错），
+       * 所以这里**必须一起剥掉**——保留纯文本记忆就够了。
+       */
+      const plain = unit.segments
+        .flatMap((segment) => segment.calls)
+        .filter((message) => message.role === 'assistant' && !Array.isArray(message.tool_calls))
+      if (plain.length === 0) continue
+      flat.push({ ...unit.head })
+      for (const message of plain) {
+        const copy = { ...message }
+        delete copy.reasoning_content
+        flat.push(copy)
+      }
+      continue
+    }
+    flat.push({ ...unit.head })
+    for (const segment of unit.segments) {
+      for (const message of segmentMessages(segment)) {
+        const copy = { ...message }
+        if (copy.role === 'assistant' && typeof copy.reasoning_content === 'string' && !needEcho) {
+          delete copy.reasoning_content
+        }
+        flat.push(copy)
+      }
     }
   }
-  return recent
+  /*
+   * `_providerId` 是纯本地标记，绝不发往模型。
+   *
+   * `internal`（"这是程序生成的提示，不是用户说的话"）**保留**：压缩要靠它
+   * 把内部提示归到当前任务里，否则真实用户目标会被当成旧回合先删掉。
+   * 发请求前由 stripLocalMarkers 统一剥掉，不会进请求体。
+   */
+  for (const message of flat) {
+    delete message._providerId
+  }
+  return flat
 }
 
 export class Agent {
@@ -56,6 +135,7 @@ export class Agent {
   #maxSteps
   #onEvent
   #gate
+  #contextPolicy
 
   /**
    * @param {object} options
@@ -66,14 +146,16 @@ export class Agent {
    * @param {number} [options.maxSteps]
    * @param {(event:{type:string,[k:string]:unknown})=>void} [options.onEvent]
    * @param {(ctx:{tool:string,args:unknown})=>Promise<{allow:boolean,reason?:string}>} [options.gate]
+   * @param {object} [options.contextPolicy] resolveContextPolicy 的结果（窗口 / 压缩触发点）
    */
-  constructor({ llm, tools, systemPrompt = DEFAULT_SYSTEM_PROMPT, maxSteps = 8, onEvent, gate }) {
+  constructor({ llm, tools, systemPrompt = DEFAULT_SYSTEM_PROMPT, maxSteps = 8, onEvent, gate, contextPolicy }) {
     this.#llm = llm
     this.#tools = tools
     this.#systemPrompt = systemPrompt
     this.#maxSteps = maxSteps
     this.#onEvent = onEvent ?? (() => {})
     this.#gate = gate ?? (async () => ({ allow: true }))
+    this.#contextPolicy = contextPolicy ?? resolveContextPolicy({})
   }
 
   /** 此刻会生效的提示词（诊断/验收用；不代表正在跑的回合，回合用开始时的快照） */
@@ -81,39 +163,152 @@ export class Agent {
     return turnSystemPrompt(this.#systemPrompt)
   }
 
+  /** 此刻会生效的步数上限 */
+  get maxSteps() {
+    return this.#maxSteps
+  }
+
+  /** 此刻会生效的上下文预算（诊断/验收用） */
+  get contextPolicy() {
+    return { ...this.#contextPolicy }
+  }
+
+  /**
+   * 运行中改步数上限（保存设置后下一轮生效，不重建 Agent）。
+   * 正在跑的回合已经按旧上限在走循环，不受影响——上限只在循环开始时比较。
+   */
+  setMaxSteps(maxSteps) {
+    const value = Number(maxSteps)
+    if (Number.isFinite(value) && value >= 1) this.#maxSteps = Math.min(20, Math.max(1, Math.round(value)))
+  }
+
+  /**
+   * 运行中改上下文预算（保存设置后下一轮生效）。
+   * 只影响下一轮开始时的快照，正在跑的回合仍用它开始时的预算。
+   */
+  setContextPolicy(policy) {
+    if (policy !== null && typeof policy === 'object') this.#contextPolicy = policy
+  }
+
   /**
    * 跑一个用户回合。
    * @param {string} input 用户说的话（已由 ASR 转成文本）
-   * @param {{signal?:AbortSignal, history?:Array<{role:string,content:string}>, systemPrompt?:string|(()=>unknown)}} [options]
-   *   history 是**同一个会话**里之前几轮的用户/助手发言（不含工具细节）。
+   * @param {{signal?:AbortSignal, history?:Array<object>, systemPrompt?:string|(()=>unknown),
+   *          contextPolicy?:object}} [options]
+   *   history 是**同一个会话**里之前几轮的消息（可含 reasoning_content / tool_calls / tool 结果）。
    *   每次唤醒由调用方清空，于是"一次唤醒 = 一次会话"。
    *   systemPrompt 覆盖构造函数的来源（**本轮快照**）。
    */
-  async run(input, { signal, history = [], onEvent = this.#onEvent, systemPrompt = this.#systemPrompt } = {}) {
+  async run(input, {
+    signal,
+    history = [],
+    onEvent = this.#onEvent,
+    systemPrompt = this.#systemPrompt,
+    contextPolicy = this.#contextPolicy,
+  } = {}) {
     const emit = (event) => { if (!signal?.aborted) onEvent(event) }
+    /*
+     * 端点快照：整回合用同一套「地址 + Key + 模型 + 推理档位」。
+     * 中途保存设置或定时切换都不能把正在跑的工具调用链换到另一个提供商上——
+     * 旧提供商的 reasoning_content / 工具历史发给新提供商就是 400。
+     * 没有 snapshot()（mock、测试注入的假 llm）就直接用它本身。
+     */
+    const llm = typeof this.#llm.snapshot === 'function' ? this.#llm.snapshot() : this.#llm
+    /*
+     * 步数上限同样是回合快照：中途保存把它调小，不该把正在跑的多步任务从中间掐断
+     * （那等于"话说到一半停了"，而且残留在上下文里的工具调用链不完整）。
+     */
+    const maxSteps = this.#maxSteps
+    /*
+     * 上下文预算也是回合快照：中途改窗口/触发点，只对**下一轮**生效，
+     * 免得一次任务跑到一半突然换了一套压缩尺度。
+     */
+    const policy = contextPolicy ?? resolveContextPolicy({})
     /*
      * 提示词在回合开始时求值一次，整个回合（含后续多步工具调用和收尾往返）都用这一份。
      * 中途改设置不能把人设换掉——用户会看到"前后两半不像同一个人"，
      * 而且工具调用序列里混进新的 system 消息很容易让模型重新解释任务。
      */
     const turnPrompt = turnSystemPrompt(systemPrompt)
+    // 当前回合能力的唯一依据：LLM 客户端档案（注册表优先，不会被旧 providerHint 覆盖）
+    const capability = typeof llm.profile !== 'undefined'
+      ? resolveCapability(llm.profile)
+      : (typeof llm.capability === 'string' ? llm.capability : '')
+    const providerId = typeof llm.profile?.providerId === 'string' ? llm.profile.providerId : ''
+    const availableTools = this.#tools.listTools()
     const messages = [
       { role: 'system', content: turnPrompt },
-      ...trimHistory(history),
-      { role: 'user', content: input },
+      ...trimHistory(history, { providerCapability: capability, providerId }),
     ]
+    /*
+     * 本轮增量边界：用**对象引用**而不是数字索引。
+     *
+     * `compress(messages)` 会整体重建数组（splice 把旧单元从头部移除），
+     * 用数字索引 `turnStart` 会在压缩后失效——可能把本轮 user / 工具结果 / 回复漏掉。
+     * 压缩总是保留“当前回合的 user”（见 context.mjs 的 splitInteractionUnits），
+     * 因此拿到本轮第一条 user 消息的对象引用，处理后按 `indexOf` 定位即可稳定切出本轮增量。
+     */
+    const turnUserMessage = { role: 'user', content: input }
+    messages.push(turnUserMessage)
+    /**
+     * 每次发请求前压一次。**没到 90% 会立刻返回**（只花一次估算），
+     * 到了才按完整片段整体删除——所以"低于阈值不压缩"是结构上保证的。
+     *
+     * 返回的 `overLimit` 表示"压完仍然装不下"：这种情况不能继续盲目发请求，
+     * 也不能静默截断用户任务后假装正常完成——本回合直接如实失败，
+     * 让上层明确告诉用户（见下面的 checkBudget）。
+     */
+    const compress = () => compressMessages(messages, policy, { tools: availableTools })
+    /**
+     * 发请求前的预算闸。
+     * @returns {string|null} 失败说明（非 null 表示这一轮装不下，不能再发）
+     */
+    const checkBudget = (report) => {
+      if (report.overLimit !== true) return null
+      return `上下文装不下这一轮（估算 ${report.overLimitTokens.toLocaleString('en-US')} tokens，`
+        + `模型输入上限 ${policy.hardLimitTokens.toLocaleString('en-US')}）。`
+    }
+    /*
+     * 发第一枪之前先看一眼总预算：历史本身就可能已经很大（长时间 CUA 会话）。
+     * 没到触发点这一步什么都不做。
+     */
+    const initialBudget = compress()
+    const initialOverflow = checkBudget(initialBudget)
+    if (initialOverflow !== null) {
+      emit({ type: 'stream_error', text: '', finishReason: 'context_overflow' })
+      return {
+        text: initialOverflow,
+        steps: [],
+        limited: false,
+        reasoningChars: 0,
+        llm,
+        turn: [{ ...turnUserMessage, _providerId: providerId }],
+        providerId,
+        failed: true,
+        failureReason: 'context_overflow',
+        contextTokens: initialBudget.after,
+        contextWindow: policy.contextWindow,
+      }
+    }
+
     const steps = []
-    const availableTools = this.#tools.listTools()
     let finalText = ''
     let hitStepLimit = false
+    /** 本轮因流式异常/错误而未正常完成（上层不应把 finalText 当作成功回答） */
+    let turnFailed = false
+    /** 失败的具体原因（stream_error / context_overflow / step_limit…），供上层如实说明 */
+    let failureReason = ''
     /** 本轮已经塞给模型多少张图 */
     let imagesAttached = 0
+    /** 本轮累计的思考内容字数（只记长度，不落盘、不播报） */
+    let reasoningChars = 0
 
-    for (let step = 1; step <= this.#maxSteps; step += 1) {
+    for (let step = 1; step <= maxSteps; step += 1) {
       throwIfAborted(signal)
 
-      const result = await this.#llm.chat({
-        messages,
+      const result = await llm.chat({
+        // 本地标记（internal / _providerId）只用于回合内部判断，绝不能进请求体
+        messages: stripLocalMarkers(messages),
         tools: availableTools,
         signal,
         stream: true, // 必须流式：首字和"先说话后动手"的白描都依赖它
@@ -122,23 +317,126 @@ export class Agent {
       throwIfAborted(signal)
 
       if (result.text) finalText += result.text
+      if (result.reasoning) {
+        reasoningChars += result.reasoning.length
+        // 只带长度，不带内容：思考过程不播报、不入库
+        emit({ type: 'reasoning', step, chars: result.reasoning.length })
+      }
+      const toolCalls = result.toolCalls ?? []
+      const broken = result.brokenToolCalls ?? []
 
-      if (result.toolCalls.length === 0) {
+      /*
+       * 响应完整性硬闸：LLMClient 只要判定这次响应不完整（截断 / length / 无结束信号 /
+       * 服务端错误事件 / 打断），`toolCallsIncomplete` 就会为 true —— 此时**一个工具都不执行**，
+       * 即使个别调用参数已经是合法 JSON（"模型说到一半"并不是可安全执行的指令）。
+       * 已流出的普通文字仍然保留；不重复执行已完成的工具（本轮没有执行任何工具）。
+       *
+       * 即使没有工具调用（纯文本错误流），也不能当成正常成功回答结束：
+       * 服务端错误/异常断流必须让上层明确感知失败。
+       */
+      if (result.toolCallsIncomplete === true) {
+        if (toolCalls.length > 0 || broken.length > 0) {
+          messages.push(assistantMessageFrom(result))
+          messages.push({
+            role: 'user',
+            content: `（上一步的模型响应不完整${result.finishReason === 'length' ? '（输出被长度上限截断）' : ''}，`
+              + '未执行任何工具调用。请重新组织你的回答；如果需要工具，请完整地重新发起调用。）',
+            // 程序生成的说明，不是用户说的话（压缩不能把它当新回合，见 context.mjs）
+            internal: true,
+          })
+          for (const call of [...toolCalls, ...broken]) {
+            steps.push({ step, tool: call.name || '(未知工具)', ok: false, text: '响应不完整，未执行' })
+            emit({ type: 'tool_end', name: call.name || '(未知工具)', ok: false, text: '响应不完整，未执行', step })
+          }
+          const internalReport = compress()
+          const internalOverflow = checkBudget(internalReport)
+          if (internalOverflow !== null) {
+            // 装不下就别再发：如实结束，不把注定失败的请求发出去
+            finalText = finalText || internalOverflow
+            emit({ type: 'stream_error', text: '', finishReason: 'context_overflow' })
+            turnFailed = true
+            failureReason = 'context_overflow'
+            break
+          }
+          if (step === maxSteps) hitStepLimit = true
+          continue
+        }
+      }
+      // 纯文本回复但也可能是错误流（finishReason 非正常 / sawError / incomplete）
+      if (toolCalls.length === 0 && broken.length === 0) {
+        const streamFailed = result.toolCallsIncomplete === true
+          || result.finishReason === 'incomplete'
+          || result.finishReason === 'length'
+          || result.finishReason === 'content_filter'
+          || result.finishReason === 'repetition_truncation'
+        if (streamFailed) {
+          // 保留已流出的文字，但明确标记本轮失败（不当作成功回答结束）
+          finalText = finalText || '（模型响应异常，未能完成回答）'
+          if (result.text) messages.push(assistantMessageFrom(result))
+          emit({ type: 'stream_error', text: result.text ?? '', finishReason: result.finishReason })
+          turnFailed = true
+          failureReason = 'stream_error'
+          break
+        }
+        // 纯文本回复也要进消息历史：后续同一会话的提问需要带着这条回复，
+        // 且如果是思考模式下，reasoning_content 也要如实回传。
+        messages.push(assistantMessageFrom(result))
         emit({ type: 'assistant', text: result.text, step })
         break
       }
 
-      messages.push({
-        role: 'assistant',
-        content: result.text || null,
-        tool_calls: result.toolCalls.map((call) => ({
-          id: call.id,
-          type: 'function',
-          function: { name: call.name, arguments: call.arguments },
-        })),
-      })
+      /*
+       * 模型这一轮想调工具，但调用本身残缺（流被截断、参数不是合法 JSON、缺函数名）。
+       * 绝不能拿半截参数去执行——点击/键盘/杀进程这类动作，参数错一位就是事故。
+       *
+       * 处理方式：assistant 消息里**只写成功的调用**（残缺的那些不进 tool_calls，
+       * 也就不给它们补 tool 结果——孤立的 tool 消息同样是协议错误），
+       * 思考内容与文本照常回传（协议要求），再用一条 user 消息如实说明没执行。
+       */
+      if (toolCalls.length === 0) {
+        messages.push(assistantMessageFrom(result))
+        messages.push({
+          role: 'user',
+          content: `（上一步的工具调用参数不完整，没有执行${broken.map((call) => call.name ? `（${call.name}）` : '').join('')}。`
+            + '请重新给出完整参数，或直接用一句话告诉用户做不到以及原因。）',
+          // 程序生成的说明，不是用户说的话（压缩不能把它当新回合，见 context.mjs）
+          internal: true,
+        })
+        for (const call of broken) {
+          steps.push({ step, tool: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行' })
+          emit({ type: 'tool_end', name: call.name || '(未知工具)', ok: false, text: '参数不完整，未执行', step })
+        }
+        const toolReport = compress()
+        const toolOverflow = checkBudget(toolReport)
+        if (toolOverflow !== null) {
+          /*
+           * 工具已经真的执行完了（有副作用），但这一轮已经装不下它的结果。
+           * 绝不能自动重试（会重复点击/输入），也不能把残缺历史发出去：
+           * 如实结束本回合，让用户知道"做了一半、后面接不下去"。
+           */
+          finalText = finalText || toolOverflow
+          emit({ type: 'stream_error', text: toolOverflow, finishReason: 'context_overflow' })
+          turnFailed = true
+          failureReason = 'context_overflow'
+          break
+        }
+        if (step === maxSteps) hitStepLimit = true
+        continue
+      }
 
-      for (const call of result.toolCalls) {
+      // 混合情况（有的能解析、有的坏了）：assistant 只带能用的那些，坏的直接不认
+      if (broken.length > 0) {
+        emit({ type: 'tool_end', name: broken.map((call) => call.name || '(未知工具)').join(', '), ok: false, text: '参数不完整，已丢弃', step })
+      }
+      messages.push(assistantMessageFrom(result))
+
+      /*
+       * 同一批工具调用的结果必须**连续**出现：协议要求 tool 消息紧跟声明它们的 assistant，
+       * 中间插一条 user（哪怕只是图片附件）就会被判成孤立工具结果。
+       * 所以截图先攒在 `pendingImages`，等这一批工具**全部**返回后再一次性补进消息。
+       */
+      const pendingImages = []
+      for (const call of toolCalls) {
         throwIfAborted(signal)
         const args = safeParseArgs(call.arguments)
 
@@ -167,18 +465,40 @@ export class Agent {
           /*
            * 截图这类工具会带回一张图。**必须把图塞进对话**，否则模型只看到
            * "图存在某个路径"的文字——它对屏幕就是瞎的（这正是"任务做一半"的根因）。
-           * OpenAI 兼容协议里图片只能放在 user 消息的 content 数组上，所以单独补一条。
-           * 一轮最多带 4 张：再多既贵又容易把上下文挤爆。
+           * OpenAI 兼容协议里图片只能放在 user 消息的 content 数组上，所以单独补一条；
+           * 但补的时机是**这一批工具全部返回之后**（见上面的 pendingImages 说明）。
            */
-          if (invoked?.image !== undefined && invoked.image !== null && imagesAttached < MAX_IMAGES_PER_RUN) {
-            imagesAttached += 1
-            messages.push({
-              role: 'user',
-              content: [
-                { type: 'text', text: `（这是 ${call.name} 刚返回的图，${invoked.image.width ?? '?'}x${invoked.image.height ?? '?'}）` },
-                { type: 'image_url', image_url: { url: `data:${invoked.image.mediaType ?? 'image/jpeg'};base64,${invoked.image.base64}` } },
-              ],
-            })
+          if (invoked?.image !== undefined && invoked.image !== null) {
+            /*
+             * 图片上限只防跑飞，正常任务碰不到。真碰到了也**不能静默丢图**：
+             * 模型会以为"屏幕上没变化"而继续瞎点。所以不给图，但给一句明确说明，
+             * 让它改用 get_app_state 的文字描述继续干活。
+             */
+            if (imagesAttached < MAX_IMAGES_PER_RUN) {
+              imagesAttached += 1
+              pendingImages.push({
+                role: 'user',
+                content: [
+                  { type: 'text', text: `（这是 ${call.name} 刚返回的图，${invoked.image.width ?? '?'}x${invoked.image.height ?? '?'}）` },
+                  { type: 'image_url', image_url: { url: `data:${invoked.image.mediaType ?? 'image/jpeg'};base64,${invoked.image.base64}` } },
+                ],
+                // 截图附件属于这一段工具调用，压缩时跟着片段走（不能当新用户回合）
+                internal: true,
+              })
+            } else {
+              /*
+               * 超上限：不给图，但给一句明确说明。它和截图一样**排在这一批工具结果之后**
+               * （pendingImages 里全是"工具结果之后才允许出现的 user 消息"），
+               * 绝不在未完成的工具结果之间插 user。
+               */
+              pendingImages.push({
+                role: 'user',
+                content: `（这一轮已经附了 ${imagesAttached} 张截图，达到单轮上限，`
+                  + `${call.name} 的这张图没有附上。请改用 get_app_state 这类文字描述来确认界面状态，不要假设屏幕没变化。）`,
+                internal: true,
+              })
+              emit({ type: 'tool_end', name: call.name, ok: true, text: '截图超出单轮上限，未附图', step })
+            }
           }
         } catch (error) {
           throwIfAborted(signal)
@@ -188,10 +508,20 @@ export class Agent {
           emit({ type: 'tool_end', name: call.name, ok: false, text: message, step })
         }
       }
+      // 这一批工具结果已经齐了，截图附件现在才能进来（不会插在结果之间）
+      messages.push(...pendingImages)
 
-      compress(messages)
+      const batchReport = compress()
+      const batchOverflow = checkBudget(batchReport)
+      if (batchOverflow !== null) {
+        finalText = finalText || batchOverflow
+        emit({ type: 'stream_error', text: '', finishReason: 'context_overflow' })
+        turnFailed = true
+        failureReason = 'context_overflow'
+        break
+      }
       // 这是最后一步，且这一步还在调工具 → 走完就撞上限，需要补一次交代
-      if (step === this.#maxSteps) hitStepLimit = true
+      if (step === maxSteps) hitStepLimit = true
     }
 
     /*
@@ -200,43 +530,95 @@ export class Agent {
      * 之前的行为是：最后一步工具执行完，往上下文塞一句"达到上限，先停下汇报"，
      * 然后循环直接结束——模型根本没机会说话，用户听到的就是"话说到一半停了"。
      * 现在多给一次不带工具的往返，让它用一句话说清楚做到哪、还差什么。
+     *
+     * 这条收尾回复**必须进消息历史**：用户听到的是这一轮的回答，
+     * 下一轮追问"那接下来呢"时模型得记得自己刚才说过什么。
      */
     throwIfAborted(signal)
     if (hitStepLimit && steps.length > 0) {
+      const noteIndex = messages.length
+      messages.push({
+        role: 'user',
+        content: `（已经用满 ${maxSteps} 步，不能再调工具了。用一句话告诉用户：你做到哪一步、还差什么、需要他怎么配合。）`,
+        // 程序生成的提示，不是用户说的话
+        internal: true,
+      })
       try {
-        const closing = await this.#llm.chat({
-          messages: [
-            ...messages,
-            {
-              role: 'user',
-              content: `（已经用满 ${this.#maxSteps} 步，不能再调工具了。用一句话告诉用户：你做到哪一步、还差什么、需要他怎么配合。）`,
-            },
-          ],
+        const closing = await llm.chat({
+          messages: stripLocalMarkers(messages),
           tools: [],
           signal,
           stream: true,
           onDelta: (text) => emit({ type: 'text_delta', text }),
         })
         throwIfAborted(signal)
+        // 这条"用满步数"的内部提示不属于对话内容，拿到回复后就撤掉（保持历史干净且协议合法）
+        messages.splice(noteIndex, 1)
         if (closing.text) {
           finalText += closing.text
-          emit({ type: 'assistant', text: closing.text, step: this.#maxSteps + 1, limited: true })
+          messages.push(assistantMessageFrom(closing))
+          emit({ type: 'assistant', text: closing.text, step: maxSteps + 1, limited: true })
         }
+        if (closing.toolCallsIncomplete === true && closing.text === '') turnFailed = true
       } catch (error) {
         throwIfAborted(signal)
-        emit({ type: 'assistant', text: `（步数用完了，没能收尾：${error.message}）`, step: this.#maxSteps + 1, limited: true })
+        messages.splice(noteIndex, 1)
+        const fallback = `（步数用完了，没能收尾：${error.message}）`
+        messages.push({ role: 'assistant', content: fallback })
+        emit({ type: 'assistant', text: fallback, step: maxSteps + 1, limited: true })
+        turnFailed = true
       }
     }
 
-    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit })
-    return { text: finalText, steps, limited: hitStepLimit }
+    emit({ type: 'done', text: finalText, steps: steps.length, limited: hitStepLimit, reasoningChars, failed: turnFailed, failureReason: failureReason || null })
+    /*
+     * 把这一回合用的端点快照一起返回：回合之后的旁路请求（比如"还要不要继续听"的判定）
+     * 必须用**同一套**提供商与推理参数，否则中途改了设置会让那次判定换个模型、
+     * 甚至换个提供商，判出来的东西和刚说的这段话不是一套。
+     */
+    /*
+     * 返回**本轮增量** `turn`：本轮 user + 全部 assistant
+     * （含 reasoning_content / tool_calls） + tool 结果 + 截图消息。
+     *
+     * 用本轮 user 消息的对象引用定位边界（compress 重建数组、删除旧单元后，
+     * 数字索引会失效；对象引用不受影响，且压缩保证不会删掉当前回合 user）。
+     * **不包含**传入 history 里的旧消息——旧历史由保存方自行维护，不能由 Agent 反复带出造成重复。
+     *
+     * 每条消息打 `_providerId` 标记供跨提供商剥离，但该字段绝不会进请求体（trimHistory 会删）。
+     */
+    const turnIndex = messages.indexOf(turnUserMessage)
+    const from = turnIndex === -1 ? messages.length : turnIndex
+    const turn = messages.slice(from).map((m) => ({
+      ...m,
+      _providerId: providerId,
+      content: typeof m.content === 'string' ? m.content : (m.content === undefined || m.content === null ? null : JSON.parse(JSON.stringify(m.content))),
+      ...(m.tool_calls !== undefined ? { tool_calls: JSON.parse(JSON.stringify(m.tool_calls)) } : {}),
+      ...(m.reasoning_content !== undefined ? { reasoning_content: m.reasoning_content } : {}),
+      ...(m.tool_call_id !== undefined ? { tool_call_id: m.tool_call_id } : {}),
+      // 内部提示的身份要跨回合保留：下一轮压缩仍要认得出它不是用户说的话
+      ...(m.internal === true ? { internal: true } : {}),
+    }))
+    return {
+      text: finalText,
+      steps,
+      limited: hitStepLimit,
+      reasoningChars,
+      llm,
+      turn,
+      providerId,
+      failed: turnFailed,
+      failureReason: failureReason || null,
+      contextTokens: estimateRequestTokens({ messages, tools: availableTools }),
+      contextWindow: policy.contextWindow,
+    }
   }
 }
 
 function safeParseArgs(raw) {
   if (typeof raw !== 'string' || raw.trim() === '') return {}
   try {
-    return JSON.parse(raw)
+    const parsed = JSON.parse(raw)
+    return parsed !== null && typeof parsed === 'object' ? parsed : { __raw: raw }
   } catch {
     return { __raw: raw }
   }
@@ -244,27 +626,10 @@ function safeParseArgs(raw) {
 
 function clamp(text, max) {
   const value = String(text ?? '')
-  return value.length <= max ? value : `${value.slice(0, max)}…（截断）`
-}
-
-/**
- * 上下文压缩：只保留最近 N 条工具结果，更早的替换成一行摘要。
- * 截图结果单条可达数 KB，不压缩的话多步任务必然超长。
- */
-function compress(messages) {
-  if (messages.length <= COMPRESS_AFTER_MESSAGES) return
-  const toolIndexes = []
-  for (let i = 0; i < messages.length; i += 1) {
-    if (messages[i].role === 'tool') toolIndexes.push(i)
-  }
-  const keepFrom = toolIndexes.length - TOOL_RESULT_KEEP
-  for (let i = 0; i < toolIndexes.length; i += 1) {
-    if (i >= keepFrom) continue
-    const target = messages[toolIndexes[i]]
-    if (target.content.startsWith('（已压缩）')) continue
-    const firstLine = String(target.content).split('\n')[0].slice(0, 80)
-    target.content = `（已压缩）${firstLine}`
-  }
+  if (value.length <= max) return value
+  // 说清楚被砍了多少：模型据此知道自己看的是片段（而不是"结果就这么多"）
+  return `${value.slice(0, max)}\n…（结果过长已截断：原文 ${value.length} 字，只保留前 ${max} 字。`
+    + '如果判断还需要后面的内容，请换更精确的命令/参数重新获取，不要凭空推测。）'
 }
 
 function throwIfAborted(signal) {
@@ -273,4 +638,23 @@ function throwIfAborted(signal) {
     error.name = 'AbortError'
     throw error
   }
+}
+
+/**
+ * 去掉只属于本地的标记，得到真正可以发出去的 messages。
+ *
+ * `internal`（程序生成的提示）、`_providerId`（跨提供商剥离用）都是回合内部语义，
+ * 发出去就是给模型塞了几个它看不懂的字段——有些端点会直接参数校验报错。
+ * 返回**新数组**（浅拷贝每条消息），不改动 Agent 自己维护的 messages。
+ */
+function stripLocalMarkers(messages) {
+  if (!Array.isArray(messages)) return messages
+  return messages.map((message) => {
+    if (message === null || typeof message !== 'object') return message
+    if (message.internal === undefined && message._providerId === undefined) return message
+    const copy = { ...message }
+    delete copy.internal
+    delete copy._providerId
+    return copy
+  })
 }

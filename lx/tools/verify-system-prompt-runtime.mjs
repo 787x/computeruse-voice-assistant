@@ -3,10 +3,10 @@
  *
  * 钉死的是"接线"，而不是配置文件变了没有：
  *   设置保存 → 内存状态 → **已缓存的 Agent** → 下一轮发给 LLM 的真实 messages。
- * 用的是 lx/apps/shell/main.mjs 里真正的 ensureAgent / settings:save handler，
+ * 用的是 apps/shell/main.mjs 里真正的 ensureAgent / settings:save handler，
  * 模型与 CUA 桥接是可控替身（不发网络、不动桌面），配置走临时目录。
  *
- * 用法：node lx/tools/verify-system-prompt-runtime.mjs
+ * 用法：node tools/verify-system-prompt-runtime.mjs
  */
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile } from 'node:fs/promises'
@@ -19,7 +19,7 @@ import { Agent as RealAgent } from '../packages/agent/loop.mjs'
 import { DEFAULT_SYSTEM_PROMPT } from '../packages/agent/system-prompt.mjs'
 import { FOLLOWUP_DEFAULTS } from '../packages/agent/followup.mjs'
 
-process.env.CUA_VA_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'cua-va-lx-prompt-shell-'))
+process.env.CUA_VA_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'cua-va-prompt-shell-'))
 const store = await import('../packages/config/store.mjs')
 await store.saveConfig({
   providerId: 'mock',
@@ -85,6 +85,8 @@ function fixture({ gateVerdicts = [] } = {}) {
     resolveSearchKey: async () => store.resolveSearchKey(),
     saveConfig: async (...args) => store.saveConfig(...args),
     listProviders: () => store.listProviders(),
+    // 主进程现在用 store 的上下文预算解析器（默认 1M / 90%），替身也要转发
+    resolveContextPolicyFor: (...args) => store.resolveContextPolicyFor(...args),
     CONFIG_FILE: store.CONFIG_FILE,
   }
 
@@ -104,6 +106,11 @@ function fixture({ gateVerdicts = [] } = {}) {
     constructor(options) { this.options = options }
     setModel() {}
     setEndpoint() {}
+    setProfile() {}
+    setTemperature() {}
+    setTimeout() {}
+    /** 回合快照：本用例关心的是提示词与调用顺序，返回自身即可 */
+    snapshot() { return this }
     async chat({ messages }) {
       llmCalls.push(messages.map((m) => ({
         role: m.role,
@@ -116,7 +123,8 @@ function fixture({ gateVerdicts = [] } = {}) {
   }
   const modules = {
     '../../packages/config/store.mjs': storeShim,
-    '../../packages/agent/llm.mjs': { LLMClient: FakeLLMClient },
+    // 壳子会给 LLMClient 传提供商档案（决定推理参数），桩件必须提供同一个函数
+    '../../packages/agent/llm.mjs': { LLMClient: FakeLLMClient, profileFromConfig: (source) => ({ providerId: source?.providerId ?? '', capability: source?.providerId ?? '' }) },
     '../../packages/agent/loop.mjs': { Agent: RealAgent },
     '../../packages/cua/adapter.mjs': { CuaToolkit: FakeToolkit },
     '../../packages/tools/web-search.mjs': { WebSearch: class { enabled = false }, WEB_SEARCH_TOOL: {} },
@@ -134,7 +142,8 @@ function fixture({ gateVerdicts = [] } = {}) {
     FOLLOWUP_DEFAULTS, isAutoStartRegistered: () => false,
     permissionGate: null,
     applyAutoStart() {}, setVoiceConfirmEnabled() {}, stopSpeaking() {}, applyModelSchedule() {},
-    log: (m) => logs.push(m), handleAgentEvent() {},
+    syncPlayerWindow() {}, log: (m) => logs.push(m), handleAgentEvent() {},
+    musicCredentials: { sync: () => Promise.resolve({}), catch: () => {} },
     ensurePermissions: async () => ({
       async check({ tool }) {
         gateCalls.push(tool)
@@ -146,11 +155,14 @@ function fixture({ gateVerdicts = [] } = {}) {
     ensureLauncher: async () => ({ launch: async () => ({ text: '已启动' }) }),
     loadModule: async (path) => modules[path],
     LAUNCH_APP_TOOL: {}, SHELL_TOOL: {}, FILES_TOOL: {}, PROC_TOOL: {}, KILL_TOOL: {},
-    SYSINFO_TOOL: {}, LX_MUSIC_TOOL: { function: { name: 'music' } },
+    // 两套发行版各有一件音乐工具：根目录用 netease_music，lx 用 lx_music。
+    // 这份测试是共用的，两个都提供，哪一套主程序引用都能跑起来。
+    SYSINFO_TOOL: {}, NETEASE_TOOL: { function: { name: 'netease_music' } },
+    LX_MUSIC_TOOL: { function: { name: 'lx_music' } },
     runShell: async () => ({ text: 'ok' }), runFiles: async () => ({ text: 'ok' }),
     runAppControl: async () => ({ text: 'ok' }), runKillApp: async () => ({ text: 'ok' }),
     runSystemInfo: async () => ({ text: 'ok' }),
-    runLx: async () => ({ text: 'ok', data: {} }),
+    runNetease: async () => ({ text: 'ok', data: {} }),
     normalizeCuaTarget: async (_toolkit, _name, args) => args,
     invokeCuaWithRecovery: async (toolkit, name, args) => toolkit.invoke(name, args),
     attachScreenshotImage: async () => null,

@@ -20,6 +20,8 @@ for(const fallback of [false,true]) for(const phase of ['launcher-failure','laun
   }}
  },
  refreshSearchKey:async()=>{},ensureAgent:async()=>{throw Object.assign(Error('network failure'),{network:true})},
+ // runCommand 的回合入口会先核对磁盘配置；本用例不关心它，给个空实现
+ syncAgentEndpointIfChanged:async()=>{},
  })
  vm.runInContext(`
  let turnSeq=0,activeTurn=null,latestTurn=null,hideTimer=null,commandTimer='timer',commandActive=false;

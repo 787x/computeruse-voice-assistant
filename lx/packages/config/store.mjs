@@ -10,8 +10,10 @@
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { defaultConfig, getProvider, PROVIDERS } from './registry.mjs'
+import { defaultConfig, getProvider, PROVIDERS, defaultModelFor } from './registry.mjs'
 import { normalizeSystemPromptForStorage } from '../agent/system-prompt.mjs'
+import { buildProfileFor, buildRequestFields, normalizeEffortLevel, normalizeThinking } from '../agent/ll-params.mjs'
+import { DEFAULT_CONTEXT_WINDOW, DEFAULT_COMPRESS_PERCENT, resolveContextPolicy } from '../agent/context.mjs'
 
 const CONFIG_DIR = process.env.CUA_VA_CONFIG_DIR ?? join(process.cwd(), '.config')
 const CONFIG_PATH = join(CONFIG_DIR, 'agent.json')
@@ -30,26 +32,113 @@ export async function loadConfig() {
     const parsed = JSON.parse(raw)
     const merged = { ...defaultConfig(), ...parsed }
     merged.apiKey = decryptField(merged.apiKey)
+    // 每个提供商自己的 Key 也逐个解回（缺这个就会把密文当 Key 发出去）
+    merged.providerKeys = decryptKeyMap(merged.providerKeys)
+    // 模型方案的 Key 同样解回：可能来自旧明文配置，也可能是 safeStorage 加密后的 enc: 值
+    if (Array.isArray(merged.modelProfiles)) {
+      merged.modelProfiles = merged.modelProfiles.map((profile) => ({
+        ...profile,
+        apiKey: decryptField(profile?.apiKey ?? ''),
+      }))
+    }
     if (merged.search !== undefined && merged.search !== null) {
       merged.search = { ...merged.search, apiKey: decryptField(merged.search.apiKey) }
     }
+    if (typeof merged.providerKeys !== 'object' || merged.providerKeys === null || Array.isArray(merged.providerKeys)) {
+      merged.providerKeys = {}
+    }
+    /*
+     * 旧配置兼容（PR#4 之前只有 `apiKey` 一个槽 / `providerKeys[providerId]`）：
+     * 把「当前选中提供商」的 Key 补进 providerKeys，这样切走再切回来不用重填。
+     * 只补空槽，绝不覆盖用户已经存着的值；密文（enc:）不参与搬运——
+     * 那是"还没解密"的值，不是用户刚填的新 Key。
+     */
+    const currentId = typeof merged.providerId === 'string' ? merged.providerId.trim() : ''
+    const realKey = (value) => isRealSecret(value) && !isEncrypted(value)
+    if (currentId !== '' && !isRealSecret(merged.providerKeys[currentId]) && realKey(merged.apiKey)) {
+      merged.providerKeys = { ...merged.providerKeys, [currentId]: merged.apiKey }
+    }
+    /*
+     * PR#4 曾把凭据拆成「认证目标」（providerTargets，键 `providerId|baseURL`）。
+     * 那套隔离让"改一下地址 Key 就消失、切回来还要重填"，与便利性要求冲突，已撤回。
+     * 这里做**只读回收**：把 providerTargets 里属于当前 providerId 的、能解开的 Key
+     * 搬回 providerKeys[currentId]（没有就补），其余目标键直接丢弃。
+     * 绝不把掩码/密文当真实 Key（isRealSecret + decryptField 已经挡住这两种情况）。
+     */
+    const legacyTargets = parsed.providerTargets
+    if (legacyTargets !== undefined && legacyTargets !== null && typeof legacyTargets === 'object' && !Array.isArray(legacyTargets)) {
+      const preferred = `${currentId}|${String(merged.baseURL ?? '').trim()}`
+      const candidates = Object.entries(legacyTargets)
+        .filter(([key]) => key.startsWith(`${currentId}|`))
+        .map(([key, value]) => [key, decryptField(value)])
+      const hit = candidates.find(([key]) => key === preferred) ?? candidates[0]
+      if (hit !== undefined && !isRealSecret(merged.providerKeys[currentId]) && realKey(hit[1])) {
+        merged.providerKeys = { ...merged.providerKeys, [currentId]: hit[1] }
+      }
+    }
+    // 生效的 apiKey 与 providerKeys 保持一致（切提供商时由 saveConfig 负责换槽位）
+    if (realKey(merged.providerKeys[currentId])) merged.apiKey = merged.providerKeys[currentId]
+    // 每次读都重算生效摘要：档位是纯函数，磁盘上那份只是给人看的，不能当真值源
+    merged.effectiveReasoning = reasoningSummary(merged)
     return merged
   } catch {
-    return defaultConfig()
+    const fresh = defaultConfig()
+    fresh.providerKeys = {}
+    fresh.effectiveReasoning = reasoningSummary(fresh)
+    return fresh
   }
 }
 
-/** 读取给界面/日志用的配置：密钥打码。 */
+/** 读取给界面/日志用的配置：密钥打码，任何情况都不暴露明文。 */
 export async function loadPublicConfig() {
   const config = await loadConfig()
   const searchKey = config.search?.apiKey ?? ''
+  /*
+   * 用显式白名单构造返回对象，禁止 `...config` 全量展开：
+   * `config` 里的 providerKeys / modelProfiles / search.apiKey
+   * 都是解密后的明文，绝不能进入公开配置（会被 settings:load 直接送回渲染层）。
+   */
   return {
-    ...config,
+    schemaVersion: config.schemaVersion,
+    providerId: config.providerId,
+    baseURL: config.baseURL,
+    model: config.model,
+    // apiKey 只报掩码 + 有没有；不包含明文
     apiKey: maskKey(config.apiKey),
     hasApiKey: Boolean(config.apiKey || process.env.CUA_VA_API_KEY),
+    // 每个提供商的 Key 只报掩码 + 有没有，界面据此决定"切回去要不要重新填"
+    providerKeys: Object.fromEntries(Object.entries(config.providerKeys ?? {}).map(([id, key]) => [id, maskKey(key)])),
+    hasProviderKey: Object.fromEntries(Object.entries(config.providerKeys ?? {}).map(([id, key]) => [id, Boolean(key)])),
+    temperature: config.temperature,
+    mimoThinking: config.mimoThinking,
+    deepseekReasoningEffort: config.deepseekReasoningEffort,
+    providerHint: config.providerHint,
+    maxSteps: config.maxSteps,
+    timeoutMs: config.timeoutMs,
+    contextWindow: config.contextWindow,
+    contextCompressPercent: config.contextCompressPercent,
+    systemPrompt: config.systemPrompt ?? null,
+    effectiveReasoning: config.effectiveReasoning ?? null,
+    ui: { ...(config.ui ?? {}) },
+    tts: { ...(config.tts ?? {}) },
+    permissions: { ...(config.permissions ?? {}) },
+    resources: { ...(config.resources ?? {}) },
+    followup: JSON.parse(JSON.stringify(config.followup ?? {})),
+    // 模型方案 Key 打码
+    modelProfiles: (config.modelProfiles ?? []).map((profile) => ({ ...profile, apiKey: maskKey(profile.apiKey), hasApiKey: Boolean(profile.apiKey) })),
+    modelSchedule: JSON.parse(JSON.stringify(config.modelSchedule ?? { enabled: false, rules: [] })),
+    // 搜索 Key 打码
     search: { ...(config.search ?? {}), apiKey: maskKey(searchKey), hasApiKey: Boolean(searchKey || process.env.TAVILY_API_KEY) },
     // 网易云：appId 可以明示，私钥只报长度（1600 字符塞进界面毫无意义）
-    modelProfiles: (config.modelProfiles ?? []).map((profile) => ({ ...profile, apiKey: maskKey(profile.apiKey), hasApiKey: Boolean(profile.apiKey) })),
+    netease: {
+      appId: config.netease?.appId ?? '',
+      privateKey: config.netease?.privateKey === undefined || config.netease.privateKey === ''
+        ? ''
+        : `已保存（${String(config.netease.privateKey).length} 字符）`,
+      hasPrivateKey: Boolean(config.netease?.privateKey),
+      // 界面要显示「已保存（N 字符）」；长度必须由这里给，掩码串自己的长度没有意义
+      privateKeyLength: String(config.netease?.privateKey ?? '').length,
+    },
   }
 }
 
@@ -88,6 +177,17 @@ function isRealSecret(value) {
 }
 const ENC_PREFIX = 'enc:'
 
+/**
+ * 认证目标键：`providerId|baseURL`。
+ *
+ * **仅为兼容 PR#4 已落盘的 providerTargets 保留**（loadConfig 用它把旧数据搬回
+ * providerKeys）。新写入一律走 providerKeys[providerId] —— 按提供商隔离 Key
+ * 已经足够安全（不同提供商不会互发），按地址再拆一层只会让用户改个地址就丢 Key。
+ */
+export function targetKey(providerId, baseURL) {
+  return `${String(providerId ?? '').trim()}|${String(baseURL ?? '').trim()}`
+}
+
 function isEncrypted(value) {
   return typeof value === 'string' && value.startsWith(ENC_PREFIX)
 }
@@ -111,19 +211,112 @@ function decryptField(value) {
   }
 }
 
+/** 逐条解密「提供商 → Key」映射（整块加解密会丢单条为空的情况） */
+function decryptKeyMap(map) {
+  if (typeof map !== 'object' || map === null || Array.isArray(map)) return {}
+  const out = {}
+  for (const [id, value] of Object.entries(map)) {
+    if (typeof value === 'string') out[id] = decryptField(value)
+  }
+  return out
+}
+
+function encryptKeyMap(map) {
+  if (typeof map !== 'object' || map === null || Array.isArray(map)) return {}
+  const out = {}
+  for (const [id, value] of Object.entries(map)) {
+    if (typeof value === 'string') out[id] = encryptField(value)
+  }
+  return out
+}
+
 /** 更新配置。
  * 空字符串或掩码值（含 *）表示"不修改密钥"，避免界面把打码值写回去。
  */
-export async function saveConfig(patch) {
+let saveQueue = Promise.resolve()
+export function saveConfig(patch, options = {}) {
+  const pending = saveQueue.then(() => saveConfigOnce(patch, options))
+  saveQueue = pending.catch(() => {})
+  return pending
+}
+async function saveConfigOnce(patch, { signal, expectedCredentials } = {}) {
+  signal?.throwIfAborted()
   const current = await loadConfig()
+  signal?.throwIfAborted()
+  if (expectedCredentials && (current.netease?.appId !== expectedCredentials.appId
+      || current.netease?.privateKey !== expectedCredentials.privateKey)) {
+    throw Object.assign(new Error('音乐配置版本已变化'), { code: 'STALE_CREDENTIALS' })
+  }
   const next = { ...current, ...patch }
 
+  /*
+   * 提供商先定下来（并校验），后面「这条 Key 属于哪一家」「生效的是哪一份 Key」
+   * 都只用这一个结果。两边各算各的会出现：Key 存进 `' mimo '` 的槽位，
+   * 而 providerId 是 `'mimo'`，查不到就等于把用户的 Key 弄丢了。
+   *
+   * 切提供商时：地址跟着默认端点走，模型换成该提供商的推荐初始值；
+   * 用户显式给了 baseURL / model 就以用户给的为准（在线模型列表刷新后就是这么提交的）。
+   * 这里**不改**推理档位：两个档位在磁盘上各自存着，切走再切回来还是用户原来选的。
+   */
+  if (typeof patch.providerId === 'string' && patch.providerId.trim() !== '') {
+    const provider = getProvider(patch.providerId.trim())
+    if (provider === undefined) throw new Error(`未知提供商: ${patch.providerId}`)
+    next.providerId = provider.id
+    if (patch.baseURL === undefined) next.baseURL = provider.baseURL
+    if (patch.model === undefined) {
+      const suggested = defaultModelFor(provider)
+      if (suggested !== '') next.model = suggested
+    }
+  } else {
+    /*
+     * providerId 为空/缺省：保持原值。不能让它变成 ''——
+     * 那样下面推导 Key 时会查到一个不存在的槽位，把用户已存的 Key"清没"，
+     * 界面却还显示"已保存"，实际请求全是 401。
+     */
+    next.providerId = current.providerId
+  }
+  const targetProviderId = next.providerId
+
+  /**
+   * 凭据语义（沿用项目原有的简单语义，撤回 PR#4 的按地址隔离）：
+   *  - `providerKeys[providerId]` 是唯一真值源，一个提供商一份 Key；
+   *  - `apiKey` 是"当前提供商正在用的那一份"，由 providerKeys 推导；
+   *  - 空串/掩码 = **不修改**，null = 清除，真值 = 替换（和其它密钥字段一致）。
+   *
+   * 为什么不做按 baseURL 的认证目标隔离：用户把地址改成自建代理、或从官方换到
+   * Token Plan，本来就是要**继续用同一颗 Key**；把它判成"新目标、Key 清空"
+   * 只会让人以为 Key 丢了，还得重填一遍。按提供商隔离已经足够——A 家的 Key
+   * 永远不会被发到 B 家的端点上。
+   */
+  const providerKeys = { ...(current.providerKeys ?? {}) }
+  const incomingKeys = patch.providerKeys && typeof patch.providerKeys === 'object' && !Array.isArray(patch.providerKeys)
+    ? patch.providerKeys
+    : null
+  if (incomingKeys !== null) {
+    for (const [rawId, value] of Object.entries(incomingKeys)) {
+      const id = typeof rawId === 'string' ? rawId.trim() : ''
+      if (id === '') continue
+      if (value === null) delete providerKeys[id]
+      else if (isRealSecret(value)) providerKeys[id] = String(value).trim()
+      // 空串/掩码：不修改
+    }
+  }
   if (typeof patch.apiKey === 'string') {
-    if (patch.apiKey === '' || patch.apiKey.includes('*')) next.apiKey = current.apiKey
-    else next.apiKey = patch.apiKey.trim()
+    if (!(patch.apiKey === '' || patch.apiKey.includes('*'))) {
+      providerKeys[targetProviderId] = patch.apiKey.trim()
+    }
+    // 空串/掩码：不修改（界面回显的是掩码，写回去就等于把 Key 抹了）
   }
   // 显式清空：apiKey: null。空串表示"不修改"，null 表示"删掉"——两者语义不同。
-  if (patch.apiKey === null) next.apiKey = ''
+  if (patch.apiKey === null) delete providerKeys[targetProviderId]
+  next.providerKeys = providerKeys
+
+  /*
+   * 生效的 apiKey **按当前提供商**推导：切到 MiMo 就用 MiMo 的 Key，切回 DeepSeek
+   * 自动复用 DeepSeek 那份。切到一家还没有 Key 的提供商时就是空（界面提示去填），
+   * 绝不会把上一家的凭据发过去。
+   */
+  next.apiKey = isRealSecret(providerKeys[targetProviderId]) ? providerKeys[targetProviderId] : ''
 
   // 搜索密钥同样遵守"空串=不修改、掩码=不修改、null=清除"
   if (patch.search !== undefined && patch.search !== null) {
@@ -136,13 +329,27 @@ export async function saveConfig(patch) {
     next.search = merged
   }
 
-  if (typeof patch.providerId === 'string') {
-    const provider = getProvider(patch.providerId)
-    if (provider === undefined) throw new Error(`未知提供商: ${patch.providerId}`)
-    // 切提供商且没显式给 baseURL → 用该提供商默认端点
-    if (patch.baseURL === undefined) next.baseURL = provider.baseURL
-    if (patch.model === undefined && provider.models.length > 0) next.model = provider.models[0]
-  }
+  /*
+   * 推理档位。语义和 systemPrompt 一样：
+   *  - patch 里没这个字段 → 保原值（保存无关设置不会冲掉用户选的模式）
+   *  - 有 → 规整后落盘（非法值回 default，绝不猜成"关闭思考"）
+   * 必须显式放回去：`{...current, ...patch}` 在 patch 带 `field: undefined`
+   * （IPC 结构化克隆会保留 undefined）时会把已存的档位冲成 undefined。
+   */
+  next.mimoThinking = patch.mimoThinking === undefined
+    ? normalizeThinking(current.mimoThinking)
+    : normalizeThinking(patch.mimoThinking)
+  next.deepseekReasoningEffort = patch.deepseekReasoningEffort === undefined
+    ? normalizeEffortLevel(current.deepseekReasoningEffort)
+    : normalizeEffortLevel(patch.deepseekReasoningEffort)
+  next.providerHint = patch.providerHint === undefined
+    ? normalizeHint(current.providerHint)
+    : normalizeHint(patch.providerHint)
+  /*
+   * 当前生效的推理参数摘要（诊断与界面提示用）。
+   * 由提供商推导，**不信**模型名：`deepseek-flash` 挂到自定义端点上不该带 DeepSeek 参数。
+   */
+  next.effectiveReasoning = reasoningSummary(next)
 
   if (typeof next.baseURL !== 'string' || !/^https?:\/\//u.test(next.baseURL)) {
     throw new Error('baseURL 必须是 http(s) 地址')
@@ -154,6 +361,21 @@ export async function saveConfig(patch) {
   next.maxSteps = Number.isFinite(steps) ? Math.min(20, Math.max(1, Math.round(steps))) : 8
   const temp = Number(next.temperature)
   next.temperature = Number.isFinite(temp) ? Math.min(2, Math.max(0, temp)) : 0.3
+
+  /*
+   * 上下文预算。语义和推理档位一致：patch 里没有这个字段就保持原值。
+   *  - contextWindow：tokens，范围 1K ~ 10M。**显式给了非法值**（0 / 负数 / 空）→ 回默认 1M，
+   *    绝不把窗口落成 0（那会让每次请求都被判定超预算）。
+   *  - contextCompressPercent：1~99，默认 90。允许用户调，但不允许 ≥100
+   *    （等于永不压缩，最终必然撞上服务端硬上限）。
+   * 两个字段的处理必须一致，否则"填错一个回默认、填错另一个保留旧值"会让用户猜不透。
+   */
+  next.contextWindow = patch.contextWindow === undefined
+    ? normalizeContextWindow(current.contextWindow)
+    : normalizeContextWindow(patch.contextWindow)
+  next.contextCompressPercent = patch.contextCompressPercent === undefined
+    ? normalizeCompressPercent(current.contextCompressPercent)
+    : normalizeCompressPercent(patch.contextCompressPercent)
 
   /*
    * 系统提示词（人设）。语义和密钥**故意不同**，因为这里没有"回显掩码"的问题：
@@ -178,11 +400,33 @@ export async function saveConfig(patch) {
   }
 
   /*
+   * 网易云凭据：两个字段各自"空/掩码=不修改、null=清除"，跟 API Key 同一套语义。
+   * 私钥很长，界面读回来只给"已保存（N 字符）"，绝不能把明文当占位符写回去。
+   */
+  if (patch.netease !== undefined && patch.netease !== null) {
+    const currentNetease = current.netease ?? { appId: '', privateKey: '' }
+    const incoming = patch.netease
+    const merged = { ...currentNetease }
+    if (incoming.appId === null) merged.appId = ''
+    else if (isRealSecret(incoming.appId)) merged.appId = incoming.appId.trim()
+    if (incoming.privateKey === null) merged.privateKey = ''
+    else if (isRealSecret(incoming.privateKey)) merged.privateKey = incoming.privateKey.trim()
+    /*
+     * 记下"同步过哪一版凭据"。这个字段丢了会导致每次启动都重写 CLI 凭据，
+     * 而重写会让已有的网易云登录态失效（token 变 Expired）。
+     */
+    if (typeof incoming.syncedHash === 'string') merged.syncedHash = incoming.syncedHash
+    next.netease = merged
+  }
+  /*
    * 模型方案：每条方案的 apiKey 单独打码；掩码值（含 * 或「已保存」）不覆盖原值。
+   * 方案还要带上**推理策略**（提供商 + 地址 + Key + 模型 + 档位是一套），
+   * 否则定时切到 MiMo 方案却仍用 DeepSeek 的参数发请求，正是这次要修的毛病。
    */
   if (Array.isArray(patch.modelProfiles)) {
     const currentProfiles = Array.isArray(current.modelProfiles) ? current.modelProfiles : []
     next.modelProfiles = patch.modelProfiles.map((profile) => {
+      const previous = currentProfiles.find((item) => item?.id === profile?.id)
       const merged = {
         id: typeof profile?.id === 'string' && profile.id !== '' ? profile.id : `p${Math.random().toString(36).slice(2, 8)}`,
         name: String(profile?.name ?? '').trim(),
@@ -190,24 +434,130 @@ export async function saveConfig(patch) {
         baseURL: String(profile?.baseURL ?? '').trim(),
         model: String(profile?.model ?? '').trim(),
         apiKey: '',
+        /*
+         * 档位三态：界面给了就用界面的；没给（undefined/空串）就沿用这条方案原来存的；
+         * 这条方案也没有（老配置新建的方案行）才回默认。
+         * 「没给」和「选了 default」必须区分开：default 是用户明确选的合法档位。
+         */
+        mimoThinking: keepOr(profile?.mimoThinking, previous?.mimoThinking, normalizeThinking),
+        deepseekReasoningEffort: keepOr(profile?.deepseekReasoningEffort, previous?.deepseekReasoningEffort, normalizeEffortLevel),
+        providerHint: keepOr(profile?.providerHint, previous?.providerHint, normalizeHint),
       }
-      const previous = currentProfiles.find((item) => item?.id === merged.id)
-      if (isRealSecret(profile?.apiKey)) merged.apiKey = String(profile.apiKey).trim()
-      else if (previous !== undefined) merged.apiKey = previous.apiKey ?? ''
+      /*
+       * 方案 Key 的语义和全局那一份一致（这也是"简单凭据"的要求）：
+       *  - 用户给了新 Key（非空、非掩码）→ 用新的；
+       *  - 没给新 Key、**提供商也没变** → 沿用这条方案原来存的 Key，不管地址有没有改。
+       *    改了地址却把 Key 清空，用户下次定时切过来只会拿到一条 401，
+       *    而他明明在同一个提供商下填过 Key。
+       *  - **换了提供商 → 绝不沿用旧 Key**：那是 A 家的凭据，发给 B 家只会 401，
+       *    更糟的是用户会以为"这套方案能用了"。此时按新提供商的顺序取：
+       *    全局 providerKeys[新提供商]（同一账号，没必要填两遍）→ 空（界面提示去填）。
+       */
+      const providerChanged = typeof previous?.providerId === 'string'
+        && previous.providerId !== '' && previous.providerId !== merged.providerId
+      if (isRealSecret(profile?.apiKey)) {
+        merged.apiKey = String(profile.apiKey).trim()
+      } else if (!providerChanged && typeof previous?.apiKey === 'string' && isRealSecret(previous.apiKey)) {
+        merged.apiKey = previous.apiKey
+      } else if (isRealSecret(providerKeys[merged.providerId])) {
+        merged.apiKey = providerKeys[merged.providerId]
+      }
       return merged
     })
   }
   // 落盘前加密（主进程注入了 safeStorage 才生效；工具脚本里就是明文）
   next.apiKey = encryptField(next.apiKey)
+  next.providerKeys = encryptKeyMap(next.providerKeys)
+  if (Array.isArray(next.modelProfiles)) {
+    next.modelProfiles = next.modelProfiles.map((profile) => ({
+      ...profile,
+      apiKey: encryptField(profile?.apiKey ?? ''),
+    }))
+  }
+  /*
+   * PR#4 的 providerTargets 已经废弃（Key 按提供商存就够用）。
+   * 旧配置里如果还留着这块，落盘时**原样写回**（不删、不改），
+   * 这样回滚到 PR#4 的旧版本时用户的凭据还在；新代码读它时只做只读回收。
+   * 新保存不会再往里写任何东西。
+   *
+   * 唯一的例外是**用户明确清了 Key**（apiKey: null）：那时必须把这一家的旧条目
+   * 一起删掉，否则下次 loadConfig 又会从旧数据里把它"回收"回来——
+   * 用户点了清除、重启之后 Key 又出现了，这比丢了更让人无法信任。
+   */
+  if (patch.apiKey === null && next.providerTargets !== undefined && next.providerTargets !== null
+      && typeof next.providerTargets === 'object') {
+    const cleaned = {}
+    for (const [key, value] of Object.entries(next.providerTargets)) {
+      if (key.startsWith(`${targetProviderId}|`)) continue
+      cleaned[key] = value
+    }
+    next.providerTargets = cleaned
+  }
+  if (next.providerTargets !== undefined && next.providerTargets !== null) {
+    next.providerTargets = encryptKeyMap(next.providerTargets)
+  }
   if (next.search !== undefined && next.search !== null) {
     next.search = { ...next.search, apiKey: encryptField(next.search.apiKey) }
   }
 
+  signal?.throwIfAborted()
   await mkdir(CONFIG_DIR, { recursive: true })
   const tmp = `${CONFIG_PATH}.tmp`
+  signal?.throwIfAborted()
   await writeFile(tmp, JSON.stringify(next, null, 2), 'utf8')
+  signal?.throwIfAborted()
   await rename(tmp, CONFIG_PATH)
   return loadPublicConfig()
+}
+
+/**
+ * 「界面上有没有表态」的三态取舍：
+ * 给了合法值 → 用给的；没给（undefined / 空串 / null）→ 用原来存的；
+ * 两个都没有 → 回默认档位。
+ * `default` 是用户**明确选过**的合法档位，绝不能当成"没给"。
+ */
+function keepOr(incoming, previous, normalize) {
+  if (typeof incoming === 'string' && incoming.trim() !== '') return normalize(incoming)
+  if (typeof previous === 'string' && previous.trim() !== '') return normalize(previous)
+  return normalize('default')
+}
+
+function normalizeHint(value) {
+  const hint = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (hint === '' || hint === null) return 'auto'
+  return hint === 'deepseek' || hint === 'mimo' || hint === 'auto' ? hint : 'auto'
+}
+
+/** 上下文窗口（tokens）：1K ~ 10M，非法值回默认 1M */
+export function normalizeContextWindow(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return DEFAULT_CONTEXT_WINDOW
+  return Math.round(Math.min(10_000_000, Math.max(1_024, number)))
+}
+
+/** 压缩触发百分比：1~99，默认 90（≥100 等于永不压缩，不允许） */
+export function normalizeCompressPercent(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return DEFAULT_COMPRESS_PERCENT
+  return Math.round(Math.min(99, Math.max(1, number)))
+}
+
+/**
+ * 当前生效的推理参数摘要（写进配置，供界面与诊断对照）。
+ * 由**当前提供商**推导，不信模型名。它只是说明性的：真正发请求时
+ * LLMClient 会重新按同一套规则组装（见 agent/ll-params.mjs）。
+ */
+function reasoningSummary(config) {
+  const profile = buildProfileFor(config)
+  const built = buildRequestFields(profile, { temperature: config.temperature })
+  return {
+    capability: profile.capability,
+    thinking: built.fields.thinking ?? null,
+    reasoningEffort: built.fields.reasoning_effort ?? null,
+    thinkingActive: built.thinkingActive,
+    temperatureSent: built.temperature !== null,
+    ignoredSampling: built.ignoredSampling,
+  }
 }
 
 /** 实际发请求时用的密钥：环境变量优先。 */
@@ -219,6 +569,25 @@ export async function resolveApiKey() {
     throw new Error('配置里的 API Key 已加密（由应用写入），请在应用里重新填写，或设 CUA_VA_API_KEY 环境变量')
   }
   return config.apiKey
+}
+
+/**
+ * 取某个提供商该用的 Key。设置页的下拉可以先选中一家还没保存的提供商，
+ * 这时**绝不能**拿当前生效的那一份去请求——那是另一家的凭据（必定 401）。
+ *
+ * - 目标就是当前提供商：走 resolveApiKey()（环境变量优先、密文检查都在那里）
+ * - 目标是别家：只用 providerKeys[providerId] 里它自己的那一份，没有就返回空
+ *   （让调用方提示"请先填 Key"）
+ *
+ * `baseURL` 参数仍然接受但**不再参与查找**：同一个提供商换地址不该丢 Key
+ * （官方 → 自建代理、按量付费 → Token Plan 都是同一颗 Key 的常规切换）。
+ */
+export async function resolveApiKeyFor(providerId, { config, baseURL } = {}) {
+  const target = typeof providerId === 'string' ? providerId.trim() : ''
+  const current = config ?? (await loadConfig())
+  if (target === '' || target === current.providerId) return await resolveApiKey()
+  const key = current.providerKeys?.[target]
+  return typeof key === 'string' ? key : ''
 }
 
 /** 搜索用的密钥：环境变量 TAVILY_API_KEY 优先于配置文件。 */
@@ -233,6 +602,42 @@ export async function resolveSearchKey() {
 
 export function listProviders() {
   return PROVIDERS
+}
+
+/**
+ * 由一份配置算出上下文预算策略（tokens）。
+ *
+ * 三层取值，优先级从高到低：
+ *  1. 用户设置 `contextWindow`（默认 1M）+ `contextCompressPercent`（默认 90）；
+ *  2. 该端点在注册表里声明的**可信**窗口（local 是 32K），以及 /models 带回的窗口元数据；
+ *  3. 都没有 → 按 1M 处理（未知模型不猜小）。
+ *
+ * 注册表里的窗口是**默认值**，不是硬上限：
+ *  - 用户没动过窗口设置（还是全局默认 1M）时，按注册表值（本地 llama.cpp 默认 32K）算，
+ *    这比按 1M 硬发靠谱；
+ *  - 用户**明确配过一个不一样的窗口**（比如把 llama-server 起成 --ctx-size 131072），
+ *    就以用户为准——注册表里的 32K 只是示例值，不能覆盖用户对自己机器的了解。
+ * /models 带回的窗口元数据是端点自报的真实容量，任何时候都参与收紧（取 min）。
+ *
+ * @param {object} config loadConfig() 的结果
+ * @param {{modelContextWindow?:number}} [modelMeta] 在线模型列表带回的能力元数据
+ */
+export function resolveContextPolicyFor(config, modelMeta = {}) {
+  const provider = getProvider(String(config?.providerId ?? '').trim())
+  const metadataWindow = Number(modelMeta?.modelContextWindow)
+  const registryWindow = Number(provider?.contextWindow)
+  const userWindow = Number(config?.contextWindow)
+  // 用户"没表态"的唯一可靠信号：窗口仍是全局默认值（设置页每次保存都会带上这个字段，
+  // 所以不能拿 "patch 里有没有它" 判断是不是用户改的）
+  const userPickedWindow = Number.isFinite(userWindow) && userWindow > 0 && userWindow !== DEFAULT_CONTEXT_WINDOW
+  const modelContextWindow = Number.isFinite(metadataWindow) && metadataWindow > 0
+    ? metadataWindow
+    : (userPickedWindow ? null : (Number.isFinite(registryWindow) && registryWindow > 0 ? registryWindow : null))
+  return resolveContextPolicy({
+    contextWindow: config?.contextWindow,
+    compressPercent: config?.contextCompressPercent,
+    modelContextWindow,
+  })
 }
 
 export function getConfigFile() {

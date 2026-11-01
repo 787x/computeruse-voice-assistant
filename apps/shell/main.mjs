@@ -25,6 +25,10 @@ import { cleanLine as cleanLineText } from '../../packages/agent/text.mjs'
 import { DEFAULT_SYSTEM_PROMPT } from '../../packages/agent/system-prompt.mjs'
 import { DEFAULT_WAKE_WORD } from '../../packages/voice/keywords.mjs'
 import { resolveModel } from '../../packages/config/schedule.mjs'
+import { profileFromConfig, LLMClient } from '../../packages/agent/llm.mjs'
+import { buildReasoningMeta } from '../../packages/agent/ll-params.mjs'
+import { compressHistory, resolveContextPolicy } from '../../packages/agent/context.mjs'
+import { getProvider, defaultModelFor, PROVIDERS } from '../../packages/config/registry.mjs'
 import { LAUNCH_APP_TOOL } from '../../packages/tools/app-launch.mjs'
 import { SHELL_TOOL, runShell } from '../../packages/tools/shell.mjs'
 import { FILES_TOOL, runFiles } from '../../packages/tools/files.mjs'
@@ -646,26 +650,69 @@ if (!manual && ((settingsWin !== null && !settingsWin.isDestroyed() && settingsW
 
 // ---------------------------------------------------------------- 会话记忆
 
-/** 会话条数上限（一轮 = user + assistant 两条） */
-const SESSION_MAX_TURNS = 6
-
 /**
  * 开始一段新会话。
  *
  * 触发点：唤醒、关麦。为什么要清：用户按下唤醒词的意思是"这事儿重新说"，
  * 而不是"接着上一件事"；留着旧记忆会让"帮我打开浏览器"变成"再开一个"。
+ *
+ * 注意这里是**整个会话**的生命周期，不是"永久记忆"：
+ * 唤醒 → 对话（可含多轮追问与几十步 CUA）→ 关麦/再唤醒时清空。
+ * 会话内部的长度由 token 预算管理（见 trimSessionHistory），
+ * 不再有"最多 6 轮"这种与模型容量无关的硬上限。
  */
 function resetSession(reason) {
   if (sessionHistory.length > 0) log(`session reset (${reason}), dropped ${sessionHistory.length} msgs`)
   sessionHistory = []
 }
 
-/** 记下一轮对话（只存话，不存工具细节） */
-function rememberTurn(userText, assistantText, toolNames) {
-  sessionHistory.push({ role: 'user', content: userText })
-  const note = toolNames.length > 0 ? `\n（这一轮动过：${toolNames.join(', ')}）` : ''
-  sessionHistory.push({ role: 'assistant', content: `${assistantText}${note}` })
-  while (sessionHistory.length > SESSION_MAX_TURNS * 2) sessionHistory.shift()
+/**
+ * 记下一轮对话：把 `Agent.run` 返回的**本轮增量** `result.turn` 追加到会话历史。
+ *
+ * 为什么是增量而不是全量：`Agent.run` 的 messages 是「旧历史(整理后) + 本轮」，
+ * 若把整段 conversation 再 push 一次，旧历史就会重复。现在 Agent 只回 `turn`
+ * （本轮 user + assistant + tool + 截图），这里直接追加即得到不重复的完整历史。
+ *
+ * 只在内存里保留，不落盘、不打日志、不进字幕/TTS（推理内容不默认持久化）。
+ */
+function rememberTurn(userText, resultOrText, toolNames = []) {
+  if (resultOrText !== null && typeof resultOrText === 'object' && Array.isArray(resultOrText.turn)) {
+    sessionHistory.push(...resultOrText.turn)
+  } else {
+    sessionHistory.push({ role: 'user', content: userText })
+    const assistantText = typeof resultOrText === 'string' ? resultOrText : (resultOrText?.text ?? '')
+    const note = (toolNames ?? []).length > 0 ? `\n（这一轮动过：${toolNames.join(', ')}）` : ''
+    sessionHistory.push({ role: 'assistant', content: `${assistantText}${note}` })
+  }
+  trimSessionHistory()
+}
+
+/**
+ * 会话历史整理：**按 token 预算**（默认 1M 窗口、到 90% 才动手）。
+ *
+ * 以前这里按"最多 6 个用户回合"删历史，长时间 CUA 任务做到一半就会被砍掉
+ * 前面几步的结论；而 6 轮对 1M 窗口来说连 1% 都用不到。
+ * 现在统一交给 agent/context.mjs：低于阈值原样保留，到了才按**完整片段**
+ * 从最老的开始整体移除（tool_calls 与结果始终配对，reasoning 不截断）。
+ */
+function trimSessionHistory() {
+  if (sessionHistory.length === 0) return
+  try {
+    const policy = currentContextPolicy()
+    const before = sessionHistory.length
+    const next = compressHistory(sessionHistory, policy)
+    if (next.length !== before) {
+      sessionHistory = next
+      log(`session history compressed: ${before} → ${next.length} msgs (budget ${policy.compressAtTokens}/${policy.contextWindow} tokens)`)
+    }
+  } catch (error) {
+    log(`session history compression failed: ${error.message}`)
+  }
+}
+
+/** 当前生效的上下文预算（来自配置；模型有更小窗口时按模型算） */
+function currentContextPolicy() {
+  return agentRuntime?.contextPolicy ?? resolveContextPolicy({})
 }
 
 // ---------------------------------------------------------------- 识别（ASR）
@@ -1086,6 +1133,17 @@ let followUpWindowStart = 0
 let lastReplyText = ''
 /** 本轮"还要不要继续"的判定结果（judgeFollowUp 的产物） */
 let followUpJudgement = null
+/**
+ * 最近这一轮的模型响应是否失败（服务端错误 / 断流 / 输出被截断 / 装不下）。
+ *
+ * 为什么必须记下来、而不是只在 runCommand 里 `return`：
+ *   runCommand 的 finally 会在播报结束后调用 afterTurnSpeechSettled，
+ *   那条路径只认 `wantContinue` / `followUpJudgement` / `lastReplyText`。
+ *   不在这里留一个标记，失败回合就会拿**上一轮**的回复去做"还要不要继续说"的判定，
+ *   用户刚被告知"没说完"，紧接着又看到一个"想继续说就直接说"的待命窗口——
+ *   等于把失败当成就地成功收尾了。
+ */
+let lastTurnFailed = false
 /** 正在跑的判定请求 */
 let followUpJudgePromise = null
 /** 连续对话的阈值与窗口配置（来自配置文件 followup.*） */
@@ -1385,6 +1443,23 @@ async function afterTurnSpeechSettled() {
   // 这一轮已经跑完：还挂着的确认卡片收掉，别让它一直"等人回答"
   closeConfirmCard()
   flushPendingUiAction()
+  /*
+   * 失败的回合在这里收尾：不判定、不待命、不改回"好了"。
+   *
+   * 失败提示本身已经播报完了（能走到这里说明 TTS 队列空了），所以用户确实听到了
+   * "刚才的回答没有说完"。这时再把状态改成 done，屏幕上就是"好了"+一个待命窗口，
+   * 与刚说的话自相矛盾；拿 lastReplyText（上一轮的正常回复）去判定更离谱——
+   * 那会让失败轮看起来比成功轮还积极地邀请用户继续说。
+   *
+   * 失败提示来自我们自己，不是模型的回答，所以也不用做"要不要继续"的判断：
+   * 用户要重说就重新喊唤醒词/直接说，不会被这里挡住。
+   */
+  if (lastTurnFailed) {
+    log(`afterTurnSpeechSettled: 本轮失败，不做追问判定（state=${currentState}）`)
+    if (currentState === 'speaking') setState('error')
+    scheduleHide()
+    return false
+  }
   const followUp = await startFollowUpIfWanted()
   if (generation !== turnSeq || userDismissedHud) return false
   log(`afterTurnSpeechSettled state=${currentState} followUp=${followUp}`)
@@ -1408,6 +1483,8 @@ async function startFollowUpIfWanted() {
   if (activeTurn !== null) return false  // 回合还没结束
   if (confirmResolver !== null) return false // 正在等确认，别抢
   if (commandActive) return false        // 已经在听了
+  // 失败的回合没有"可继续的话题"：回复本身就没说完，待命只会让用户以为它答完了
+  if (lastTurnFailed) return false
 
   const judgement = await resolveFollowUpJudgement()
   if (generation !== turnSeq || userDismissedHud || !listening || activeTurn !== null || confirmResolver !== null) return false
@@ -1446,6 +1523,12 @@ async function startFollowUpIfWanted() {
  * 万一还没回来，最多等 1.2 秒，超时用启发式——收尾不能被一个判断卡住。
  */
 async function resolveFollowUpJudgement() {
+  /*
+   * 失败回合没有可判的东西。lastReplyText 这时还是**上一轮**的回复，
+   * 用它算出来的启发式只会得出"上一轮该继续问"的结论，与本轮无关。
+   * 直接给出"不继续"的结论，调用方据此正常收起。
+   */
+  if (lastTurnFailed) return { wait: false, confidence: 0, why: '本轮模型响应失败', source: 'turn-failed' }
   if (followUpJudgement !== null) return followUpJudgement
   if (followUpJudgePromise !== null) {
     try {
@@ -1595,6 +1678,24 @@ function handleAgentEvent(event, turn = activeTurn) {
     turn.raw += event.text
     turn.buffer += event.text
     for (const sentence of takeSentences(turn)) speakLine(turn, sentence)
+    return
+  }
+  if (event.type === 'stream_error') {
+    /*
+     * 模型这一路响应没正常结束（服务端错误 / 断流 / 输出被长度上限截断）。
+     *
+     * 已经流出来的话照常说完——用户听到的内容是真的，不该因为后半段出错就吞掉，
+     * 也不重播。这里只做一个**标记**，由 runCommand 在本轮收尾时如实告知
+     * "回答没有完整完成"，绝不把这一轮当成正常成功。
+     *
+     * 注意：用户主动打断走的是 AbortController + 正常取消路径（signal.aborted 为真时
+     * 本函数开头就返回了），不会走到这里，所以不会把"用户喊停"误报成模型故障。
+     */
+    turn.streamError = true
+    turn.streamErrorReason = typeof event.finishReason === 'string' && event.finishReason !== ''
+      ? event.finishReason
+      : 'unknown'
+    log(`stream_error: reason=${turn.streamErrorReason} partial=${String(event.text ?? '').length}chars`)
     return
   }
   if (event.type === 'tool_start') {
@@ -2009,13 +2110,25 @@ async function ensureAgent(signal) {
       model: config.model,
       temperature: config.temperature,
       timeoutMs: config.timeoutMs,
+      // 提供商档案：决定这次会话发哪种推理参数（见 packages/agent/ll-params.mjs）
+      profile: llmModule.profileFromConfig(config),
     })
+    /*
+     * 上下文预算：默认 1M 窗口、到 90% 才压缩（见 packages/agent/context.mjs）。
+     * 模型有更小窗口时按模型实际容量算，未知模型按 1M。
+     */
+    const contextPolicy = store.resolveContextPolicyFor(config)
+    /*
+     * 缓存里这套端点的"出处"要记清楚：定时切换与保存设置都按 profileId 判断
+     * 该不该换整套端点（含 Key）。apiKey 单独存一份是为了切回默认时能拿回来。
+     */
     const agent = new loopModule.Agent({
       llm,
       tools,
       // 提示词按"当前配置"取，而不是初始化时定死：改设置不需要重建 Agent
       systemPrompt: () => agentSystemPrompt,
       maxSteps: config.maxSteps,
+      contextPolicy,
       onEvent: handleAgentEvent,
       // 所有工具调用都要过权限门，拒绝时把原因回填给模型（它会改用别的办法或告诉用户）
       gate: async ({ tool, args, signal }) => {
@@ -2042,13 +2155,68 @@ async function ensureAgent(signal) {
     })
 
     checkpoint()
-    return { agent, toolkit, config, webSearch, llm, apiKey, readyMs: Date.now() - startedAt }
+    return { agent, toolkit, config, webSearch, llm, apiKey, contextPolicy, readyMs: Date.now() - startedAt }
   })
   signal?.throwIfAborted()
   if (shuttingDown) throw new DOMException('Application exiting', 'AbortError')
   applyModelSchedule('agent-ready')
   log(`agent ready in ${runtime.readyMs}ms model=${runtime.config.model}`)
   return runtime
+}
+
+/**
+ * 每一轮开始前核对一次磁盘配置，有变化就同步到运行时（**下一轮生效**）。
+ *
+ * 为什么放在回合入口而不是初始化里：
+ *  - 初始化期间（CUA 冷启动 1 秒+）用户完全可能点了保存；
+ *  - 回合入口这道检查同时覆盖"初始化中改""定时切换刚改""另一处代码改了配置"三种情况，
+ *    不需要每个改配置的地方都记得来通知壳子。
+ * 失败绝不阻断这一轮：拿最新配置失败就用运行时现有的端点继续（和以前行为一致）。
+ */
+async function syncAgentEndpointIfChanged() {
+  if (agentRuntime === null) return
+  try {
+    const store = await import('../../packages/config/store.mjs')
+    const latest = await store.loadConfig()
+    if (!endpointFieldsDiffer(agentRuntime.config, latest)) return
+    await syncAgentEndpoint(store, latest)
+  } catch (error) {
+    log(`agent endpoint reconcile skipped: ${error.message}`)
+  }
+}
+
+/**
+ * 会影响"这一轮该用哪套端点与推理参数"的字段。
+ *
+ * 比较用**规整后的生效摘要**，不是直接比对象：loadConfig 每次返回新对象，
+ * 而 modelSchedule / modelProfiles 是每次新建的数组——按引用比会"每轮都算有变化"，
+ * 白白多跑一次同步与定时切换。
+ */
+function endpointSignature(config) {
+  return JSON.stringify({
+    providerId: config?.providerId,
+    baseURL: config?.baseURL,
+    model: config?.model,
+    apiKey: config?.apiKey ?? '',
+    temperature: config?.temperature,
+    timeoutMs: config?.timeoutMs,
+    maxSteps: config?.maxSteps,
+    mimoThinking: config?.mimoThinking,
+    deepseekReasoningEffort: config?.deepseekReasoningEffort,
+    providerHint: config?.providerHint,
+    contextWindow: config?.contextWindow,
+    contextCompressPercent: config?.contextCompressPercent,
+    modelSchedule: config?.modelSchedule,
+    modelProfiles: (config?.modelProfiles ?? []).map((p) => ({
+      id: p?.id, name: p?.name, providerId: p?.providerId, baseURL: p?.baseURL, model: p?.model,
+      apiKey: p?.apiKey ?? '', mimoThinking: p?.mimoThinking, deepseekReasoningEffort: p?.deepseekReasoningEffort,
+      providerHint: p?.providerHint,
+    })),
+  })
+}
+
+function endpointFieldsDiffer(before, after) {
+  return endpointSignature(before) !== endpointSignature(after)
 }
 
 /**
@@ -2202,6 +2370,15 @@ async function runCommand(text) {
   lastUtterance = text
   deniedInTurn = {}
   wantContinue = false
+  /*
+   * 新回合开始：失败标记必须清掉，否则上一轮失败会让这一轮**正常**的回答
+   * 也被按失败收尾（不追问、不待命）。判定的结果与"上一轮原文"同样作废——
+   * 它们都是上一轮的产物。
+   */
+  lastTurnFailed = false
+  followUpJudgement = null
+  followUpJudgePromise = null
+  lastReplyText = ''
   turnHistoryCounts.push(sessionHistory.length)
   log(`turn start history=${sessionHistory.length} "${text.slice(0, 40)}"`)
   cancelActiveTurn('new command')
@@ -2238,16 +2415,69 @@ async function runCommand(text) {
 
     await refreshSearchKey(turn.controller.signal)
     if (!isCurrentTurn(turn)) return
-    const { agent, llm } = await ensureAgent(turn.controller.signal)
+    /*
+     * 回合入口先核对磁盘配置：初始化期间、定时切换、或别的代码改了设置，
+     * 都在这一步被吸收，保证这一轮用的端点与推理参数就是磁盘上那一份。
+     */
+    await syncAgentEndpointIfChanged()
+    if (!isCurrentTurn(turn)) return
+    const { agent } = await ensureAgent(turn.controller.signal)
     if (!isCurrentTurn(turn)) return
     const result = await agent.run(text, { history: sessionHistory, signal: turn.controller.signal,
       onEvent: (event) => handleAgentEvent(event, turn) })
     if (!isCurrentTurn(turn)) return
+    /*
+     * 回合用的端点快照。判定请求要用它，而不是运行时那套：
+     * 中途保存设置或定时切换都可能已经换掉了提供商，判定必须和刚说的那段话同一家。
+     */
+    const turnLlm = result.llm ?? agentRuntime?.llm ?? null
     flushTurn(turn)
     // 旧的文本标记只留作日志线索，真正决定要不要等的是下面的判定
     wantContinue = process.env.CUA_VA_FORCE_CONTINUE === '1' || /\[\[继续\]\]/u.test(turn.raw)
-    rememberTurn(text, result.text ?? '', (result.steps ?? []).map((step) => step.tool))
+    rememberTurn(text, result, (result.steps ?? []).map((step) => step.tool))
+    /*
+     * 模型这一轮**没有正常完成**（服务端错误 / 断流 / 输出被截断）。
+     *
+     * 已经说出口的话不回收、不重播，工具也确实执行过了（不自动重试，避免重复点击/输入）。
+     * 但这一轮不能被当成"正常完成"：字幕上说清楚没答完，状态落到出错，
+     * 也不做"还要不要继续听"的判定（那会基于一段半截回答去猜用户意图）。
+     */
+    const turnFailed = result.failed === true || turn.streamError === true
+    if (turnFailed) {
+      const reason = turn.streamErrorReason ?? result.finishReason ?? 'unknown'
+      log(`turn ${turn.id} failed in model response (${reason}) tools=${turn.tools} chars=${(result.text ?? '').length}`)
+      wantContinue = false
+      followUpJudgement = null
+      followUpJudgePromise = null
+      /*
+       * 打上"这一轮失败了"的标记：播报结束后 afterTurnSpeechSettled 会看它，
+       * 从而不做追问判定、不把状态改回「好了」。
+       * 同时把 lastReplyText 清空——它是一个"上一轮回复"的缓存，
+       * 失败时留着只会被误当成这一轮的内容。
+       */
+      lastTurnFailed = true
+      lastReplyText = ''
+      turn.completed = true
+      if (turn.raw.trim() === '') {
+        // 一个字都没出来：必须给一句明确的失败说明，不能只留下"我想一下…"然后静默收场
+        const text = '模型这次没有正常回答，可以再说一次。'
+        lastAssistantText = text
+        setState('error')
+        sendSubtitle({ final: text })
+        enqueueSpeech(text)
+      } else {
+        // 已经说了一半：让这句话播完，再接一句"没说完"，不重播、不吞掉已说的内容
+        setState('error')
+        // 状态渲染会重写字幕副标题，所以这条提示必须在 setState 之后再推
+        sendSubtitle({ hint: '回答没有完整完成，可以再问我一次' })
+        enqueueSpeech('（刚才的回答没有说完，可以再问我一次。）')
+      }
+      scheduleHide()
+      return
+    }
     log(`turn ${turn.id} done in ${Date.now() - turn.startedAt}ms tools=${turn.tools} chars=${result.text.length}`)
+    // 这一轮正常完成：清掉失败标记，后续收尾/追问判定按正常路径走
+    lastTurnFailed = false
     setState('speaking')
 
     /*
@@ -2258,7 +2488,9 @@ async function runCommand(text) {
     followUpJudgement = null
     const judgeStartedAt = Date.now()
     followUpJudgePromise = judgeFollowUp({
-      chat: (options) => llm.chat({ ...options, signal: turn.controller.signal }),
+      chat: (options) => turnLlm === null
+        ? Promise.reject(new Error('没有可用的模型客户端'))
+        : turnLlm.chat({ ...options, signal: turn.controller.signal }),
       userText: text,
       replyText: lastReplyText,
       timeoutMs: followUpConfig.judgeTimeoutMs,
@@ -2324,6 +2556,15 @@ async function runCommand(text) {
     }
     log(`turn ${turn.id} failed: ${error.message}`)
     wantContinue = false
+    /*
+     * 连接失败 / 超时 / HTTP 错误也走同一条"这次没答成"的处理：
+     * 打上失败标记并清掉上一轮回复原文，免得播报后的收尾拿旧回复去判定追问。
+     * （用户主动打断在上面已经 return，不会走到这里。）
+     */
+    lastTurnFailed = true
+    lastReplyText = ''
+    followUpJudgement = null
+    followUpJudgePromise = null
     sendSubtitle({ final: `× ${error.message}` })
     setState('error')
     scheduleHide()
@@ -2534,18 +2775,45 @@ function applyModelSchedule(reason) {
     const decisionKey = decided.profile === null ? 'default' : String(decided.profile.id)
     if (decisionKey === lastAppliedProfileId && llm.model === target) return
 
+    /*
+     * 定时切换换的是**整套**：地址、Key、提供商、推理档位一起。
+     * 少了后两项，就会用上一个提供商的推理参数打新提供商（400 / 参数被忽略）。
+     * 没配方案时回到全局那一套（config 顶层的 providerId / apiKey / 档位）。
+     */
     const endpoint = decided.endpoint ?? {
       baseURL: config.baseURL,
+      // 用 runtime 里那份**已解析**的 Key（环境变量覆盖也在这里生效），
+      // 而不是 config.apiKey——后者可能是没解密的密文槽位
       apiKey: agentRuntime.apiKey ?? '',
+      providerId: config.providerId,
+      mimoThinking: config.mimoThinking,
+      deepseekReasoningEffort: config.deepseekReasoningEffort,
+      providerHint: config.providerHint,
     }
-    llm.setEndpoint({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model: target })
+    if (typeof target === 'string' && target !== '') {
+      llm.setEndpoint({ baseURL: endpoint.baseURL, apiKey: endpoint.apiKey, model: target })
+    }
+    llm.setProfile(profileFromConfig({ ...endpoint, model: target }))
+    /*
+     * 上下文预算也跟着端点走：定时切到本地 32K 模型后，仍按 1M 窗口算 90%
+     * 就会把远超模型容量的请求硬发过去。切回官方端点时再按 1M 恢复。
+     */
+    const providerWindow = getProvider(String(endpoint.providerId ?? '').trim())?.contextWindow
+    const scheduleContext = resolveContextPolicy({
+      contextWindow: config.contextWindow,
+      compressPercent: config.contextCompressPercent,
+      modelContextWindow: Number.isFinite(Number(providerWindow)) && Number(providerWindow) > 0 ? Number(providerWindow) : null,
+    })
+    agentRuntime.contextPolicy = scheduleContext
+    if (agentRuntime.agent?.setContextPolicy !== undefined) agentRuntime.agent.setContextPolicy(scheduleContext)
     lastAppliedProfileId = decisionKey
 
     const rule = decided.rule
     const profile = decided.profile
     log(`model switch (${reason}): → ${target} @ ${endpoint.baseURL}`
       + `${profile === null ? '' : `（方案 ${profile.name ?? profile.id}）`}`
-      + `${rule === null ? '' : `（规则 ${rule.from}-${rule.to}）`}`)
+      + `${rule === null ? '' : `（规则 ${rule.from}-${rule.to}）`}`
+      + ` 提供商=${endpoint.providerId ?? '-'}`)
   } catch (error) {
     log(`model schedule failed: ${error.message}`)
   }
@@ -2565,6 +2833,57 @@ function syncAgentSystemPrompt(config) {
   // null/缺省/空白 → null（= 内置默认）；合法自定义文本 → 原样保留，不改写
   agentSystemPrompt = typeof value === 'string' && value.trim() !== '' ? value : null
   log(`system prompt: ${agentSystemPrompt === null ? '默认' : `自定义 ${agentSystemPrompt.length} 字`}`)
+}
+
+/**
+ * 这次保存有没有动到「模型端点 / 推理档位」。
+ * 只认这些字段：动别的（音色、权限）不该去碰 LLM 客户端。
+ */
+function touchesModelSettings(payload) {
+  if (payload === null || typeof payload !== 'object') return false
+  for (const key of ['providerId', 'baseURL', 'model', 'apiKey', 'temperature',
+    'mimoThinking', 'deepseekReasoningEffort', 'providerHint', 'timeoutMs', 'modelProfiles', 'maxSteps',
+    'contextWindow', 'contextCompressPercent']) {
+    if (payload[key] !== undefined) return true
+  }
+  return false
+}
+
+/**
+ * 把磁盘上的模型设置同步到运行时（下一轮对话生效）。
+ *
+ * 为什么要单独一个函数、而不是"保存时重建 Agent"：
+ * 重建 Agent 会连带把 CUA 桥接和语音链路一起拆了重来（冷启动 1 秒+，
+ * 正在跑的回合还会被打断）。LLM 客户端本身零成本，换端点只要改几个字段。
+ *
+ * Key 走 resolveApiKey()：环境变量覆盖、密文检查都在那里，和首次初始化同一条路径。
+ */
+async function syncAgentEndpoint(store, preloaded) {
+  if (agentRuntime === null) return
+  const config = preloaded ?? await store.loadConfig()
+  agentRuntime.config = config
+  const apiKey = await store.resolveApiKey()
+  agentRuntime.apiKey = apiKey
+  /*
+   * 上下文预算跟着配置走：窗口/触发点改了，**下一轮**就用新的。
+   * 正在跑的回合用它开始时的快照（见 Agent.run 的 policy），不会被中途换尺度。
+   */
+  const contextPolicy = store.resolveContextPolicyFor(config)
+  agentRuntime.contextPolicy = contextPolicy
+  const llm = agentRuntime.llm
+  if (llm === undefined) return
+  llm.setEndpoint({ baseURL: config.baseURL, apiKey, model: config.model })
+  llm.setProfile(profileFromConfig(config))
+  llm.setTemperature(config.temperature)
+  if (Number.isFinite(Number(config.timeoutMs)) && Number(config.timeoutMs) > 0) llm.setTimeout(config.timeoutMs)
+  // 步数上限与上下文预算：下一轮生效（正在跑的回合用它开始时的快照）
+  if (agentRuntime.agent?.setMaxSteps !== undefined) agentRuntime.agent.setMaxSteps(config.maxSteps)
+  if (agentRuntime.agent?.setContextPolicy !== undefined) agentRuntime.agent.setContextPolicy(contextPolicy)
+  // 方案/规则可能在本次保存里改了：重算一次，让"此刻该用哪套"和磁盘一致
+  lastAppliedProfileId = null
+  applyModelSchedule('settings-model')
+  log(`model runtime synced: ${config.providerId} @ ${config.baseURL} model=${config.model} thinking=${config.mimoThinking} effort=${config.deepseekReasoningEffort}`
+    + ` context=${contextPolicy.contextWindow}@${contextPolicy.compressPercent}%`)
 }
 
 /** 从配置文件读界面开关（以前这些只活在内存里，重启就丢） */
@@ -2637,6 +2956,23 @@ async function saveUiPrefs() {
 
 // ---------------------------------------------------------------- 设置窗口
 
+/**
+ * 在线模型列表的短期缓存（`提供商|地址` → 结果）。
+ * 只存模型 id 和能力元数据，**绝不存 API Key**。
+ * 60 秒：够界面来回切提供商不重复打 API（MiMo 有 RPM 限制），
+ * 又短到"上新模型"这件事不会半天看不见。
+ */
+const MODEL_LIST_TTL_MS = 60_000
+const modelListCache = new Map()
+
+/**
+ * 推理控件元数据。文案与档位都来自 packages/agent/ll-params.mjs——
+ * 界面不许自己编一份 MiMo/DeepSeek 的能力表，验收脚本读的也是同一份。
+ */
+function reasoningControls() {
+  return buildReasoningMeta(PROVIDERS)
+}
+
 /** 设置窗口：普通窗口（有自己的标题栏），关掉就销毁，不做常驻 */
 function openSettings() {
   if (settingsWin !== null && !settingsWin.isDestroyed()) {
@@ -2701,7 +3037,70 @@ function registerSettingsIpc() {
        * 必须由主进程从同一个来源给，不能让前端自己抄一份文案。
        */
       defaultSystemPrompt: DEFAULT_SYSTEM_PROMPT,
+      /*
+       * 推理控件的元数据（哪套档位、官方对采样参数的限制）。
+       * 由主进程从同一份 ll-params 给：界面不许自己抄一份"MiMo 有 low/high/max"这种
+       * 不存在的能力，也不许显示"温度生效"而实际被模型覆盖。
+       */
+      reasoning: reasoningControls(),
     }
+  })
+
+  /*
+   * 拉取在线模型列表（`GET /v1/models`）。逻辑本体在 packages/config/model-discovery.mjs，
+   * 这里只做三件事：定目标提供商、按提供商挑 Key、把结果转给界面。
+   *
+   *  - Key 允许由界面直接传（用户刚粘贴、还没保存的 Key 也要能测通）；
+   *    传进来的 Key 只用于这一次请求，**不进缓存、不落盘、不打日志**。
+   *  - 目标提供商不是当前那一家时，只用它自己槽位里的 Key（见 resolveApiKeyFor）。
+   *  - 失败时把上一次成功的列表一起返回并标 stale，绝不改动用户已选的模型。
+   */
+  ipcMain.handle('settings:models', async (_event, payload) => {
+    const [store, discovery] = await Promise.all([
+      import('../../packages/config/store.mjs'),
+      import('../../packages/config/model-discovery.mjs'),
+    ])
+    const stored = await store.loadConfig()
+    const providerId = typeof payload?.providerId === 'string' && payload.providerId.trim() !== ''
+      ? payload.providerId.trim() : stored.providerId
+    const provider = getProvider(providerId)
+    const baseURL = typeof payload?.baseURL === 'string' && /^https?:\/\//u.test(payload.baseURL.trim())
+      ? payload.baseURL.trim() : (provider?.baseURL ?? stored.baseURL)
+    const typedKey = typeof payload?.apiKey === 'string' && payload.apiKey.trim() !== '' && !payload.apiKey.includes('*')
+      ? payload.apiKey.trim() : ''
+    // 按提供商取 Key：A 家的 Key 绝不能被拿去请求 B 家的端点
+    const apiKey = typedKey !== '' ? typedKey : await store.resolveApiKeyFor(providerId, { config: stored }).catch(() => '')
+    const result = await discovery.fetchChatModels({
+      providerId,
+      baseURL,
+      apiKey,
+      apiKeyRequired: provider?.apiKeyRequired !== false,
+      fallbackModel: stored.model || defaultModelFor(provider) || 'models',
+      cache: modelListCache,
+      ttlMs: MODEL_LIST_TTL_MS,
+      force: typedKey !== '' || payload?.force === true,
+    })
+    return result
+  })
+
+  /** 清除模型列表缓存（提供商/地址/Key 改了以后强制重取） */
+  ipcMain.handle('settings:models:clear', (_event, payload) => {
+    if (typeof payload?.providerId === 'string' && payload.providerId !== '') {
+      for (const key of [...modelListCache.keys()]) {
+        if (key.startsWith(`${payload.providerId.trim()}|`)) modelListCache.delete(key)
+      }
+    } else {
+      modelListCache.clear()
+    }
+    return { ok: true }
+  })
+
+  /** 在系统浏览器打开提供商控制台（拿 API Key 用）。只允许 http(s)。 */
+  ipcMain.handle('settings:openKeyConsole', (_event, payload) => {
+    const url = String(payload?.url ?? '')
+    if (!/^https?:\/\//u.test(url)) return { ok: false, error: '地址不合法' }
+    void shell.openExternal(url)
+    return { ok: true }
   })
 
   ipcMain.handle('settings:save', async (_event, payload) => {
@@ -2783,6 +3182,17 @@ function registerSettingsIpc() {
         warnings.push(`定时切换规则未即时生效：${scheduleError.message}`)
         log(`settings runtime sync failed (modelSchedule): ${scheduleError.message}`)
       }
+      /*
+       * 模型端点与推理档位：落盘成功后同步到运行时，**下一轮对话生效**。
+       * 不重启应用、不重建 CUA 桥接和语音；正在跑的回合用它开始时的快照，
+       * 中途不会被这次保存换掉端点（见 Agent.run 里的 snapshot）。
+       */
+      try {
+        if (touchesModelSettings(payload)) await syncAgentEndpoint(store)
+      } catch (endpointError) {
+        warnings.push(`模型设置未即时生效：${endpointError.message}`)
+        log(`settings runtime sync failed (model): ${endpointError.message}`)
+      }
       try {
         if (!ttsEnabled) stopSpeaking()
       } catch (stopError) {
@@ -2809,27 +3219,60 @@ function registerSettingsIpc() {
     }
   })
 
+  /*
+   * 测试模型：必须走**和真实请求同一条组装路径**，否则会出现"测着是绿的、
+   * 用起来 400"或反过来——测试路径多带一个该提供商不支持的 temperature /
+   * reasoning_effort，就会被判成失败（假失败）。
+   * 所以这里用 profileFromConfig + 同一个 LLMClient，只是把界面当前填的值当生效值。
+   */
   ipcMain.handle('settings:testModel', async (_event, payload) => {
     try {
-      const [{ LLMClient }, store] = await Promise.all([
-        import('../../packages/agent/llm.mjs'),
-        import('../../packages/config/store.mjs'),
-      ])
+      const store = await import('../../packages/config/store.mjs')
       const stored = await store.loadConfig()
-      const apiKey = typeof payload?.apiKey === 'string' && payload.apiKey !== '' && !payload.apiKey.includes('*')
-        ? payload.apiKey
-        : await store.resolveApiKey()
-      if (!apiKey) return { ok: false, error: '还没配置 API Key' }
+      const targetProviderId = typeof payload?.providerId === 'string' && payload.providerId.trim() !== ''
+        ? payload.providerId.trim() : stored.providerId
+      const typedKey = typeof payload?.apiKey === 'string' && payload.apiKey !== '' && !payload.apiKey.includes('*')
+        ? payload.apiKey.trim() : ''
+      /*
+       * 地址必须跟着"选中的那一家"走：没显式给地址时，切了提供商就不能再用
+       * stored.baseURL——那还是上一家的端点，会把这一家的 Key 发错地方。
+       */
+      const mergedBaseURL = typeof payload?.baseURL === 'string' && payload.baseURL.trim() !== ''
+        ? payload.baseURL.trim()
+        : (getProvider(targetProviderId)?.baseURL ?? stored.baseURL)
+      // 测试必须用**那一家**自己的 Key：拿当前生效的 Key 去打别家，结果只会是假的 401（或假的成功）
+      const apiKey = typedKey !== '' ? typedKey
+        : await store.resolveApiKeyFor(targetProviderId, { config: stored })
+      if (!apiKey) return { ok: false, error: '还没配置该提供商的 API Key' }
+      const merged = {
+        ...stored,
+        providerId: targetProviderId,
+        baseURL: mergedBaseURL,
+        model: payload?.model ?? stored.model,
+        temperature: payload?.temperature ?? stored.temperature,
+        mimoThinking: payload?.mimoThinking ?? stored.mimoThinking,
+        deepseekReasoningEffort: payload?.deepseekReasoningEffort ?? stored.deepseekReasoningEffort,
+        providerHint: payload?.providerHint ?? stored.providerHint,
+      }
       const client = new LLMClient({
-        baseURL: payload?.baseURL || stored.baseURL,
+        baseURL: merged.baseURL,
         apiKey,
-        model: payload?.model || stored.model,
-        temperature: 0,
+        model: merged.model,
+        temperature: merged.temperature,
         timeoutMs: 20000,
+        profile: profileFromConfig(merged),
       })
       const startedAt = Date.now()
-      const reply = await client.chat({ messages: [{ role: 'user', content: '回复 ok' }], stream: false })
-      return { ok: true, ms: Date.now() - startedAt, text: (reply.text ?? '').slice(0, 40) }
+      const reply = await client.chat({ messages: [{ role: 'user', content: '回复 ok' }], stream: false, tools: undefined })
+      return {
+        ok: true,
+        ms: Date.now() - startedAt,
+        text: (reply.text ?? '').slice(0, 40),
+        // 思考内容不进字幕、不播报，这里只报"有没有"，让用户确认档位确实生效
+        reasoningChars: (reply.reasoning ?? '').length,
+        finishReason: reply.finishReason,
+        endpoint: client.endpoint,
+      }
     } catch (error) {
       return { ok: false, error: error.message }
     }
