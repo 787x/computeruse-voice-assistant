@@ -291,43 +291,71 @@ export class LLMClient {
       while ((boundary = buffer.indexOf('\n\n')) >= 0) {
         const rawEvent = buffer.slice(0, boundary)
         buffer = buffer.slice(boundary + 2)
+        /*
+         * 先拆成 `字段: 值` 判断这个事件是不是错误事件。
+         *
+         * 为什么不能再用 `rawEvent.includes('\nevent: error')`：那样要求 `event:` 前面
+         * 必须有换行，于是**第一行就是 `event: error`** 的标准写法被漏掉
+         * （OpenAI 兼容端点里这就是最常见的一种），错误流会被当成正常结束。
+         * 这里按行解析，并容忍 `event:error` / `EVENT: error` / 多余空格，
+         * 字段名大小写按 SSE 规范不敏感。
+         */
+        let eventName = ''
+        const dataLines = []
         for (const line of rawEvent.split('\n')) {
-          const trimmed = line.trim()
-          if (!trimmed.startsWith('data:')) continue
-          const payload = trimmed.slice(5).trim()
-          if (payload === '') continue
-          if (payload === '[DONE]') { sawDone = true; continue }
-          // 服务端错误事件（OpenAI 兼容的 `event: error` / `data: {"error": ...}`）
-          if (rawEvent.includes('\nevent: error') || (payload.startsWith('{') && /"error"\s*:/u.test(payload))) {
-            sawError = true
-            continue
-          }
-          let json
-          try {
-            json = JSON.parse(payload)
-          } catch {
-            continue
-          }
-          if (json?.error) { sawError = true; continue }
-          if (json?.usage) usage = json.usage
-          // 有些端点在最后一个 chunk 里把 choices 置空，只带 usage
-          const choice = json?.choices?.[0]
-          if (choice === undefined) continue
-          if (choice.finish_reason) { finishReason = choice.finish_reason; sawFinish = true }
-          const delta = choice.delta ?? choice.message ?? {}
-          // 个别实现把错误放在 delta.error 上（OpenAI 流式错误规范之一）
-          if (delta?.error) { sawError = true; continue }
-          if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
-            reasoning += delta.reasoning_content
-            // 思考内容**只**走 onReasoning（默认不接），绝不混进字幕/TTS 的 text_delta
-            onReasoning?.(delta.reasoning_content)
-          }
-          if (typeof delta.content === 'string' && delta.content !== '') {
-            text += delta.content
-            onDelta?.(delta.content)
-          }
-          if (Array.isArray(delta.tool_calls)) assembler.feed(delta.tool_calls)
+          if (line === '') continue
+          // SSE 注释行（以冒号开头）：只用于保活，忽略
+          if (line.startsWith(':')) continue
+          const colon = line.indexOf(':')
+          const field = (colon < 0 ? line : line.slice(0, colon)).trim().toLowerCase()
+          let value = colon < 0 ? '' : line.slice(colon + 1)
+          if (value.startsWith(' ')) value = value.slice(1)
+          if (field === 'event') eventName = value.trim().toLowerCase()
+          else if (field === 'data') dataLines.push(value)
         }
+        const eventIsError = eventName === 'error'
+        // 多行 data 按 SSE 规范用换行拼接
+        const payload = dataLines.join('\n').trim()
+        if (payload === '') {
+          if (eventIsError) sawError = true
+          continue
+        }
+        if (payload === '[DONE]') { sawDone = true; continue }
+        /*
+         * 服务端错误事件：
+         *  - `event: error`（**不管负载长什么样**——常见形态是 `{"message":"quota exceeded"}`，
+         *    根本没有 error 字段，只看 `"error":` 会漏判）；
+         *  - 负载里带 error 字段（`data: {"error": ...}`）。
+         */
+        if (eventIsError || (payload.startsWith('{') && /"error"\s*:/u.test(payload))) {
+          sawError = true
+          continue
+        }
+        let json
+        try {
+          json = JSON.parse(payload)
+        } catch {
+          continue
+        }
+        if (json?.error) { sawError = true; continue }
+        if (json?.usage) usage = json.usage
+        // 有些端点在最后一个 chunk 里把 choices 置空，只带 usage
+        const choice = json?.choices?.[0]
+        if (choice === undefined) continue
+        if (choice.finish_reason) { finishReason = choice.finish_reason; sawFinish = true }
+        const delta = choice.delta ?? choice.message ?? {}
+        // 个别实现把错误放在 delta.error 上（OpenAI 流式错误规范之一）
+        if (delta?.error) { sawError = true; continue }
+        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
+          reasoning += delta.reasoning_content
+          // 思考内容**只**走 onReasoning（默认不接），绝不混进字幕/TTS 的 text_delta
+          onReasoning?.(delta.reasoning_content)
+        }
+        if (typeof delta.content === 'string' && delta.content !== '') {
+          text += delta.content
+          onDelta?.(delta.content)
+        }
+        if (Array.isArray(delta.tool_calls)) assembler.feed(delta.tool_calls)
       }
     }
 

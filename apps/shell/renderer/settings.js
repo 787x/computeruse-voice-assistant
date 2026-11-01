@@ -180,6 +180,15 @@ function fillProviderNote() {
   renderReasoning()
 }
 
+/**
+ * 上一次真正渲染到界面上的提供商 id。
+ *
+ * 存在的唯一原因：`change` 事件里 `$('provider').value` 已经变成新值，
+ * 拿它当"草稿属于谁"会把旧提供商的 Key 记到新提供商名下。
+ * 必须声明在所有用到它的函数**之前**（fillForm 也会写它）。
+ */
+let lastRenderedProviderId = ''
+
 /** 当前界面上选中的提供商对象 */
 function currentProvider() {
   return providerList.find((item) => item.id === $('provider').value) ?? null
@@ -511,8 +520,29 @@ function renderCapabilities() {
 }
 
 /* ---------------- 模型方案（供应商 + Key + 模型） ---------------- */
+/** 行 id：用随机串而不是数组下标，删行之后不会串到别的行 */
 function profileRowId() {
   return `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+}
+
+/**
+ * 方案行里**还没保存**的 Key 草稿，键是「行 id + 提供商」。
+ *
+ * 只存在于内存（关掉设置窗口就没了，和全局那份一致）。作用是：
+ *  - 切换提供商时，旧家的草稿留在旧家名下，不会变成新家的 Key；
+ *  - 切回旧家时把草稿还回来，用户不必重填；
+ *  - 同一个提供商改 Base URL 时草稿不受影响。
+ * 保存成功后按行清掉（磁盘为准，见 save 处理）。
+ */
+const profileKeyDrafts = new Map()
+/** 记住某一行在某提供商下**还没保存**的 Key（空内容 = 用户删掉了，草稿也要清掉） */
+function rememberProfileKeyDraft(key, input) {
+  const value = typeof input?.value === 'string' ? input.value.trim() : ''
+  if (value === '') profileKeyDrafts.delete(key)
+  else profileKeyDrafts.set(key, value)
+}
+function recallProfileKeyDraft(key) {
+  return profileKeyDrafts.get(key) ?? ''
 }
 
 /** 默认方案下拉：空值 = 用顶部那套全局模型 */
@@ -560,6 +590,14 @@ function renderProfileRows(profiles) {
       provider.append(option)
     }
     provider.value = profile.providerId ?? providerList[0]?.id ?? 'openai-compatible'
+    /*
+     * 这一行未保存的 Key 草稿按**提供商**记，和上面全局那份同一套语义。
+     * 为什么必须在切换前先存：`change` 事件触发时 provider.value 已经是新提供商，
+     * 直接拿它当归属就会把 DeepSeek 的 Key A 记到 MiMo 名下——用户只是换了个
+     * 提供商、没重填 Key，保存下去 MiMo 方案就带上了 DeepSeek 的凭据。
+     */
+    const apiKeyDraftKey = (id) => `profileKey:${row.dataset.id}:${id}`
+    let rowProviderId = provider.value
     provider.addEventListener('change', () => {
       const matched = providerList.find((item) => item.id === provider.value)
       if (matched !== undefined) {
@@ -575,6 +613,15 @@ function renderProfileRows(profiles) {
         } else {
           modelInput.title = `当前填写的 «${currentModel}» 可能不属于 ${matched.name}，保存前请确认`
         }
+        /*
+         * 草稿搬家：先把框里的内容记到**切换前**的提供商名下，再把新家自己的草稿取回来。
+         * 这样"DeepSeek 填了 A → 切 MiMo → 不填 → 切回 DeepSeek"能拿回 A，
+         * 而 MiMo 那一份是空的（不会被 A 顶掉）。
+         */
+        rememberProfileKeyDraft(apiKeyDraftKey(rowProviderId), keyInput)
+        rowProviderId = matched.id
+        const restored = recallProfileKeyDraft(apiKeyDraftKey(rowProviderId))
+        keyInput.value = typeof restored === 'string' ? restored : ''
         // Key 提示按「该提供商」判断：换提供商才需要重填，改地址不用
         const hasForProvider = state?.config?.hasProviderKey?.[provider.value] === true
         keyInput.placeholder = hasForProvider ? '已保存，留空不修改' : (matched.apiKeyRequired === false ? '本地端点可留空' : '未配置（可在控制台获取）')
@@ -683,6 +730,13 @@ function collectProfiles() {
     const providerId = pick('providerId')
     const kind = reasoningKindForProvider(providerId, pick('providerHint'))
     const level = pick('reasoning')
+    /*
+     * Key 只交**当前选中的这家**的：
+     * 框里留着的是上一家的草稿（切换时已搬回上一家名下、这里也换了内容），
+     * 万一用户没触发切换就直接敲了字，那也是给当前这家的。
+     * 空 = 不修改（主进程按掩码语义保留这条方案已存的 Key）。
+     */
+    rememberProfileKeyDraft(`profileKey:${row.dataset.id}:${providerId}`, row.querySelector('[data-field="apiKey"]'))
     const record = {
       id: row.dataset.id,
       name: pick('name').trim(),
@@ -690,7 +744,6 @@ function collectProfiles() {
       baseURL: pick('baseURL').trim(),
       model: pick('model').trim(),
       providerHint: pick('providerHint') || 'auto',
-      // 空=不修改（主进程按掩码语义保留原 Key）
       apiKey: pick('apiKey').trim(),
     }
     /*
@@ -1056,13 +1109,6 @@ $('baseURL').addEventListener('change', () => {
  * 按量付费 → Token Plan）是常规操作，拆成不同槽位会让用户以为 Key 丢了。
  */
 const apiKeyDrafts = {}
-/**
- * 上一次真正渲染到界面上的提供商 id。
- *
- * 存在的唯一原因：`change` 事件里 `$('provider').value` 已经变成新值，
- * 拿它当"草稿属于谁"会把旧提供商的 Key 记到新提供商名下。
- */
-let lastRenderedProviderId = ''
 function draftKeyForUI() {
   return currentProvider()?.id ?? ''
 }
@@ -1070,7 +1116,15 @@ function draftKeyForUI() {
 function rememberApiKeyDraft(providerId = draftKeyForUI()) {
   const value = $('apiKey').value.trim()
   const key = typeof providerId === 'string' ? providerId : ''
-  if (value === '' || key === '') return
+  if (key === '') return
+  /*
+   * 空输入框 = 用户把草稿删掉了，草稿也要一起清掉。
+   *
+   * 以前这里是"空就不写"，于是删掉的草稿还留在表里：切走再切回来，被删掉的 Key
+   * 又出现在输入框里，用户会以为删不掉。注意这只影响**草稿**——
+   * 已保存的 Key 在磁盘上，清空输入框的语义仍是"不修改"，不会被这里抹掉。
+   */
+  if (value === '') { delete apiKeyDrafts[key]; return }
   apiKeyDrafts[key] = value
 }
 function restoreApiKeyDraft() {
@@ -1156,6 +1210,15 @@ $('save').addEventListener('click', async () => {
     if (typeof state.config.providerHint !== 'string') state.config.providerHint = 'auto'
     const savedProvider = draftKeyForUI()
     if (payload.apiKey !== undefined) delete apiKeyDrafts[savedProvider]
+    /*
+     * 方案行里已经提交出去的 Key 草稿同样作废：磁盘上已经有了，留着只会在
+     * 下次切提供商时把旧值又填回输入框（看起来像"我明明清掉了它又回来了"）。
+     */
+    for (const profile of payload.modelProfiles ?? []) {
+      if (profile.apiKey !== undefined && profile.apiKey !== '') {
+        profileKeyDrafts.delete(`profileKey:${profile.id}:${profile.providerId}`)
+      }
+    }
     fillForm()
     // 保存成功后再标记：如果这次保存是"恢复默认"，
     // 用户切回自定义时应看到完整默认提示词（fillForm 已清空框，applyPromptModeUI 会填默认）

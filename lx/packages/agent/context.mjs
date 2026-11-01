@@ -194,9 +194,14 @@ function isAttachmentUser(message) {
  * 不区分的话，压缩会把它当成"较新的用户回合"，于是更早但更真实的用户目标
  * （"把页面滚到底部"）反而被当成旧历史删掉——用户看到的就是"它忘了我要干什么"。
  *
- * 识别方式以显式标记为准（`internal: true`）。另外兼容**旧版本已经落进会话历史里的**
- * 内部提示（升级前的回合把它们当普通字符串存着，没有标记），按它们固定的措辞前缀识别——
- * 这些文本全部由 loop/context 自己生成，不会与用户口语撞上。
+ * 识别分两层：
+ *  1. **以显式标记为准**（`internal: true`）——新版本的 loop 都会打这个标记；
+ *  2. 兼容**旧版本已经落进会话历史里的**内部提示（升级前的回合把它们当普通字符串
+ *     存着，没有标记）：按生成时的固定措辞 + 整条被括号包住来判断。
+ *
+ * 第二层刻意只作为升级过渡，不作为长期依据：它只能认出"我们自己写过的原文"，
+ * 换个说法就失效。真正保证正确性的是第 1 层——凡是程序生成的 user 消息都必须带标记，
+ * 并且这个标记会随 `turn` 一起返回、跨回合保留（见 loop.mjs）。
  */
 const INTERNAL_PROMPT_PREFIXES = [
   '（上一步的工具调用参数不完整',
@@ -210,7 +215,9 @@ export function isInternalUserMessage(message) {
   if (message?.role !== 'user') return false
   if (message.internal === true || message._internal === true) return true
   if (typeof message.content !== 'string') return false
-  return INTERNAL_PROMPT_PREFIXES.some((prefix) => message.content.startsWith(prefix))
+  const text = message.content.trim()
+  if (!text.startsWith('（') || !text.endsWith('）')) return false
+  return INTERNAL_PROMPT_PREFIXES.some((prefix) => text.startsWith(prefix))
 }
 
 function declaredCallIds(message) {
@@ -233,6 +240,8 @@ function declaredCallIds(message) {
  */
 function splitSegments(calls) {
   const segments = []
+  /** 出现在第一条 assistant 之前的内部提示（压缩摘要就属于这种） */
+  const leadingNotes = []
   let current = null
   for (const message of calls) {
     if (message.role === 'assistant') {
@@ -242,9 +251,13 @@ function splitSegments(calls) {
     }
     if (current === null) {
       /*
-       * 内部提示出现在第一条 assistant 之前：不丢，挂成"单元头之后的备注"
-       * （它不属于任何片段，删除片段时不该连带它）。
+       * 内部提示出现在第一条 assistant 之前：留着，挂在单元头之后。
+       *
+       * 压缩摘要是**上一次**压缩写下的，它前面没有任何 assistant——
+       * 直接丢掉就等于把"更早的目标"整段忘掉，第二次压缩就再也找不回来了。
+       * 它不归任何片段：删片段时不该连带它（删它由摘要合并逻辑专门处理）。
        */
+      if (isInternalUserMessage(message)) leadingNotes.push(message)
       continue
     }
     if (message.role === 'tool') {
@@ -265,11 +278,14 @@ function splitSegments(calls) {
     if (isInternalUserMessage(message)) current.notes.push(message)
   }
   // 片段完整性：声明的 id 必须有结果。缺结果的整段剔除（不补假结果、不执行半截调用）
-  return segments.filter((segment) => {
-    const declared = segment.calls.flatMap((call) => declaredCallIds(call))
-    const results = new Set(segment.results.map((result) => String(result.tool_call_id)))
-    return declared.every((id) => results.has(id))
-  })
+  return {
+    segments: segments.filter((segment) => {
+      const declared = segment.calls.flatMap((call) => declaredCallIds(call))
+      const results = new Set(segment.results.map((result) => String(result.tool_call_id)))
+      return declared.every((id) => results.has(id))
+    }),
+    leadingNotes,
+  }
 }
 
 function flattenSegments(segments) {
@@ -290,22 +306,41 @@ function flattenSegments(segments) {
 export function splitInteractionUnits(messages) {
   const units = []
   let current = null
+  /** 出现在**任何**用户回合之前的内部提示（压缩摘要就是这种，它由上一轮压缩写下） */
+  const leadingNotes = []
   for (const message of messages) {
     if (isPlainUserText(message)) {
       current = { head: message, calls: [] }
       units.push(current)
       continue
     }
-    if (current === null) continue // 没有用户开头就出现的 assistant/tool：残缺开头，丢掉
+    if (current === null) {
+      /*
+       * 没有用户开头就出现的消息：assistant/tool 属于残缺开头，丢掉；
+       * 但内部提示（压缩摘要）要留着——它是"更早的目标"唯一的载体。
+       */
+      if (isInternalUserMessage(message)) leadingNotes.push(message)
+      continue
+    }
     current.calls.push(message)
   }
-  return units.map((unit) => ({ head: unit.head, segments: splitSegments(unit.calls) }))
+  if (units.length === 0) {
+    return leadingNotes.length === 0
+      ? []
+      : [{ head: null, segments: [], leadingNotes }]
+  }
+  return units.map((unit, index) => {
+    const { segments, leadingNotes: unitNotes } = splitSegments(unit.calls)
+    // 首个单元带上单元外的前导内部提示，保证它们仍然出现在请求里
+    return { head: unit.head, segments, leadingNotes: index === 0 ? [...leadingNotes, ...unitNotes] : unitNotes }
+  })
 }
 
 function flattenUnits(units) {
   const out = []
   for (const unit of units) {
-    out.push(unit.head, ...flattenSegments(unit.segments))
+    if (unit.head !== null) out.push(unit.head)
+    out.push(...(unit.leadingNotes ?? []), ...flattenSegments(unit.segments))
   }
   return out
 }
@@ -359,8 +394,17 @@ export function compressMessages(messages, policy, { tools = [] } = {}) {
   })
 
   result.before = estimateRequestTokens({ messages, tools })
-  // 没到触发点：一个字节都不动（旧实现里的条数/字符阈值已经全部删掉）
-  if (result.before <= budget.compressAtTokens) {
+  /*
+   * 什么时候需要动手：
+   *  - 到了用户设的触发点（默认 90%）→ 按正常规则压缩；
+   *  - **或者已经超过输入硬上限**（窗口减去输出预留）→ 无论如何都要压。
+   *
+   * 第二条是容量保护，不是另一条"提前裁剪"规则：正常设置下硬上限（≈95% 窗口）
+   * 永远高于触发点（90%），所以平时根本走不到；只有用户把百分比调到 97~99 时，
+   * 才可能出现"已经发不出去了却还没到触发点"。没有这一条，那段区间里的请求会
+   * 带着超过模型容量的输入直接发出去，被服务端拒绝或静默截断。
+   */
+  if (result.before <= budget.compressAtTokens && result.before <= budget.hardLimitTokens) {
     result.after = result.before
     return result
   }
@@ -371,6 +415,36 @@ export function compressMessages(messages, policy, { tools = [] } = {}) {
   if (units.length === 0) {
     result.after = result.before
     return result
+  }
+  /*
+   * 之前几轮压缩留下的摘要要先收回来。
+   *
+   * 为什么不能在丢弃老回合时把它当成普通 user 消息一起丢掉：摘要里装着**更早**的
+   * 被折叠目标，是唯一还记得"用户最开始要干什么"的地方。第二次压缩如果把它当旧回合
+   * 删掉，最初的任务线索就彻底没了（模型只知道最近几轮，最早的意图再也找不回来）。
+   * 收回来之后并入这一轮新生成的摘要，越早的目标排得越前。
+   *
+   * 注意摘要**不是**交互单元的头（它后面通常紧跟 assistant/tool），所以这里直接
+   * 从原消息里挑出来，再从单元里摘掉——留在单元里会被当成"这一轮早就存在的对话"。
+   */
+  const digestPattern = /^（为控制上下文长度/u
+  const isDigestMessage = (message) => message !== null && typeof message === 'object'
+    && isInternalUserMessage(message) && digestPattern.test(String(message.content ?? ''))
+  const inheritedDigests = [
+    ...units.flatMap((unit) => unit.leadingNotes ?? []),
+    ...units.flatMap((unit) => unit.segments.flatMap((segment) => segment.notes)),
+    ...rest,
+  ].filter(isDigestMessage).map((message) => String(message.content))
+  // 同一个摘要可能被上面几条路径同时看见，去重后按出现顺序保留
+  const uniqueDigests = [...new Set(inheritedDigests)]
+  if (uniqueDigests.length > 0) {
+    // 把旧摘要从单元里摘掉：它只作为这一轮新摘要的原料，不再单独占一条消息
+    for (const unit of units) {
+      unit.leadingNotes = (unit.leadingNotes ?? []).filter((message) => !isDigestMessage(message))
+      for (const segment of unit.segments) {
+        segment.notes = segment.notes.filter((message) => !isDigestMessage(message))
+      }
+    }
   }
   const droppedGoals = []
   const noteDropped = (unit) => {
@@ -463,20 +537,44 @@ export function compressMessages(messages, policy, { tools = [] } = {}) {
     result.droppedUnits += 1
   }
 
-  // 5) 单轮自身就超过硬上限：把用户目标文本截短（这是唯一还能安全缩的东西——
-  //    工具链片段已经整组删过，reasoning 绝不截断后继续配对）
+  /*
+   * 5) 单轮自身就超过硬上限。
+   *
+   * **绝不截断真实用户指令**。以前这里把用户输入砍到前 400 字再照常发出，
+   * 模型收到的是一段被悄悄改写过的任务，用户听到的回答可能驴唇不对马嘴，
+   * 而且没有任何提示——这比直接说"这一轮装不下"糟糕得多。
+   * 现在只如实标记 overLimit，由上层明确告知用户（用户说的话可能很长、
+   * 或者粘贴了大段内容；让他自己缩短，好过替他截断）。
+   *
+   * 旧的 `truncated` 字段保留为 false：它曾经表示"用户输入被改写了"，
+   * 而现在这种情况根本不会发生。
+   */
   if (totalOf(system, units, null) > budget.hardLimitTokens) {
-    const head = units.at(-1)?.head
-    if (head !== undefined && typeof head.content === 'string' && head.content.length > 400) {
-      head.content = `${head.content.slice(0, 400)}…（内容过长已截断）`
-      result.truncated = true
-    }
+    result.overLimit = true
   }
 
-  // 折叠摘要：让模型知道"之前还要求过什么"，而不是一片空白
+  /*
+   * 折叠摘要：让模型知道"之前还要求过什么"，而不是一片空白。
+   *
+   * 把上一轮留下的摘要正文接在最前面——它们记的是更早的目标，顺序必须保持
+   * "越早越靠前"，否则模型会把最近一段当成整个任务的开头。
+   */
   let digest = null
-  if (droppedGoals.length > 0) {
-    const text = `（为控制上下文长度，已折叠较早的 ${droppedGoals.length} 段对话。此前用户先后提过：${droppedGoals.join(' / ')}）`
+  if (droppedGoals.length > 0 || uniqueDigests.length > 0) {
+    /*
+     * 旧摘要的正文要原样搬进新摘要。
+     *
+     * 这里只剥掉最外层的"（…）"包裹，**不能**用 `[^）]*` 去切前缀：
+     * 摘要内部本身还有别的括号，那样会把整段正文一起吃掉（表现为"合并了但什么都没留下"）。
+     */
+    const inheritedText = uniqueDigests
+      .map((text) => text.replace(/^（为控制上下文长度[^：]*：?/u, '').replace(/）\s*$/u, '').trim())
+      .filter((text) => text !== '')
+      .join(' / ')
+    const parts = []
+    if (inheritedText !== '') parts.push(`更早还提过：${inheritedText}`)
+    if (droppedGoals.length > 0) parts.push(`此前用户先后提过：${droppedGoals.join(' / ')}`)
+    const text = `（为控制上下文长度，已折叠较早的对话。${parts.join('；')}）`
     // 带上内部标记：它是程序生成的说明，不是用户刚发出的新指令
     digest = { role: 'user', content: clip(text, DIGEST_MAX_CHARS), internal: true }
   }

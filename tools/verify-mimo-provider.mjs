@@ -488,6 +488,77 @@ async function captureBody(config, messages = [{ role: 'user', content: 'hi' }])
     check('D11 流中的 error 对象不当正文，已到的正文保留', r.text === '半句', JSON.stringify(r.text))
   })
 
+  /*
+   * D11c：`event: error` 事件 —— 包括**第一行就是 event: error** 的标准写法。
+   *
+   * 旧实现用 `rawEvent.includes('\nevent: error')` 判断，要求 `event:` 前面有换行，
+   * 于是首行写法被漏掉；而首行写法恰恰是 OpenAI 兼容端点最常见的一种。
+   * 负载也常常只有 `{"message": ...}`，没有 error 字段，只看 `"error":` 同样会漏。
+   */
+  {
+    const rawServer = async (chunks) => {
+      const server = createServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        let i = 0
+        const tick = () => {
+          if (i >= chunks.length) return res.end()
+          res.write(chunks[i]); i += 1
+          setTimeout(tick, 4)
+        }
+        tick()
+      })
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const client = new LLMClient({ baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: 'k', model: 'm' })
+      const got = await client.chat({ messages: [{ role: 'user', content: 'x' }] })
+      server.close()
+      return got
+    }
+
+    // 首行 event: error + 只有 message 的负载
+    const firstLine = await rawServer(['event: error\ndata: {"message":"quota exceeded"}\n\ndata: [DONE]\n\n'])
+    check('D11c 首行 event: error（负载只有 message）被识别为服务端错误',
+      firstLine.toolCallsIncomplete === true, JSON.stringify({ finish: firstLine.finishReason }))
+
+    // event: error 在 data 之后（另一种合法行顺序）
+    const afterData = await rawServer(['data: {"message":"quota exceeded"}\nevent: error\n\ndata: [DONE]\n\n'])
+    check('D11d event: error 在 data 之后同样被识别',
+      afterData.toolCallsIncomplete === true, JSON.stringify({ finish: afterData.finishReason }))
+
+    // 错误前已经收到的正常文字必须保留
+    const withText = await rawServer([
+      'data: {"choices":[{"index":0,"delta":{"content":"我先看一下屏幕"}}]}\n\n'
+        + 'event: error\ndata: {"message":"配额不足"}\n\ndata: [DONE]\n\n',
+    ])
+    check('D11e 错误前已收到的文字保留',
+      withText.text === '我先看一下屏幕' && withText.toolCallsIncomplete === true, JSON.stringify(withText.text))
+
+    // CRLF 恰好切在 \r 与 \n 之间
+    const crlf = Buffer.from('event: error\r\ndata: {"message":"quota exceeded"}\r\n\r\ndata: [DONE]\r\n\r\n', 'utf8')
+    let splitMisses = 0
+    let splitCount = 0
+    for (let i = 1; i < crlf.length; i += 1) {
+      if (crlf[i - 1] !== 0x0d || crlf[i] !== 0x0a) continue
+      splitCount += 1
+      const got = await rawServer([crlf.subarray(0, i), crlf.subarray(i)])
+      if (got.toolCallsIncomplete !== true) splitMisses += 1
+    }
+    check('D11f CRLF 跨分片时 event: error 仍被识别',
+      splitCount > 0 && splitMisses === 0, `${splitCount} 个边界，漏判 ${splitMisses}`)
+
+    // 正常流式（含思考与工具调用）不受解析改动影响
+    const normal = await rawServer([
+      'data: {"choices":[{"index":0,"delta":{"reasoning_content":"想一想"}}]}\n\n'
+        + 'data: {"choices":[{"index":0,"delta":{"content":"好"}}]}\n\n'
+        + 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"scroll","arguments":"{}"}}]}}]}\n\n'
+        + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n',
+    ])
+    check('D11g 正常流式（思考+正文+工具调用）不受影响',
+      normal.text === '好' && normal.reasoning === '想一想'
+        && normal.toolCalls.length === 1 && normal.toolCalls[0].id === 'c9'
+        && normal.finishReason === 'tool_calls' && normal.toolCallsIncomplete !== true,
+      JSON.stringify({ text: normal.text, tools: normal.toolCalls.map((c) => c.id) }))
+  }
+
   // D11b：Agent 层——没有工具调用的纯文本错误流不能伪装成正常成功回答
   await withMock(() => ({ sse: [{ error: { message: '上游模型炸了' } }, { choices: [{ index: 0, delta: { content: '半句回答' } }] }] }), async (mock) => {
     const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'm' })

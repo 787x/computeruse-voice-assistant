@@ -41,7 +41,7 @@ globalThis.__judged = 0
 let turnSeq = 0, activeTurn = null, latestTurn = null, hideTimer = null, commandTimer = null
 let commandActive = false, wantContinue = false, followUpJudgement = null, followUpJudgePromise = null
 let asr = null, lastCommandText = '', lastSentPartial = '', lastUtterance = '', deniedInTurn = {}
-let turnHistoryCounts = [], sessionHistory = [], userDismissedHud = false, listening = false
+let turnHistoryCounts = [], sessionHistory = [], userDismissedHud = false, listening = true
 let agentRuntime = null, lastReplyText = '', lastAssistantText = '', followUpWindowStart = 0
 let followUpConfig = { thresholds: { high: 0.7, low: 0.3 }, windowsMs: { high: 0, mid: 0, low: 0 }, judgeTimeoutMs: 1000 }
 function isOfflineError() { return false }
@@ -65,8 +65,14 @@ function rememberTurn() {}
 function judgeFollowUp() { __judged += 1; return Promise.resolve({ wait: false, confidence: 0.5, source: 'stub' }) }
 function heuristicFollowUp() { return { wait: false, confidence: 0.5 } }
 function windowFor() { return 0 }
-function afterTurnSpeechSettled() {}
 function scheduleHide() {}
+function playingAudio() { return false }
+function flushPendingUiAction() {}
+let ttsPumping = false, ttsQueue = [], speechBuffer = '', continuousMode = true
+let currentState = 'hidden', confirmResolver = null, heardAny = false, commandStartAt = 0
+${fn('async function afterTurnSpeechSettled()')}
+${fn('async function startFollowUpIfWanted()')}
+${fn('async function resolveFollowUpJudgement()')}
 async function refreshSearchKey() {}
 async function syncAgentEndpointIfChanged() {}
 async function ensureAgent() {
@@ -88,6 +94,13 @@ ${fn('async function runCommand(text)')}
   vm.runInContext('globalThis.__agentResult = ' + JSON.stringify(agentResult), ctx)
   vm.runInContext('globalThis.__events = ' + JSON.stringify(events), ctx)
   await vm.runInContext("runCommand('问一下')", ctx)
+  /*
+   * 播报结束后的收尾必经之路：runCommand 的 finally 会调它（ttsQueue 空时也会由
+   * pumpSpeech 调）。这里显式跑一次**真实实现**，才能验证"失败提示播完之后
+   * 会不会又被改成「好了」/开待命窗口"——把 afterTurnSpeechSettled 换成空函数
+   * 恰好会把这个问题藏起来。
+   */
+  await vm.runInContext('afterTurnSpeechSettled()', ctx)
   const ui = JSON.parse(vm.runInContext('JSON.stringify(__ui)', ctx))
   return {
     ui,
@@ -117,6 +130,14 @@ ${fn('async function runCommand(text)')}
   check('P3 明确告诉用户回答没说完', outcome.hints.some((h) => h.includes('没有完整完成'))
     || outcome.speech.some((l) => l.includes('没有说完')), JSON.stringify({ hints: outcome.hints, speech: outcome.speech }))
   check('P4 失败回合不做追问判定（不基于半截回答猜意图）', outcome.judged === 0, outcome.judged)
+  /*
+   * 失败提示播完之后（afterTurnSpeechSettled 走真实实现），不能再冒出
+   * "好了" + 待命窗口——那等于把失败当成正常收尾，而用户刚被告知没说完。
+   */
+  check('P4b 失败提示播完后不会改回「好了」（不误报正常完成）',
+    !outcome.states.includes('done'), outcome.states.join(','))
+  check('P4c 失败提示播完后不开待命窗口（不会再问"想继续说"）',
+    !outcome.hints.some((h) => h.includes('想继续说')), JSON.stringify(outcome.hints))
 }
 
 // ============================================================ 2 一个字都没出来
@@ -149,6 +170,26 @@ ${fn('async function runCommand(text)')}
   check('P9 正常完成仍然做追问判定（连续对话体验不变）', outcome.judged === 1, outcome.judged)
   check('P10 正常完成不追加"没说完"之类的话',
     !outcome.speech.some((l) => l.includes('没有说完')), JSON.stringify(outcome.speech))
+}
+
+// ============================================================ 3b 失败不会沿用上一轮回复做判定
+
+{
+  /*
+   * 上一轮正常回答里带了个问句（"要我给你打开吗？"），如果失败轮还拿 lastReplyText
+   * 去做启发式，就会得出"应该继续等"的结论——用户刚被告知"没说完"，
+   * 紧接着又看到一个"想继续说就直接说"的待命窗口。
+   */
+  const outcome = await runTurnWithEvents(
+    { text: '我看看这个', steps: [], turn: [], failed: true, failureReason: 'stream_error', llm: null },
+    [
+      { type: 'text_delta', text: '我看看这个。' },
+      { type: 'stream_error', text: '我看看这个', finishReason: 'incomplete' },
+      { type: 'done', text: '我看看这个', failed: true },
+    ],
+  )
+  check('P13 失败轮不会基于上一轮的问句开待命窗口',
+    !outcome.hints.some((h) => h.includes('想继续说')), JSON.stringify(outcome.hints))
 }
 
 // ============================================================ 4 用户主动打断

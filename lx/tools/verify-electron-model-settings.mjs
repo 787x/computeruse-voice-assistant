@@ -634,6 +634,79 @@ async function main() {
       reasoningDraft.mimoPicked === 'disabled' && reasoningDraft.mimoBack === 'disabled',
       JSON.stringify({ picked: reasoningDraft.mimoPicked, back: reasoningDraft.mimoBack }))
 
+    /* ---------------- 12d. 方案行的 Key 草稿按提供商归属 ---------------- */
+    /*
+     * 用户实际会做的事：在 DeepSeek 方案里填一颗还没保存的 Key A，把方案切到 MiMo，
+     * 不重填直接保存。旧实现会把 A 当成 MiMo 的 Key 存下去——那是 A 家的凭据，
+     * 发给 MiMo 只会 401，而且用户根本不知道自己的 Key 被搬走了。
+     */
+    const profileKeyFlow = await js(win, `(async () => {
+      const row = document.querySelector('#profileRows tr');
+      const p = row.querySelector('[data-field="providerId"]');
+      const key = row.querySelector('[data-field="apiKey"]');
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const pick = async (id) => {
+        p.value = id;
+        p.dispatchEvent(new Event('change', { bubbles: true }));
+        await wait(150);
+      };
+      await pick('deepseek');
+      key.value = 'sk-deepseek-draft-A';
+      key.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(50);
+      // 切到 MiMo：A 不能跟过来
+      await pick('mimo');
+      const mimoView = key.value;
+      // 切回 DeepSeek：A 必须还在
+      await pick('deepseek');
+      const backToDs = key.value;
+      // 再切到 MiMo 并保存：MiMo 方案不能带上 A
+      await pick('mimo');
+      key.value = '';
+      document.getElementById('save').click();
+      await wait(600);
+      return { mimoView, backToDs };
+    })()`)
+    record('12d1 方案在 DeepSeek 填的未保存 Key 不会跟到 MiMo',
+      profileKeyFlow.mimoView === '', JSON.stringify(profileKeyFlow.mimoView))
+    record('12d2 方案切回 DeepSeek 时未保存的 Key 恢复',
+      profileKeyFlow.backToDs === 'sk-deepseek-draft-A', JSON.stringify(profileKeyFlow.backToDs))
+    const savedAfterSwitch = savedPayloads.at(-1)?.modelProfiles?.[0]
+    record('12d3 切到 MiMo 后保存，不会把 DeepSeek 的 Key 当成 MiMo 的',
+      savedAfterSwitch?.providerId === 'mimo'
+        && (savedAfterSwitch?.apiKey ?? '') !== 'sk-deepseek-draft-A',
+      JSON.stringify({ p: savedAfterSwitch?.providerId, key: savedAfterSwitch?.apiKey }))
+
+    /* ---------------- 12e. 全局草稿删掉之后不复活 ---------------- */
+    const clearedDraft = await js(win, `(async () => {
+      const p = document.getElementById('provider');
+      const key = document.getElementById('apiKey');
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const pick = async (id) => {
+        p.value = id;
+        p.dispatchEvent(new Event('change', { bubbles: true }));
+        await wait(200);
+      };
+      await pick('mimo');
+      key.value = 'sk-mimo-scratch';
+      key.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(50);
+      await pick('deepseek');
+      await pick('mimo');
+      const restored = key.value;
+      // 用户手动删掉这颗草稿
+      key.value = '';
+      key.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(50);
+      await pick('deepseek');
+      await pick('mimo');
+      return { restored, afterDelete: key.value };
+    })()`)
+    record('12e1 未保存草稿切回来后先还在（对照）',
+      clearedDraft.restored === 'sk-mimo-scratch', JSON.stringify(clearedDraft.restored))
+    record('12e2 用户删掉草稿后，切走再切回来不会复活',
+      clearedDraft.afterDelete === '', JSON.stringify(clearedDraft.afterDelete))
+
     /* ---------------- 13. PR3 提示词语义未受影响 ---------------- */
     const noPrompt = !('systemPrompt' in savedPayloads.at(-1))
     record('保存模型设置不会顺手重写系统提示词', noPrompt, `keys=${Object.keys(savedPayloads.at(-1)).join(',')}`)

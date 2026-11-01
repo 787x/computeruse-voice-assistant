@@ -494,6 +494,20 @@ function makeHistory(turns, charsPerTurn) {
   check('K54 旧历史里的内部提示（无标记）也按措辞识别',
     legacyUnits.length === 1 && legacyUnits[0].head.content === '真实目标',
     legacyUnits.map((u) => String(u.head.content).slice(0, 14)))
+
+  /*
+   * 真正可靠的是显式标记；措辞匹配只是升级过渡。两点都要成立：
+   *  - 带标记的消息**无论措辞**都算内部提示；
+   *  - 用户自己说的括号句不因为长得像就被吞掉。
+   */
+  check('K54a 带 internal 标记的消息无论措辞都算内部提示',
+    context.isInternalUserMessage({ role: 'user', content: '这条是程序写的，措辞随便', internal: true }) === true
+      && context.isInternalUserMessage({ role: 'user', content: '（换了个说法的内部提示）', internal: true }) === true,
+    '')
+  check('K54b 用户自己说的括号句不会被误判成内部提示',
+    context.isInternalUserMessage({ role: 'user', content: '（明天）帮我把报告导出来' }) === false
+      && context.isInternalUserMessage({ role: 'user', content: '记住：参数不完整时不要重试' }) === false,
+    '')
 }
 
 // ============================================================ 9 压完仍超硬上限要如实报告
@@ -573,6 +587,116 @@ function makeHistory(turns, charsPerTurn) {
     check('K63 internal 标记没有进请求体',
       !last.messages.some((m) => 'internal' in m), '')
   })
+}
+
+// ============================================================ 11 硬上限：任何请求都不越过
+
+{
+  /*
+   * 用户把压缩百分比调到 99% 时，会出现"输入已超过硬上限（窗口 - 输出预留），
+   * 但还没到 99% 触发点"的区间。旧实现在这个区间直接跳过压缩与超限判断，
+   * 请求带着超过模型容量的输入发出去。
+   *
+   * 这里用**缩小的窗口**做等比例测试，并且验证**实际发出的请求体**，
+   * 而不只看压缩函数的返回值。
+   */
+  const policies = [90, 99].map((percent) => context.resolveContextPolicy({ contextWindow: 100_000, compressPercent: percent }))
+  for (const policy of policies) {
+    // 造一段落在 (hardLimit, compressAt] 的历史（只对 99% 存在这种区间）
+    let history = []
+    for (let n = 1; n <= 80; n += 1) {
+      history = []
+      for (let i = 0; i < n; i += 1) {
+        history.push({ role: 'user', content: `轮${i}：${'做'.repeat(3000)}` })
+        history.push({ role: 'assistant', content: `答${i}：${'答'.repeat(3000)}` })
+      }
+      const size = context.estimateRequestTokens({ messages: [{ role: 'system', content: 'sys' }, ...history] })
+      if (size > policy.compressAtTokens) break
+      if (size > policy.hardLimitTokens) break
+    }
+    const bodies = []
+    await withMock(({ body }) => {
+      bodies.push(JSON.parse(JSON.stringify(body)))
+      return { sse: [{ choices: [{ index: 0, delta: { content: '好' }, finish_reason: 'stop' }] }] }
+    }, async (mock) => {
+      const client = new LLMClient({ baseURL: mock.url, apiKey: 'k', model: 'm', profile: profileFromConfig({ providerId: 'openai-compatible', model: 'm' }) })
+      const agent = new Agent({ llm: client, tools: { listTools: () => [], invoke: async () => ({ text: '' }) }, maxSteps: 2, contextPolicy: policy })
+      await agent.run('新的问题', { history })
+    })
+    for (const body of bodies) {
+      const sent = context.estimateRequestTokens({ messages: body.messages, tools: body.tools ?? [] })
+      check(`H1 ${policy.compressPercent}%：实际发出的请求不超过输入硬上限`,
+        sent <= policy.hardLimitTokens, `${sent} <= ${policy.hardLimitTokens}`)
+    }
+  }
+}
+
+// ============================================================ 12 真实用户指令不被静默截断
+
+{
+  /*
+   * 用户说的话本身就超过窗口容量时，旧实现把它截到前 400 字再照常发出，
+   * 模型收到的是被改写过的任务，而且没有任何提示。
+   * 现在必须"明确报告装不下"，而不是交给模型一段残缺指令。
+   */
+  const policy = context.resolveContextPolicy({ contextWindow: 50_000, compressPercent: 90 })
+  const messages = [
+    { role: 'system', content: 'S' },
+    { role: 'user', content: '把'.repeat(48_000) },
+  ]
+  const outcome = context.compressMessages(messages, policy, { tools: [] })
+  const userText = String(messages.find((m) => m.role === 'user').content)
+  check('H2 用户输入没有被改写（长度原样）', userText.length === 48_000, userText.length)
+  check('H3 装不下时明确标记 overLimit（不静默截断后照发）',
+    outcome.overLimit === true, JSON.stringify({ overLimit: outcome.overLimit, truncated: outcome.truncated }))
+
+  // Agent 层：这种回合不能发请求，必须如实失败
+  let calls = 0
+  const agent = new Agent({
+    llm: { profile: { providerId: 'openai-compatible' }, chat: async () => { calls += 1; return { text: 'x', toolCalls: [], finishReason: 'stop' } } },
+    tools: { listTools: () => [], invoke: async () => ({ text: '' }) },
+    maxSteps: 2,
+    contextPolicy: policy,
+  })
+  const result = await agent.run('把'.repeat(48_000))
+  check('H4 Agent 不为装不下的回合发请求', calls === 0, `calls=${calls}`)
+  check('H5 装不下的回合标记失败并给出原因',
+    result.failed === true && result.failureReason === 'context_overflow', `${result.failed}/${result.failureReason}`)
+}
+
+// ============================================================ 13 连续压缩不丢更早的目标
+
+{
+  /*
+   * 第一次压缩写下的摘要里记着最早的目标。第二次压缩如果把它当成普通 user 回合
+   * 一起丢掉，"用户最开始要干什么"就永久消失（只剩最近几轮）。
+   */
+  const policy = context.resolveContextPolicy({ contextWindow: 3_000, compressPercent: 90 })
+  const messages = [{ role: 'system', content: 'sys' }]
+  for (let i = 1; i <= 6; i += 1) {
+    messages.push({ role: 'user', content: `早期目标${i}：${'做'.repeat(300)}` })
+    messages.push({ role: 'assistant', content: `答${i}：${'答'.repeat(300)}` })
+  }
+  messages.push({ role: 'user', content: '当前目标：导出报告' })
+  const first = context.compressMessages(messages, policy, { tools: [] })
+  check('H6 第一次压缩发生了', first.compressed === true, first.droppedUnits)
+
+  for (let i = 1; i <= 8; i += 1) {
+    messages.push({ role: 'user', content: `后续回合${i}：${'x'.repeat(500)}` })
+    messages.push({ role: 'assistant', content: `回${i}：${'y'.repeat(500)}` })
+  }
+  messages.push({ role: 'user', content: '最新目标' })
+  const second = context.compressMessages(messages, policy, { tools: [] })
+  check('H7 第二次压缩真的发生了', second.compressed === true, second.droppedUnits)
+
+  const digests = messages.filter((m) => m.internal === true)
+  check('H8 只保留一份摘要（不会越压越多）', digests.length === 1, digests.length)
+  check('H9 第二次压缩后，最早的目标仍在摘要里（不因分组方式丢失）',
+    digests.some((m) => m.content.includes('早期目标1')), digests.map((m) => m.content.slice(0, 60)))
+  check('H10 最新目标仍然作为真实用户消息保留',
+    messages.some((m) => m.content === '最新目标'), '')
+  check('H11 摘要没有被当成用户新指令（带 internal 标记）',
+    digests.every((m) => m.internal === true && m.role === 'user'), '')
 }
 
 // ============================================================ 汇总

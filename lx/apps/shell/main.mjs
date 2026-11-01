@@ -1125,6 +1125,17 @@ let followUpWindowStart = 0
 let lastReplyText = ''
 /** 本轮"还要不要继续"的判定结果（judgeFollowUp 的产物） */
 let followUpJudgement = null
+/**
+ * 最近这一轮的模型响应是否失败（服务端错误 / 断流 / 输出被截断 / 装不下）。
+ *
+ * 为什么必须记下来、而不是只在 runCommand 里 `return`：
+ *   runCommand 的 finally 会在播报结束后调用 afterTurnSpeechSettled，
+ *   那条路径只认 `wantContinue` / `followUpJudgement` / `lastReplyText`。
+ *   不在这里留一个标记，失败回合就会拿**上一轮**的回复去做"还要不要继续说"的判定，
+ *   用户刚被告知"没说完"，紧接着又看到一个"想继续说就直接说"的待命窗口——
+ *   等于把失败当成就地成功收尾了。
+ */
+let lastTurnFailed = false
 /** 正在跑的判定请求 */
 let followUpJudgePromise = null
 /** 连续对话的阈值与窗口配置（来自配置文件 followup.*） */
@@ -1424,6 +1435,23 @@ async function afterTurnSpeechSettled() {
   // 这一轮已经跑完：还挂着的确认卡片收掉，别让它一直"等人回答"
   closeConfirmCard()
   flushPendingUiAction()
+  /*
+   * 失败的回合在这里收尾：不判定、不待命、不改回"好了"。
+   *
+   * 失败提示本身已经播报完了（能走到这里说明 TTS 队列空了），所以用户确实听到了
+   * "刚才的回答没有说完"。这时再把状态改成 done，屏幕上就是"好了"+一个待命窗口，
+   * 与刚说的话自相矛盾；拿 lastReplyText（上一轮的正常回复）去判定更离谱——
+   * 那会让失败轮看起来比成功轮还积极地邀请用户继续说。
+   *
+   * 失败提示来自我们自己，不是模型的回答，所以也不用做"要不要继续"的判断：
+   * 用户要重说就重新喊唤醒词/直接说，不会被这里挡住。
+   */
+  if (lastTurnFailed) {
+    log(`afterTurnSpeechSettled: 本轮失败，不做追问判定（state=${currentState}）`)
+    if (currentState === 'speaking') setState('error')
+    scheduleHide()
+    return false
+  }
   const followUp = await startFollowUpIfWanted()
   if (generation !== turnSeq || userDismissedHud) return false
   log(`afterTurnSpeechSettled state=${currentState} followUp=${followUp}`)
@@ -1447,6 +1475,8 @@ async function startFollowUpIfWanted() {
   if (activeTurn !== null) return false  // 回合还没结束
   if (confirmResolver !== null) return false // 正在等确认，别抢
   if (commandActive) return false        // 已经在听了
+  // 失败的回合没有"可继续的话题"：回复本身就没说完，待命只会让用户以为它答完了
+  if (lastTurnFailed) return false
 
   const judgement = await resolveFollowUpJudgement()
   if (generation !== turnSeq || userDismissedHud || !listening || activeTurn !== null || confirmResolver !== null) return false
@@ -1485,6 +1515,12 @@ async function startFollowUpIfWanted() {
  * 万一还没回来，最多等 1.2 秒，超时用启发式——收尾不能被一个判断卡住。
  */
 async function resolveFollowUpJudgement() {
+  /*
+   * 失败回合没有可判的东西。lastReplyText 这时还是**上一轮**的回复，
+   * 用它算出来的启发式只会得出"上一轮该继续问"的结论，与本轮无关。
+   * 直接给出"不继续"的结论，调用方据此正常收起。
+   */
+  if (lastTurnFailed) return { wait: false, confidence: 0, why: '本轮模型响应失败', source: 'turn-failed' }
   if (followUpJudgement !== null) return followUpJudgement
   if (followUpJudgePromise !== null) {
     try {
@@ -2165,6 +2201,15 @@ async function runCommand(text) {
   lastUtterance = text
   deniedInTurn = {}
   wantContinue = false
+  /*
+   * 新回合开始：失败标记必须清掉，否则上一轮失败会让这一轮**正常**的回答
+   * 也被按失败收尾（不追问、不待命）。判定的结果与"上一轮原文"同样作废——
+   * 它们都是上一轮的产物。
+   */
+  lastTurnFailed = false
+  followUpJudgement = null
+  followUpJudgePromise = null
+  lastReplyText = ''
   turnHistoryCounts.push(sessionHistory.length)
   log(`turn start history=${sessionHistory.length} "${text.slice(0, 40)}"`)
   cancelActiveTurn('new command')
@@ -2235,6 +2280,14 @@ async function runCommand(text) {
       wantContinue = false
       followUpJudgement = null
       followUpJudgePromise = null
+      /*
+       * 打上"这一轮失败了"的标记：播报结束后 afterTurnSpeechSettled 会看它，
+       * 从而不做追问判定、不把状态改回「好了」。
+       * 同时把 lastReplyText 清空——它是一个"上一轮回复"的缓存，
+       * 失败时留着只会被误当成这一轮的内容。
+       */
+      lastTurnFailed = true
+      lastReplyText = ''
       turn.completed = true
       if (turn.raw.trim() === '') {
         // 一个字都没出来：必须给一句明确的失败说明，不能只留下"我想一下…"然后静默收场
@@ -2254,6 +2307,8 @@ async function runCommand(text) {
       return
     }
     log(`turn ${turn.id} done in ${Date.now() - turn.startedAt}ms tools=${turn.tools} chars=${result.text.length}`)
+    // 这一轮正常完成：清掉失败标记，后续收尾/追问判定按正常路径走
+    lastTurnFailed = false
     setState('speaking')
 
     /*
@@ -2332,6 +2387,15 @@ async function runCommand(text) {
     }
     log(`turn ${turn.id} failed: ${error.message}`)
     wantContinue = false
+    /*
+     * 连接失败 / 超时 / HTTP 错误也走同一条"这次没答成"的处理：
+     * 打上失败标记并清掉上一轮回复原文，免得播报后的收尾拿旧回复去判定追问。
+     * （用户主动打断在上面已经 return，不会走到这里。）
+     */
+    lastTurnFailed = true
+    lastReplyText = ''
+    followUpJudgement = null
+    followUpJudgePromise = null
     sendSubtitle({ final: `× ${error.message}` })
     setState('error')
     scheduleHide()

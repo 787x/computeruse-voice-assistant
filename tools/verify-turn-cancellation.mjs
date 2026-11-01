@@ -62,7 +62,7 @@ console.log('Shell turn cancellation: 4 asynchronous phases PASS (dismiss, late 
 {
  const reply=deferred()
  const ctx=vm.createContext({resolveFollowUpJudgement:()=>reply.promise})
- vm.runInContext(`let turnSeq=1,continuousMode=true,listening=true,activeTurn=null,confirmResolver=null,commandActive=false,userDismissedHud=false;
+ vm.runInContext(`let turnSeq=1,continuousMode=true,listening=true,activeTurn=null,confirmResolver=null,commandActive=false,userDismissedHud=false,lastTurnFailed=false;
  ${fn('async function startFollowUpIfWanted()')}`,ctx)
  const pending=vm.runInContext('startFollowUpIfWanted()',ctx)
  vm.runInContext('turnSeq++;userDismissedHud=true',ctx)
