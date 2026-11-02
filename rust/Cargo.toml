@@ -2,7 +2,7 @@
 name = "cuava"
 version = "0.1.0"
 edition = "2021"
-description = "Computer Use 语音助手 —— Rust + Slint 原生桌面程序（PR5：文本 Agent / CUA 闭环）"
+description = "Computer Use 语音助手 —— Rust + Slint 原生桌面程序（PR6：语音输入 + 文本 Agent / CUA 闭环）"
 publish = false
 
 [lib]
@@ -43,6 +43,36 @@ serde_json = "1"
 thiserror = "2"
 base64 = "0.22"
 
+# ---- 语音输入（PR6）----
+# 采集：cpal 在 Windows 上走 WASAPI。回调里只做格式转换/下混，不做推理。
+cpal = "0.18"
+# 重采样：加窗 sinc + 抗混叠低通（不能用丢样本的朴素做法）。
+rubato = "0.16"
+# WAV 读写：只用于离线测试与基准，运行期录音不落盘。
+hound = "3.5"
+# 唤醒词：k2-fsa 官方 Rust 封装，有完整的流式 KWS 接口
+# （create_stream / is_ready / decode / reset / get_result）。
+# 默认 feature 是 static：产物单文件，不需要额外分发 sherpa/onnxruntime DLL。
+sherpa-onnx = "2.0.1"
+# ASR：whisper.cpp 1.8.3 的 Rust 绑定（cmake 静态编译），模型进程内复用。
+# 默认构建带 CUDA（见 [features]）；没有 CUDA Toolkit 的机器用 CPU 基线构建。
+whisper-rs = "0.16"
+# 需要 ggml 的**设备枚举**来判断「请求了 GPU」到底有没有真的用上 GPU：
+# whisper.cpp 在找不到设备时会静默退回 CPU，只看初始化成功会被误判。
+# 这是 whisper-rs 自身的依赖（同一版本、同一份静态库），不是新增原生依赖；
+# whisper-rs 把 raw 绑定放在 `raw-api` feature 后面，这里直接依赖 sys crate 更明确。
+whisper-rs-sys = { version = "0.15", default-features = false }
+
+[features]
+# 默认带 CUDA：这是本项目的推荐运行方式（实测 CUDA 205ms vs CPU 2335ms）。
+# 构建 CUDA 版需要本机 CUDA Toolkit（nvcc + cudart/cublas）与 NVIDIA 驱动。
+#
+# 没有 CUDA 工具链的开发机 / CI 用 CPU-only 构建：
+#   cargo build --release --no-default-features
+# 两条路径都能运行同一份代码；运行时后端由 `voice::asr` 如实上报。
+default = ["cuda"]
+cuda = ["whisper-rs/cuda"]
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -54,6 +84,21 @@ slint-build = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "sync", "fs", "net"] }
+# 语音端到端测试直接用 whisper 上下文（与工作线程同一套调用）。
+whisper-rs = "0.16"
+hound = "3.5"
+sherpa-onnx = "2.0.1"
 
+# 构建注意（写在这里，比 README 更靠近构建系统）：
+# whisper-rs-sys 用 CMake + Ninja 现场编译 whisper.cpp，MSVC 在**很长的中文路径**
+# 下偶发 `cl.exe error D8050 / c1.dll`（命令行放不进调试记录）。
+#
+# 两个解法，任选其一：
+#  1. 把本仓库放在**较短且纯 ASCII** 的路径下（推荐，最省事）；
+#  2. 若仓库路径本身很长，改用 Visual Studio 生成器：
+#       set CMAKE_GENERATOR="Visual Studio 18 2026"
+#     并把 SHERPA_ONNX_LIB_DIR 指到已解压的 sherpa-onnx 静态库。
+#
+# 这个设置只影响 whisper.cpp 这类 C/C++ 子构建，不影响 Rust 代码本身。
 [profile.release]
 opt-level = 2

@@ -19,6 +19,13 @@ use crate::permissions::{
 };
 use crate::prompt;
 use crate::secret::SecretStore;
+use crate::voice::{
+    asr::AsrBackend,
+    coordinator::{self, ActiveSession, CoordinatorConfig, SharedSink, VoiceHandle},
+    settings::VoicePaths,
+    CaptureInfoForUi, RejectReason, VoiceEvent, VoiceEventKind, VoiceInstance, VoiceState,
+    VoiceTurn,
+};
 use crate::ChatEntry;
 use crate::ToolCard;
 
@@ -48,6 +55,10 @@ pub enum UiCommand {
     ProviderChanged(i32),
     /// 打开设置：按当前已保存的配置回填界面。
     OpenSettings,
+    /// 启用/关闭麦克风监听（界面开关）。
+    SetVoiceEnabled(bool),
+    /// 语音线程发回的事件（内部消息，不是用户动作）。
+    Voice(VoiceEvent),
     /// 退出。
     Quit,
 }
@@ -227,6 +238,13 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let tx = command_tx.clone();
+        window.on_set_voice_enabled(move |enabled| {
+            // 立即反映开关状态；真正的启动/停止由工作线程完成，失败会回报原因。
+            let _ = tx.send(UiCommand::SetVoiceEnabled(enabled));
+        });
+    }
+    {
+        let tx = command_tx.clone();
         let weak = window.as_weak();
         let confirmer = confirmer.clone();
         window.on_quit_app(move || {
@@ -260,7 +278,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             let weak_for_exit = weak.clone();
             runtime.block_on(run_worker(
-                weak, paths, secret, settings, command_rx, confirmer,
+                weak, paths, secret, settings, command_rx, command_tx, confirmer,
             ));
             /*
              * 工作线程结束 = 待处理回合已被取消、PowerShell 子进程已释放。
@@ -344,6 +362,26 @@ fn parse_hex_color(value: &str) -> slint::Color {
         }
     }
     slint::Color::from_rgb_u8(255, 255, 255)
+}
+
+/// `push_entry` 的弱引用版本：工作线程里拿不到 `&AppWindow` 时用。
+fn push_entry_via_weak(
+    weak: &slint::Weak<AppWindow>,
+    role: &str,
+    text: &str,
+    detail: &str,
+    tint: &str,
+) {
+    let role = role.to_string();
+    let text = text.to_string();
+    let detail = detail.to_string();
+    let tint = tint.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            push_entry(&window, &role, &text, &detail, &tint);
+        }
+    });
 }
 
 fn push_entry(window: &AppWindow, role: &str, text: &str, detail: &str, tint: &str) {
@@ -544,6 +582,7 @@ async fn run_worker(
     secret: SecretStore,
     mut settings: Settings,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
+    command_tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
     confirmer: Arc<UiConfirmer>,
 ) {
     // Computer Use 后端：懒启动（第一次真正调用时才拉起 PowerShell）。
@@ -568,6 +607,17 @@ async fn run_worker(
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut turn_cancel: Option<CancelToken> = None;
 
+    // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
+    // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
+    let mut voice = VoiceRuntime::new();
+
+    /*
+     * 已保存的启用偏好在启动时**不自动开麦**：
+     * 任务书要求「新安装启动时不意外开麦」，主人不在电脑前时更不该开。
+     * 偏好只在用户点了开关之后才写回。
+     */
+    seed_voice_ui(&weak, &settings);
+
     loop {
         let Some(command) = commands.recv().await else {
             break;
@@ -580,6 +630,7 @@ async fn run_worker(
                     token.cancel();
                 }
                 confirmer.abort_pending();
+                voice.disable(&weak);
                 break;
             }
             UiCommand::Cancel => {
@@ -587,6 +638,9 @@ async fn run_worker(
                     token.cancel();
                     set_status(&weak, "正在中断…");
                 }
+                // 取消也作用于「正在录/正在识别的那一句」：之后返回的结果不提交。
+                // 已经开始的 Agent 回合仍按原有取消语义处理。
+                voice.cancel_pending();
             }
             UiCommand::OpenSettings => {
                 // 权威配置在工作线程：每次打开设置都按当前值回填，不用启动快照。
@@ -649,100 +703,93 @@ async fn run_worker(
                 }
             }
             UiCommand::Send(input) => {
-                if turn_cancel.is_some() {
-                    set_status(&weak, "上一轮还在跑，先取消再发新指令");
-                    continue;
-                }
-                let Some(toolkit) = toolkit.clone() else {
-                    set_status(&weak, "Computer Use 后端不可用，无法执行指令");
-                    set_busy(&weak, false);
-                    continue;
-                };
-
-                // 端点快照：整轮用同一套「地址 + Key + 模型 + 推理档位」。
-                // **按提供商取 Key**：当前提供商没有就拿空串，绝不借用别家的。
-                let api_key = secret
-                    .load(&settings.provider_id)
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-                let profile = settings.profile();
-                let echo_reasoning = profile.capability.requires_reasoning_echo();
-                let llm = match LlmClient::new(
-                    profile,
-                    api_key,
-                    settings.temperature,
-                    settings.timeout_ms,
-                ) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        set_status(&weak, &format!("端点配置无效：{error}"));
-                        set_busy(&weak, false);
-                        continue;
-                    }
-                };
-                let model_context_window = crate::config::get_provider(&settings.provider_id)
-                    .and_then(|provider| provider.context_window);
-                let policy = crate::context::resolve_context_policy(
-                    Some(settings.context_window),
-                    Some(settings.context_compress_percent),
-                    model_context_window,
-                );
-                let agent_config = AgentConfig {
-                    max_steps: settings.max_steps,
-                    context_policy: policy,
-                    system_prompt: prompt::resolve_system_prompt(settings.system_prompt.as_deref()),
-                    echo_reasoning,
-                };
-                let permissions = PermissionState::new(settings.permission_mode);
-                let mut agent = Agent::new(llm, toolkit, agent_config, permissions);
-
-                let token = CancelToken::new();
-                // 记下本回合的令牌，让"取消"能作用于正在跑的这一轮。
-                turn_cancel = Some(token.clone());
-
-                /*
-                 * 回合必须跑在**独立任务**里，不能在这里直接 await。
-                 *
-                 * 直接 await 会把整个工作线程占住，`Cancel` / `Quit` 命令排在它后面
-                 * 根本轮不到处理——用户点了"取消"却没有任何反应，直到模型自己跑完。
-                 * 放到 spawn 里之后，主循环随时能拿到命令，取消也就能立刻生效。
-                 */
-                let weak_events = weak.clone();
-                let settings_snapshot = settings.clone();
-                let turn_confirmer = confirmer.clone();
-                let turn_history = std::mem::take(&mut history);
-                let turn = tokio::spawn(async move {
-                    let emit = move |event: AgentEvent| {
-                        apply_event(&weak_events, event);
-                    };
-                    let mut turn_history = turn_history;
-                    let outcome = agent
-                        .run(&input, &mut turn_history, &token, &turn_confirmer, &emit)
-                        .await;
-                    (outcome, turn_history, settings_snapshot)
-                });
-
-                // 等待结束，但**同时**继续处理取消/退出/设置命令。
-                match wait_turn(
-                    &mut commands,
-                    turn,
+                match start_turn(
                     &weak,
-                    &mut turn_cancel,
                     &paths,
                     &secret,
-                    &mut settings,
+                    &settings,
+                    &toolkit,
                     &confirmer,
-                )
-                .await
-                {
-                    TurnWait::Finished(returned) => history = returned,
-                    TurnWait::Quit => break,
+                    &mut history,
+                    &mut turn_cancel,
+                    input,
+                ) {
+                    TurnStart::Started(turn) => {
+                        // 等待结束，但**同时**继续处理取消/退出/设置命令。
+                        match wait_turn(
+                            &mut commands,
+                            turn,
+                            &weak,
+                            &mut turn_cancel,
+                            &paths,
+                            &secret,
+                            &mut settings,
+                            &confirmer,
+                            &mut voice,
+                            &command_tx,
+                        )
+                        .await
+                        {
+                            TurnWait::Finished(returned) => history = returned,
+                            TurnWait::Quit => break,
+                        }
+                    }
+                    TurnStart::Rejected(status) => set_status(&weak, &status),
+                }
+            }
+            UiCommand::SetVoiceEnabled(enabled) => {
+                apply_voice_enabled(
+                    &weak,
+                    &paths,
+                    &mut settings,
+                    &mut voice,
+                    &command_tx,
+                    enabled,
+                );
+            }
+            UiCommand::Voice(event) => {
+                let prompt = voice.on_event(&weak, event, turn_cancel.is_some());
+                if let Some(prompt) = prompt {
+                    let turn = commit_voice_text(
+                        &weak,
+                        prompt.text,
+                        prompt.audio_seconds,
+                        prompt.decode_ms,
+                        &mut turn_cancel,
+                        &toolkit,
+                        &confirmer,
+                        &mut history,
+                        &settings,
+                        &paths,
+                        &secret,
+                    );
+                    if let Some(turn) = turn {
+                        // 与文本输入完全相同的等待方式：取消/退出/设置照常处理。
+                        match wait_turn(
+                            &mut commands,
+                            turn,
+                            &weak,
+                            &mut turn_cancel,
+                            &paths,
+                            &secret,
+                            &mut settings,
+                            &confirmer,
+                            &mut voice,
+                            &command_tx,
+                        )
+                        .await
+                        {
+                            TurnWait::Finished(returned) => history = returned,
+                            TurnWait::Quit => break,
+                        }
+                    }
                 }
             }
         }
     }
 
-    // 退出前：取消回合、清掉确认、释放子进程。
+    // 退出前：关麦克风、取消回合、清掉确认、释放子进程。
+    voice.disable(&weak);
     confirmer.abort_pending();
     if let Some(token) = turn_cancel.take() {
         token.cancel();
@@ -750,6 +797,539 @@ async fn run_worker(
     if let Some(toolkit) = toolkit.take() {
         toolkit.bridge().dispose().await;
     }
+}
+
+// ---------------------------------------------------------------- 语音
+
+/// 当前语音实例与待提交会话的路由。
+///
+/// 纯状态，不持有线程和界面：这样「旧实例的迟到事件不得影响新实例」这类
+/// 规则可以脱离真实麦克风做确定性测试。
+#[derive(Debug, Default)]
+struct VoiceRoute {
+    instance: Option<VoiceInstance>,
+    pending: Option<VoiceTurn>,
+    next_instance: VoiceInstance,
+    /// 当前实例自己的活动会话。
+    ///
+    /// 每开一次麦克风换一份新的：旧实例的线程（`shutdown` / `fail` / 迟到的
+    /// ASR 回调）只持有**旧的那份**，清不到新实例正在识别的这一句。
+    active: ActiveSession,
+}
+
+impl VoiceRoute {
+    /// 打开麦克风：分配新的实例号与**新的**活动会话。
+    ///
+    /// 旧实例的迟到事件从这里开始不再有效；它的收尾动作也再碰不到新实例。
+    fn open(&mut self) -> VoiceInstance {
+        self.next_instance += 1;
+        self.instance = Some(self.next_instance);
+        self.pending = None;
+        self.active = ActiveSession::new();
+        self.next_instance
+    }
+
+    /// 关闭麦克风：当前实例作废（旧线程可以继续收尾，但不再代表“当前”）。
+    fn close(&mut self) {
+        self.instance = None;
+        self.pending = None;
+        // 只清**这一份**：让本实例的在途结果立刻过期（ASR 回调的归属核对会失败，
+        // 音频线程也会据此置位 abort）。其它时代的实例各自持有自己的会话。
+        self.active.clear();
+    }
+
+    /// 交给新实例的活动会话（内部共享同一份状态）。
+    fn active_session(&self) -> ActiveSession {
+        self.active.clone()
+    }
+
+    /// 让当前实例的在途输入过期（用户取消这一句）。
+    fn clear_active(&self) {
+        self.active.clear();
+    }
+
+    fn is_current(&self, instance: VoiceInstance) -> bool {
+        self.instance == Some(instance)
+    }
+
+    /// 唤醒：记下这一句（只有当前实例才认）。
+    fn bind(&mut self, instance: VoiceInstance, turn: VoiceTurn) -> bool {
+        if !self.is_current(instance) {
+            return false;
+        }
+        self.pending = Some(turn);
+        true
+    }
+
+    /// 取走可提交的这一句：归属必须对得上，而且只取一次。
+    fn take(&mut self, instance: VoiceInstance, turn: VoiceTurn) -> Option<VoiceTurn> {
+        if !self.is_current(instance) || self.pending != Some(turn) {
+            return None;
+        }
+        self.pending = None;
+        Some(turn)
+    }
+
+    /// 这一句结束了（被拒绝/太短/空转录），只清归属匹配的那一句。
+    fn release(&mut self, instance: VoiceInstance, turn: VoiceTurn) {
+        if self.is_current(instance) && self.pending == Some(turn) {
+            self.pending = None;
+        }
+    }
+
+    /// 取消当前输入；返回被取消的那一句。
+    fn cancel(&mut self) -> Option<VoiceTurn> {
+        self.pending.take()
+    }
+}
+
+/// 一次可提交的语音结果。
+struct VoicePrompt {
+    text: String,
+    audio_seconds: f32,
+    decode_ms: u64,
+}
+
+/// 语音运行时：线程句柄 + 实例路由（含当前实例自己的活动会话）。
+struct VoiceRuntime {
+    handle: Option<VoiceHandle>,
+    route: VoiceRoute,
+}
+
+impl VoiceRuntime {
+    fn new() -> Self {
+        Self {
+            handle: None,
+            route: VoiceRoute::default(),
+        }
+    }
+
+    /// 打开麦克风。
+    ///
+    /// 模型加载与设备打开全在新线程上：加载要几百毫秒到几秒，不能堵住这里。
+    /// 失败会以 `StateChanged(Error)` 回到主循环，界面如实显示，
+    /// **文本 Agent 完全不受影响**。
+    fn enable(
+        &mut self,
+        weak: &slint::Weak<AppWindow>,
+        paths: &AppPaths,
+        settings: &Settings,
+        command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    ) {
+        if self
+            .handle
+            .as_ref()
+            .map(|handle| handle.is_running())
+            .unwrap_or(false)
+        {
+            set_status(weak, "麦克风已经在监听");
+            return;
+        }
+        // 上一个实例（如果还有句柄）到此彻底作废：新实例不该继承任何旧会话。
+        self.handle = None;
+        self.route.close();
+
+        let voice_paths = VoicePaths::resolve(paths);
+        let config = match CoordinatorConfig::resolve(&settings.voice, &voice_paths) {
+            Ok(config) => config,
+            Err(errors) => {
+                // 模型缺失：明确提示，并且**不进入监听状态**。
+                let message = errors.join("\n\n");
+                set_voice_state(weak, &VoiceState::Error("缺少语音模型".to_string()));
+                push_entry_via_weak(weak, "系统", &message, "", "#fdeeee");
+                set_status(weak, "语音模型不完整；文本模式仍然可用");
+                return;
+            }
+        };
+
+        let tx = command_tx.clone();
+        let sink = SharedSink::new(move |event| {
+            let _ = tx.send(UiCommand::Voice(event));
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let instance = self.route.open();
+        let active = self.route.active_session();
+        match coordinator::spawn(config, sink, active, stop, instance) {
+            Ok(handle) => {
+                self.handle = Some(handle);
+                set_voice_state(weak, &VoiceState::Loading);
+                set_status(weak, "正在启动麦克风…");
+            }
+            Err(error) => {
+                self.route.close();
+                set_voice_state(weak, &VoiceState::Error(error.clone()));
+                set_status(weak, &format!("无法启动语音：{error}"));
+            }
+        }
+    }
+
+    /// 关闭麦克风：真的停止采集、让在途结果过期，并如实进入 Off。
+    ///
+    /// 与「偏好保存」无关：即使 `settings.json` 写失败，这里也必须真的关掉。
+    fn disable(&mut self, weak: &slint::Weak<AppWindow>) {
+        // 先让还在识别的结果过期，再停线程：迟到的文本不会落到新实例上。
+        self.route.close();
+        if let Some(mut handle) = self.handle.take() {
+            handle.stop();
+        }
+        set_voice_state(weak, &VoiceState::Off);
+    }
+
+    /// 取消当前这一句（不关麦）：之后返回的识别结果不再提交。
+    fn cancel_pending(&mut self) {
+        self.route.cancel();
+        self.route.clear_active();
+    }
+
+    /// 处理一条语音事件。
+    ///
+    /// `agent_busy` 为真时（有回合在跑、含等待点击确认）**只更新状态，
+    /// 不启动第二回合，也不排队延后执行**。
+    fn on_event(
+        &mut self,
+        weak: &slint::Weak<AppWindow>,
+        event: VoiceEvent,
+        agent_busy: bool,
+    ) -> Option<VoicePrompt> {
+        // 旧实例的迟到事件：不改界面状态、不动新会话、不触发任何工具。
+        if !self.route.is_current(event.instance) {
+            return None;
+        }
+        match event.kind {
+            VoiceEventKind::StateChanged(state) => {
+                set_voice_state(weak, &state);
+                set_status(weak, &state.label());
+                if !state.is_active() {
+                    // 线程已结束或即将结束：释放句柄，但保留界面上的原因。
+                    self.route.close();
+                    if let Some(mut handle) = self.handle.take() {
+                        handle.stop();
+                    }
+                }
+                None
+            }
+            VoiceEventKind::Ready(info) => {
+                apply_capture_info(weak, &info);
+                None
+            }
+            VoiceEventKind::Woke { turn, keyword } => {
+                self.route.bind(event.instance, turn);
+                set_voice_state(weak, &VoiceState::Capturing);
+                set_status(weak, &format!("已唤醒（{keyword}），请说指令"));
+                None
+            }
+            VoiceEventKind::Level { level_db, floor_db } => {
+                apply_level(weak, level_db, floor_db);
+                None
+            }
+            VoiceEventKind::Rejected { turn, reason } => {
+                self.route.release(event.instance, turn);
+                // 空转录/太短属于「没听清」，给一句可读的提示；
+                // 不需要弹窗，也不能触发工具。
+                if matches!(
+                    reason,
+                    RejectReason::EmptyTranscript | RejectReason::TooShort
+                ) {
+                    set_status(weak, "没听清，再说一次？");
+                } else {
+                    set_status(weak, &reason.message());
+                }
+                None
+            }
+            VoiceEventKind::Overflow => {
+                set_status(weak, "音频积压，已丢弃这一句");
+                None
+            }
+            VoiceEventKind::Final {
+                turn,
+                text,
+                audio_seconds,
+                decode_ms,
+            } => {
+                // 归属核对 + 一次性消费：过期/重复的结果绝不提交。
+                if self.route.take(event.instance, turn).is_none() {
+                    set_status(weak, "这次语音已取消");
+                    return None;
+                }
+                set_transcript(weak, &text);
+                if agent_busy {
+                    set_status(weak, "上一轮还在跑；这句话没有执行");
+                    return None;
+                }
+                Some(VoicePrompt {
+                    text,
+                    audio_seconds,
+                    decode_ms,
+                })
+            }
+        }
+    }
+}
+
+/// 应用一次语音开关：**先操作设备，再谈持久化**。
+///
+/// 空闲与执行中走同一条路径：偏好保存失败只影响持久化，不妨碍本次开/关。
+fn apply_voice_enabled(
+    weak: &slint::Weak<AppWindow>,
+    paths: &AppPaths,
+    settings: &mut Settings,
+    voice: &mut VoiceRuntime,
+    command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    enabled: bool,
+) {
+    let mut next = settings.clone();
+    next.voice.enabled = enabled;
+    match config::save_settings(paths, &next) {
+        Ok(()) => *settings = next,
+        Err(error) => {
+            // 偏好没存下来不影响本次启停，但必须如实告诉用户。
+            set_status(weak, &format!("语音偏好保存失败：{error}"));
+        }
+    }
+    if enabled {
+        voice.enable(weak, paths, settings, command_tx);
+    } else {
+        voice.disable(weak);
+    }
+}
+
+/// 语音最终文本 → 现有 Agent 入口（与文本发送同一条路径）。
+///
+/// 返回 `Some(handle)` 表示回合已启动，调用方负责等待；`None` 表示没有启动
+/// （空文本，或 Agent 忙/等待确认/正在取消）。
+#[allow(clippy::too_many_arguments)]
+fn commit_voice_text(
+    weak: &slint::Weak<AppWindow>,
+    text: String,
+    audio_seconds: f32,
+    decode_ms: u64,
+    turn_cancel: &mut Option<CancelToken>,
+    toolkit: &Option<Arc<CuaToolkit>>,
+    confirmer: &Arc<UiConfirmer>,
+    history: &mut Vec<ChatMessage>,
+    settings: &Settings,
+    paths: &AppPaths,
+    secret: &SecretStore,
+) -> Option<tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>> {
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 先把结果放进对话区：用户看得见「我听到的是这句」。
+    push_entry_via_weak(
+        weak,
+        "你（语音）",
+        &trimmed,
+        &format!("{audio_seconds:.1}s 音频 · 识别 {decode_ms} ms"),
+        "#e8f0fe",
+    );
+    match start_turn(
+        weak,
+        paths,
+        secret,
+        settings,
+        toolkit,
+        confirmer,
+        history,
+        turn_cancel,
+        trimmed,
+    ) {
+        TurnStart::Started(turn) => {
+            set_busy(weak, true);
+            set_status(weak, "正在思考…");
+            Some(turn)
+        }
+        TurnStart::Rejected(status) => {
+            // Agent 忙 / 等待点击确认 / 正在取消：**不启动第二回合**，
+            // 也不把这句话排队延后执行——明确告诉用户这句话没有执行。
+            set_status(weak, &format!("{status}；这句话没有执行"));
+            None
+        }
+    }
+}
+
+/// 把最终识别文字显示出来（只显示 Final；Preview 从不进入这里）。
+fn set_transcript(weak: &slint::Weak<AppWindow>, text: &str) {
+    let text = text.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_transcript(text.into());
+        }
+    });
+}
+
+/// 语音状态 → 界面。开关状态与状态码分开：开关反映「用户想不想听」，
+/// 状态反映「现在实际在做什么」。
+fn set_voice_state(weak: &slint::Weak<AppWindow>, state: &VoiceState) {
+    let code = state.code().to_string();
+    // 只有真正可工作的状态才算「开」：Error 时麦克风并没有在跑，
+    // 按钮要回到「打开麦克风」，让用户可以重试。
+    let enabled = state.is_active();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_state(code.into());
+            window.set_voice_enabled(enabled);
+        }
+    });
+}
+
+/// 后端说明：只描述**实际**选择，不把用户期望当成事实。
+fn describe_backend(info: &CaptureInfoForUi) -> String {
+    match info.backend {
+        AsrBackend::Cuda => "Whisper CUDA".to_string(),
+        AsrBackend::Cpu => match &info.fallback_reason {
+            Some(reason) => format!("Whisper CPU（{reason}）"),
+            None => "Whisper CPU".to_string(),
+        },
+    }
+}
+
+/// 采集信息就绪：显示设备与实际采样率（用户能据此判断「是不是选错麦」）。
+fn apply_capture_info(weak: &slint::Weak<AppWindow>, info: &CaptureInfoForUi) {
+    let text = format!(
+        "{} · {} Hz{} · 唤醒：{} · 模型：{}",
+        info.device_name,
+        info.sample_rate,
+        if info.resampled {
+            "（已重采样到 16k）"
+        } else {
+            ""
+        },
+        if info.wake_labels.is_empty() {
+            "（未配置）".to_string()
+        } else {
+            info.wake_labels.join("/")
+        },
+        describe_backend(info)
+    );
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_device(text.into());
+        }
+    });
+}
+
+/// 电平显示：只给一个粗略的相对电平，避免刷屏。
+fn apply_level(weak: &slint::Weak<AppWindow>, level_db: f32, floor_db: f32) {
+    let text = format!("电平 {level_db:.0} dBFS / 底噪 {floor_db:.0} dB");
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_level(text.into());
+        }
+    });
+}
+
+/// 启动时把已保存的语音偏好同步到界面（**不**自动开麦）。
+fn seed_voice_ui(weak: &slint::Weak<AppWindow>, settings: &Settings) {
+    let weak = weak.clone();
+    let enabled = settings.voice.enabled;
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            // 偏好为 true 时仍不自动开麦：界面开关显示为关，
+            // 由用户点一下才真正启动（见 run_worker 里的说明）。
+            window.set_voice_enabled(false);
+            window.set_voice_state("off".into());
+            if enabled {
+                window.set_voice_device("上次退出时麦克风是开着的，点「打开麦克风」继续".into());
+            }
+        }
+    });
+}
+
+/// 一次回合的启动结果。
+enum TurnStart {
+    Started(tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>),
+    /// 没启动（上一轮还在跑 / 后端不可用 / 端点无效），附给用户看的原因。
+    Rejected(String),
+}
+
+/// 启动一个 Agent 回合。文本输入与语音最终文本都**只**经由这里，
+/// 所以两条路径的权限、取消与并发约束完全一致。
+#[allow(clippy::too_many_arguments)]
+fn start_turn(
+    weak: &slint::Weak<AppWindow>,
+    _paths: &AppPaths,
+    secret: &SecretStore,
+    settings: &Settings,
+    toolkit: &Option<Arc<CuaToolkit>>,
+    confirmer: &Arc<UiConfirmer>,
+    history: &mut Vec<ChatMessage>,
+    turn_cancel: &mut Option<CancelToken>,
+    input: String,
+) -> TurnStart {
+    /*
+     * 并发约束：上一轮还在跑（含等待点击确认）时**不启动第二回合**。
+     * 语音文本也走这一条——不能因为「是语音说的」就插队或排队延后执行。
+     */
+    if turn_cancel.is_some() {
+        return TurnStart::Rejected("上一轮还在跑，先取消再发新指令".to_string());
+    }
+    let Some(toolkit) = toolkit.clone() else {
+        set_busy(weak, false);
+        return TurnStart::Rejected("Computer Use 后端不可用，无法执行指令".to_string());
+    };
+
+    // 端点快照：整轮用同一套「地址 + Key + 模型 + 推理档位」。
+    // **按提供商取 Key**：当前提供商没有就拿空串，绝不借用别家的。
+    let api_key = secret
+        .load(&settings.provider_id)
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let profile = settings.profile();
+    let echo_reasoning = profile.capability.requires_reasoning_echo();
+    let llm = match LlmClient::new(profile, api_key, settings.temperature, settings.timeout_ms) {
+        Ok(client) => client,
+        Err(error) => {
+            set_busy(weak, false);
+            return TurnStart::Rejected(format!("端点配置无效：{error}"));
+        }
+    };
+    let model_context_window = crate::config::get_provider(&settings.provider_id)
+        .and_then(|provider| provider.context_window);
+    let policy = crate::context::resolve_context_policy(
+        Some(settings.context_window),
+        Some(settings.context_compress_percent),
+        model_context_window,
+    );
+    let agent_config = AgentConfig {
+        max_steps: settings.max_steps,
+        context_policy: policy,
+        system_prompt: prompt::resolve_system_prompt(settings.system_prompt.as_deref()),
+        echo_reasoning,
+    };
+    let permissions = PermissionState::new(settings.permission_mode);
+    let mut agent = Agent::new(llm, toolkit, agent_config, permissions);
+
+    let token = CancelToken::new();
+    // 记下本回合的令牌，让"取消"能作用于正在跑的这一轮。
+    *turn_cancel = Some(token.clone());
+
+    /*
+     * 回合必须跑在**独立任务**里，不能在这里直接 await。
+     *
+     * 直接 await 会把整个工作线程占住，`Cancel` / `Quit` 命令排在它后面
+     * 根本轮不到处理——用户点了"取消"却没有任何反应，直到模型自己跑完。
+     * 放到 spawn 里之后，主循环随时能拿到命令，取消也就能立刻生效。
+     */
+    let weak_events = weak.clone();
+    let settings_snapshot = settings.clone();
+    let turn_confirmer = confirmer.clone();
+    let turn_history = std::mem::take(history);
+    let turn = tokio::spawn(async move {
+        let emit = move |event: AgentEvent| {
+            apply_event(&weak_events, event);
+        };
+        let mut turn_history = turn_history;
+        let outcome = agent
+            .run(&input, &mut turn_history, &token, &turn_confirmer, &emit)
+            .await;
+        (outcome, turn_history, settings_snapshot)
+    });
+    TurnStart::Started(turn)
 }
 
 /// 等待回合结束期间的命令处理结果。
@@ -916,6 +1496,8 @@ async fn wait_turn(
     secret: &SecretStore,
     settings: &mut Settings,
     confirmer: &UiConfirmer,
+    voice: &mut VoiceRuntime,
+    command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
 ) -> TurnWait {
     loop {
         tokio::select! {
@@ -945,6 +1527,8 @@ async fn wait_turn(
                             token.cancel();
                             set_status(weak, "正在中断…");
                         }
+                        // 语音输入也一并取消（不再提交），但不影响已开始回合的收尾。
+                        voice.cancel_pending();
                     }
                     Some(UiCommand::Quit) => {
                         if let Some(token) = turn_cancel.as_ref() {
@@ -970,6 +1554,20 @@ async fn wait_turn(
                     }
                     Some(UiCommand::Send(_)) => {
                         set_status(weak, "上一轮还在跑，先取消再发新指令");
+                    }
+                    /*
+                     * 回合进行中的语音命令：
+                     *  - 开关仍走**同一条**路径：关麦必须真的停止采集，
+                     *    偏好保存失败也不妨碍本次关麦；开麦同理立即生效。
+                     *  - 语音最终文本不在这里插队：`on_event(agent_busy = true)`
+                     *    只更新状态、不启动第二回合，也不排队延后执行。
+                     *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
+                     */
+                    Some(UiCommand::SetVoiceEnabled(enabled)) => {
+                        apply_voice_enabled(weak, paths, settings, voice, command_tx, enabled);
+                    }
+                    Some(UiCommand::Voice(event)) => {
+                        let _ = voice.on_event(weak, event, true);
                     }
                     Some(UiCommand::OpenSettings) => {
                         // 执行中也能查看当前（已保存的）配置。
@@ -1227,6 +1825,71 @@ mod tests {
         let (reply, wait) = tokio::sync::oneshot::channel();
         *confirmer.pending.lock().unwrap() = Some(PendingConfirm { request_id, reply });
         wait
+    }
+
+    /// **并发约束**：回合还在跑（含等待点击确认）时，语音/文本都**不能**启动第二回合。
+    ///
+    /// 这条是任务书的硬要求：不可启动第二回合，也不可把语音排队延后执行。
+    #[test]
+    fn busy_turn_rejects_a_second_turn() {
+        let root = unique_test_root("worker-busy");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let settings = Settings::default();
+        let toolkit: Option<Arc<CuaToolkit>> = None;
+        let confirmer = Arc::new(confirmer_without_ui());
+        let mut history = Vec::new();
+
+        // 模拟「上一轮还在跑」：令牌槽位非空。
+        let mut running = Some(CancelToken::new());
+        match start_turn(
+            &slint::Weak::default(),
+            &paths,
+            &secret,
+            &settings,
+            &toolkit,
+            &confirmer,
+            &mut history,
+            &mut running,
+            "打开浏览器".to_string(),
+        ) {
+            TurnStart::Rejected(reason) => {
+                assert!(reason.contains("上一轮"), "原因必须说清楚：{reason}");
+            }
+            TurnStart::Started(_) => panic!("忙的时候绝不能启动第二回合"),
+        }
+        // 原来的令牌不能被语音/Cua 的拒绝路径换掉。
+        assert!(running.is_some(), "拒绝新回合不能清掉正在跑的那一轮");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 没有 CUA 后端时也不能启动回合，但必须给出可读原因（而不是静默失败）。
+    #[test]
+    fn missing_toolkit_rejects_with_reason() {
+        let root = unique_test_root("worker-no-toolkit");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let settings = Settings::default();
+        let toolkit: Option<Arc<CuaToolkit>> = None;
+        let confirmer = Arc::new(confirmer_without_ui());
+        let mut history = Vec::new();
+        let mut idle = None;
+        match start_turn(
+            &slint::Weak::default(),
+            &paths,
+            &secret,
+            &settings,
+            &toolkit,
+            &confirmer,
+            &mut history,
+            &mut idle,
+            "列出窗口".to_string(),
+        ) {
+            TurnStart::Rejected(reason) => assert!(reason.contains("Computer Use")),
+            TurnStart::Started(_) => panic!("没有工具后端时不该启动"),
+        }
+        assert!(idle.is_none(), "失败时不能留下取消令牌");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1650,6 +2313,8 @@ mod tests {
         let mut cancel_slot = Some(turn_cancel.clone());
         let confirmer = confirmer_without_ui();
 
+        let mut voice = VoiceRuntime::new();
+        let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             wait_turn(
@@ -1661,6 +2326,8 @@ mod tests {
                 &secret,
                 &mut settings,
                 &confirmer,
+                &mut voice,
+                &command_tx,
             ),
         )
         .await
@@ -1671,6 +2338,584 @@ mod tests {
         assert!(cancel_slot.is_none(), "退出后令牌槽位要清空");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **执行中关麦**：`wait_turn` 里的开关命令必须真的停采集，
+    /// 而不是只改一行提示文字；同时不能把正在跑的回合取消掉。
+    #[tokio::test]
+    async fn closing_voice_while_waiting_a_turn_really_stops_capture() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let watch = CancelToken::new();
+        let token_for_turn = watch.clone();
+
+        // 假回合：只有被取消才会结束——正是"关麦不该结束它"的场景。
+        let turn = tokio::spawn(async move {
+            while !token_for_turn.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            (
+                TurnOutcome {
+                    cancelled: true,
+                    failed: true,
+                    ..TurnOutcome::default()
+                },
+                Vec::new(),
+                Settings::default(),
+            )
+        });
+
+        let root = unique_test_root("worker-close-mic-in-turn");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut cancel_slot = Some(watch.clone());
+        let confirmer = confirmer_without_ui();
+
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let stop = Arc::new(AtomicBool::new(false));
+        voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
+
+        // 模拟用户在执行中点了「关闭麦克风」，随后又点了「取消」。
+        // 两个 future 在同一个任务上交替推进（不需要 'static）。
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(UiCommand::SetVoiceEnabled(false));
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(stop.load(Ordering::SeqCst), "执行中关麦必须真的停止采集");
+            assert!(!watch.is_cancelled(), "关麦不是撤销：回合不能被取消");
+            let _ = tx.send(UiCommand::Cancel);
+        };
+        let weak = slint::Weak::default();
+        let wait = wait_turn(
+            &mut commands,
+            turn,
+            &weak,
+            &mut cancel_slot,
+            &paths,
+            &secret,
+            &mut settings,
+            &confirmer,
+            &mut voice,
+            &tx,
+        );
+        let (result, ()) = tokio::join!(wait, driver);
+
+        assert!(matches!(result, TurnWait::Finished(_)));
+        assert!(stop.load(Ordering::SeqCst), "关麦后采集必须保持停止");
+        assert!(voice.handle.is_none(), "关麦后不能继续持有采集线程");
+        assert!(voice.route.active.current().is_none(), "在途语音必须过期");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **偏好保存失败只影响持久化**：本次关麦必须照样生效。
+    #[test]
+    fn voice_preference_save_failure_still_closes_the_mic() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = unique_test_root("worker-voice-pref-fail");
+        let paths = AppPaths::with_root(&root);
+        let mut settings = Settings::default();
+        settings.voice.enabled = true;
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let stop = Arc::new(AtomicBool::new(false));
+        voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
+
+        // 注入故障：占住配置写入用的临时文件路径，让 save_settings 失败。
+        let tmp = paths.settings_file().with_extension("json.tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        apply_voice_enabled(
+            &slint::Weak::default(),
+            &paths,
+            &mut settings,
+            &mut voice,
+            &tx,
+            false,
+        );
+
+        assert!(stop.load(Ordering::SeqCst), "保存失败也必须真的关麦");
+        assert!(voice.handle.is_none(), "句柄必须释放");
+        assert!(
+            settings.voice.enabled,
+            "写盘失败时内存里的偏好不应被改成未落盘的值"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ------------------------------------------------------------ 语音路由
+
+    /// 归属核对：旧实例（关麦前那个）的事件一律无效。
+    #[test]
+    fn voice_route_rejects_stale_instances() {
+        let mut route = VoiceRoute::default();
+        let old = route.open();
+        let turn = VoiceTurn {
+            instance: old,
+            session: 1,
+        };
+        assert!(route.bind(old, turn));
+
+        // 关麦后立刻重开：新实例号不同，旧实例的事件不再生效。
+        route.close();
+        let new = route.open();
+        assert_ne!(old, new);
+        assert!(!route.is_current(old));
+        assert!(route.is_current(new));
+        assert_eq!(route.take(old, turn), None, "旧实例的结果不得被取走");
+        assert_eq!(
+            route.take(
+                new,
+                VoiceTurn {
+                    instance: new,
+                    session: 1
+                }
+            ),
+            None,
+            "新实例没有这一句，也不能提交"
+        );
+    }
+
+    #[test]
+    fn voice_route_takes_each_turn_once() {
+        let mut route = VoiceRoute::default();
+        let instance = route.open();
+        let turn = VoiceTurn {
+            instance,
+            session: 3,
+        };
+        assert!(route.bind(instance, turn));
+        assert_eq!(route.take(instance, turn), Some(turn));
+        assert_eq!(route.take(instance, turn), None, "同一句只能提交一次");
+
+        // 拒绝只清归属匹配的那一句。
+        let first = VoiceTurn {
+            instance,
+            session: 4,
+        };
+        let second = VoiceTurn {
+            instance,
+            session: 5,
+        };
+        assert!(route.bind(instance, first));
+        route.release(instance, second);
+        assert_eq!(route.pending, Some(first), "别的会话不能清掉当前这句");
+        assert_eq!(route.cancel(), Some(first));
+        assert_eq!(route.pending, None);
+    }
+
+    /// **旧实例收尾不能清掉新实例的活动会话**（快速关麦 / 重开的真实路径）。
+    ///
+    /// 修复前整个 `VoiceRuntime` 只有一份 `ActiveSession`，每个实例
+    /// `spawn` 时都 clone 同一份：旧线程迟到的 `shutdown()` / `fail()` 里
+    /// 的无条件 `clear()` 会把新实例正在识别的那一句抹掉 ——
+    /// 于是新实例的 Final 被当成过期丢弃（表现为「所有 Final 都无效」）。
+    ///
+    /// 这里走真实的分配路径：实例号与会话都由 `VoiceRoute::open()` 给出，
+    /// 再用两个真实的 `SessionMachine` 驱动识别与收尾。
+    #[test]
+    fn old_instance_teardown_cannot_clear_the_new_instance_session() {
+        use std::sync::Mutex;
+
+        use crate::voice::asr::{AsrError, InferenceCancel, Transcript};
+        use crate::voice::coordinator::{AsrSubmitter, ReplySink, SessionMachine};
+
+        /// 记录事件（带实例号，用来判断结果属于谁）。
+        #[derive(Clone, Default)]
+        struct Sink {
+            events: Arc<Mutex<Vec<(VoiceInstance, VoiceEventKind)>>>,
+        }
+
+        impl Sink {
+            fn shared(&self) -> SharedSink {
+                let events = self.events.clone();
+                SharedSink::new(move |event| {
+                    events.lock().unwrap().push((event.instance, event.kind))
+                })
+            }
+
+            fn finals(&self) -> Vec<(VoiceInstance, String)> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(instance, kind)| match kind {
+                        VoiceEventKind::Final { text, .. } => Some((*instance, text.clone())),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        }
+
+        /// 手动控制结果回调的假 ASR：由测试决定「推理什么时候结束」。
+        struct DeferredAsr(Arc<Mutex<Vec<(VoiceTurn, ReplySink)>>>);
+
+        impl AsrSubmitter for DeferredAsr {
+            fn submit(
+                &self,
+                turn: VoiceTurn,
+                _samples: Vec<f32>,
+                _cancel: InferenceCancel,
+                reply: ReplySink,
+            ) -> Result<(), AsrError> {
+                self.0.lock().unwrap().push((turn, reply));
+                Ok(())
+            }
+        }
+
+        fn transcript(text: &str, turn: VoiceTurn) -> Result<Transcript, AsrError> {
+            Ok(Transcript {
+                session_id: turn.session,
+                text: text.to_string(),
+                audio_seconds: 1.0,
+                decode_ms: 5,
+                language_id: 1,
+                no_speech: vec![],
+            })
+        }
+
+        let sink = Sink::default();
+        let mut route = VoiceRoute::default();
+
+        // ---- 实例 A：唤醒后进入识别（推理还没回来）----
+        let a = route.open();
+        let active_a = route.active_session();
+        let pending_a = Arc::new(Mutex::new(Vec::new()));
+        let mut machine_a = SessionMachine::new(
+            a,
+            sink.shared(),
+            active_a.clone(),
+            Box::new(DeferredAsr(pending_a.clone())),
+            0,
+        );
+        machine_a.start_listening();
+        machine_a.begin("小爱同学".to_string());
+        machine_a.finish(1.0, vec![0.1, -0.1, 0.2, -0.2]);
+        assert_eq!(machine_a.state(), &VoiceState::Transcribing);
+        assert!(active_a.current().is_some(), "A 应该有在途会话");
+
+        // ---- 用户关麦并立刻重开：B 从这里拿到**自己**的会话 ----
+        route.close();
+        let b = route.open();
+        assert_ne!(a, b, "重开必须是新实例");
+        let active_b = route.active_session();
+        let pending_b = Arc::new(Mutex::new(Vec::new()));
+        let mut machine_b = SessionMachine::new(
+            b,
+            sink.shared(),
+            active_b.clone(),
+            Box::new(DeferredAsr(pending_b.clone())),
+            0,
+        );
+        machine_b.start_listening();
+        machine_b.begin("小爱同学".to_string());
+        machine_b.finish(1.0, vec![0.1, -0.1, 0.2, -0.2]);
+        let turn_b = active_b.current().expect("B 应该有在途会话");
+        assert!(route.bind(b, turn_b));
+
+        // ---- A 的线程这时才收尾：shutdown / fail 都会无条件 clear ----
+        machine_a.shutdown();
+        machine_a.fail("麦克风错误：设备断开".to_string());
+        assert!(active_a.current().is_none(), "A 自己的会话确实被清了");
+        assert!(
+            active_b.is_current(turn_b),
+            "旧实例的收尾不能清掉新实例的活动会话"
+        );
+
+        // ---- B 的识别正常结束：Final 恰好一次，且属于 B ----
+        let (turn, reply_b) = pending_b.lock().unwrap().pop().expect("B 应有一次识别");
+        reply_b(transcript("打开浏览器", turn));
+        assert!(machine_b.poll(), "B 应该回到监听");
+        assert!(route.take(b, turn).is_some(), "B 的结果必须能提交");
+        assert!(route.take(b, turn).is_none(), "同一句只能提交一次");
+
+        // ---- A 的识别这时才回来：不能交付 ----
+        let (late, reply_a) = pending_a.lock().unwrap().pop().expect("A 应有一次识别");
+        reply_a(transcript("上一句", late));
+        assert!(route.take(a, late).is_none(), "旧实例的结果不能提交");
+
+        assert_eq!(
+            sink.finals(),
+            vec![(b, "打开浏览器".to_string())],
+            "只有新实例的这句被交付，且恰好一次"
+        );
+    }
+
+    /// 旧实例的迟到事件：不改状态、不动新会话、不触发 Agent。
+    #[test]
+    fn stale_events_from_previous_instance_are_ignored() {
+        let weak = slint::Weak::default();
+        let mut voice = VoiceRuntime::new();
+        let old = voice.route.open();
+        let old_turn = VoiceTurn {
+            instance: old,
+            session: 1,
+        };
+
+        // 关麦 → 立刻重开
+        voice.route.close();
+        let new = voice.route.open();
+        let new_turn = VoiceTurn {
+            instance: new,
+            session: 1,
+        };
+        assert!(voice.route.bind(new, new_turn));
+
+        let stale_events = [
+            VoiceEventKind::Ready(Box::new(test_capture_info(AsrBackend::Cpu, None))),
+            VoiceEventKind::Woke {
+                turn: old_turn,
+                keyword: "小爱同学".to_string(),
+            },
+            VoiceEventKind::StateChanged(VoiceState::Listening),
+            VoiceEventKind::StateChanged(VoiceState::Error("旧的设备错误".to_string())),
+            VoiceEventKind::Final {
+                turn: old_turn,
+                text: "打开浏览器".to_string(),
+                audio_seconds: 1.0,
+                decode_ms: 1,
+            },
+            VoiceEventKind::Rejected {
+                turn: old_turn,
+                reason: RejectReason::EmptyTranscript,
+            },
+        ];
+        for kind in stale_events {
+            let prompt = voice.on_event(
+                &weak,
+                VoiceEvent {
+                    instance: old,
+                    kind,
+                },
+                false,
+            );
+            assert!(prompt.is_none(), "旧实例的事件不得触发 Agent");
+        }
+        // 新实例的这一句仍在等结果，不能被旧事件清掉。
+        assert_eq!(voice.route.pending, Some(new_turn));
+    }
+
+    /// Agent 执行中关麦：采集真的停了，但正在跑的回合不被撤销。
+    #[test]
+    fn closing_voice_during_turn_stops_capture_without_cancelling_turn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let weak = slint::Weak::default();
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let stop = Arc::new(AtomicBool::new(false));
+        voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
+        voice.route.active.begin(VoiceTurn {
+            instance,
+            session: 1,
+        });
+        let turn_cancel = CancelToken::new();
+
+        voice.disable(&weak);
+
+        assert!(stop.load(Ordering::SeqCst), "关麦必须真的停止采集");
+        assert!(voice.handle.is_none(), "句柄要释放，避免重复持有设备");
+        assert!(voice.route.active.current().is_none(), "在途识别必须过期");
+        assert!(
+            !turn_cancel.is_cancelled(),
+            "关麦不是撤销：正在执行的回合继续"
+        );
+    }
+
+    /// Agent 忙（含等待点击确认）时，有效 Final 不启动第二回合，也不排队。
+    #[test]
+    fn final_during_busy_turn_is_dropped_not_queued() {
+        let weak = slint::Weak::default();
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let turn = VoiceTurn {
+            instance,
+            session: 1,
+        };
+        assert!(voice.route.bind(instance, turn));
+
+        let final_event = VoiceEvent {
+            instance,
+            kind: VoiceEventKind::Final {
+                turn,
+                text: "打开浏览器".to_string(),
+                audio_seconds: 1.0,
+                decode_ms: 5,
+            },
+        };
+        assert!(
+            voice.on_event(&weak, final_event.clone(), true).is_none(),
+            "Agent 忙时不能启动第二回合"
+        );
+        assert!(voice.route.pending.is_none(), "这句话不能排队延后执行");
+
+        // 合法的状态事件仍然照常处理：不会被当成“另一条指令”，
+        // 也不会在忙的时候触发任何回合。
+        assert!(voice
+            .on_event(
+                &weak,
+                VoiceEvent {
+                    instance,
+                    kind: VoiceEventKind::StateChanged(VoiceState::Listening),
+                },
+                true,
+            )
+            .is_none());
+        assert!(voice
+            .on_event(
+                &weak,
+                VoiceEvent {
+                    instance,
+                    kind: VoiceEventKind::Overflow,
+                },
+                true,
+            )
+            .is_none());
+    }
+
+    /// 正常路径：有效 Final 恰好提交一次；重复事件不会提交第二次。
+    #[test]
+    fn valid_final_is_submitted_exactly_once() {
+        let weak = slint::Weak::default();
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let turn = VoiceTurn {
+            instance,
+            session: 2,
+        };
+        assert!(voice.route.bind(instance, turn));
+        let event = VoiceEvent {
+            instance,
+            kind: VoiceEventKind::Final {
+                turn,
+                text: "打开记事本".to_string(),
+                audio_seconds: 1.2,
+                decode_ms: 9,
+            },
+        };
+
+        let prompt = voice
+            .on_event(&weak, event.clone(), false)
+            .expect("空闲时有效 Final 应当提交");
+        assert_eq!(prompt.text, "打开记事本");
+        assert!((prompt.audio_seconds - 1.2).abs() < f32::EPSILON);
+
+        assert!(
+            voice.on_event(&weak, event, false).is_none(),
+            "同一结果不得提交第二次"
+        );
+    }
+
+    /// 取消当前输入后，迟到的 Final 不得提交。
+    #[test]
+    fn late_final_after_cancel_is_dropped() {
+        let weak = slint::Weak::default();
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let turn = VoiceTurn {
+            instance,
+            session: 1,
+        };
+        assert!(voice.route.bind(instance, turn));
+        voice.cancel_pending();
+        assert!(voice.route.active.current().is_none());
+
+        let prompt = voice.on_event(
+            &weak,
+            VoiceEvent {
+                instance,
+                kind: VoiceEventKind::Final {
+                    turn,
+                    text: "打开浏览器".to_string(),
+                    audio_seconds: 1.0,
+                    decode_ms: 5,
+                },
+            },
+            false,
+        );
+        assert!(prompt.is_none(), "取消之后的结果不得提交");
+    }
+
+    /// 旧实例的 Final 不得冒充新实例的会话（两者 session 号可能相同）。
+    #[test]
+    fn old_instance_final_cannot_impersonate_new_session() {
+        let weak = slint::Weak::default();
+        let mut voice = VoiceRuntime::new();
+        let old = voice.route.open();
+        let old_turn = VoiceTurn {
+            instance: old,
+            session: 1,
+        };
+        voice.route.close();
+        let new = voice.route.open();
+        let new_turn = VoiceTurn {
+            instance: new,
+            session: 1,
+        };
+        assert!(voice.route.bind(new, new_turn));
+
+        assert!(voice
+            .on_event(
+                &weak,
+                VoiceEvent {
+                    instance: old,
+                    kind: VoiceEventKind::Final {
+                        turn: old_turn,
+                        text: "上一句".to_string(),
+                        audio_seconds: 1.0,
+                        decode_ms: 5,
+                    },
+                },
+                false,
+            )
+            .is_none());
+        assert_eq!(voice.route.pending, Some(new_turn));
+    }
+
+    /// 界面文字只反映**实际**后端。
+    #[test]
+    fn backend_label_reflects_actual_backend() {
+        assert_eq!(
+            describe_backend(&test_capture_info(AsrBackend::Cuda, None)),
+            "Whisper CUDA"
+        );
+        assert_eq!(
+            describe_backend(&test_capture_info(AsrBackend::Cpu, None)),
+            "Whisper CPU"
+        );
+        let degraded = test_capture_info(
+            AsrBackend::Cpu,
+            Some("CUDA：初始化失败（缺少 CUDA 运行库）".to_string()),
+        );
+        assert_eq!(
+            describe_backend(&degraded),
+            "Whisper CPU（CUDA：初始化失败（缺少 CUDA 运行库））"
+        );
+        let cpu_build = test_capture_info(AsrBackend::Cpu, Some("本构建未启用 CUDA".to_string()));
+        assert_eq!(
+            describe_backend(&cpu_build),
+            "Whisper CPU（本构建未启用 CUDA）"
+        );
+    }
+
+    fn test_capture_info(backend: AsrBackend, fallback_reason: Option<String>) -> CaptureInfoForUi {
+        CaptureInfoForUi {
+            device_name: "测试麦克风".to_string(),
+            sample_rate: 48_000,
+            resampled: true,
+            wake_labels: vec!["小爱同学".to_string()],
+            keywords_file: std::path::PathBuf::from("kws-keywords.txt"),
+            whisper_model: std::path::PathBuf::from("ggml-small.bin"),
+            backend,
+            fallback_reason,
+        }
     }
 
     fn unique_test_root(prefix: &str) -> std::path::PathBuf {

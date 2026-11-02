@@ -15,6 +15,7 @@
 //!  - [`cancel`]：回合取消语义
 //!  - [`prompt`]：系统提示词
 //!  - [`ui`]：Slint 界面与工作线程
+//!  - [`voice`]：语音输入（采集 / 唤醒词 / 端点 / whisper.cpp 转录）
 
 pub mod agent;
 pub mod cancel;
@@ -26,6 +27,7 @@ pub mod permissions;
 pub mod prompt;
 pub mod secret;
 pub mod ui;
+pub mod voice;
 
 // Slint 生成的组件类型（`AppWindow` / `ChatEntry` / `ToolCard`）注册在 crate 根，
 // 这样界面层与测试都能直接引用。

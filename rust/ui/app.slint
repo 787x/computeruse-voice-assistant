@@ -136,6 +136,14 @@ export component AppWindow inherits Window {
     // 本次确认的请求 id：点按钮时原样回传，避免上一次确认的重复点击串到下一次。
     in-out property <int> confirm-request-id: 0;
 
+    // 语音（PR6）：只暴露「用户能看懂」的几项，不做完整 HUD。
+    in-out property <bool> voice-enabled: false;
+    // off | loading | listening | capturing | transcribing | error
+    in-out property <string> voice-state: "off";
+    in-out property <string> voice-device: "";
+    in-out property <string> voice-level: "";
+    in-out property <string> voice-transcript: "";
+
     // ---- 回调（Rust 侧实现） ----
     callback send(text: string);
     callback cancel-turn();
@@ -146,7 +154,18 @@ export component AppWindow inherits Window {
     callback clear-api-key(provider-index: int);
     callback provider-changed(provider-index: int);
     callback confirm-decision(request-id: int, allow: bool);
+    callback set-voice-enabled(enabled: bool);
     callback quit-app();
+
+    // 状态 → 用户能看懂的中文（与 Rust 侧 VoiceState::label 保持一致的口径）。
+    pure function voice-label(state: string) -> string {
+        if (state == "loading") { return "正在加载语音模型…"; }
+        if (state == "listening") { return "正在监听唤醒词"; }
+        if (state == "capturing") { return "我在听，请说"; }
+        if (state == "transcribing") { return "正在识别…"; }
+        if (state == "error") { return "语音不可用"; }
+        return "麦克风已关闭";
+    }
 
     // ---- 布局 ----
     VerticalLayout {
@@ -176,6 +195,12 @@ export component AppWindow inherits Window {
                     text: root.endpoint-text;
                     color: #666666;
                     vertical-alignment: center;
+                }
+
+                AppButton {
+                    label: root.voice-enabled ? "关闭麦克风" : "打开麦克风";
+                    primary: root.voice-enabled;
+                    clicked => { root.set-voice-enabled(!root.voice-enabled); }
                 }
 
                 AppButton {
@@ -236,6 +261,44 @@ export component AppWindow inherits Window {
                                     wrap: word-wrap;
                                 }
                             }
+                        }
+                    }
+                }
+
+                // 语音状态条（不加 HUD：只显示状态与识别出的最终文字）
+                if root.voice-enabled : Rectangle {
+                    height: voice-row.preferred-height + 12px;
+                    border-radius: 6px;
+                    background: root.voice-state == "error" ? #fdeeee : #ffffff;
+                    border-width: 1px;
+                    border-color: #e3e3e6;
+
+                    voice-row := HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 10px;
+
+                        Text {
+                            text: voice-label(root.voice-state);
+                            font-size: 12px;
+                            color: root.voice-state == "error" ? #a02020 : #1f1f22;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.voice-level;
+                            font-size: 11px;
+                            color: #8a8a90;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.voice-transcript != "" : Text {
+                            text: "识别：" + root.voice-transcript;
+                            font-size: 12px;
+                            color: #1f1f22;
+                            vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
                 }
