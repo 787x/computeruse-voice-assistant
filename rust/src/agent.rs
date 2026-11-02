@@ -283,7 +283,11 @@ impl Agent {
                 && (!result.tool_calls.is_empty() || !result.broken_tool_calls.is_empty())
             {
                 {
-                    messages.push(assistant_message_from(&result, self.config.echo_reasoning));
+                    messages.push(assistant_message_from(
+                        &result,
+                        self.config.echo_reasoning,
+                        &self.llm.provider_id(),
+                    ));
                     let note = if result.finish_reason == "length" {
                         "（上一步的模型响应不完整（输出被长度上限截断），未执行任何工具调用。请重新组织你的回答；如果需要工具，请完整地重新发起调用。）"
                     } else if result.interrupted {
@@ -337,7 +341,11 @@ impl Agent {
                         outcome.text = "（模型响应异常，未能完成回答）".to_string();
                     }
                     if !result.text.is_empty() {
-                        messages.push(assistant_message_from(&result, self.config.echo_reasoning));
+                        messages.push(assistant_message_from(
+                            &result,
+                            self.config.echo_reasoning,
+                            &self.llm.provider_id(),
+                        ));
                     }
                     outcome.failed = true;
                     outcome.failure_reason = Some("stream_error".to_string());
@@ -347,7 +355,11 @@ impl Agent {
                     });
                     return outcome;
                 }
-                messages.push(assistant_message_from(&result, self.config.echo_reasoning));
+                messages.push(assistant_message_from(
+                    &result,
+                    self.config.echo_reasoning,
+                    &self.llm.provider_id(),
+                ));
                 outcome.text = if outcome.text.is_empty() {
                     result.text.clone()
                 } else {
@@ -358,7 +370,11 @@ impl Agent {
 
             // ---- 只有残缺调用：一条都不执行 -----------------------------------
             if result.tool_calls.is_empty() {
-                messages.push(assistant_message_from(&result, self.config.echo_reasoning));
+                messages.push(assistant_message_from(
+                    &result,
+                    self.config.echo_reasoning,
+                    &self.llm.provider_id(),
+                ));
                 let names: Vec<String> = result
                     .broken_tool_calls
                     .iter()
@@ -400,10 +416,24 @@ impl Agent {
                 continue;
             }
 
-            // ---- 正常的一批工具调用 -------------------------------------------
+            /*
+             * ---- 同批里有残缺调用：整批一条都不执行 -------------------------
+             *
+             * 模型的"一次响应"是一个整体意图：`["先点A", "再输入半截…"]` 里的第一条
+             * 看着合法，但它是建立在一条**没写完**的指令上的。只执行"看起来对"的那几条，
+             * 等于替模型猜它想干什么——对点击/输入这类动作就是事故。
+             *
+             * 处理方式与"只有残缺调用"完全一致：assistant 消息只带**全部调用**
+             * （不给残缺的那些补 tool 结果，避免孤立的 tool 消息），
+             * 再用一条内部提示说明"这批没执行，请完整重新发起"。
+             */
             if !result.broken_tool_calls.is_empty() {
-                let names: Vec<String> = result
-                    .broken_tool_calls
+                let all: Vec<&crate::llm::ToolCall> = result
+                    .tool_calls
+                    .iter()
+                    .chain(result.broken_tool_calls.iter())
+                    .collect();
+                let names: Vec<String> = all
                     .iter()
                     .map(|call| {
                         if call.name.is_empty() {
@@ -413,14 +443,44 @@ impl Agent {
                         }
                     })
                     .collect();
-                emit(AgentEvent::ToolEnd {
-                    name: names.join(", "),
-                    ok: false,
-                    text: "参数不完整，已丢弃".to_string(),
-                    step,
-                });
+                // 只写有效的调用进 assistant 消息：残缺的调用不能出现在 tool_calls 里，
+                // 否则模型会以为那条调用已经被接受过。
+                messages.push(assistant_message_from(
+                    &result,
+                    self.config.echo_reasoning,
+                    &self.llm.provider_id(),
+                ));
+                messages.push(ChatMessage::internal_note(format!(
+                    "（上一步这一批工具调用里有参数不完整或缺少函数名的调用（{}），整批都没有执行。请重新给出这一批调用的完整参数，或直接用一句话告诉用户做不到以及原因。）",
+                    names.join("、")
+                )));
+                for name in &names {
+                    outcome.steps.push(StepRecord {
+                        step,
+                        tool: name.clone(),
+                        ok: false,
+                        text: "参数不完整，整批未执行".to_string(),
+                        ms: 0,
+                    });
+                    emit(AgentEvent::ToolEnd {
+                        name: name.clone(),
+                        ok: false,
+                        text: "参数不完整，整批未执行".to_string(),
+                        step,
+                    });
+                }
+                if step as u32 == self.config.max_steps {
+                    hit_step_limit = true;
+                }
+                continue;
             }
-            messages.push(assistant_message_from(&result, self.config.echo_reasoning));
+
+            // ---- 正常的一批工具调用 -------------------------------------------
+            messages.push(assistant_message_from(
+                &result,
+                self.config.echo_reasoning,
+                &self.llm.provider_id(),
+            ));
 
             let mut pending_images: Vec<ChatMessage> = Vec::new();
             for call in result.tool_calls.clone() {
@@ -436,7 +496,7 @@ impl Agent {
 
                 // ---- 权限判断（执行前） -----------------------------------
                 let decision = PermissionGate::new(&self.permissions)
-                    .check(&call.name, &args, Some(confirmer))
+                    .check(&call.name, &args, Some(confirmer), cancel)
                     .await;
                 if cancel.is_cancelled() {
                     return cancelled(outcome, &mut messages, history, emit, policy, &tools);
@@ -569,7 +629,11 @@ impl Agent {
                     messages.remove(note_index);
                     if !closing.text.is_empty() {
                         outcome.text.push_str(&closing.text);
-                        messages.push(assistant_message_from(&closing, self.config.echo_reasoning));
+                        messages.push(assistant_message_from(
+                            &closing,
+                            self.config.echo_reasoning,
+                            &self.llm.provider_id(),
+                        ));
                     }
                     if closing.tool_calls_incomplete && closing.text.is_empty() {
                         outcome.failed = true;
@@ -697,6 +761,7 @@ where
     fn confirm<'a>(
         &'a self,
         request: crate::permissions::ConfirmRequest,
+        _cancel: &'a crate::cancel::CancelToken,
     ) -> crate::permissions::ConfirmFuture<'a> {
         let prompt = ConfirmationPrompt {
             tool: request.tool,
@@ -716,6 +781,7 @@ impl Confirmer for DenyAllConfirmer {
     fn confirm<'a>(
         &'a self,
         _request: crate::permissions::ConfirmRequest,
+        _cancel: &'a crate::cancel::CancelToken,
     ) -> crate::permissions::ConfirmFuture<'a> {
         Box::pin(async { crate::permissions::ConfirmAnswer::deny_click() })
     }
@@ -728,6 +794,7 @@ impl Confirmer for AllowAllConfirmer {
     fn confirm<'a>(
         &'a self,
         _request: crate::permissions::ConfirmRequest,
+        _cancel: &'a crate::cancel::CancelToken,
     ) -> crate::permissions::ConfirmFuture<'a> {
         Box::pin(async { crate::permissions::ConfirmAnswer::allow_click() })
     }

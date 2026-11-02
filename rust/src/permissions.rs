@@ -413,13 +413,25 @@ pub type ConfirmFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = ConfirmAnswer> + Send + 'a>>;
 
 pub trait Confirmer: Send + Sync {
-    fn confirm<'a>(&'a self, request: ConfirmRequest) -> ConfirmFuture<'a>;
+    /// 向用户求一次确认。
+    ///
+    /// `cancel` 让等待中的确认能被回合取消/程序退出立刻结束——
+    /// 否则会留下一个"还开着、之后可能被点允许"的确认框。
+    fn confirm<'a>(
+        &'a self,
+        request: ConfirmRequest,
+        cancel: &'a crate::cancel::CancelToken,
+    ) -> ConfirmFuture<'a>;
 }
 
 /// `Arc<T>` 也能当确认器用：界面把确认器交给后台任务时不需要额外包装。
 impl<T: Confirmer + ?Sized> Confirmer for std::sync::Arc<T> {
-    fn confirm<'a>(&'a self, request: ConfirmRequest) -> ConfirmFuture<'a> {
-        (**self).confirm(request)
+    fn confirm<'a>(
+        &'a self,
+        request: ConfirmRequest,
+        cancel: &'a crate::cancel::CancelToken,
+    ) -> ConfirmFuture<'a> {
+        (**self).confirm(request, cancel)
     }
 }
 
@@ -474,11 +486,15 @@ impl<'a> PermissionGate<'a> {
     }
 
     /// 判定一次调用。`confirm` 为 `None` 时，`ask` 一律拒绝（没有确认通道就不该放行）。
+    ///
+    /// `cancel` 在等待用户确认期间被置位时，本次判定直接按拒绝返回，
+    /// 并且**不**把这条迟到的答复留给下一次确认消费。
     pub async fn check(
         &self,
         tool: &str,
         args: &serde_json::Value,
         confirm: Option<&dyn Confirmer>,
+        cancel: &crate::cancel::CancelToken,
     ) -> Decision {
         let now = (self.now)();
 
@@ -555,7 +571,18 @@ impl<'a> PermissionGate<'a> {
                     reason: verdict.reason.clone(),
                     args_summary: summarize_args(args),
                 };
-                let answer = confirm.confirm(request).await;
+                let answer = confirm.confirm(request, cancel).await;
+                // 用户点了允许、但回合在此期间已被取消/退出：这条答复**不生效**。
+                // 取消是终态，迟到的"允许"不能把一个已经结束的回合重新变成可执行。
+                if cancel.is_cancelled() {
+                    return Decision {
+                        allow: false,
+                        level: Level::Ask,
+                        capability: verdict.capability,
+                        channel: "cancelled",
+                        reason: "已中断，未执行".to_string(),
+                    };
+                }
                 let allowed = answer.allow && matches!(answer.channel, "click" | "voice");
                 Decision {
                     allow: allowed,
@@ -613,6 +640,7 @@ pub fn capability_label(capability: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel::CancelToken;
 
     fn gate(mode: PermissionMode) -> PermissionState {
         PermissionState::new(mode)
@@ -621,7 +649,11 @@ mod tests {
     /// 固定答复的确认器：PR5 只有点击确认。
     struct Fixed(bool);
     impl Confirmer for Fixed {
-        fn confirm<'a>(&'a self, _request: ConfirmRequest) -> ConfirmFuture<'a> {
+        fn confirm<'a>(
+            &'a self,
+            _request: ConfirmRequest,
+            _cancel: &'a crate::cancel::CancelToken,
+        ) -> ConfirmFuture<'a> {
             let answer = if self.0 {
                 ConfirmAnswer::allow_click()
             } else {
@@ -641,7 +673,12 @@ mod tests {
     async fn screenshot_is_allowed_without_a_prompt() {
         let state = gate(PermissionMode::Standard);
         let decision = PermissionGate::new(&state)
-            .check("screenshot", &args(serde_json::json!({})), None)
+            .check(
+                "screenshot",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
             .await;
         assert!(decision.allow);
         assert_eq!(decision.level, Level::Allow);
@@ -653,7 +690,12 @@ mod tests {
         let state = gate(PermissionMode::Standard);
         let gate_ref = PermissionGate::new(&state);
         let decision = gate_ref
-            .check("left_click", &args(serde_json::json!({"x":1,"y":2})), None)
+            .check(
+                "left_click",
+                &args(serde_json::json!({"x":1,"y":2})),
+                None,
+                &CancelToken::new(),
+            )
             .await;
         assert!(decision.allow);
         assert!(gate_ref.should_audit("input.pointer"));
@@ -663,7 +705,12 @@ mod tests {
     async fn clipboard_read_requires_confirmation() {
         let state = gate(PermissionMode::Standard);
         let decision = PermissionGate::new(&state)
-            .check("read_clipboard", &args(serde_json::json!({})), Some(&YES))
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                Some(&YES),
+                &CancelToken::new(),
+            )
             .await;
         assert!(decision.allow);
         assert_eq!(decision.level, Level::Ask);
@@ -678,6 +725,7 @@ mod tests {
                 "read_clipboard",
                 &args(serde_json::json!({})),
                 Some(&Fixed(false)),
+                &CancelToken::new(),
             )
             .await;
         assert!(!decision.allow);
@@ -688,7 +736,12 @@ mod tests {
     async fn ask_without_confirm_channel_is_denied() {
         let state = gate(PermissionMode::Standard);
         let decision = PermissionGate::new(&state)
-            .check("read_clipboard", &args(serde_json::json!({})), None)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
             .await;
         assert!(!decision.allow);
         assert_eq!(decision.channel, "no-channel");
@@ -698,7 +751,12 @@ mod tests {
     async fn unknown_tool_is_always_denied() {
         let state = gate(PermissionMode::Permissive);
         let decision = PermissionGate::new(&state)
-            .check("os_shutdown", &args(serde_json::json!({})), Some(&YES))
+            .check(
+                "os_shutdown",
+                &args(serde_json::json!({})),
+                Some(&YES),
+                &CancelToken::new(),
+            )
             .await;
         assert!(!decision.allow);
         assert_eq!(decision.capability, "unknown");
@@ -708,7 +766,12 @@ mod tests {
     async fn risky_key_chord_escalates_to_ask() {
         let state = gate(PermissionMode::Standard);
         let decision = PermissionGate::new(&state)
-            .check("key", &args(serde_json::json!({"key":"WIN+R"})), None)
+            .check(
+                "key",
+                &args(serde_json::json!({"key":"WIN+R"})),
+                None,
+                &CancelToken::new(),
+            )
             .await;
         assert_eq!(
             decision.level,
@@ -726,6 +789,7 @@ mod tests {
                 "key",
                 &args(serde_json::json!({"key":"win + r"})),
                 Some(&YES),
+                &CancelToken::new(),
             )
             .await;
         assert!(decision.allow);
@@ -740,6 +804,7 @@ mod tests {
                 "type",
                 &args(serde_json::json!({"text":"rm -rf /tmp/x"})),
                 Some(&YES),
+                &CancelToken::new(),
             )
             .await;
         assert!(decision.allow);
@@ -754,6 +819,7 @@ mod tests {
                 "type",
                 &args(serde_json::json!({"text":"你好，请帮我写个备忘"})),
                 None,
+                &CancelToken::new(),
             )
             .await;
         assert!(decision.allow);
@@ -764,7 +830,12 @@ mod tests {
     async fn conservative_mode_promotes_input_to_ask() {
         let state = gate(PermissionMode::Conservative);
         let decision = PermissionGate::new(&state)
-            .check("left_click", &args(serde_json::json!({"x":1,"y":2})), None)
+            .check(
+                "left_click",
+                &args(serde_json::json!({"x":1,"y":2})),
+                None,
+                &CancelToken::new(),
+            )
             .await;
         assert!(!decision.allow, "保守档下点击必须确认（此处无通道→拒绝）");
     }
@@ -773,7 +844,12 @@ mod tests {
     async fn permissive_mode_demotes_clipboard_read() {
         let state = gate(PermissionMode::Permissive);
         let decision = PermissionGate::new(&state)
-            .check("read_clipboard", &args(serde_json::json!({})), None)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
             .await;
         assert!(decision.allow);
     }
@@ -783,7 +859,12 @@ mod tests {
         let mut state = gate(PermissionMode::Standard);
         state.pause(10);
         let decision = PermissionGate::new(&state)
-            .check("screenshot", &args(serde_json::json!({})), Some(&YES))
+            .check(
+                "screenshot",
+                &args(serde_json::json!({})),
+                Some(&YES),
+                &CancelToken::new(),
+            )
             .await;
         assert!(!decision.allow);
         assert_eq!(decision.channel, "pause");
@@ -794,7 +875,12 @@ mod tests {
         let mut state = gate(PermissionMode::Standard);
         state.grant_once("clipboard.read", 5);
         let decision = PermissionGate::new(&state)
-            .check("read_clipboard", &args(serde_json::json!({})), None)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
             .await;
         assert!(decision.allow);
     }

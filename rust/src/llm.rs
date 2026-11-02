@@ -192,6 +192,12 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
     /// 程序生成的内部提示（"参数不完整，请重新生成"）。**绝不发往模型**。
     pub internal: bool,
+    /// 产生这条消息的提供商 id（`None` = 未知/用户消息）。
+    ///
+    /// 用来解决跨提供商的私有字段问题：MiMo / DeepSeek 的 `reasoning_content`
+    /// 是各自端点的私有协议上下文，发给另一家可能直接 400。历史里保留普通对话
+    /// 与完整的工具调用链，只在提供商**不同**时剥掉 `reasoning_content`。
+    pub provider_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -203,6 +209,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             internal: false,
+            provider_id: None,
         }
     }
 
@@ -228,6 +235,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             reasoning_content: None,
             internal: false,
+            provider_id: None,
         }
     }
 
@@ -246,6 +254,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             internal: true,
+            provider_id: None,
         };
         // 附件属于工具调用片段，不是新的用户回合。
         message.internal = true;
@@ -253,7 +262,16 @@ impl ChatMessage {
     }
 
     /// 序列化成请求体里的消息对象。内部标记与本地字段一律剥掉。
-    pub fn to_request_value(&self, echo_reasoning: bool) -> Value {
+    ///
+    /// `current_provider` 是本次请求要打的提供商。历史里来自**别的**提供商的
+    /// `reasoning_content` 不发送——它是那家的私有协议上下文，发给这家可能直接 400。
+    /// 普通正文、`tool_calls` 与 `tool` 结果都照常保留，所以对话记忆与工具链不受影响。
+    pub fn to_request_value(&self, echo_reasoning: bool, current_provider: &str) -> Value {
+        let from_other_provider = match (&self.provider_id, current_provider) {
+            (Some(origin), current) => !current.is_empty() && origin != current,
+            // 没标记来源的（用户消息、旧历史）按本家处理，保持原样。
+            (None, _) => false,
+        };
         let mut object = serde_json::Map::new();
         object.insert("role".to_string(), json!(self.role.as_str()));
         if self.role == Role::Assistant && !self.tool_calls.is_empty() {
@@ -289,7 +307,7 @@ impl ChatMessage {
         if let Some(id) = &self.tool_call_id {
             object.insert("tool_call_id".to_string(), json!(id));
         }
-        if echo_reasoning {
+        if echo_reasoning && !from_other_provider {
             if let Some(reasoning) = &self.reasoning_content {
                 // 空串与缺省在协议上不是一回事：没想过就别回一个空字段。
                 if !reasoning.is_empty() {
@@ -302,7 +320,14 @@ impl ChatMessage {
 }
 
 /// 由一次响应收口出 assistant 消息（`assistantMessageFrom` 的对应实现）。
-pub fn assistant_message_from(result: &ChatResult, echo_reasoning: bool) -> ChatMessage {
+///
+/// `provider_id` 记下这条消息是**哪家**端点产生的，供后续切换提供商时
+/// 判断要不要剥掉私有 `reasoning_content`。
+pub fn assistant_message_from(
+    result: &ChatResult,
+    echo_reasoning: bool,
+    provider_id: &str,
+) -> ChatMessage {
     let mut message = ChatMessage {
         role: Role::Assistant,
         content: Content::Text(result.text.clone()),
@@ -315,6 +340,7 @@ pub fn assistant_message_from(result: &ChatResult, echo_reasoning: bool) -> Chat
         tool_call_id: None,
         reasoning_content: None,
         internal: false,
+        provider_id: Some(provider_id.to_string()),
     };
     if echo_reasoning && !result.reasoning.is_empty() {
         message.reasoning_content = Some(result.reasoning.clone());
@@ -549,6 +575,11 @@ impl LlmClient {
         })
     }
 
+    /// 本次请求的提供商 id（用于给 assistant 消息打来源标记）。
+    pub fn provider_id(&self) -> String {
+        self.profile.provider_id.clone()
+    }
+
     /// 组装请求体（导出给测试断言"界面测的就是实际发的"）。
     pub fn build_body(&self, messages: &[ChatMessage], tools: &[Value], stream: bool) -> Value {
         let echo = self.profile.capability.requires_reasoning_echo();
@@ -557,7 +588,12 @@ impl LlmClient {
         body.insert("model".to_string(), json!(self.profile.model));
         body.insert(
             "messages".to_string(),
-            Value::Array(messages.iter().map(|m| m.to_request_value(echo)).collect()),
+            Value::Array(
+                messages
+                    .iter()
+                    .map(|m| m.to_request_value(echo, &self.profile.provider_id))
+                    .collect(),
+            ),
         );
         body.insert("stream".to_string(), json!(stream));
         if let Some(temperature) = built.temperature {
@@ -642,7 +678,15 @@ impl LlmClient {
         on_reasoning: &mut impl FnMut(&str),
     ) -> Result<ChatResult, LlmError> {
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        /*
+         * 网络分片是**字节**级的：一个中文字符（3 字节）或一个 `\r\n` 都可能被拆在
+         * 两次 `bytes_stream()` 之间。所以这里按字节缓冲、按字节找事件边界，
+         * 只在拿到一整段**完整 UTF-8** 之后才解码。
+         *
+         * 之前逐块 `String::from_utf8_lossy` 会在字符中间插入 U+FFFD，
+         * 把中文正文和工具参数里的 JSON 一起毁掉。
+         */
+        let mut buffer: Vec<u8> = Vec::new();
         let mut assembler = ToolCallAssembler::default();
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -654,9 +698,25 @@ impl LlmClient {
         let mut interrupted = false;
 
         'outer: loop {
+            /*
+             * 读超时：连接建立后如果服务端长时间不吐字节（思考卡住、中间层挂起），
+             * 不能无限等下去。每收到一块就重新计时，所以持续输出的长推理
+             * **不会**被误杀——它一直在重置这个计时器。
+             */
+            let idle = std::time::Duration::from_millis(self.timeout_ms);
             let chunk = tokio::select! {
-                chunk = stream.next() => chunk,
+                chunk = tokio::time::timeout(idle, stream.next()) => chunk,
                 _ = signal.cancelled() => { interrupted = true; break 'outer; }
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    if signal.is_cancelled() {
+                        interrupted = true;
+                        break 'outer;
+                    }
+                    return Err(LlmError::Timeout(self.timeout_ms));
+                }
             };
             let Some(chunk) = chunk else { break };
             let bytes = match chunk {
@@ -664,20 +724,50 @@ impl LlmClient {
                 Err(error) => {
                     if signal.is_cancelled() {
                         interrupted = true;
-                        break;
+                        break 'outer;
                     }
                     return Err(LlmError::Other(error.to_string()));
                 }
             };
-            // SSE 允许 \r\n，统一成 \n 再按空行切事件。
-            let piece = String::from_utf8_lossy(&bytes);
-            buffer.push_str(&piece.replace("\r\n", "\n").replace('\r', "\n"));
+            buffer.extend_from_slice(&bytes);
 
-            while let Some(boundary) = buffer.find("\n\n") {
-                let raw_event: String = buffer.drain(..boundary + 2).collect();
-                let raw_event = &raw_event[..raw_event.len() - 2];
-                if pump_event(
-                    raw_event,
+            // 按字节切出完整事件；只有完整 UTF-8 的片段才会被解码。
+            while let Some(boundary) = find_event_boundary(&buffer) {
+                let raw: Vec<u8> = buffer.drain(..boundary.0).collect();
+                // boundary.1 是分隔符长度（`\n\n` 或 `\r\n\r\n`），一并丢弃。
+                buffer.drain(..boundary.1);
+                if let Ok(raw) = String::from_utf8(raw) {
+                    if pump_event(
+                        &raw,
+                        &mut assembler,
+                        &mut text,
+                        &mut reasoning,
+                        &mut finish_reason,
+                        &mut usage,
+                        &mut saw_finish,
+                        &mut saw_done,
+                        &mut saw_error,
+                        on_delta,
+                        on_reasoning,
+                    ) {
+                        // 收到 [DONE]：协议已经结束，不必再等连接关闭。
+                        saw_done = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if signal.is_cancelled() {
+                interrupted = true;
+                break;
+            }
+        }
+
+        // 收尾：把缓冲区里最后一个没有空行结尾的事件也处理掉。
+        if !buffer.is_empty() && !interrupted {
+            let raw: Vec<u8> = std::mem::take(&mut buffer);
+            if let Ok(raw) = String::from_utf8(raw) {
+                let _ = pump_event(
+                    &raw,
                     &mut assembler,
                     &mut text,
                     &mut reasoning,
@@ -688,33 +778,8 @@ impl LlmClient {
                     &mut saw_error,
                     on_delta,
                     on_reasoning,
-                ) {
-                    // 收到 [DONE] 就到此为止
-                    break;
-                }
+                );
             }
-            if signal.is_cancelled() {
-                interrupted = true;
-                break;
-            }
-        }
-
-        // 收尾：把缓冲区里最后一个没有空行结尾的事件也处理掉。
-        if !buffer.trim().is_empty() && !interrupted {
-            let raw: String = std::mem::take(&mut buffer);
-            let _ = pump_event(
-                &raw,
-                &mut assembler,
-                &mut text,
-                &mut reasoning,
-                &mut finish_reason,
-                &mut usage,
-                &mut saw_finish,
-                &mut saw_done,
-                &mut saw_error,
-                on_delta,
-                on_reasoning,
-            );
         }
 
         Ok(finalize(FinalizeInput {
@@ -768,6 +833,35 @@ impl LlmClient {
     }
 }
 
+/// 在字节缓冲里找下一个 SSE 事件边界。
+///
+/// 返回 `(事件结束位置, 分隔符长度)`。SSE 允许 `\n\n`、`\r\n\r\n` 以及混合写法，
+/// 这里按字节匹配，因此即使分隔符本身被拆在两个网络块之间也能正确识别。
+fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        // \n\n
+        if buffer[index] == b'\n' && buffer.get(index + 1) == Some(&b'\n') {
+            return Some((index, 2));
+        }
+        // \r\n\r\n
+        if buffer[index] == b'\r'
+            && buffer.get(index + 1) == Some(&b'\n')
+            && buffer.get(index + 2) == Some(&b'\r')
+            && buffer.get(index + 3) == Some(&b'\n')
+        {
+            return Some((index, 4));
+        }
+        // \n\r\n（首行以 LF 结尾、次行以 CRLF 结尾的混写）
+        if buffer[index] == b'\n'
+            && buffer.get(index + 1) == Some(&b'\r')
+            && buffer.get(index + 2) == Some(&b'\n')
+        {
+            return Some((index, 3));
+        }
+    }
+    None
+}
+
 /// 解析单个 SSE 事件。返回 `true` 表示收到 `[DONE]`。
 #[allow(clippy::too_many_arguments)]
 fn pump_event(
@@ -785,7 +879,9 @@ fn pump_event(
 ) -> bool {
     let mut event_name = String::new();
     let mut data_lines: Vec<&str> = Vec::new();
+    // 事件内部也可能用 CRLF 换行（`\r\n\r\n` 分隔时，事件体里就是 `\r\n`）。
     for line in raw_event.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() || line.starts_with(':') {
             continue;
         }
@@ -1212,7 +1308,7 @@ mod tests {
     #[test]
     fn internal_messages_are_never_serialized_as_internal() {
         let message = ChatMessage::internal_note("（程序生成的提示）");
-        let value = message.to_request_value(true);
+        let value = message.to_request_value(true, "test");
         assert!(value.get("internal").is_none());
         assert_eq!(value.get("role").unwrap(), &json!("user"));
     }
@@ -1221,9 +1317,9 @@ mod tests {
     fn reasoning_is_echoed_only_for_vendor_capabilities() {
         let mut message = ChatMessage::text(Role::Assistant, "答");
         message.reasoning_content = Some("想".to_string());
-        let echoed = message.to_request_value(true);
+        let echoed = message.to_request_value(true, "test");
         assert_eq!(echoed.get("reasoning_content").unwrap(), &json!("想"));
-        let plain = message.to_request_value(false);
+        let plain = message.to_request_value(false, "test");
         assert!(
             plain.get("reasoning_content").is_none(),
             "标准端点带上私有字段可能被判非法"
@@ -1244,8 +1340,8 @@ mod tests {
             }],
             ..ChatResult::default()
         };
-        let message = assistant_message_from(&result, true);
-        let value = message.to_request_value(true);
+        let message = assistant_message_from(&result, true, "test");
+        let value = message.to_request_value(true, "test");
         assert_eq!(value.get("content").unwrap(), &Value::Null);
         assert_eq!(value.get("reasoning_content").unwrap(), &json!("想"));
         assert!(value.get("tool_calls").is_some());

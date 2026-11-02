@@ -31,12 +31,20 @@ cargo build --release
 | --- | --- | --- |
 | `mimo` | `https://api.xiaomimimo.com/v1` | 只有思考开关（`thinking`），没有强度档位 |
 | `deepseek` | `https://api.deepseek.com/v1` | 只发 `reasoning_effort`，不发 `thinking` |
-| `openai-compatible` | 任意 | 一个提供商专属字段都不发 |
+| `openai-compatible` | 任意 | 默认不发专属字段；在设置里显式选协议提示后按该协议发 |
 
 - 设置保存在 `%APPDATA%\cuava\settings.json`（**不含任何密钥**），可用 `CUAVA_DATA_DIR` 覆盖目录。
-- API Key 用 **Windows DPAPI** 以当前用户身份加密后存在同目录的 `secret.bin`，日志里只出现打码值。
+- API Key 用 **Windows DPAPI** 以当前用户身份加密，**按提供商各存一份**：
+  `%APPDATA%\cuava\secrets\<provider-id>.bin`。
+  - 切换 MiMo ↔ DeepSeek ↔ 自定义端点时，只会用当前提供商自己的 Key；
+  - 当前提供商没配 Key 就**不发** Authorization，绝不借用别家的；
+  - 设置里「API Key」留空 = 不修改该提供商的 Key；点「清除」才是真的删掉。
+- PR5 早期版本只存过一把 Key（`secret.bin`）。首次启动时会把它迁移到 `settings.json`
+  里**明确记录的那个提供商**名下；不猜测、不删除原文件。
 - 旧版 Electron 的 `.config/` 既不会被读取也不会被改写。它的 `enc:` 值由 Chromium
   `safeStorage` 加密，**不是** DPAPI 密文，本程序会明确报错而不是猜测——正式迁移留给后续发布任务。
+- 设置保存失败（地址非法、写盘失败、Key 写入失败）会如实报错，**不会**显示"已保存"，
+  也不会覆盖当前有效的配置。
 
 ### 可选环境变量
 
@@ -44,13 +52,13 @@ cargo build --release
 | --- | --- |
 | `CUAVA_DATA_DIR` | 覆盖数据目录（隔离测试用） |
 | `CUAVA_CUA_SCRIPT` | 指定 `cua.ps1` 路径（默认自动从仓库里找） |
-| `CUAVA_BASE_URL` / `CUAVA_MODEL` / `CUAVA_PROVIDER_HINT` | 临时覆盖端点（指向本地 mock 用） |
+| `CUAVA_BASE_URL` / `CUAVA_MODEL` / `CUAVA_PROVIDER_HINT` | 启动时覆盖端点（指向本地 mock 用）；非法值会被忽略 |
 
 ## 验证
 
 ```powershell
 cd rust
-cargo test                 # 87 单元 + 22 集成（Mock LLM/SSE）+ 9 桥接故障注入
+cargo test                 # 单元 + 集成（Mock LLM/SSE、配置与密钥、桥接故障注入）
 cargo fmt --check
 cargo clippy --all-targets
 ```

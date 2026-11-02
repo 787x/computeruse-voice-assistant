@@ -26,73 +26,178 @@ pub enum SecretError {
     LegacyEncrypted,
 }
 
-/// 密钥文件：DPAPI 密文的 base64 文本。
+/// 密钥仓库：**每个提供商一个** DPAPI 密文文件。
+///
+/// 为什么按提供商分开（与旧版 `providerKeys` 同义）：同一份 `secret.bin` 存一个 Key，
+/// 切换 MiMo → DeepSeek 时会把上一家的 Key 发到新端点。那既是凭据泄漏，
+/// 也会让新端点报 401——用户看到的却是"模型服务坏了"。
+///
+/// 布局：
+/// - `<root>/secrets/<provider-id>.bin`：按提供商的密文
+/// - `<root>/secret.bin`：PR5 早期版本的**单 Key** 文件（只读迁移来源）
+///
+/// 迁移规则（只在 `migrate_legacy` 里做，且只做一次）：
+/// 把单 Key 分配给 `settings.json` 里**明确记录的那个 provider_id**，
+/// 不做任何猜测，也不删除原文件（用户随时可以回退）。
 pub struct SecretStore {
-    path: PathBuf,
+    dir: PathBuf,
+    legacy_path: PathBuf,
 }
 
 impl SecretStore {
+    /// `root` 是数据目录；单 Key 时代传的是 `<root>/secret.bin`，
+    /// 这里同时接受两种形态，保证老调用点仍能工作。
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let (dir, legacy_path) = if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == "secret.bin")
+            .unwrap_or(false)
+        {
+            let root = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            (root.join("secrets"), path)
+        } else {
+            (path.join("secrets"), path.join("secret.bin"))
+        };
+        Self { dir, legacy_path }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// 某个提供商的密文文件路径（供测试与排查）。
+    pub fn path_for(&self, provider_id: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.bin", sanitize_provider_id(provider_id)))
     }
 
-    pub fn exists(&self) -> bool {
-        self.path.is_file()
+    pub fn legacy_path(&self) -> &Path {
+        &self.legacy_path
     }
 
-    /// 读出明文 Key。没有文件 → `Ok(None)`。
-    pub fn load(&self) -> Result<Option<String>, SecretError> {
-        if !self.path.is_file() {
-            return Ok(None);
-        }
-        let encoded = std::fs::read_to_string(&self.path)?;
-        let encoded = encoded.trim();
-        if encoded.is_empty() {
-            return Ok(None);
-        }
-        let cipher = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|_| SecretError::Decrypt)?;
-        let plain = protect::unprotect(&cipher)?;
-        let text = String::from_utf8(plain).map_err(|_| SecretError::Decrypt)?;
-        Ok(Some(text))
+    /// 该提供商是否已有保存的 Key。
+    pub fn has(&self, provider_id: &str) -> bool {
+        self.path_for(provider_id).is_file()
     }
 
-    /// 写入明文 Key（内部加密）。空串等同于删除。
-    pub fn save(&self, plaintext: &str) -> Result<(), SecretError> {
+    /// 读出**指定提供商**的明文 Key。没有文件 → `Ok(None)`。
+    ///
+    /// 关键语义：**绝不回退到别的提供商**。当前提供商没 Key 就返回 `None`，
+    /// 调用方据此决定"不发 Authorization"，而不是借用上一家的 Key。
+    pub fn load(&self, provider_id: &str) -> Result<Option<String>, SecretError> {
+        read_secret_file(&self.path_for(provider_id))
+    }
+
+    /// 写入指定提供商的 Key。空串等同于删除**这一个**提供商的 Key。
+    pub fn save(&self, provider_id: &str, plaintext: &str) -> Result<(), SecretError> {
         if plaintext.is_empty() {
-            return self.clear();
+            return self.clear(provider_id);
         }
         if plaintext.starts_with("enc:") {
             return Err(SecretError::LegacyEncrypted);
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let cipher = protect::protect(plaintext.as_bytes())?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(cipher);
-        // 先写临时文件再改名：写到一半崩溃不会留下半个密文。
-        // Windows 的 rename 在目标已存在时会失败，所以先删旧文件
-        // （密文本身可重建，且删除与改名之间的窗口只会导致"没有 Key"，不会读到半个值）。
-        let tmp = self.path.with_extension("bin.tmp");
-        std::fs::write(&tmp, encoded)?;
-        if self.path.exists() {
-            std::fs::remove_file(&self.path)?;
-        }
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        std::fs::create_dir_all(&self.dir)?;
+        write_secret_file(&self.path_for(provider_id), plaintext)
     }
 
-    pub fn clear(&self) -> Result<(), SecretError> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+    /// 清除指定提供商的 Key（不影响其它提供商）。
+    pub fn clear(&self, provider_id: &str) -> Result<(), SecretError> {
+        remove_secret_file(&self.path_for(provider_id))
+    }
+
+    /// 把所有已知提供商的 Key 摘要（打码值）——只用于诊断，不含明文。
+    pub fn masked_keys(&self, provider_ids: &[&str]) -> Vec<(String, String)> {
+        provider_ids
+            .iter()
+            .filter_map(|id| {
+                self.load(id)
+                    .ok()
+                    .flatten()
+                    .map(|key| (id.to_string(), mask_secret(&key)))
+            })
+            .collect()
+    }
+
+    /// 把 PR5 早期的单 Key 文件迁移到 `provider_id` 名下。
+    ///
+    /// - 只迁移到调用方**明确**给出的提供商（即 `settings.json` 里的 provider_id）；
+    /// - 目标已有 Key 时不覆盖（用户的新输入优先）；
+    /// - 迁移后**保留**原文件，不删除用户数据；
+    /// - 解密失败（比如换了 Windows 用户）时返回错误，由调用方提示用户重填，
+    ///   而不是把坏数据搬过去。
+    ///
+    /// 返回 `true` 表示这次真的迁移了一个 Key。
+    pub fn migrate_legacy(&self, provider_id: &str) -> Result<bool, SecretError> {
+        if provider_id.trim().is_empty() || !self.legacy_path.is_file() {
+            return Ok(false);
         }
+        if self.has(provider_id) {
+            return Ok(false);
+        }
+        let Some(key) = read_secret_file(&self.legacy_path)? else {
+            return Ok(false);
+        };
+        self.save(provider_id, &key)?;
+        Ok(true)
+    }
+}
+
+/// 提供商 id 用作文件名前先做一次白名单收敛：
+/// 只保留字母、数字、`-`、`_`，避免路径穿越或非法字符。
+fn sanitize_provider_id(provider_id: &str) -> String {
+    let cleaned: String = provider_id
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn read_secret_file(path: &Path) -> Result<Option<String>, SecretError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let encoded = std::fs::read_to_string(path)?;
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    let cipher = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| SecretError::Decrypt)?;
+    let plain = protect::unprotect(&cipher)?;
+    let text = String::from_utf8(plain).map_err(|_| SecretError::Decrypt)?;
+    Ok(Some(text))
+}
+
+fn write_secret_file(path: &Path, plaintext: &str) -> Result<(), SecretError> {
+    let cipher = protect::protect(plaintext.as_bytes())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cipher);
+    // 先写临时文件再改名：写到一半崩溃不会留下半个密文。
+    // Windows 的 rename 在目标已存在时会失败，所以先删旧文件
+    // （密文本身可重建，且删除与改名之间的窗口只会导致"没有 Key"，不会读到半个值）。
+    let tmp = path.with_extension("bin.tmp");
+    std::fs::write(&tmp, encoded)?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn remove_secret_file(path: &Path) -> Result<(), SecretError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -227,18 +332,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = SecretStore::new(dir.join("secret.bin"));
 
-        store.save("sk-test-key-value-0123456789").unwrap();
+        store.save("mimo", "sk-test-key-value-0123456789").unwrap();
         assert_eq!(
-            store.load().unwrap().as_deref(),
+            store.load("mimo").unwrap().as_deref(),
             Some("sk-test-key-value-0123456789")
         );
 
         // 磁盘上不能出现明文
-        let raw = std::fs::read_to_string(store.path()).unwrap();
+        let raw = std::fs::read_to_string(store.path_for("mimo")).unwrap();
         assert!(!raw.contains("sk-test-key-value"));
 
-        store.clear().unwrap();
-        assert_eq!(store.load().unwrap(), None);
+        store.clear("mimo").unwrap();
+        assert_eq!(store.load("mimo").unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -248,8 +353,78 @@ mod tests {
         let dir = unique_temp_dir("cuava-secret-enc");
         std::fs::create_dir_all(&dir).unwrap();
         let store = SecretStore::new(dir.join("secret.bin"));
-        let error = store.save("enc:abcdef==").unwrap_err();
+        let error = store.save("mimo", "enc:abcdef==").unwrap_err();
         assert!(matches!(error, SecretError::LegacyEncrypted));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 每个提供商的 Key 相互独立：切换不会串用，缺失也不回退。
+    #[cfg(windows)]
+    #[test]
+    fn keys_are_isolated_per_provider() {
+        let dir = unique_temp_dir("cuava-secret-isolation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SecretStore::new(&dir);
+
+        store.save("mimo", "sk-mimo-key").unwrap();
+        store.save("deepseek", "sk-deepseek-key").unwrap();
+
+        assert_eq!(store.load("mimo").unwrap().as_deref(), Some("sk-mimo-key"));
+        assert_eq!(
+            store.load("deepseek").unwrap().as_deref(),
+            Some("sk-deepseek-key")
+        );
+        // 没配置过的提供商必须返回 None，绝不能借用别家的 Key。
+        assert_eq!(store.load("my-gateway").unwrap(), None);
+        assert!(!store.has("my-gateway"));
+
+        // 清除一家不影响另一家（MiMo → DeepSeek → MiMo 仍可用）
+        store.clear("deepseek").unwrap();
+        assert_eq!(store.load("deepseek").unwrap(), None);
+        assert_eq!(store.load("mimo").unwrap().as_deref(), Some("sk-mimo-key"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR5 早期的单 Key 文件：只迁移到配置里明确记录的提供商，且不删原文件。
+    #[cfg(windows)]
+    #[test]
+    fn legacy_single_key_migrates_to_recorded_provider_only() {
+        let dir = unique_temp_dir("cuava-secret-migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("secret.bin");
+        // 用保存路径先造出与旧版一致的密文
+        write_secret_file(&legacy, "sk-legacy-single-key").unwrap();
+
+        let store = SecretStore::new(&dir);
+        assert!(
+            store.migrate_legacy("mimo").unwrap(),
+            "应迁移到记录的提供商"
+        );
+        assert_eq!(
+            store.load("mimo").unwrap().as_deref(),
+            Some("sk-legacy-single-key")
+        );
+        // 绝不猜测分配给别的提供商
+        assert_eq!(store.load("deepseek").unwrap(), None);
+        // 原文件保留（用户数据不静默删除）
+        assert!(legacy.is_file());
+
+        // 再迁一次不会再复制一遍，也不会覆盖目标已有的 Key
+        store.save("mimo", "sk-new-key").unwrap();
+        assert!(!store.migrate_legacy("mimo").unwrap());
+        assert_eq!(store.load("mimo").unwrap().as_deref(), Some("sk-new-key"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 提供商 id 会被收敛成安全的文件名，不能出现路径穿越。
+    #[test]
+    fn provider_id_is_sanitized_for_file_names() {
+        assert_eq!(sanitize_provider_id("mimo"), "mimo");
+        assert_eq!(sanitize_provider_id("my-gateway_v2"), "my-gateway_v2");
+        assert_eq!(sanitize_provider_id("../../etc"), "______etc");
+        assert_eq!(sanitize_provider_id("   "), "unknown");
+        assert_eq!(sanitize_provider_id("a/b"), "a_b");
     }
 }

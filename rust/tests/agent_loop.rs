@@ -298,7 +298,11 @@ impl FixedConfirmer {
 }
 
 impl Confirmer for FixedConfirmer {
-    fn confirm<'a>(&'a self, request: ConfirmRequest) -> ConfirmFuture<'a> {
+    fn confirm<'a>(
+        &'a self,
+        request: ConfirmRequest,
+        _cancel: &'a CancelToken,
+    ) -> ConfirmFuture<'a> {
         self.seen.lock().unwrap().push(request.tool.clone());
         let answer = if self.allow {
             ConfirmAnswer::allow_click()
@@ -313,7 +317,11 @@ impl Confirmer for FixedConfirmer {
 struct NeverConfirmer;
 
 impl Confirmer for NeverConfirmer {
-    fn confirm<'a>(&'a self, _request: ConfirmRequest) -> ConfirmFuture<'a> {
+    fn confirm<'a>(
+        &'a self,
+        _request: ConfirmRequest,
+        _cancel: &'a CancelToken,
+    ) -> ConfirmFuture<'a> {
         Box::pin(async {
             ConfirmAnswer {
                 allow: false,
@@ -1404,4 +1412,458 @@ async fn history_keeps_tool_pairs_across_turns() {
     assert!(last
         .iter()
         .any(|message| message["role"] == json!("user") && message["content"] == json!("第二轮")));
+}
+
+// ---------------------------------------------------------------------------
+// 同批工具调用里任意一项残缺 → 整批不执行
+// ---------------------------------------------------------------------------
+
+/// 一批里既有合法调用、又有参数坏掉的调用：**一个都不能执行**。
+#[tokio::test]
+async fn mixed_batch_with_one_broken_call_executes_nothing() {
+    let server = MockServer::start(Box::new(|attempt, _body| {
+        if attempt == 0 {
+            vec![
+                tool_delta(0, Some("call_ok"), Some("list_windows"), Some("{}")),
+                tool_delta(1, Some("call_bad"), Some("left_click"), Some("{oops")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else {
+            vec![text_delta("那我不点了。"), stop_event("stop"), done()]
+        }
+    }))
+    .await;
+
+    let tools = FakeTools::new();
+    let settings = settings_for("openai-compatible", &server.base_url);
+    let mut agent = Agent::new(
+        client(&settings),
+        tools.clone(),
+        agent_config(),
+        PermissionState::new(PermissionMode::Standard),
+    );
+    let mut history = Vec::new();
+    let (outcome, _) = run_turn(
+        &mut agent,
+        "点一下",
+        &mut history,
+        &FixedConfirmer::new(true),
+        &CancelToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        tools.call_count(),
+        0,
+        "同批有残缺调用时，工具执行次数必须为零"
+    );
+    assert!(
+        outcome
+            .steps
+            .iter()
+            .all(|step| step.text.contains("整批未执行") || step.text.contains("响应不完整")),
+        "每一步都该说明未执行：{:?}",
+        outcome.steps
+    );
+    let bodies = server.bodies();
+    let second = bodies[1]["messages"].as_array().unwrap();
+    assert!(
+        second.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .map(|text| text.contains("整批都没有执行"))
+                .unwrap_or(false)
+        }),
+        "必须把'整批没执行'如实告诉模型"
+    );
+}
+
+/// 一批里缺函数名的调用同样让整批作废。
+#[tokio::test]
+async fn batch_with_missing_function_name_executes_nothing() {
+    let server = MockServer::start(Box::new(|attempt, _body| {
+        if attempt == 0 {
+            vec![
+                tool_delta(0, Some("call_ok"), Some("list_windows"), Some("{}")),
+                tool_delta(1, Some("call_noname"), None, Some("{}")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else {
+            vec![text_delta("好。"), stop_event("stop"), done()]
+        }
+    }))
+    .await;
+
+    let tools = FakeTools::new();
+    let settings = settings_for("openai-compatible", &server.base_url);
+    let mut agent = Agent::new(
+        client(&settings),
+        tools.clone(),
+        agent_config(),
+        PermissionState::new(PermissionMode::Standard),
+    );
+    let mut history = Vec::new();
+    let _ = run_turn(
+        &mut agent,
+        "看看",
+        &mut history,
+        &FixedConfirmer::new(true),
+        &CancelToken::new(),
+    )
+    .await;
+
+    assert_eq!(tools.call_count(), 0, "缺函数名的调用让整批作废");
+}
+
+/// 完整的多工具批次仍然照常执行并配对（修复不能误伤正常路径）。
+#[tokio::test]
+async fn complete_multi_tool_batch_still_executes() {
+    let server = MockServer::start(Box::new(|attempt, _body| {
+        if attempt == 0 {
+            vec![
+                tool_delta(0, Some("c1"), Some("list_windows"), Some("{}")),
+                tool_delta(
+                    1,
+                    Some("c2"),
+                    Some("get_app_state"),
+                    Some("{\"app\":\"notepad\"}"),
+                ),
+                tool_delta(2, Some("c3"), Some("read_clipboard"), Some("{}")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else {
+            vec![text_delta("齐了。"), stop_event("stop"), done()]
+        }
+    }))
+    .await;
+
+    let tools = FakeTools::new();
+    let settings = settings_for("openai-compatible", &server.base_url);
+    let mut agent = Agent::new(
+        client(&settings),
+        tools.clone(),
+        agent_config(),
+        PermissionState::new(PermissionMode::PassThrough),
+    );
+    let mut history = Vec::new();
+    let (outcome, _) = run_turn(
+        &mut agent,
+        "都读一下",
+        &mut history,
+        &FixedConfirmer::new(true),
+        &CancelToken::new(),
+    )
+    .await;
+
+    assert!(!outcome.failed);
+    assert_eq!(tools.call_count(), 3);
+    let bodies = server.bodies();
+    let last = bodies.last().unwrap()["messages"].as_array().unwrap();
+    let ids: Vec<String> = last
+        .iter()
+        .filter(|message| message["role"] == json!("tool"))
+        .map(|message| message["tool_call_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec!["c1", "c2", "c3"], "三条结果都要配对");
+}
+
+// ---------------------------------------------------------------------------
+// 权限确认的请求关联与生命周期
+// ---------------------------------------------------------------------------
+
+/// 连续两次 ask：两次都必须真正各问一次，不能被上一次的答复顶掉。
+#[tokio::test]
+async fn repeated_confirm_clicks_do_not_grant_the_next_tool() {
+    let server = MockServer::start(Box::new(|attempt, _body| {
+        if attempt == 0 {
+            vec![
+                tool_delta(0, Some("c1"), Some("read_clipboard"), Some("{}")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else if attempt == 1 {
+            vec![
+                tool_delta(0, Some("c2"), Some("read_clipboard"), Some("{}")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else {
+            vec![text_delta("好。"), stop_event("stop"), done()]
+        }
+    }))
+    .await;
+
+    let tools = FakeTools::new();
+    let settings = settings_for("openai-compatible", &server.base_url);
+    let mut agent = Agent::new(
+        client(&settings),
+        tools.clone(),
+        agent_config(),
+        PermissionState::new(PermissionMode::Standard),
+    );
+    // 第一次允许、第二次拒绝：两次都必须**真正各问一次**。
+    let confirmer = ScriptedConfirmer::new(vec![true, false]);
+    let mut history = Vec::new();
+    let _ = run_turn(
+        &mut agent,
+        "读两次",
+        &mut history,
+        &confirmer,
+        &CancelToken::new(),
+    )
+    .await;
+
+    assert_eq!(confirmer.asked(), 2, "两次 ask 必须各问一次");
+    assert_eq!(tools.call_count(), 1, "只执行被允许的那一次");
+    assert_eq!(tools.names(), vec!["read_clipboard"]);
+}
+
+/// 取消令牌已置位时，确认环节按拒绝处理，不执行工具。
+#[tokio::test]
+async fn cancelled_turn_never_executes_pending_tool() {
+    let server = MockServer::start(Box::new(|attempt, _body| {
+        if attempt == 0 {
+            vec![
+                tool_delta(0, Some("c1"), Some("read_clipboard"), Some("{}")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else {
+            vec![text_delta("算了。"), stop_event("stop"), done()]
+        }
+    }))
+    .await;
+
+    let tools = FakeTools::new();
+    let settings = settings_for("openai-compatible", &server.base_url);
+    let mut agent = Agent::new(
+        client(&settings),
+        tools.clone(),
+        agent_config(),
+        PermissionState::new(PermissionMode::Standard),
+    );
+    let mut history = Vec::new();
+    let cancel = CancelToken::new();
+    // 确认器会在被调用时立刻取消回合，模拟"确认框还开着时点了退出"。
+    let confirmer = CancellingConfirmer::new(cancel.clone());
+    let (outcome, _) = run_turn(&mut agent, "读剪贴板", &mut history, &confirmer, &cancel).await;
+
+    assert!(outcome.cancelled);
+    assert_eq!(tools.call_count(), 0, "取消后不能执行等待中的工具");
+}
+
+/// 普通许可操作仍然不弹确认（修复不能把摩擦加回来）。
+#[tokio::test]
+async fn normal_tools_still_need_no_confirmation() {
+    let server = MockServer::start(Box::new(|attempt, _body| {
+        if attempt == 0 {
+            vec![
+                tool_delta(0, Some("c1"), Some("list_windows"), Some("{}")),
+                tool_delta(1, Some("c2"), Some("get_app_state"), Some("{}")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else {
+            vec![text_delta("好。"), stop_event("stop"), done()]
+        }
+    }))
+    .await;
+
+    let tools = FakeTools::new();
+    let settings = settings_for("openai-compatible", &server.base_url);
+    let mut agent = Agent::new(
+        client(&settings),
+        tools.clone(),
+        agent_config(),
+        PermissionState::new(PermissionMode::Standard),
+    );
+    let confirmer = ScriptedConfirmer::new(vec![]);
+    let mut history = Vec::new();
+    let _ = run_turn(
+        &mut agent,
+        "看看",
+        &mut history,
+        &confirmer,
+        &CancelToken::new(),
+    )
+    .await;
+
+    assert_eq!(confirmer.asked(), 0, "普通操作不该弹确认");
+    assert_eq!(tools.call_count(), 2);
+}
+
+/// 按剧本答复的确认器（记录被问了几次）。
+struct ScriptedConfirmer {
+    answers: Mutex<Vec<bool>>,
+    asked: AtomicUsize,
+}
+
+impl ScriptedConfirmer {
+    fn new(answers: Vec<bool>) -> Self {
+        Self {
+            answers: Mutex::new(answers),
+            asked: AtomicUsize::new(0),
+        }
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.load(Ordering::SeqCst)
+    }
+}
+
+impl Confirmer for ScriptedConfirmer {
+    fn confirm<'a>(
+        &'a self,
+        _request: ConfirmRequest,
+        _cancel: &'a CancelToken,
+    ) -> ConfirmFuture<'a> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let allow = {
+            let mut answers = self.answers.lock().unwrap();
+            if answers.is_empty() {
+                false
+            } else {
+                answers.remove(0)
+            }
+        };
+        Box::pin(async move {
+            if allow {
+                ConfirmAnswer::allow_click()
+            } else {
+                ConfirmAnswer::deny_click()
+            }
+        })
+    }
+}
+
+/// 被问到时立刻取消回合的确认器（模拟"确认框开着时点了退出"）。
+struct CancellingConfirmer {
+    token: CancelToken,
+}
+
+impl CancellingConfirmer {
+    fn new(token: CancelToken) -> Self {
+        Self { token }
+    }
+}
+
+impl Confirmer for CancellingConfirmer {
+    fn confirm<'a>(
+        &'a self,
+        _request: ConfirmRequest,
+        _cancel: &'a CancelToken,
+    ) -> ConfirmFuture<'a> {
+        self.token.cancel();
+        Box::pin(async { ConfirmAnswer::allow_click() })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 跨提供商的 reasoning_content
+// ---------------------------------------------------------------------------
+
+/// 切换提供商后，**不**把上一家的私有 reasoning_content 发给新端点，
+/// 但普通对话与工具调用链照常保留。
+#[tokio::test]
+async fn switching_provider_drops_foreign_reasoning_only() {
+    let server = MockServer::start(Box::new(|attempt, _body| {
+        if attempt == 0 {
+            vec![
+                reasoning_delta("旧提供商的思考"),
+                tool_delta(0, Some("c1"), Some("list_windows"), Some("{}")),
+                stop_event("tool_calls"),
+                done(),
+            ]
+        } else if attempt == 1 {
+            vec![text_delta("第一轮完。"), stop_event("stop"), done()]
+        } else {
+            vec![
+                reasoning_delta("新提供商的思考"),
+                text_delta("第二轮完。"),
+                stop_event("stop"),
+                done(),
+            ]
+        }
+    }))
+    .await;
+
+    let tools = FakeTools::new();
+    // 第一轮：mimo（会回传 reasoning_content）
+    let mimo = Settings {
+        provider_id: "mimo".to_string(),
+        base_url: server.base_url.clone(),
+        model: "mimo-v2.5-flash".to_string(),
+        ..Settings::default()
+    };
+    let mut config = agent_config();
+    config.echo_reasoning = true;
+    let mut agent = Agent::new(
+        client(&mimo),
+        tools.clone(),
+        config.clone(),
+        PermissionState::new(PermissionMode::Standard),
+    );
+    let mut history = Vec::new();
+    let _ = run_turn(
+        &mut agent,
+        "第一轮",
+        &mut history,
+        &FixedConfirmer::new(true),
+        &CancelToken::new(),
+    )
+    .await;
+
+    // 第二轮：切到 openai-compatible（标准端点，不认私有 reasoning 字段）
+    let plain = Settings {
+        provider_id: "openai-compatible".to_string(),
+        base_url: server.base_url.clone(),
+        model: "mock".to_string(),
+        ..Settings::default()
+    };
+    let mut agent = Agent::new(
+        client(&plain),
+        tools.clone(),
+        AgentConfig {
+            echo_reasoning: false,
+            ..config
+        },
+        PermissionState::new(PermissionMode::Standard),
+    );
+    let _ = run_turn(
+        &mut agent,
+        "第二轮",
+        &mut history,
+        &FixedConfirmer::new(true),
+        &CancelToken::new(),
+    )
+    .await;
+
+    let bodies = server.bodies();
+    let last = bodies.last().unwrap()["messages"].as_array().unwrap();
+
+    // 1) 来自 MiMo 的 reasoning_content 不得出现
+    for message in last {
+        if message["role"] == json!("assistant") {
+            assert!(
+                message.get("reasoning_content").is_none(),
+                "不能把上一家的私有 reasoning 发给新端点：{message}"
+            );
+        }
+    }
+    // 2) 但普通对话与工具链要保留
+    assert!(
+        last.iter()
+            .any(|message| message["role"] == json!("assistant")
+                && message["content"] == json!("第一轮完。")),
+        "普通对话记忆不能丢"
+    );
+    assert!(
+        last.iter()
+            .any(|message| message["role"] == json!("tool")
+                && message["tool_call_id"] == json!("c1")),
+        "工具调用链不能丢"
+    );
 }

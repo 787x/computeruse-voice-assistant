@@ -318,11 +318,22 @@ impl Settings {
     }
 
     /// 生成模型端点的档案（能力判定只在这里做一次）。
+    ///
+    /// 判定顺序（与旧版 `resolveCapability` 等价）：
+    ///  1. 内置提供商**声明了具体协议**（MiMo / DeepSeek）→ 以注册表为准，
+    ///     旧配置里残留的 hint 不得把官方端点带偏；
+    ///  2. 注册表里的「通用 OpenAI 兼容」条目本身没有协议声明 → 认用户显式填的 hint；
+    ///  3. 注册表里没有的自定义 id → 同样认 hint；
+    ///  4. 以上都没有 → 标准兼容协议（一个专属字段都不发）。
+    ///
+    /// 关键点：hint 只在**用户明确设成** `deepseek` / `mimo` 时生效，
+    /// 绝不根据模型名去猜协议。
     pub fn profile(&self) -> ProviderProfile {
         let capability = match get_provider(&self.provider_id) {
-            // 内置提供商的协议以注册表为准：旧配置里残留的 hint 不得把官方端点带偏。
-            Some(provider) => provider.capability,
-            None => match self.provider_hint {
+            // 只有真正声明了协议的提供商才压过 hint。
+            Some(provider) if provider.capability != Capability::Plain => provider.capability,
+            // 通用兼容条目 / 完全自定义的 id：用用户显式的协议提示。
+            Some(_) | None => match self.provider_hint {
                 ProviderHint::DeepSeek => Capability::DeepSeek,
                 ProviderHint::Mimo => Capability::Mimo,
                 ProviderHint::Auto => Capability::Plain,
@@ -523,6 +534,51 @@ mod tests {
         assert_eq!(plain.profile().capability, Capability::Plain);
     }
 
+    /// 自定义端点（`openai-compatible`）本身没有协议声明，必须认用户显式填的 hint。
+    #[test]
+    fn custom_provider_honours_explicit_hint() {
+        let base = Settings {
+            provider_id: "openai-compatible".to_string(),
+            base_url: "http://127.0.0.1:9000/v1".to_string(),
+            model: "m".to_string(),
+            ..Settings::default()
+        };
+
+        let auto = Settings {
+            provider_hint: ProviderHint::Auto,
+            ..base.clone()
+        };
+        assert_eq!(
+            auto.profile().capability,
+            Capability::Plain,
+            "没填 hint 时按标准兼容协议"
+        );
+
+        let mimo = Settings {
+            provider_hint: ProviderHint::Mimo,
+            ..base.clone()
+        };
+        assert_eq!(mimo.profile().capability, Capability::Mimo);
+
+        let deepseek = Settings {
+            provider_hint: ProviderHint::DeepSeek,
+            ..base
+        };
+        assert_eq!(deepseek.profile().capability, Capability::DeepSeek);
+    }
+
+    /// 绝不按模型名猜协议：换个像 DeepSeek 的模型名也不会改变能力判定。
+    #[test]
+    fn model_name_never_decides_capability() {
+        let settings = Settings {
+            provider_id: "openai-compatible".to_string(),
+            base_url: "http://127.0.0.1:9000/v1".to_string(),
+            model: "deepseek-flash".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(settings.profile().capability, Capability::Plain);
+    }
+
     #[test]
     fn local_small_window_wins_over_configured_1m() {
         let settings = Settings {
@@ -575,5 +631,60 @@ mod tests {
         assert!(!json.contains("api_key"));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.model, settings.model);
+    }
+
+    /// 环境变量覆盖是 README 里写明的用法，必须在真实取值链路上生效。
+    ///
+    /// 两个断言合并成一个测试：它们都改**进程级**环境变量，
+    /// 分成两个测试会并行跑、互相覆盖。
+    ///
+    /// `unsafe` 说明：Rust 2024 起 `std::env::set_var` 被标记为 unsafe
+    /// （多线程下修改环境不安全）。这里只出现在单元测试里，且整段串行；
+    /// 生产代码只**读**环境变量。Windows 上 `set_var` 是线程安全的，
+    /// 但仍按新签名显式标注。
+    #[test]
+    #[cfg(windows)]
+    fn env_overrides_apply_to_settings() {
+        #[allow(unsafe_code)]
+        // SAFETY: 单测内独占执行；生产代码不调用 set_var。
+        unsafe {
+            std::env::set_var("CUAVA_BASE_URL", "http://127.0.0.1:18080/v1");
+            std::env::set_var("CUAVA_MODEL", "mock-tool-use");
+            std::env::set_var("CUAVA_PROVIDER_HINT", "deepseek");
+        }
+
+        let mut settings = Settings::default();
+        apply_env_overrides(&mut settings);
+        assert_eq!(settings.base_url, "http://127.0.0.1:18080/v1");
+        assert_eq!(settings.model, "mock-tool-use");
+        assert_eq!(settings.provider_hint, ProviderHint::DeepSeek);
+        // hint 让自定义端点按 DeepSeek 协议发参数
+        let profile = Settings {
+            provider_id: "openai-compatible".to_string(),
+            ..settings.clone()
+        }
+        .profile();
+        assert_eq!(profile.capability, Capability::DeepSeek);
+
+        // 非法值不会覆盖已有配置（宁可用原地址，也不要发出打不出去的请求）
+        #[allow(unsafe_code)]
+        // SAFETY: 同上。
+        unsafe {
+            std::env::set_var("CUAVA_BASE_URL", "not-a-url");
+            std::env::set_var("CUAVA_MODEL", "   ");
+        }
+        let before_base = settings.base_url.clone();
+        let before_model = settings.model.clone();
+        apply_env_overrides(&mut settings);
+        assert_eq!(settings.base_url, before_base);
+        assert_eq!(settings.model, before_model);
+
+        #[allow(unsafe_code)]
+        // SAFETY: 同上。
+        unsafe {
+            std::env::remove_var("CUAVA_BASE_URL");
+            std::env::remove_var("CUAVA_MODEL");
+            std::env::remove_var("CUAVA_PROVIDER_HINT");
+        }
     }
 }

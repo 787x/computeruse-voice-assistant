@@ -133,6 +133,8 @@ export component AppWindow inherits Window {
     in-out property <string> confirm-label: "";
     in-out property <string> confirm-reason: "";
     in-out property <string> confirm-args: "";
+    // 本次确认的请求 id：点按钮时原样回传，避免上一次确认的重复点击串到下一次。
+    in-out property <int> confirm-request-id: 0;
 
     // ---- 回调（Rust 侧实现） ----
     callback send(text: string);
@@ -141,7 +143,7 @@ export component AppWindow inherits Window {
     callback save-settings(provider-index: int, base-url: string, model-name: string, api-key: string, permission-index: int);
     callback clear-api-key();
     callback provider-changed(provider-index: int);
-    callback confirm-decision(allow: bool);
+    callback confirm-decision(request-id: int, allow: bool);
     callback quit-app();
 
     // ---- 布局 ----
@@ -527,13 +529,13 @@ export component AppWindow inherits Window {
 
                     AppButton {
                         label: "拒绝";
-                        clicked => { root.confirm-decision(false); }
+                        clicked => { root.confirm-decision(root.confirm-request-id, false); }
                     }
 
                     AppButton {
                         label: "允许";
                         primary: true;
-                        clicked => { root.confirm-decision(true); }
+                        clicked => { root.confirm-decision(root.confirm-request-id, true); }
                     }
                 }
             }
