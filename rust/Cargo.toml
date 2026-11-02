@@ -1,0 +1,59 @@
+[package]
+name = "cuava"
+version = "0.1.0"
+edition = "2021"
+description = "Computer Use 语音助手 —— Rust + Slint 原生桌面程序（PR5：文本 Agent / CUA 闭环）"
+publish = false
+
+[lib]
+name = "cuava"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cuava"
+path = "src/main.rs"
+
+[dependencies]
+# UI：纯 Rust 原生渲染，不使用 Electron / Tauri / WebView。
+# 软件渲染器（renderer-winit-software）对虚拟机 / 无 GPU 环境更宽容。
+slint = { version = "1", default-features = false, features = [
+    "compat-1-2",
+    "std",
+    "backend-winit",
+    "renderer-winit-software",
+    "software-renderer-systemfonts",
+] }
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "process",
+    "io-util",
+    "sync",
+    "fs",
+] }
+# TLS 走 Windows 自带的 Schannel（reqwest 的 default-tls → native-tls → schannel）。
+# 这样不需要 aws-lc-rs / ring 这类要本地 C 工具链的加密库，
+# 也不会给"按文档就能构建"增加 NASM / OpenSSL 之类的隐性前置条件。
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
+
+[build-dependencies]
+slint-build = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "sync", "fs", "net"] }
+
+[profile.release]
+opt-level = 2
