@@ -39,8 +39,11 @@ pub enum UiCommand {
         api_key: String,
         permission_index: i32,
     },
-    /// 清除**当前提供商**的 Key。
-    ClearApiKey,
+    /// 清除**指定提供商**的 Key（界面当前选中的那一家）。
+    ///
+    /// 必须带 provider_id：设置页可以切到别家而不保存，
+    /// 那时"清除"应该作用于界面显示的那家，而不是已保存配置里的那家。
+    ClearApiKey(String),
     /// 切换提供商（界面据此回填地址与模型）。
     ProviderChanged(i32),
     /// 打开设置：按当前已保存的配置回填界面。
@@ -153,24 +156,32 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let tx = command_tx.clone();
-        window.on_clear_api_key(move || {
-            let _ = tx.send(UiCommand::ClearApiKey);
+        window.on_clear_api_key(move |provider_index| {
+            // 界面传的是下拉框里的索引，这里立刻翻译成 provider id：
+            // 命令在通道里排队期间用户可能又改了选择，先固定住目标。
+            let provider_id = provider_id_for_index(provider_index).to_string();
+            let _ = tx.send(UiCommand::ClearApiKey(provider_id));
         });
     }
     {
         let tx = command_tx.clone();
         let weak = window.as_weak();
+        let paths_for_key = paths.clone();
         window.on_provider_changed(move |index| {
             let _ = tx.send(UiCommand::ProviderChanged(index));
-            // 界面侧同步回填该提供商的默认地址/模型（用户仍可手改）。
+            let provider_id = provider_id_for_index(index).to_string();
+            // "该提供商有没有 Key" 要跟着下拉框变，否则界面会对着
+            // 一家没有 Key 的提供商显示"已保存"。这里只探测文件存在性，不读明文。
+            let has_key = SecretStore::new(paths_for_key.secret_file()).has(&provider_id);
             if let Some(window) = weak.upgrade() {
-                let id = provider_id_for_index(index);
-                if let Some(provider) = config::get_provider(id) {
+                // 同步回填该提供商的默认地址/模型（用户仍可手改）。
+                if let Some(provider) = config::get_provider(&provider_id) {
                     window.set_base_url(provider.base_url.into());
                     if !provider.default_model.is_empty() {
                         window.set_model_name(provider.default_model.into());
                     }
                 }
+                window.set_has_key(has_key);
             }
         });
     }
@@ -529,18 +540,22 @@ async fn run_worker(
             UiCommand::ProviderChanged(_index) => {
                 // 地址/模型由界面侧回填；这里不需要动作。
             }
-            UiCommand::ClearApiKey => {
-                let provider_id = settings.provider_id.clone();
+            UiCommand::ClearApiKey(provider_id) => {
                 match secret.clear(&provider_id) {
                     Ok(()) => {
+                        /*
+                         * 界面上的 `has-key` 永远表示"**当前选中**的提供商有没有 Key"。
+                         * 用户可能在设置页切到 DeepSeek（未保存）后清除 MiMo 的 Key，
+                         * 这时该显示 DeepSeek 自己的状态，而不是被清掉的那家。
+                         */
+                        let active_has_key = secret.has(&settings.provider_id);
+                        let endpoint = config::describe_endpoint(&settings, active_has_key);
                         let weak_ui = weak.clone();
                         let provider_id_ui = provider_id.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(window) = weak_ui.upgrade() {
-                                window.set_has_key(false);
-                                window.set_endpoint_text(
-                                    config::describe_endpoint(&Settings::default(), false).into(),
-                                );
+                                window.set_has_key(active_has_key);
+                                window.set_endpoint_text(endpoint.into());
                                 window.set_status(format!("已清除 {provider_id_ui} 的 Key").into());
                             }
                         });
@@ -699,6 +714,9 @@ struct SaveRequest {
 /// 关键规则：
 /// - 校验失败 / 写盘失败**都不更新**内存里的 `settings`，界面也拿不到"已保存"；
 /// - Key 只写到**目标提供商**名下；留空表示"不动该提供商的 Key"；
+/// - **先写配置、再写 Key**。反过来不行：先覆盖 Key 再回滚，
+///   会在回滚时把用户原有的 Key A 一起删掉（原来 Bug 就是这样丢数据的）。
+///   现在配置写失败时，Key 根本还没被动过，Key A 必然还在。
 /// - 任何错误都会如实回报界面，不假装成功。
 fn handle_save_settings(
     weak: &slint::Weak<AppWindow>,
@@ -721,36 +739,32 @@ fn handle_save_settings(
         }
     };
 
-    // Key：只有用户真的填了才写，且只写到**目标提供商**名下。
+    // 1) 先落盘配置。失败时 Key 还没动过，用户原来的 Key 完好无损。
+    if let Err(error) = config::save_settings(paths, &next) {
+        set_status(weak, &format!("保存设置失败：{error}"));
+        return false;
+    }
+
+    // 2) 配置已生效，再写 Key（只有用户真的填了才写，且只写到目标提供商名下）。
     let key_provider = next.provider_id.clone();
     let new_key = request.api_key.trim().to_string();
-    let key_written = if new_key.is_empty() {
-        false
-    } else {
-        match secret.save(&key_provider, &new_key) {
-            Ok(()) => true,
-            Err(error) => {
-                set_status(weak, &format!("Key 保存失败，设置未保存：{error}"));
-                return false;
-            }
-        }
-    };
-
-    match config::save_settings(paths, &next) {
-        Ok(()) => {
+    if !new_key.is_empty() {
+        if let Err(error) = secret.save(&key_provider, &new_key) {
+            /*
+             * 配置已经写成功了，但 Key 没写进去。
+             *
+             * 这里**不回滚配置**：配置本身是合法的、用户也确实想改，
+             * 回滚反而会让"地址/模型改了、Key 没改"这个更常见的意图落空。
+             * 如实告诉用户"设置已保存，但 Key 没保存"，并让界面保持 Key 未保存的状态。
+             */
             *settings = next;
-            true
-        }
-        Err(error) => {
-            // 配置写盘失败：把刚写进去的 Key 回滚掉，避免"Key 变了但配置没变"
-            // 这种半截状态。只在这次确实写入过新 Key 时才回滚。
-            if key_written {
-                let _ = secret.clear(&key_provider);
-            }
-            set_status(weak, &format!("保存设置失败：{error}"));
-            false
+            set_status(weak, &format!("设置已保存，但 Key 保存失败：{error}"));
+            return false;
         }
     }
+
+    *settings = next;
+    true
 }
 
 /// 把设置（与 Key 状态）推给界面。
@@ -875,13 +889,12 @@ async fn wait_turn(
                         apply_settings_to_ui(weak, settings, has_key);
                     }
                     Some(UiCommand::ProviderChanged(_)) => {}
-                    Some(UiCommand::ClearApiKey) => {
+                    Some(UiCommand::ClearApiKey(provider_id)) => {
                         /*
                          * 任务执行期间清除 Key：**真实执行**，不是只提示。
                          * 本轮已经在用启动时的端点快照（Key 已读进 LlmClient），
                          * 所以立即生效的是"下一轮不再带这个 Key"。
                          */
-                        let provider_id = settings.provider_id.clone();
                         match secret.clear(&provider_id) {
                             Ok(()) => {
                                 set_status(
@@ -1312,6 +1325,53 @@ mod tests {
         assert_eq!(settings.provider_id, before.provider_id);
         assert_eq!(settings.model, before.model);
         assert!(secret.load("mimo").unwrap().is_none(), "失败时不该写入 Key");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 已有 Key A → 输入 Key B → 配置写盘失败 → Key A 必须仍然可用。
+    ///
+    /// 这是原先最严重的数据丢失路径：旧实现"先覆盖 Key、配署失败再 clear()"，
+    /// 结果把用户原来的 Key A 也清掉了。现在先写配置，失败时 Key 压根没被碰过。
+    #[cfg(windows)]
+    #[test]
+    fn config_failure_keeps_previous_key_in_save_flow() {
+        let root = unique_test_root("worker-save-config-fail");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        secret.save("mimo", "sk-key-a").unwrap();
+
+        // 注入故障：占住配置的临时文件路径，让 save_settings 写临时文件失败
+        let tmp = paths.settings_file().with_extension("json.tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let ok = handle_save_settings(
+            &slint::Weak::default(),
+            &paths,
+            &secret,
+            &mut settings,
+            SaveRequest {
+                provider_index: 0,
+                base_url: "https://api.xiaomimimo.com/v1".to_string(),
+                model: "mimo-v2.6-pro".to_string(),
+                api_key: "sk-key-b".to_string(),
+                permission_index: 0,
+            },
+        );
+
+        assert!(!ok, "配置写失败必须返回 false");
+        assert_eq!(
+            settings.model, "mimo-v2.6-flash",
+            "内存配置不能被改成未落盘的值"
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(
+            secret.load("mimo").unwrap().as_deref(),
+            Some("sk-key-a"),
+            "Key B 没保存成功，Key A 也不能丢"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

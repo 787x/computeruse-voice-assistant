@@ -370,11 +370,14 @@ impl Agent {
 
             // ---- 只有残缺调用：一条都不执行 -----------------------------------
             if result.tool_calls.is_empty() {
-                messages.push(assistant_message_from(
+                // 与混合批次同理：没执行过，就不能在历史里留下"声明了却没结果"的调用。
+                let mut assistant = assistant_message_from(
                     &result,
                     self.config.echo_reasoning,
                     &self.llm.provider_id(),
-                ));
+                );
+                assistant.tool_calls.clear();
+                messages.push(assistant);
                 let names: Vec<String> = result
                     .broken_tool_calls
                     .iter()
@@ -443,13 +446,21 @@ impl Agent {
                         }
                     })
                     .collect();
-                // 只写有效的调用进 assistant 消息：残缺的调用不能出现在 tool_calls 里，
-                // 否则模型会以为那条调用已经被接受过。
-                messages.push(assistant_message_from(
+                /*
+                 * 写进历史的 assistant 消息**不能带任何 tool_calls**。
+                 *
+                 * 这一批一条都没执行；只要在 `tool_calls` 里留下 id，协议就要求
+                 * 后面必须跟一条对应的 `tool` 结果。留下"声明了却没结果"的调用，
+                 * 下一次请求会被严格端点判成非法（400），宽松端点也会把模型带偏。
+                 * 文字部分（模型已经说出口的话）保留，只把调用记录去掉。
+                 */
+                let mut assistant = assistant_message_from(
                     &result,
                     self.config.echo_reasoning,
                     &self.llm.provider_id(),
-                ));
+                );
+                assistant.tool_calls.clear();
+                messages.push(assistant);
                 messages.push(ChatMessage::internal_note(format!(
                     "（上一步这一批工具调用里有参数不完整或缺少函数名的调用（{}），整批都没有执行。请重新给出这一批调用的完整参数，或直接用一句话告诉用户做不到以及原因。）",
                     names.join("、")
@@ -673,9 +684,18 @@ fn sync_history(history: &mut Vec<ChatMessage>, messages: &[ChatMessage]) {
 }
 
 /// 取消时的收尾：丢弃本轮未完成的一切，不触发任何新工具。
+///
+/// 关键：取消可能发生在"一批工具调用**执行到一半**"。
+/// 那时 assistant 消息已经带着全部 `tool_calls` 进了历史，但只有前面的几条有结果。
+/// 直接把这样一段历史留到下一轮，就是"声明了却没结果"的协议错误。
+///
+/// 所以这里给**还没执行**的调用补一条明确的"未执行"结果：
+///  - 配对完整，下一轮请求合法；
+///  - 已完成的那些结果原样保留（已发生的操作不能被抹掉）；
+///  - 模型能看到"这几条因为中断没做"，不会误以为做过。
 fn cancelled(
     mut outcome: TurnOutcome,
-    messages: &mut [ChatMessage],
+    messages: &mut Vec<ChatMessage>,
     history: &mut Vec<ChatMessage>,
     emit: &(dyn Fn(AgentEvent) + Send + Sync),
     policy: ContextPolicy,
@@ -687,6 +707,7 @@ fn cancelled(
     if outcome.text.is_empty() {
         outcome.text = "已中断".to_string();
     }
+    backfill_unanswered_tool_calls(messages);
     outcome.context_tokens = estimate_request_tokens(messages, tools);
     outcome.context_window = policy.context_window;
     sync_history(history, messages);
@@ -694,6 +715,52 @@ fn cancelled(
         reason: "已中断".to_string(),
     });
     outcome
+}
+
+/// 给历史里"声明了但没有结果"的 `tool_calls` 补一条未执行说明。
+///
+/// 只补缺失的那些，已经有的结果一个都不动——已完成的执行结果必须保留。
+fn backfill_unanswered_tool_calls(messages: &mut Vec<ChatMessage>) {
+    // 先收集历史里所有已存在的 tool 结果 id。
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for message in messages.iter() {
+        if message.role == Role::Tool {
+            if let Some(id) = &message.tool_call_id {
+                answered.insert(id.clone());
+            }
+        }
+    }
+    /*
+     * 逐条补：`tool` 消息必须**紧跟**声明它的 assistant 之后，
+     * 不能统一追加到末尾——中间隔了别的消息就又是孤立结果。
+     * 这里从后往前插，插入位置不受后续改动影响。
+     */
+    let mut insertions: Vec<(usize, Vec<String>)> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != Role::Assistant || message.tool_calls.is_empty() {
+            continue;
+        }
+        let missing: Vec<String> = message
+            .tool_calls
+            .iter()
+            .map(|call| call.id.clone())
+            .filter(|id| !answered.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            insertions.push((index, missing));
+        }
+    }
+    for (index, missing) in insertions.into_iter().rev() {
+        let mut inserts: Vec<ChatMessage> = missing
+            .into_iter()
+            .map(|id| ChatMessage::tool_result(id, "（这一条因为中断没有执行。）"))
+            .collect();
+        // 插在 assistant 之后、它已有结果之前——顺序不影响协议，紧跟即可。
+        inserts.reverse();
+        for message in inserts {
+            messages.insert(index + 1, message);
+        }
+    }
 }
 
 /// 解析模型给的参数文本。解析失败返回空对象——但那种调用**不会**走到这里

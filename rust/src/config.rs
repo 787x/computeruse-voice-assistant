@@ -434,12 +434,33 @@ pub fn save_settings(paths: &AppPaths, settings: &Settings) -> Result<(), String
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
     std::fs::write(&tmp, text).map_err(|error| format!("写入配置失败：{error}"))?;
-    // Windows 的 rename 不会覆盖已存在的目标文件。
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|error| format!("提交配置失败：{error}"))?;
+
+    /*
+     * 提交：**绝不先删除唯一有效的配置文件**。
+     *
+     * Windows 的 rename 不能覆盖已有目标，之前的实现是"删旧 → 改名"；
+     * 改名失败时用户的配置文件就没了。现在先把旧文件降级为 `.bak`，
+     * 新文件上位成功后再删备份；失败则用备份还原。
+     */
+    if !path.exists() {
+        return std::fs::rename(&tmp, &path).map_err(|error| format!("提交配置失败：{error}"));
     }
-    std::fs::rename(&tmp, &path).map_err(|error| format!("提交配置失败：{error}"))?;
-    Ok(())
+
+    let backup = path.with_extension("json.bak");
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(&path, &backup).map_err(|error| format!("提交配置失败：{error}"))?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(error) => {
+            // 新配置没能上位：还原旧配置，用户原来的设置仍然有效。
+            let _ = std::fs::rename(&backup, &path);
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("提交配置失败：{error}"))
+        }
+    }
 }
 
 /// 供界面显示端点摘要（**不含密钥**）。

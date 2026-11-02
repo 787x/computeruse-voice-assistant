@@ -26,6 +26,16 @@ pub enum SecretError {
     LegacyEncrypted,
 }
 
+/// 迁移完成标记的文件名（放在 secrets 目录里）。
+///
+/// 为什么需要它：旧 `secret.bin` 迁移后**保留**作为备份（不删用户数据），
+/// 但只要它还在，"目标提供商没 Key" 就和"还没迁移过"长得一模一样。
+/// 没有标记的话，用户清除某个 Key 之后重启，就会被旧文件重新填回来——
+/// 用户的清除操作看起来"没生效"。
+///
+/// 标记里记下**迁移给了哪个提供商**：之后无论配置切到哪家，都不会再迁一次。
+const LEGACY_MIGRATION_MARKER: &str = ".legacy-migrated";
+
 /// 密钥仓库：**每个提供商一个** DPAPI 密文文件。
 ///
 /// 为什么按提供商分开（与旧版 `providerKeys` 同义）：同一份 `secret.bin` 存一个 Key，
@@ -34,11 +44,11 @@ pub enum SecretError {
 ///
 /// 布局：
 /// - `<root>/secrets/<provider-id>.bin`：按提供商的密文
-/// - `<root>/secret.bin`：PR5 早期版本的**单 Key** 文件（只读迁移来源）
+/// - `<root>/secrets/.legacy-migrated`：旧 Key 已迁移的标记（记下归属提供商）
+/// - `<root>/secret.bin`：PR5 早期版本的**单 Key** 文件（只读迁移来源，保留作备份）
 ///
-/// 迁移规则（只在 `migrate_legacy` 里做，且只做一次）：
-/// 把单 Key 分配给 `settings.json` 里**明确记录的那个 provider_id**，
-/// 不做任何猜测，也不删除原文件（用户随时可以回退）。
+/// 迁移规则（`migrate_legacy`）：把单 Key 分配给 `settings.json` 里**明确记录**的
+/// provider_id，做一次就写标记；不猜测归属、不删除原文件。
 pub struct SecretStore {
     dir: PathBuf,
     legacy_path: PathBuf,
@@ -71,6 +81,21 @@ impl SecretStore {
 
     pub fn legacy_path(&self) -> &Path {
         &self.legacy_path
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        self.dir.join(LEGACY_MIGRATION_MARKER)
+    }
+
+    /// 旧 Key 已经迁移给哪个提供商（`None` = 还没迁移过）。
+    pub fn legacy_migrated_to(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.marker_path()).ok()?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// 该提供商是否已有保存的 Key。
@@ -116,27 +141,58 @@ impl SecretStore {
             .collect()
     }
 
-    /// 把 PR5 早期的单 Key 文件迁移到 `provider_id` 名下。
+    /// 把 PR5 早期的单 Key 文件迁移到 `provider_id` 名下。**最多只做一次。**
     ///
+    /// 规则：
     /// - 只迁移到调用方**明确**给出的提供商（即 `settings.json` 里的 provider_id）；
-    /// - 目标已有 Key 时不覆盖（用户的新输入优先）；
+    /// - 已经迁移过（有标记）就什么都不做——重启、切换提供商、清除 Key 之后都不会重来；
+    /// - 目标已有 Key 时不覆盖（用户的新输入优先），但仍写标记，避免以后被旧文件回填；
     /// - 迁移后**保留**原文件，不删除用户数据；
-    /// - 解密失败（比如换了 Windows 用户）时返回错误，由调用方提示用户重填，
-    ///   而不是把坏数据搬过去。
+    /// - 解密失败时返回错误且**不写标记**：下次还能重试，也不会伪装成成功。
     ///
     /// 返回 `true` 表示这次真的迁移了一个 Key。
     pub fn migrate_legacy(&self, provider_id: &str) -> Result<bool, SecretError> {
-        if provider_id.trim().is_empty() || !self.legacy_path.is_file() {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
             return Ok(false);
         }
+        // 已经迁移过：无论配置现在指向哪家，都不再迁第二次。
+        if self.legacy_migrated_to().is_some() {
+            return Ok(false);
+        }
+        if !self.legacy_path.is_file() {
+            return Ok(false);
+        }
+        // 目标已经有 Key：说明用户在新版本里自己填过，旧文件不该覆盖它。
+        // 仍然写标记，这样以后清除该 Key 也不会被旧文件复活。
         if self.has(provider_id) {
+            self.write_marker(provider_id)?;
             return Ok(false);
         }
+
+        // 读失败会直接返回错误（不写标记）：下次启动仍可重试，且不会伪装成功。
         let Some(key) = read_secret_file(&self.legacy_path)? else {
             return Ok(false);
         };
-        self.save(provider_id, &key)?;
+        std::fs::create_dir_all(&self.dir)?;
+        /*
+         * 先写**标记**再写 Key。
+         *
+         * 反过来不行：Key 写成功、标记写失败时，函数返回 Err 但 Key 已经在盘上了；
+         * 下次启动没有标记，就可能把这把旧 Key 再迁给另一个提供商。
+         * 先写标记则最坏情况是"标记写了、Key 没写成"——用户看到迁移失败提示，
+         * 重填一次即可，绝不会把 Key 归错家。
+         */
+        self.write_marker(provider_id)?;
+        write_secret_file(&self.path_for(provider_id), &key)?;
         Ok(true)
+    }
+
+    /// 写迁移标记。失败必须让调用方知道——否则下次会重复迁移。
+    fn write_marker(&self, provider_id: &str) -> Result<(), SecretError> {
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.marker_path(), provider_id)?;
+        Ok(())
     }
 }
 
@@ -181,16 +237,43 @@ fn read_secret_file(path: &Path) -> Result<Option<String>, SecretError> {
 fn write_secret_file(path: &Path, plaintext: &str) -> Result<(), SecretError> {
     let cipher = protect::protect(plaintext.as_bytes())?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(cipher);
-    // 先写临时文件再改名：写到一半崩溃不会留下半个密文。
-    // Windows 的 rename 在目标已存在时会失败，所以先删旧文件
-    // （密文本身可重建，且删除与改名之间的窗口只会导致"没有 Key"，不会读到半个值）。
+    /*
+     * 写入策略：**绝不先删除唯一有效副本**。
+     *
+     * 之前是"写临时文件 → 删旧文件 → 改名"。Windows 上 rename 不能覆盖已有目标，
+     * 但这个顺序在改名失败时会把原 Key 连根拔掉——用户只是改个 Key，
+     * 结果原来那把也没了。
+     *
+     * 现在：
+     *  - 没有旧文件 → 直接改名上位；
+     *  - 有旧文件 → 先把旧文件降级为 `.bak`，再把临时文件改名为正式文件；
+     *    第二步失败时用备份还原。密文随时可从内存里的明文重新加密，
+     *    所以备份只是"这次操作失败不丢数据"的保险，不是长期存储。
+     */
     let tmp = path.with_extension("bin.tmp");
-    std::fs::write(&tmp, encoded)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    std::fs::write(&tmp, &encoded)?;
+
+    if !path.exists() {
+        std::fs::rename(&tmp, path)?;
+        return Ok(());
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+
+    let backup = path.with_extension("bin.bak");
+    let _ = remove_secret_file(&backup);
+    // 旧文件 → 备份。这一步失败说明旧文件动不了，直接放弃写入（原 Key 还在）。
+    std::fs::rename(path, &backup)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => {
+            let _ = remove_secret_file(&backup);
+            Ok(())
+        }
+        Err(error) => {
+            // 新文件没能上位：把旧文件放回原位，保证用户原来的 Key 仍然可用。
+            let _ = std::fs::rename(&backup, path);
+            let _ = remove_secret_file(&tmp);
+            Err(error.into())
+        }
+    }
 }
 
 fn remove_secret_file(path: &Path) -> Result<(), SecretError> {

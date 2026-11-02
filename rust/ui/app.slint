@@ -141,7 +141,9 @@ export component AppWindow inherits Window {
     callback cancel-turn();
     callback open-settings();
     callback save-settings(provider-index: int, base-url: string, model-name: string, api-key: string, permission-index: int);
-    callback clear-api-key();
+    // 带上界面当前选中的提供商索引：清除的是**用户看到的**那一家，
+    // 不是已保存配置里的那一家。
+    callback clear-api-key(provider-index: int);
     callback provider-changed(provider-index: int);
     callback confirm-decision(request-id: int, allow: bool);
     callback quit-app();
@@ -445,7 +447,7 @@ export component AppWindow inherits Window {
                     AppButton {
                         label: "清除已保存的 Key";
                         enabled: root.has-key;
-                        clicked => { root.clear-api-key(); }
+                        clicked => { root.clear-api-key(root.provider-index); }
                     }
 
                     Rectangle { horizontal-stretch: 1; }
