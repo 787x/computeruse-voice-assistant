@@ -6,14 +6,19 @@
 //!  3. 停止监听 / 取消 / 退出后，**迟到的识别结果必须丢弃**，
 //!     不能发送到新一轮，也不能触发工具。
 //!
-//! 第 3 条用「会话序号」实现：加载时记下 `session_id`，返回时再比一次。
-//! 序号对不上就直接丢弃——即使底层推理没能被 abort 回调立刻打断。
+//! 第 3 条有两道闸：协调器用「实例号 + 会话号」核对结果归属（正确性），
+//! 同时把 whisper 的 abort 回调接到取消标记上（尽快停下，属于优化）。
+//! 即使 abort 没被底层及时轮询，结果返回时仍会被归属核对丢弃。
+//!
+//! 后端选择：**用户请求**与**实际后端**是两件事。`ReadyInfo` 只回报实际
+//! 初始化成功的后端；请求了 GPU 但 CUDA 不可用时降级到同一模型的 CPU 并
+//! 带上原因，两者都失败则报错——不会出现「显示就绪但其实没有可用后端」。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self as std_mpsc, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
@@ -27,6 +32,7 @@ pub struct AsrConfig {
     pub model_path: PathBuf,
     pub language: AsrLanguage,
     pub threads: usize,
+    /// **用户请求**是否用 GPU。实际后端由 [`ReadyInfo`] 如实回报。
     pub use_gpu: bool,
     /// 提示词：中文场景给简体偏好 + 标点，减少 Whisper 混出繁体。
     pub initial_prompt: String,
@@ -34,10 +40,34 @@ pub struct AsrConfig {
 
 /// 本构建是否带 CUDA 后端。
 ///
-/// `cuda` 是可选 feature：不开启时即使设置里要求 GPU 也只能走 CPU。
-/// 这不是「降级到意外的东西」——界面会明确显示「本构建未启用 CUDA」。
+/// `cuda` 是默认 feature，但可以关掉（`--no-default-features`）。
+/// 关掉时即使设置里要求 GPU 也只能走 CPU：界面会明确显示原因。
 pub const fn gpu_compiled_in() -> bool {
     cfg!(feature = "cuda")
+}
+
+/// 实际用于推理的后端。**不是**用户期望值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrBackend {
+    Cpu,
+    Cuda,
+}
+
+impl AsrBackend {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
+
+    /// 给界面用的稳定状态码。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
 }
 
 impl AsrConfig {
@@ -49,11 +79,121 @@ impl AsrConfig {
             model_path,
             language: settings.language,
             threads: settings.resolved_threads(),
-            // 请求 GPU 但没有编进 CUDA 时不要真的去初始化 GPU：
-            // 那会在加载阶段失败，而不是「用 CPU 跑起来」。
-            use_gpu: settings.use_gpu && gpu_compiled_in(),
+            // 这里保存的是「用户请求」，不在这里偷偷按 feature 改值：
+            // 后端决策与「实际后端」的回报集中在 `load_context`。
+            use_gpu: settings.use_gpu,
             initial_prompt: default_initial_prompt(settings.language),
         }
+    }
+}
+
+/// 后端尝试计划（纯逻辑，可确定性测试）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendPlan {
+    /// 依次尝试的后端。
+    pub order: Vec<AsrBackend>,
+    /// 为什么没有尝试 GPU（CPU-only 构建 / 没有可用设备）；请求 GPU 时才有值。
+    pub gpu_unavailable: Option<String>,
+}
+
+/// 决定尝试哪些后端。
+///
+/// 关键点：**只有本构建带 CUDA 且确实有可用 GPU 设备时才去请求 GPU**。
+/// whisper.cpp 在请求 GPU 但找不到设备时不会让初始化失败，而是静默用 CPU；
+/// 那样「初始化成功」就不能证明在用 GPU。所以先用 ggml 的设备枚举确认。
+pub fn plan_backends(request_gpu: bool, compiled: bool, gpu_devices: usize) -> BackendPlan {
+    if !request_gpu {
+        return BackendPlan {
+            order: vec![AsrBackend::Cpu],
+            gpu_unavailable: None,
+        };
+    }
+    if !compiled {
+        return BackendPlan {
+            order: vec![AsrBackend::Cpu],
+            gpu_unavailable: Some("本构建未启用 CUDA".to_string()),
+        };
+    }
+    if gpu_devices == 0 {
+        return BackendPlan {
+            order: vec![AsrBackend::Cpu],
+            gpu_unavailable: Some("没有检测到可用的 CUDA 设备".to_string()),
+        };
+    }
+    BackendPlan {
+        order: vec![AsrBackend::Cuda, AsrBackend::Cpu],
+        gpu_unavailable: None,
+    }
+}
+
+/// 按计划依次尝试后端的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendSelection {
+    /// 实际初始化成功的后端。
+    pub backend: AsrBackend,
+    /// 前面尝试失败的原因（降级到 CPU 时给用户看）。
+    pub fallback_reason: Option<String>,
+}
+
+/// 依次尝试后端，返回第一个成功的；全部失败时把每次的原因拼成一条错误。
+///
+/// 抽成独立函数是为了能确定性地测「GPU 初始化失败 → CPU 接管」这条路，
+/// 而不需要在没有 GPU 的机器上真的制造一次 CUDA 故障。
+pub fn select_backend(
+    plan: &[AsrBackend],
+    mut attempt: impl FnMut(AsrBackend) -> Result<(), String>,
+) -> Result<BackendSelection, String> {
+    let mut failures: Vec<String> = Vec::new();
+    for backend in plan {
+        match attempt(*backend) {
+            Ok(()) => {
+                return Ok(BackendSelection {
+                    backend: *backend,
+                    fallback_reason: (!failures.is_empty()).then(|| failures.join("；")),
+                })
+            }
+            Err(reason) => failures.push(format!("{}：{reason}", backend.label())),
+        }
+    }
+    Err(failures.join("；"))
+}
+
+/// ggml 实际能看到的 GPU 设备数。
+///
+/// 为什么需要它，为什么只能用 `unsafe`：whisper.cpp 在 `use_gpu = true` 但找不到
+/// 设备时**不会**让初始化失败，而是静默退回 CPU 并只打一行日志。若只看
+/// 「初始化成功」就把后端报成 CUDA，等于把用户期望当成事实——这正是要避免的。
+/// whisper-rs 没有包装 `ggml_backend_dev_*`，所以这里直接调用同一份静态链接
+/// 进来的查询函数：
+///
+///  - 替代方案 A：信任初始化成功 → 会产生假的「CUDA」显示；
+///  - 替代方案 B：抓 whisper 的日志钩子 → 全局日志副作用 + 脆弱的字符串匹配；
+///  - 替代方案 C：开子进程跑 `nvidia-smi` → 多一个外部依赖，且它看到设备
+///    不等于 ggml/whisper 能看到可用设备。
+///
+/// 安全前提：只做设备枚举，不分配、不持有指针、不修改状态；索引严格来自
+/// `ggml_backend_dev_count()`。若上游改名/删除这些符号，会在**链接期**失败
+/// （构建错误），不会变成运行期的未定义行为。
+pub fn gpu_device_count() -> usize {
+    use whisper_rs_sys as sys;
+    // SAFETY: 见函数文档。`ggml_backend_dev_get` 在索引小于设备数时返回有效指针
+    // （或空指针，已判空）；设备指针只在本次调用内读取。
+    unsafe {
+        let count = sys::ggml_backend_dev_count();
+        let mut gpus = 0;
+        for index in 0..count {
+            let device = sys::ggml_backend_dev_get(index);
+            if device.is_null() {
+                continue;
+            }
+            let kind = sys::ggml_backend_dev_type(device);
+            if kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                || kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+            {
+                gpus += 1;
+            }
+        }
+        gpus
     }
 }
 
@@ -142,10 +282,33 @@ pub struct AsrWorker {
     last_completed: Arc<AtomicU64>,
 }
 
+/// 一次推理的取消标记（whisper 的 abort 回调会轮询它）。
+///
+/// 注意：abort 是**优化**，不是正确性依赖。底层可能在整个推理结束前才轮询，
+/// 也可能已经产出了半句文本；结果是否可用仍由协调器的归属核对决定。
+#[derive(Debug, Clone, Default)]
+pub struct InferenceCancel(Arc<AtomicBool>);
+
+impl InferenceCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 enum Request {
     Transcribe {
         session_id: u64,
         samples: Vec<f32>,
+        /// 让正在跑的推理尽快停下（取消/关麦时置位）。
+        cancel: InferenceCancel,
         /// 结果回传给谁（由语音协调器提供）。
         reply: ReplySink,
     },
@@ -178,18 +341,14 @@ impl AsrWorker {
         let join = std::thread::Builder::new()
             .name("cuava-asr".to_string())
             .spawn(move || {
-                let context = match load_context(&config) {
-                    Ok(context) => {
-                        let _ = ready_tx.send(Ok(ReadyInfo {
-                            use_gpu: config.use_gpu,
-                        }));
-                        context
-                    }
+                let (context, ready) = match load_context(&config) {
+                    Ok(loaded) => loaded,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                         return;
                     }
                 };
+                let _ = ready_tx.send(Ok(ready));
                 run_loop(context, &config, rx, last_for_thread);
             })
             .map_err(|error| AsrError::Load(format!("无法启动 ASR 线程：{error}")))?;
@@ -209,7 +368,9 @@ impl AsrWorker {
                 Err(error)
             }
             Err(_) => {
-                let _ = join.join();
+                // 线程在报告就绪前崩了。不要无限等：它要么已经结束，要么
+                // 卡在底层初始化里，界面上如实报错比堵住更安全。
+                join_bounded(join, DROP_JOIN_BUDGET);
                 Err(AsrError::Load("ASR 线程在报告就绪前退出了".to_string()))
             }
         }
@@ -220,12 +381,14 @@ impl AsrWorker {
         &self,
         session_id: u64,
         samples: Vec<f32>,
+        cancel: InferenceCancel,
         reply: ReplySink,
     ) -> Result<(), AsrError> {
         self.tx
             .send(Request::Transcribe {
                 session_id,
                 samples,
+                cancel,
                 reply,
             })
             .map_err(|_| AsrError::Stopped)
@@ -236,47 +399,130 @@ impl AsrWorker {
         self.last_completed.load(Ordering::Relaxed)
     }
 
-    /// 停止线程并释放模型。已经进入推理的请求会被 abort 回调尽快打断。
+    /// 停止线程并释放模型。
+    ///
+    /// `Shutdown` 会排在正在跑的推理之后；这里**有上限**地等待（见
+    /// [`join_bounded`]），超时就把线程分离。已经发生的推理无法从外部强杀，
+    /// 但结果不会再提交（协调器按归属丢弃），模型也会在推理结束时释放。
     pub fn shutdown(mut self) {
         let _ = self.tx.send(Request::Shutdown);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            join_bounded(join, SHUTDOWN_JOIN_BUDGET);
         }
     }
+}
+
+/// 显式停止时最多等多久（覆盖一次正常推理的收尾）。
+const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(3);
+/// Drop 时最多等多久：关麦/退出不该因为一句推理卡住界面。
+const DROP_JOIN_BUDGET: Duration = Duration::from_millis(300);
+
+/// 有上限地 join 一个线程：超时就分离（进程退出时回收）。
+///
+/// `std::thread::JoinHandle` 没有超时接口，这里用 `is_finished()` 轮询。
+/// 返回 `true` 表示线程已经结束并被 join。
+fn join_bounded(join: std::thread::JoinHandle<()>, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while !join.is_finished() {
+        if Instant::now() >= deadline {
+            // 分离：线程会在推理结束后自行退出并释放模型/上下文。
+            // 不无限等待，避免关麦或退出卡住工作线程。
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = join.join();
+    true
 }
 
 impl Drop for AsrWorker {
     fn drop(&mut self) {
         let _ = self.tx.send(Request::Shutdown);
         if let Some(join) = self.join.take() {
-            // 不能无限等：底层推理若卡住，交给进程退出回收。
-            // 但正常情况（abort 回调生效）会很快结束。
-            let _ = join.join();
+            // 正常情况（推理已结束或 abort 生效）会很快退出；
+            // 否则分离线程，由它自己收尾——这里绝不无限等待。
+            join_bounded(join, DROP_JOIN_BUDGET);
         }
     }
 }
 
-/// 线程就绪时回报的最小信息（是否走 GPU 由界面显示）。
-#[derive(Debug, Clone)]
+/// 线程就绪时回报的**实际**后端。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyInfo {
-    pub use_gpu: bool,
+    /// 真正初始化成功的后端。
+    pub backend: AsrBackend,
+    /// 降级原因：请求了 GPU 但 CUDA 不可用（构建未启用 / 无设备 / 初始化失败）。
+    pub fallback_reason: Option<String>,
 }
 
-fn load_context(config: &AsrConfig) -> Result<WhisperContext, AsrError> {
+/// 加载模型并确定实际后端：先按计划尝试，失败再降级。
+///
+/// 模型文件本身不可用（不存在/损坏）时**不降级**——那是真正的错误，
+/// 不是「GPU 不可用」，必须如实报出来。
+fn load_context(config: &AsrConfig) -> Result<(WhisperContext, ReadyInfo), AsrError> {
     if !config.model_path.is_file() {
         return Err(AsrError::Load(format!(
             "模型文件不存在：{}",
             config.model_path.display()
         )));
     }
+
+    // 只有真的要请求 GPU 时才去探测设备（CPU-only 构建里这次调用也不会发生）。
+    let gpu_devices = if config.use_gpu && gpu_compiled_in() {
+        gpu_device_count()
+    } else {
+        0
+    };
+    let plan = plan_backends(config.use_gpu, gpu_compiled_in(), gpu_devices);
+    let mut loaded: Option<WhisperContext> = None;
+    let selection = select_backend(&plan.order, |backend| {
+        match open_context(&config.model_path, backend) {
+            Ok(context) => {
+                loaded = Some(context);
+                Ok(())
+            }
+            Err(reason) => Err(reason),
+        }
+    })
+    .map_err(|reason| {
+        AsrError::Load(format!(
+            "无法加载 Whisper 模型 {}：{reason}",
+            config.model_path.display()
+        ))
+    })?;
+
+    let Some(context) = loaded else {
+        // select_backend 成功时必然已经写入上下文；这里只是不假设。
+        return Err(AsrError::Load(format!(
+            "无法加载 Whisper 模型 {}：没有可用的推理后端",
+            config.model_path.display()
+        )));
+    };
+
+    // 只有实际在用 CPU 时才带上降级原因；用上 GPU 时不解释「为什么不是 GPU」。
+    let fallback_reason = if selection.backend == AsrBackend::Cpu {
+        selection.fallback_reason.or(plan.gpu_unavailable)
+    } else {
+        None
+    };
+    Ok((
+        context,
+        ReadyInfo {
+            backend: selection.backend,
+            fallback_reason,
+        },
+    ))
+}
+
+/// 按指定后端打开 whisper 上下文。
+fn open_context(path: &Path, backend: AsrBackend) -> Result<WhisperContext, String> {
     let mut params = WhisperContextParameters::default();
-    params.use_gpu(config.use_gpu);
-    WhisperContext::new_with_params(&config.model_path, params).map_err(|error| {
-        let detail = match error {
-            WhisperError::InitError => "无法初始化（文件损坏、格式不兼容，或缺少 CUDA 运行库）",
-            other => return AsrError::Load(format!("{other:?}")),
-        };
-        AsrError::Load(format!("{detail}：{}", config.model_path.display()))
+    params.use_gpu(backend == AsrBackend::Cuda);
+    WhisperContext::new_with_params(path, params).map_err(|error| match error {
+        WhisperError::InitError => {
+            "初始化失败（模型损坏/格式不兼容，或缺少 CUDA 运行库）".to_string()
+        }
+        other => format!("{other:?}"),
     })
 }
 
@@ -292,9 +538,15 @@ fn run_loop(
             Request::Transcribe {
                 session_id,
                 samples,
+                cancel,
                 reply,
             } => {
-                let result = transcribe(&context, config, session_id, &samples);
+                // 排队期间就被取消：连推理都不启动，直接回报停止。
+                let result = if cancel.is_cancelled() {
+                    Err(AsrError::Stopped)
+                } else {
+                    transcribe_controlled(&context, config, session_id, &samples, Some(&cancel))
+                };
                 last_completed.store(session_id, Ordering::Relaxed);
                 reply(result);
             }
@@ -302,12 +554,27 @@ fn run_loop(
     }
 }
 
-/// 同步执行一次识别。供工作线程与离线测试共用。
+/// 同步执行一次识别。供离线测试与基准共用（不带取消）。
 pub fn transcribe(
     context: &WhisperContext,
     config: &AsrConfig,
     session_id: u64,
     samples: &[f32],
+) -> Result<Transcript, AsrError> {
+    transcribe_controlled(context, config, session_id, samples, None)
+}
+
+/// 同步执行一次识别，可选地接入取消标记。
+///
+/// `cancel` 会被装到 whisper 的 abort 回调上：底层在解码步之间轮询它，
+/// 置位后尽快结束。这是**优化**——被取消时可能仍返回半句文本，
+/// 调用方必须再用会话归属核对一次。
+fn transcribe_controlled(
+    context: &WhisperContext,
+    config: &AsrConfig,
+    session_id: u64,
+    samples: &[f32],
+    cancel: Option<&InferenceCancel>,
 ) -> Result<Transcript, AsrError> {
     if samples.is_empty() {
         return Ok(Transcript {
@@ -339,6 +606,18 @@ pub fn transcribe(
     params.set_language(config.language.whisper_language());
     if !config.initial_prompt.is_empty() {
         params.set_initial_prompt(&config.initial_prompt);
+    }
+    // 取消/关麦时尽快停下：whisper 会在解码步之间轮询这个回调。
+    // 它不能强杀线程，也不保证立即返回——所以结果仍然要按归属核对。
+    //
+    // 这里必须传 **boxed trait object**，不能传裸闭包：whisper-rs 0.16 的
+    // `set_abort_callback_safe` 把 user_data 还原成 `*mut F`（F 是泛型参数），
+    // 而实际存进去的是 `Box<dyn FnMut() -> bool>`。传裸闭包时 F 是闭包类型，
+    // 布局对不上，回调会读到垃圾值并随机中止推理（实测表现为每次识别都以
+    // `GenericError(-6)` 失败）。传 `Box<dyn FnMut() -> bool>` 时两者一致。
+    if let Some(cancel) = cancel.cloned() {
+        let abort: Box<dyn FnMut() -> bool> = Box::new(move || cancel.is_cancelled());
+        params.set_abort_callback_safe(abort);
     }
 
     let started = Instant::now();
@@ -372,36 +651,6 @@ pub fn tidy(text: &str) -> String {
         .join(" ")
         .trim()
         .to_string()
-}
-
-/// 用回调驱动的取消标志包装一次识别（供已经放到独立线程里的长期任务使用）。
-///
-/// 说明：本 PR 的 ASR 工作线程是串行队列，取消通过「结果过期丢弃」保证正确性；
-/// 这个 abort 标志用于**尽快**结束正在跑的推理，属于优化而非正确性依赖。
-pub struct AbortFlag(Arc<AtomicBool>);
-
-impl AbortFlag {
-    pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
-
-    pub fn abort(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    pub fn clear(&self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-
-    pub fn is_aborted(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for AbortFlag {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// 把一段 16k 单声道 PCM 存成 WAV（**只用于测试/基准**，运行期录音不落盘）。
@@ -539,6 +788,98 @@ mod tests {
             no_speech: vec![],
         };
         assert!(!transcript.is_submittable());
+    }
+
+    /// 后端计划：四种组合都必须给出「实际可尝试」的顺序，而不是用户期望。
+    #[test]
+    fn backend_plan_matches_availability() {
+        // 用户没要求 GPU：只走 CPU，也不需要解释。
+        let plan = plan_backends(false, true, 2);
+        assert_eq!(plan.order, vec![AsrBackend::Cpu]);
+        assert_eq!(plan.gpu_unavailable, None);
+
+        // CPU-only 构建：即使要求 GPU 也只走 CPU，并说明原因。
+        let plan = plan_backends(true, false, 0);
+        assert_eq!(plan.order, vec![AsrBackend::Cpu]);
+        assert!(plan.gpu_unavailable.unwrap().contains("CUDA"));
+
+        // 构建带 CUDA 但没有可用设备：不请求 GPU（whisper 会静默退回 CPU）。
+        let plan = plan_backends(true, true, 0);
+        assert_eq!(plan.order, vec![AsrBackend::Cpu]);
+        assert!(plan.gpu_unavailable.unwrap().contains("设备"));
+
+        // 有可用设备：先 CUDA，CPU 作为回退。
+        let plan = plan_backends(true, true, 1);
+        assert_eq!(plan.order, vec![AsrBackend::Cuda, AsrBackend::Cpu]);
+        assert_eq!(plan.gpu_unavailable, None);
+    }
+
+    /// GPU 初始化失败 → 同一模型的 CPU 接管，并带上原因。
+    #[test]
+    fn gpu_failure_falls_back_to_cpu_with_reason() {
+        let mut tried = Vec::new();
+        let selection = select_backend(&[AsrBackend::Cuda, AsrBackend::Cpu], |backend| {
+            tried.push(backend);
+            match backend {
+                AsrBackend::Cuda => Err("CUDA 初始化失败".to_string()),
+                AsrBackend::Cpu => Ok(()),
+            }
+        })
+        .expect("CPU 成功后必须返回选择结果");
+        assert_eq!(tried, vec![AsrBackend::Cuda, AsrBackend::Cpu]);
+        assert_eq!(selection.backend, AsrBackend::Cpu);
+        assert!(selection.fallback_reason.unwrap().contains("CUDA"));
+    }
+
+    /// 两者都失败：如实报错，不能假装就绪。
+    #[test]
+    fn both_backends_failing_is_an_error() {
+        let error = select_backend(&[AsrBackend::Cuda, AsrBackend::Cpu], |backend| {
+            Err(format!("{} 不可用", backend.label()))
+        })
+        .unwrap_err();
+        assert!(error.contains("CUDA") && error.contains("CPU"), "{error}");
+    }
+
+    /// 直接用上 GPU 时不需要「降级原因」。
+    #[test]
+    fn gpu_success_has_no_fallback_reason() {
+        let selection = select_backend(&[AsrBackend::Cuda], |_| Ok(())).expect("CUDA 成功");
+        assert_eq!(selection.backend, AsrBackend::Cuda);
+        assert_eq!(selection.fallback_reason, None);
+    }
+
+    /// 模型文件不存在：立刻报错，不能出现「线程起来了但其实没模型」。
+    /// 这不是「GPU 不可用」，不该被后端回退掩盖。
+    #[test]
+    fn missing_model_is_an_explicit_error() {
+        let config = AsrConfig {
+            model_path: std::path::PathBuf::from("definitely-not-here/ggml-missing.bin"),
+            language: AsrLanguage::Chinese,
+            threads: 2,
+            use_gpu: true,
+            initial_prompt: String::new(),
+        };
+        let message = match AsrWorker::start(config) {
+            Ok(_) => panic!("模型文件不存在时必须报错，不能假装就绪"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("模型文件不存在"), "{message}");
+    }
+
+    /// CPU-only 构建里 ggml 不该报出任何 GPU 设备（否则会误以为能上 GPU）。
+    #[test]
+    fn gpu_device_probe_matches_build() {
+        if gpu_compiled_in() {
+            // 带 CUDA 的构建：这台机器可能有、也可能没有可用 GPU，只打印实测值，
+            // 不把「本机有显卡」写成测试断言。
+            eprintln!(
+                "本构建带 CUDA，ggml 可见 GPU 设备数：{}",
+                gpu_device_count()
+            );
+            return;
+        }
+        assert_eq!(gpu_device_count(), 0, "CPU-only 构建不应看到 GPU 设备");
     }
 
     #[test]

@@ -4,20 +4,21 @@
 //! `transcribe()` 拿出来，方便和 faster-whisper 对照：
 //!
 //! ```powershell
-//! # CPU 基线
+//! # 默认构建（带 CUDA；需要 CUDA Toolkit，见 README）
 //! cargo build --release --example whisper_bench
 //! .\target\release\examples\whisper_bench.exe assets\test\asr-zh.wav 8 3
 //!
-//! # CUDA（需要 CUDA Toolkit；见 README）
-//! cargo build --release --features cuda --example whisper_bench
+//! # CPU-only
+//! cargo build --release --no-default-features --example whisper_bench
 //! ```
 //!
 //! 输出是 JSON（一行），字段与 `tools/bench-whisper.mjs` 的期望一致。
+//! `cuda` 字段表示**实际**用的后端：请求了 GPU 但机器上没有可用设备时会如实为 false。
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use cuava::voice::asr::{read_wav_16k, transcribe, AsrConfig};
+use cuava::voice::asr::{gpu_compiled_in, gpu_device_count, read_wav_16k, transcribe, AsrConfig};
 use cuava::voice::settings::{AsrLanguage, VoiceSettings};
 
 fn main() {
@@ -48,9 +49,10 @@ fn main() {
     let config = AsrConfig::from_settings(&settings, model.clone());
 
     // 冷启动：模型加载单独计时（与「端点后转录延迟」区分开）。
+    let use_gpu = gpu_compiled_in() && settings.use_gpu && gpu_device_count() > 0;
     let load_start = Instant::now();
     let mut params = whisper_rs::WhisperContextParameters::default();
-    params.use_gpu(cuava::voice::asr::gpu_compiled_in() && settings.use_gpu);
+    params.use_gpu(use_gpu);
     let context = whisper_rs::WhisperContext::new_with_params(&model, params).expect("加载模型");
     let load_ms = load_start.elapsed().as_millis();
 
@@ -70,7 +72,7 @@ fn main() {
     let payload = serde_json::json!({
         "engine": "whisper.cpp",
         "model": model.display().to_string(),
-        "cuda": cuava::voice::asr::gpu_compiled_in(),
+        "cuda": use_gpu,
         "loadMs": load_ms,
         "threads": threads,
         "wav": wav.display().to_string(),

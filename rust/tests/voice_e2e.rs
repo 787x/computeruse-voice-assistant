@@ -337,13 +337,15 @@ fn real_session_from_wake_to_final_text() {
 ///
 /// 这条专门防一个已经踩过的时序缺陷：如果 ASR 回调在投递结果后立刻把
 /// 「当前会话」清零，工作线程稍后处理事件时会把它判成过期，
-/// **所有**语音指令都会被静默丢弃。这里断言结果送达后会话号仍然有效，
+/// **所有**语音指令都会被静默丢弃。这里断言结果送达后会话归属仍然有效，
 /// 由接收方（工作线程）接受后再清零。
+///
+/// 顺带断言「实际后端」：CPU-only 构建必须报 CPU 并带原因；
+/// 带 CUDA 的构建如果报 CUDA，就不能同时带降级原因（否则自相矛盾）。
 #[test]
 fn asr_worker_delivers_final_and_keeps_session_until_consumed() {
-    use cuava::voice::asr::AsrWorker;
-    use cuava::voice::coordinator::{is_current_session, ActiveSession};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use cuava::voice::asr::{AsrBackend, AsrWorker, InferenceCancel};
+    use cuava::voice::coordinator::{ActiveSession, VoiceTurn};
     use std::sync::mpsc;
 
     let (Some(model), Some(wav)) = (
@@ -359,18 +361,41 @@ fn asr_worker_delivers_final_and_keeps_session_until_consumed() {
         ..Default::default()
     };
     let config = AsrConfig::from_settings(&settings, model);
-    let (worker, _ready) = AsrWorker::start(config).expect("启动 ASR 线程");
+    let (worker, ready) = AsrWorker::start(config).expect("启动 ASR 线程");
+    eprintln!(
+        "实际后端：{:?}（降级原因：{:?}）",
+        ready.backend, ready.fallback_reason
+    );
+    if !cuava::voice::asr::gpu_compiled_in() {
+        assert_eq!(ready.backend, AsrBackend::Cpu, "CPU-only 构建必须报 CPU");
+        assert!(
+            ready.fallback_reason.is_some(),
+            "CPU-only 构建要说明为什么不是 CUDA"
+        );
+    }
+    if ready.backend == AsrBackend::Cuda {
+        assert!(
+            ready.fallback_reason.is_none(),
+            "用上 GPU 时不该同时挂着降级原因"
+        );
+    }
 
-    let active: ActiveSession = std::sync::Arc::new(AtomicU64::new(9));
+    let turn = VoiceTurn {
+        instance: 1,
+        session: 9,
+    };
+    let active = ActiveSession::new();
+    active.begin(turn);
     let (tx, rx) = mpsc::channel();
     let active_for_reply = active.clone();
     worker
         .submit(
-            9,
+            turn.session,
             read_wav_16k(&wav).unwrap(),
+            InferenceCancel::new(),
             Box::new(move |result| {
                 // 与协调器回调同样的检查：结果必须仍属于当前会话。
-                let current = is_current_session(&active_for_reply, 9);
+                let current = active_for_reply.is_current(turn);
                 let _ = tx.send((result.map(|t| t.text), current));
             }),
         )
@@ -384,11 +409,11 @@ fn asr_worker_delivers_final_and_keeps_session_until_consumed() {
     assert!(!text.is_empty());
     assert!(
         still_current,
-        "结果送达时会话号必须仍然有效（否则工作线程会丢弃它）"
+        "结果送达时会话归属必须仍然有效（否则工作线程会丢弃它）"
     );
 
     // 接收方消费后清零：同一会话的重复结果不再被接受。
-    active.store(0, Ordering::SeqCst);
-    assert!(!is_current_session(&active, 9));
+    active.clear();
+    assert!(!active.is_current(turn));
     worker.shutdown();
 }

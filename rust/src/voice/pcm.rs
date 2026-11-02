@@ -32,15 +32,19 @@ pub fn downmix_interleaved(samples: &[f32], channels: usize) -> Vec<f32> {
 
 /// 有符号整型样本转 `[-1, 1]` 浮点。
 ///
-/// `bits` 是**有效位深**（i16 为 16、i24 为 24），不是存储宽度：
+/// `bits` 是**有效位深**（i16 为 16、i24 为 24、i64 为 64），不是存储宽度：
 /// CPAL 的 `I24` 用 4 字节存 24 位有效数据，按 32 位归一化会让音量小 256 倍。
+///
+/// 64 位也必须真的换算：以前 `bits > 32` 直接返回 0.0，`I64` 设备会得到
+/// **整段全零**的音频——VAD 永远不触发、KWS 永远听不到，而且没有任何报错。
+/// 用 `f64` 的 2 的幂做分母（对 2^n 精确），64 位也能线性归一化。
 pub fn int_to_float(value: i64, bits: u32) -> f32 {
-    if bits == 0 || bits > 32 {
+    if bits == 0 || bits > 64 {
         return 0.0;
     }
     // 除以 2^(bits-1) 而不是 2^(bits-1)-1：负数端点也能落到 -1.0，
     // 并保持线性（用 max 归一化会让正负半轴增益不一致）。
-    let scale = (1i64 << (bits - 1)) as f64;
+    let scale = 2f64.powi(bits as i32 - 1);
     (value as f64 / scale).clamp(-1.0, 1.0) as f32
 }
 
@@ -222,6 +226,39 @@ mod tests {
         // 越界/非法位深不 panic。
         assert_eq!(int_to_float(1, 0), 0.0);
         assert_eq!(int_to_float(i64::MAX, 16), 1.0);
+    }
+
+    /// **回归**：64 位整型样本不能静默变成全零。
+    ///
+    /// CPAL 的 `I64` 采样格式会走到这里；以前 `bits > 32` 直接返回 0.0，
+    /// 于是整段音频是静音，表现为「麦克风没坏但永远听不到」。
+    #[test]
+    fn int64_samples_are_not_silently_zero() {
+        assert_eq!(int_to_float(0, 64), 0.0);
+        assert_eq!(int_to_float(i64::MIN, 64), -1.0);
+        assert!((int_to_float(i64::MAX, 64) - 1.0).abs() < 1e-6);
+        // 半幅：2^62 对应 0.5
+        assert!((int_to_float(1i64 << 62, 64) - 0.5).abs() < 1e-6);
+        // 小信号也必须保留（不是被 clamp 或截断成 0）
+        assert!(int_to_float(1i64 << 30, 64) > 0.0);
+
+        // 所有整数位深在「中点」都必须给出非零幅度：
+        // 任何一个变成 0 都意味着该采样格式的音频是静音。
+        for bits in [8u32, 16, 24, 32, 64] {
+            let half = if bits == 64 {
+                1i64 << 62
+            } else {
+                1i64 << (bits - 2)
+            };
+            let value = int_to_float(half, bits);
+            assert!(
+                (value - 0.5).abs() < 1e-6,
+                "{bits} 位半幅应当映射到 0.5，实际 {value}"
+            );
+        }
+
+        // 超过 64 位不是任何真实设备格式：仍然返回 0，但不会 panic。
+        assert_eq!(int_to_float(i64::MAX, 65), 0.0);
     }
 
     #[test]

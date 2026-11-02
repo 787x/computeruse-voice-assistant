@@ -33,7 +33,7 @@ Python 或 faster-whisper。没有 Python 环境时就如实报告「未执行�
 # 1) whisper.cpp 侧（同一台机器、同一模型）
 cd rust
 cargo build --release --example whisper_bench
-# GPU 版：cargo build --release --features cuda --example whisper_bench
+# CPU-only 版：cargo build --release --no-default-features --example whisper_bench
 $env:CUAVA_WHISPER_MODEL = "D:\path\to\ggml-small.bin"
 .\target\release\examples\whisper_bench.exe ..\assets\test\asr-zh.wav 8 5
 

@@ -23,6 +23,6 @@ pub mod vad;
 
 pub use coordinator::{
     ActiveSession, CaptureInfoForUi, Coordinator, CoordinatorConfig, RejectReason, SharedSink,
-    VoiceEvent, VoiceHandle, VoiceState,
+    VoiceEvent, VoiceEventKind, VoiceHandle, VoiceInstance, VoiceState, VoiceTurn,
 };
 pub use settings::{AsrLanguage, VoicePaths, VoiceSettings};
