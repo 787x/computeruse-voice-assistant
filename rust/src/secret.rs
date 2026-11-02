@@ -141,14 +141,20 @@ impl SecretStore {
             .collect()
     }
 
-    /// 把 PR5 早期的单 Key 文件迁移到 `provider_id` 名下。**最多只做一次。**
+    /// 把 PR5 早期的单 Key 文件迁移到 `provider_id` 名下。
     ///
     /// 规则：
     /// - 只迁移到调用方**明确**给出的提供商（即 `settings.json` 里的 provider_id）；
-    /// - 已经迁移过（有标记）就什么都不做——重启、切换提供商、清除 Key 之后都不会重来；
-    /// - 目标已有 Key 时不覆盖（用户的新输入优先），但仍写标记，避免以后被旧文件回填；
+    /// - 迁移成功后写标记，之后重启、切换提供商、清除 Key 都不会重来；
+    /// - 目标已有 Key 时不覆盖（用户的新输入优先），写标记防止以后被旧文件回填；
     /// - 迁移后**保留**原文件，不删除用户数据；
-    /// - 解密失败时返回错误且**不写标记**：下次还能重试，也不会伪装成成功。
+    /// - **失败可重试**：只有 Key 与标记**都写成功**才算完成。
+    ///
+    /// 写入顺序是「先 Key、后标记」，失败时会**撤销 Key**：
+    ///  - 先写标记的旧做法有个死结——标记写成功、Key 写失败时，
+    ///    下次启动会以为"已迁移"，于是永远不再重试，用户的旧 Key 就此丢失；
+    ///  - 现在最坏情况是"Key 写了但标记没写成"：撤销 Key 后状态回到迁移前，
+    ///    下次启动可以安全重试，且重试目标仍是同一个 provider_id（不会归错家）。
     ///
     /// 返回 `true` 表示这次真的迁移了一个 Key。
     pub fn migrate_legacy(&self, provider_id: &str) -> Result<bool, SecretError> {
@@ -164,27 +170,25 @@ impl SecretStore {
             return Ok(false);
         }
         // 目标已经有 Key：说明用户在新版本里自己填过，旧文件不该覆盖它。
-        // 仍然写标记，这样以后清除该 Key 也不会被旧文件复活。
+        // 写标记，这样以后清除该 Key 也不会被旧文件复活。
         if self.has(provider_id) {
             self.write_marker(provider_id)?;
             return Ok(false);
         }
 
-        // 读失败会直接返回错误（不写标记）：下次启动仍可重试，且不会伪装成功。
+        // 读失败直接返回错误（不写任何东西）：下次启动仍可重试。
         let Some(key) = read_secret_file(&self.legacy_path)? else {
             return Ok(false);
         };
         std::fs::create_dir_all(&self.dir)?;
-        /*
-         * 先写**标记**再写 Key。
-         *
-         * 反过来不行：Key 写成功、标记写失败时，函数返回 Err 但 Key 已经在盘上了；
-         * 下次启动没有标记，就可能把这把旧 Key 再迁给另一个提供商。
-         * 先写标记则最坏情况是"标记写了、Key 没写成"——用户看到迁移失败提示，
-         * 重填一次即可，绝不会把 Key 归错家。
-         */
-        self.write_marker(provider_id)?;
+
+        // 1) 先写 Key。
         write_secret_file(&self.path_for(provider_id), &key)?;
+        // 2) 再写标记。标记失败要撤销刚写的 Key，让状态回到"可重试"。
+        if let Err(error) = self.write_marker(provider_id) {
+            let _ = remove_secret_file(&self.path_for(provider_id));
+            return Err(error);
+        }
         Ok(true)
     }
 

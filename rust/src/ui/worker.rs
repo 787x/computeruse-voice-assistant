@@ -82,21 +82,45 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let paths = AppPaths::resolve();
     let secret = SecretStore::new(paths.secret_file());
 
-    // 初次加载：把当前配置灌进界面。
-    let mut settings = config::load_settings(&paths).unwrap_or_else(|error| {
-        eprintln!("[config] {error}");
-        Settings::default()
-    });
+    /*
+     * 初次加载配置。
+     *
+     * 文件损坏时**不**回退默认配置：那会让程序用一个用户从没配过的端点发请求，
+     * 并在下次保存时把那份（也许只是暂时读不了的）真实配置覆盖掉。
+     * 这里如实报错、停在只读状态，也不做旧 Key 迁移——
+     * 迁移需要"配置里明确记录的提供商"，配置读不出来就没有这个依据。
+     */
+    let mut settings = match config::load_settings(&paths) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("[config] {error}");
+            seed_ui_with_load_error(&window, &paths, &error.to_string());
+            window.run()?;
+            return Ok(());
+        }
+    };
     // 旧版单 Key 数据：只迁移到配置里**明确记录**的提供商，不猜测、不删除。
-    if let Ok(true) = secret.migrate_legacy(&settings.provider_id) {
-        eprintln!(
+    // 迁移失败要让用户看得见——它是"旧 Key 还在不在"的唯一线索。
+    let mut migration_error: Option<String> = None;
+    match secret.migrate_legacy(&settings.provider_id) {
+        Ok(true) => eprintln!(
             "[secret] 已把旧版单 Key 迁移到提供商 {}",
             settings.provider_id
-        );
+        ),
+        Ok(false) => {}
+        Err(error) => {
+            // 迁移失败不影响启动（用户仍可手动重填 Key），但必须让他知道：
+            // 否则旧 Key "看起来消失了"，而实际上还能重试。
+            eprintln!("[secret] 旧 Key 迁移失败：{error}");
+            migration_error = Some(error.to_string());
+        }
     }
     config::apply_env_overrides(&mut settings);
     let has_key = secret.has(&settings.provider_id);
     seed_ui(&window, &settings, has_key);
+    if let Some(error) = migration_error {
+        window.set_status(format!("旧 Key 迁移失败：{error}").into());
+    }
 
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
 
@@ -273,6 +297,38 @@ fn seed_ui(window: &AppWindow, settings: &Settings, has_key: bool) {
     window.set_endpoint_text(config::describe_endpoint(settings, has_key).into());
     window.set_entries(ModelRc::new(VecModel::from(Vec::<ChatEntry>::new())));
     window.set_tools(ModelRc::new(VecModel::from(Vec::<ToolCard>::new())));
+}
+
+/// 配置读不出来时的界面：把错误原文显示出来，**不伪造一份默认配置**。
+///
+/// 刻意什么都不预填（地址/模型留空、不显示端点摘要）：
+/// 填上默认值会让用户以为"配置就是这个"，然后在保存时把它当真写回去，
+/// 把原本那份（也许只是暂时读不了的）配置覆盖掉。
+fn seed_ui_with_load_error(window: &AppWindow, paths: &AppPaths, message: &str) {
+    window.set_entries(ModelRc::new(VecModel::from(Vec::<ChatEntry>::new())));
+    window.set_tools(ModelRc::new(VecModel::from(Vec::<ToolCard>::new())));
+    window.set_busy(false);
+    window.set_provider_index(0);
+    window.set_base_url("".into());
+    window.set_model_name("".into());
+    window.set_api_key_input("".into());
+    window.set_has_key(false);
+    window.set_settings_open(false);
+    window.set_confirm_open(false);
+    window.set_endpoint_text("配置未加载".into());
+    window.set_context_text(format!("配置文件位置：{}", paths.settings_file().display()).into());
+    window.set_status(format!("配置无法读取：{message}").into());
+    push_entry(
+        window,
+        "系统",
+        &format!(
+            "配置文件读不出来，程序已停止加载配置。\n\n{message}\n\n\
+             为了不覆盖你的设置，程序不会自动使用默认配置，也不会迁移旧版 Key。\n\
+             修复或删除上面那个文件后重启即可。"
+        ),
+        "",
+        "#fdeeee",
+    );
 }
 
 /// 把 `#rrggbb` 解析成颜色；解析失败退回中性灰（绝不因为配色问题让界面崩掉）。
@@ -544,18 +600,22 @@ async fn run_worker(
                 match secret.clear(&provider_id) {
                     Ok(()) => {
                         /*
-                         * 界面上的 `has-key` 永远表示"**当前选中**的提供商有没有 Key"。
-                         * 用户可能在设置页切到 DeepSeek（未保存）后清除 MiMo 的 Key，
-                         * 这时该显示 DeepSeek 自己的状态，而不是被清掉的那家。
+                         * 设置页的 `has-key` 表示"**设置页当前选中**的提供商有没有 Key"。
+                         *
+                         * 用户点"清除"时，界面选中的就是 `provider_id`（命令携带的就是它），
+                         * 所以状态要按它算——不能用 `settings.provider_id`：
+                         * 那是**已保存**的那家，用户可能刚切走还没保存，两者不是一回事。
+                         *
+                         * 主界面的端点摘要反映的是**实际生效**的配置，
+                         * 所以它继续按 `settings` 算，不跟着未保存的选择走。
                          */
-                        let active_has_key = secret.has(&settings.provider_id);
-                        let endpoint = config::describe_endpoint(&settings, active_has_key);
+                        let view = view_after_clear(&secret, &settings, &provider_id);
                         let weak_ui = weak.clone();
                         let provider_id_ui = provider_id.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(window) = weak_ui.upgrade() {
-                                window.set_has_key(active_has_key);
-                                window.set_endpoint_text(endpoint.into());
+                                window.set_has_key(view.selected_has_key);
+                                window.set_endpoint_text(view.endpoint_summary.into());
                                 window.set_status(format!("已清除 {provider_id_ui} 的 Key").into());
                             }
                         });
@@ -707,6 +767,34 @@ struct SaveRequest {
     model: String,
     api_key: String,
     permission_index: i32,
+}
+
+/// 清除某个提供商的 Key 之后，界面该怎么更新。
+///
+/// 两个显示位置含义不同，不能混用同一个 provider：
+///  - **设置页的 `has-key`** 反映"设置页**当前选中**的提供商有没有 Key"。
+///    用户点"清除"时选中的就是 `cleared_provider`，所以按它算。
+///    用已保存的 `settings.provider_id` 会答错——用户可能刚切走还没保存。
+///  - **主界面端点摘要** 反映"实际生效的配置"，所以仍按 `settings` 算，
+///    不跟着未保存的界面选择走。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClearedKeyView {
+    /// 设置页应当显示的 has-key。
+    selected_has_key: bool,
+    /// 主界面应当显示的端点摘要。
+    endpoint_summary: String,
+}
+
+fn view_after_clear(
+    secret: &SecretStore,
+    settings: &Settings,
+    cleared_provider: &str,
+) -> ClearedKeyView {
+    ClearedKeyView {
+        selected_has_key: secret.has(cleared_provider),
+        // 生效摘要看的是已保存的配置，与界面上未保存的选择无关。
+        endpoint_summary: config::describe_endpoint(settings, secret.has(&settings.provider_id)),
+    }
 }
 
 /// 应用一次设置保存。返回 `true` 表示配置已落盘。
@@ -894,13 +982,27 @@ async fn wait_turn(
                          * 任务执行期间清除 Key：**真实执行**，不是只提示。
                          * 本轮已经在用启动时的端点快照（Key 已读进 LlmClient），
                          * 所以立即生效的是"下一轮不再带这个 Key"。
+                         *
+                         * 界面反馈与空闲路径保持一致：状态按被清除的那家（= 界面选中那家）算，
+                         * 端点摘要仍按已生效的配置算。
                          */
                         match secret.clear(&provider_id) {
                             Ok(()) => {
-                                set_status(
-                                    weak,
-                                    &format!("已清除 {provider_id} 的 Key（从下一轮生效）"),
-                                );
+                                let view = view_after_clear(secret, settings, &provider_id);
+                                let weak_ui = weak.clone();
+                                let provider_id_ui = provider_id.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(window) = weak_ui.upgrade() {
+                                        window.set_has_key(view.selected_has_key);
+                                        window.set_endpoint_text(view.endpoint_summary.into());
+                                        window.set_status(
+                                            format!(
+                                                "已清除 {provider_id_ui} 的 Key（从下一轮生效）"
+                                            )
+                                            .into(),
+                                        );
+                                    }
+                                });
                             }
                             Err(error) => {
                                 set_status(weak, &format!("清除 Key 失败：{error}"));
@@ -1294,6 +1396,98 @@ mod tests {
         // 磁盘上也读得到新值（这就是"下次打开设置显示最新值"的依据）
         let reloaded = config::load_settings(&paths).unwrap();
         assert_eq!(reloaded.model, "deepseek-v4-pro");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 清除界面选中的提供商后：
+    /// 设置页按**选中**的那家显示，主界面摘要按**已保存**的配置显示。
+    #[cfg(windows)]
+    #[test]
+    fn clear_updates_selected_state_not_saved_state() {
+        let root = unique_test_root("worker-clear-selected");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+
+        // 已保存的配置是 mimo，两家都有 Key
+        let saved = Settings {
+            provider_id: "mimo".to_string(),
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            model: "mimo-v2.6-flash".to_string(),
+            ..Settings::default()
+        };
+        secret.save("mimo", "sk-mimo").unwrap();
+        secret.save("deepseek", "sk-deepseek").unwrap();
+
+        // 用户在设置页切到 deepseek（未保存），点清除
+        secret.clear("deepseek").unwrap();
+        let view = view_after_clear(&secret, &saved, "deepseek");
+
+        assert!(
+            !view.selected_has_key,
+            "设置页显示的是选中那家（deepseek），它刚被清掉，应当显示'未保存'"
+        );
+        assert!(
+            view.endpoint_summary.contains("Key 已保存"),
+            "主界面摘要反映已生效的 mimo 配置，它仍有 Key：{}",
+            view.endpoint_summary
+        );
+        assert_eq!(
+            secret.load("mimo").unwrap().as_deref(),
+            Some("sk-mimo"),
+            "已保存那家的 Key 不能被动到"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 清除的正是已保存的那家：设置页与摘要都显示"未保存"。
+    #[cfg(windows)]
+    #[test]
+    fn clear_saved_provider_updates_both_views() {
+        let root = unique_test_root("worker-clear-saved");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+
+        let saved = Settings {
+            provider_id: "mimo".to_string(),
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            model: "mimo-v2.6-flash".to_string(),
+            ..Settings::default()
+        };
+        secret.save("mimo", "sk-mimo").unwrap();
+        secret.clear("mimo").unwrap();
+
+        let view = view_after_clear(&secret, &saved, "mimo");
+        assert!(!view.selected_has_key);
+        assert!(
+            view.endpoint_summary.contains("未保存 Key"),
+            "生效摘要也应当反映出来：{}",
+            view.endpoint_summary
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 清除一家不影响另一家：选中的那家状态变，另一家 Key 不动。
+    #[cfg(windows)]
+    #[test]
+    fn clearing_one_provider_spares_the_other_in_view() {
+        let root = unique_test_root("worker-clear-spare");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let saved = Settings {
+            provider_id: "mimo".to_string(),
+            ..Settings::default()
+        };
+        secret.save("mimo", "sk-mimo").unwrap();
+        secret.save("deepseek", "sk-deepseek").unwrap();
+
+        secret.clear("deepseek").unwrap();
+        assert!(!view_after_clear(&secret, &saved, "deepseek").selected_has_key);
+        // 切回 mimo 看：它还在
+        assert!(view_after_clear(&secret, &saved, "mimo").selected_has_key);
+        assert_eq!(secret.load("mimo").unwrap().as_deref(), Some("sk-mimo"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

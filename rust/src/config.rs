@@ -413,16 +413,52 @@ impl AppPaths {
 
 /// 读取设置：文件不存在 → 默认值。**解析失败不回退默认**，而是报错，
 /// 免得用户以为自己的设置还在、实际却静默换成默认端点。
-pub fn load_settings(paths: &AppPaths) -> Result<Settings, String> {
+/// 读取设置的失败原因。
+///
+/// 为什么要把"没有文件"和"读不了"分开：这两种情况对调用方的决定完全不同。
+///  - 没有文件 → 全新安装，用默认配置继续，**可以**做旧 Key 迁移；
+///  - 读不了（损坏/权限/IO 错误）→ 用户本来有配置，绝不能悄悄换成默认值，
+///    更不能拿默认的 provider_id 去给旧 Key 定归属。
+#[derive(Debug)]
+pub enum LoadError {
+    /// 配置文件存在，但读不出来或解析不了。**不要回退默认配置**。
+    Corrupt(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// 读取设置：文件不存在 → 默认值（全新安装）。
+///
+/// **解析/读取失败不回退默认**，而是返回 `LoadError::Corrupt`：
+/// 用默认配置继续跑，会一边把请求打到用户没配过的端点，一边在下次保存时
+/// 覆盖掉那份（可能只是暂时读不了的）真实配置。
+pub fn load_settings(paths: &AppPaths) -> Result<Settings, LoadError> {
     let path = paths.settings_file();
     if !path.is_file() {
         return Ok(Settings::default());
     }
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|error| format!("读取配置失败（{}）：{error}", path.display()))?;
-    let parsed: Settings = serde_json::from_str(&raw)
-        .map_err(|error| format!("配置文件无法解析（{}）：{error}", path.display()))?;
-    Ok(parsed)
+    let raw = std::fs::read_to_string(&path).map_err(|error| {
+        LoadError::Corrupt(format!(
+            "读取配置失败（{}）：{error}。\n\
+             为避免覆盖你的设置，程序不会用默认配置继续运行。\
+             可以修复或删除该文件后重启。",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&raw).map_err(|error| {
+        LoadError::Corrupt(format!(
+            "配置文件无法解析（{}）：{error}。\n\
+             为避免覆盖你的设置，程序不会用默认配置继续运行。\
+             可以修复或删除该文件后重启。",
+            path.display()
+        ))
+    })
 }
 
 /// 原子写入设置。

@@ -212,7 +212,15 @@ impl Agent {
 
         for step in 1..=self.config.max_steps.max(1) {
             if cancel.is_cancelled() {
-                return cancelled(outcome, &mut messages, history, emit, policy, &tools);
+                return cancelled(
+                    outcome,
+                    &mut messages,
+                    history,
+                    emit,
+                    policy,
+                    &tools,
+                    &std::collections::HashSet::new(),
+                );
             }
 
             // 每次发请求前压一次。没到 90% 会立刻返回（只花一次估算）。
@@ -249,7 +257,15 @@ impl Agent {
             let result = match chat {
                 Ok(result) => result,
                 Err(LlmError::Aborted) => {
-                    return cancelled(outcome, &mut messages, history, emit, policy, &tools);
+                    return cancelled(
+                        outcome,
+                        &mut messages,
+                        history,
+                        emit,
+                        policy,
+                        &tools,
+                        &std::collections::HashSet::new(),
+                    );
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -262,7 +278,15 @@ impl Agent {
             };
 
             if cancel.is_cancelled() {
-                return cancelled(outcome, &mut messages, history, emit, policy, &tools);
+                return cancelled(
+                    outcome,
+                    &mut messages,
+                    history,
+                    emit,
+                    policy,
+                    &tools,
+                    &std::collections::HashSet::new(),
+                );
             }
 
             let step = step as usize;
@@ -494,9 +518,26 @@ impl Agent {
             ));
 
             let mut pending_images: Vec<ChatMessage> = Vec::new();
+            /*
+             * 本批里"已经把动作发出去、但还没拿到结果"的调用 id。
+             *
+             * CUA 工具一旦把命令写进 PowerShell 的 stdin，桌面就可能已经动了；
+             * 这时取消拿到的是 `Cancelled`，我们**无法判断**那一下到底生效没有。
+             * 记下来，取消收尾时据此写"结果未知"，而不是谎称"没执行"。
+             */
+            let mut dispatched: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for call in result.tool_calls.clone() {
                 if cancel.is_cancelled() {
-                    return cancelled(outcome, &mut messages, history, emit, policy, &tools);
+                    return cancelled(
+                        outcome,
+                        &mut messages,
+                        history,
+                        emit,
+                        policy,
+                        &tools,
+                        &dispatched,
+                    );
                 }
                 let args = parse_args(&call.arguments);
                 emit(AgentEvent::ToolStart {
@@ -510,7 +551,16 @@ impl Agent {
                     .check(&call.name, &args, Some(confirmer), cancel)
                     .await;
                 if cancel.is_cancelled() {
-                    return cancelled(outcome, &mut messages, history, emit, policy, &tools);
+                    // 确认阶段被取消：工具**没有**发出去，确定未执行。
+                    return cancelled(
+                        outcome,
+                        &mut messages,
+                        history,
+                        emit,
+                        policy,
+                        &tools,
+                        &dispatched,
+                    );
                 }
                 if decision.denied() {
                     let denied = format!("已拒绝：{}", decision.reason);
@@ -532,10 +582,20 @@ impl Agent {
                 }
 
                 // ---- 执行 -------------------------------------------------
+                // 从这里开始，动作有可能已经到达桌面：先登记为"已发起"。
+                dispatched.insert(call.id.clone());
                 let started = std::time::Instant::now();
                 let executed = self.tools.invoke(&call.name, &args, cancel).await;
                 if cancel.is_cancelled() {
-                    return cancelled(outcome, &mut messages, history, emit, policy, &tools);
+                    return cancelled(
+                        outcome,
+                        &mut messages,
+                        history,
+                        emit,
+                        policy,
+                        &tools,
+                        &dispatched,
+                    );
                 }
                 match executed {
                     Ok(execution) => {
@@ -586,6 +646,13 @@ impl Agent {
                     }
                     Err(error) => {
                         let message = if error.is_cancelled() {
+                            /*
+                             * 工具在**执行途中**被取消。
+                             *
+                             * 命令可能已经写进了 PowerShell（桌面可能已经动了），
+                             * 但我们没拿到结果——这条留在 `dispatched` 里，
+                             * 收尾时写"状态未知"，不能声称没执行。
+                             */
                             return cancelled(
                                 outcome,
                                 &mut messages,
@@ -593,6 +660,7 @@ impl Agent {
                                 emit,
                                 policy,
                                 &tools,
+                                &dispatched,
                             );
                         } else {
                             format!("工具执行失败：{}", error.user_message())
@@ -653,7 +721,15 @@ impl Agent {
                 }
                 Err(LlmError::Aborted) => {
                     messages.remove(note_index);
-                    return cancelled(outcome, &mut messages, history, emit, policy, &tools);
+                    return cancelled(
+                        outcome,
+                        &mut messages,
+                        history,
+                        emit,
+                        policy,
+                        &tools,
+                        &std::collections::HashSet::new(),
+                    );
                 }
                 Err(error) => {
                     messages.remove(note_index);
@@ -689,10 +765,12 @@ fn sync_history(history: &mut Vec<ChatMessage>, messages: &[ChatMessage]) {
 /// 那时 assistant 消息已经带着全部 `tool_calls` 进了历史，但只有前面的几条有结果。
 /// 直接把这样一段历史留到下一轮，就是"声明了却没结果"的协议错误。
 ///
-/// 所以这里给**还没执行**的调用补一条明确的"未执行"结果：
-///  - 配对完整，下一轮请求合法；
-///  - 已完成的那些结果原样保留（已发生的操作不能被抹掉）；
-///  - 模型能看到"这几条因为中断没做"，不会误以为做过。
+/// 所以这里给还没结果的调用补一条说明——但**不能一律写"没执行"**：
+/// CUA 工具只要把命令写进了 PowerShell，桌面就可能已经动了，
+/// 而我们没拿到响应，无法判断那一下生效没有。三种状态分开写：
+///  - `dispatched` 里有：**已发起、结果未知**（既不能说没执行，也不能说成功）；
+///  - 不在 `dispatched` 里：**确定未发起**（权限没放行 / 还没轮到它）；
+///  - 已有真实结果的：原样保留，一个字都不改。
 fn cancelled(
     mut outcome: TurnOutcome,
     messages: &mut Vec<ChatMessage>,
@@ -700,6 +778,7 @@ fn cancelled(
     emit: &(dyn Fn(AgentEvent) + Send + Sync),
     policy: ContextPolicy,
     tools: &[Value],
+    dispatched: &std::collections::HashSet<String>,
 ) -> TurnOutcome {
     outcome.cancelled = true;
     outcome.failed = true;
@@ -707,7 +786,7 @@ fn cancelled(
     if outcome.text.is_empty() {
         outcome.text = "已中断".to_string();
     }
-    backfill_unanswered_tool_calls(messages);
+    backfill_unanswered_tool_calls(messages, dispatched);
     outcome.context_tokens = estimate_request_tokens(messages, tools);
     outcome.context_window = policy.context_window;
     sync_history(history, messages);
@@ -717,10 +796,14 @@ fn cancelled(
     outcome
 }
 
-/// 给历史里"声明了但没有结果"的 `tool_calls` 补一条未执行说明。
+/// 给历史里"声明了但没有结果"的 `tool_calls` 补一条如实说明。
 ///
-/// 只补缺失的那些，已经有的结果一个都不动——已完成的执行结果必须保留。
-fn backfill_unanswered_tool_calls(messages: &mut Vec<ChatMessage>) {
+/// 只补缺失的那些，已经有的真实结果一个都不动。
+/// 已发起但没拿到结果的，写"结果未知"，并明确提醒模型**不要重试可能已有副作用的操作**。
+fn backfill_unanswered_tool_calls(
+    messages: &mut Vec<ChatMessage>,
+    dispatched: &std::collections::HashSet<String>,
+) {
     // 先收集历史里所有已存在的 tool 结果 id。
     let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
     for message in messages.iter() {
@@ -753,7 +836,18 @@ fn backfill_unanswered_tool_calls(messages: &mut Vec<ChatMessage>) {
     for (index, missing) in insertions.into_iter().rev() {
         let mut inserts: Vec<ChatMessage> = missing
             .into_iter()
-            .map(|id| ChatMessage::tool_result(id, "（这一条因为中断没有执行。）"))
+            .map(|id| {
+                let text = if dispatched.contains(&id) {
+                    // 动作可能已经到了桌面，只是响应没回来。
+                    "（这一条在中断前已发出，但没有收到执行结果，状态未知。\
+                     它有可能已经生效，不要当作没做过而直接重试；\
+                     需要确认时请先读一次当前界面状态。）"
+                } else {
+                    // 权限没放行、或还没轮到它：确定没发出去。
+                    "（这一条因为中断没有执行。）"
+                };
+                ChatMessage::tool_result(id, text)
+            })
             .collect();
         // 插在 assistant 之后、它已有结果之前——顺序不影响协议，紧跟即可。
         inserts.reverse();
