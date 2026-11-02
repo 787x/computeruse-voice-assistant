@@ -19,6 +19,11 @@ use crate::permissions::{
 };
 use crate::prompt;
 use crate::secret::SecretStore;
+use crate::voice::{
+    coordinator::{self, ActiveSession, CoordinatorConfig, SharedSink, VoiceHandle},
+    settings::VoicePaths,
+    CaptureInfoForUi, RejectReason, VoiceEvent, VoiceState,
+};
 use crate::ChatEntry;
 use crate::ToolCard;
 
@@ -48,6 +53,10 @@ pub enum UiCommand {
     ProviderChanged(i32),
     /// 打开设置：按当前已保存的配置回填界面。
     OpenSettings,
+    /// 启用/关闭麦克风监听（界面开关）。
+    SetVoiceEnabled(bool),
+    /// 语音线程发回的事件（内部消息，不是用户动作）。
+    Voice(VoiceEvent),
     /// 退出。
     Quit,
 }
@@ -227,6 +236,13 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let tx = command_tx.clone();
+        window.on_set_voice_enabled(move |enabled| {
+            // 立即反映开关状态；真正的启动/停止由工作线程完成，失败会回报原因。
+            let _ = tx.send(UiCommand::SetVoiceEnabled(enabled));
+        });
+    }
+    {
+        let tx = command_tx.clone();
         let weak = window.as_weak();
         let confirmer = confirmer.clone();
         window.on_quit_app(move || {
@@ -260,7 +276,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             let weak_for_exit = weak.clone();
             runtime.block_on(run_worker(
-                weak, paths, secret, settings, command_rx, confirmer,
+                weak, paths, secret, settings, command_rx, command_tx, confirmer,
             ));
             /*
              * 工作线程结束 = 待处理回合已被取消、PowerShell 子进程已释放。
@@ -344,6 +360,26 @@ fn parse_hex_color(value: &str) -> slint::Color {
         }
     }
     slint::Color::from_rgb_u8(255, 255, 255)
+}
+
+/// `push_entry` 的弱引用版本：工作线程里拿不到 `&AppWindow` 时用。
+fn push_entry_via_weak(
+    weak: &slint::Weak<AppWindow>,
+    role: &str,
+    text: &str,
+    detail: &str,
+    tint: &str,
+) {
+    let role = role.to_string();
+    let text = text.to_string();
+    let detail = detail.to_string();
+    let tint = tint.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            push_entry(&window, &role, &text, &detail, &tint);
+        }
+    });
 }
 
 fn push_entry(window: &AppWindow, role: &str, text: &str, detail: &str, tint: &str) {
@@ -544,6 +580,7 @@ async fn run_worker(
     secret: SecretStore,
     mut settings: Settings,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
+    command_tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
     confirmer: Arc<UiConfirmer>,
 ) {
     // Computer Use 后端：懒启动（第一次真正调用时才拉起 PowerShell）。
@@ -568,6 +605,18 @@ async fn run_worker(
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut turn_cancel: Option<CancelToken> = None;
 
+    // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
+    let mut voice: Option<VoiceHandle> = None;
+    // 语音线程的「当前会话」：取消/新唤醒时置 0，迟到的识别结果被丢弃。
+    let active_session: ActiveSession = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    /*
+     * 已保存的启用偏好在启动时**不自动开麦**：
+     * 任务书要求「新安装启动时不意外开麦」，主人不在电脑前时更不该开。
+     * 偏好只在用户点了开关之后才写回。
+     */
+    seed_voice_ui(&weak, &settings);
+
     loop {
         let Some(command) = commands.recv().await else {
             break;
@@ -580,6 +629,7 @@ async fn run_worker(
                     token.cancel();
                 }
                 confirmer.abort_pending();
+                stop_voice(&weak, &mut voice, &active_session);
                 break;
             }
             UiCommand::Cancel => {
@@ -649,100 +699,98 @@ async fn run_worker(
                 }
             }
             UiCommand::Send(input) => {
-                if turn_cancel.is_some() {
-                    set_status(&weak, "上一轮还在跑，先取消再发新指令");
-                    continue;
-                }
-                let Some(toolkit) = toolkit.clone() else {
-                    set_status(&weak, "Computer Use 后端不可用，无法执行指令");
-                    set_busy(&weak, false);
-                    continue;
-                };
-
-                // 端点快照：整轮用同一套「地址 + Key + 模型 + 推理档位」。
-                // **按提供商取 Key**：当前提供商没有就拿空串，绝不借用别家的。
-                let api_key = secret
-                    .load(&settings.provider_id)
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-                let profile = settings.profile();
-                let echo_reasoning = profile.capability.requires_reasoning_echo();
-                let llm = match LlmClient::new(
-                    profile,
-                    api_key,
-                    settings.temperature,
-                    settings.timeout_ms,
-                ) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        set_status(&weak, &format!("端点配置无效：{error}"));
-                        set_busy(&weak, false);
-                        continue;
-                    }
-                };
-                let model_context_window = crate::config::get_provider(&settings.provider_id)
-                    .and_then(|provider| provider.context_window);
-                let policy = crate::context::resolve_context_policy(
-                    Some(settings.context_window),
-                    Some(settings.context_compress_percent),
-                    model_context_window,
-                );
-                let agent_config = AgentConfig {
-                    max_steps: settings.max_steps,
-                    context_policy: policy,
-                    system_prompt: prompt::resolve_system_prompt(settings.system_prompt.as_deref()),
-                    echo_reasoning,
-                };
-                let permissions = PermissionState::new(settings.permission_mode);
-                let mut agent = Agent::new(llm, toolkit, agent_config, permissions);
-
-                let token = CancelToken::new();
-                // 记下本回合的令牌，让"取消"能作用于正在跑的这一轮。
-                turn_cancel = Some(token.clone());
-
-                /*
-                 * 回合必须跑在**独立任务**里，不能在这里直接 await。
-                 *
-                 * 直接 await 会把整个工作线程占住，`Cancel` / `Quit` 命令排在它后面
-                 * 根本轮不到处理——用户点了"取消"却没有任何反应，直到模型自己跑完。
-                 * 放到 spawn 里之后，主循环随时能拿到命令，取消也就能立刻生效。
-                 */
-                let weak_events = weak.clone();
-                let settings_snapshot = settings.clone();
-                let turn_confirmer = confirmer.clone();
-                let turn_history = std::mem::take(&mut history);
-                let turn = tokio::spawn(async move {
-                    let emit = move |event: AgentEvent| {
-                        apply_event(&weak_events, event);
-                    };
-                    let mut turn_history = turn_history;
-                    let outcome = agent
-                        .run(&input, &mut turn_history, &token, &turn_confirmer, &emit)
-                        .await;
-                    (outcome, turn_history, settings_snapshot)
-                });
-
-                // 等待结束，但**同时**继续处理取消/退出/设置命令。
-                match wait_turn(
-                    &mut commands,
-                    turn,
+                match start_turn(
                     &weak,
-                    &mut turn_cancel,
                     &paths,
                     &secret,
-                    &mut settings,
+                    &settings,
+                    &toolkit,
                     &confirmer,
-                )
-                .await
-                {
-                    TurnWait::Finished(returned) => history = returned,
-                    TurnWait::Quit => break,
+                    &mut history,
+                    &mut turn_cancel,
+                    input,
+                ) {
+                    TurnStart::Started(turn) => {
+                        // 等待结束，但**同时**继续处理取消/退出/设置命令。
+                        match wait_turn(
+                            &mut commands,
+                            turn,
+                            &weak,
+                            &mut turn_cancel,
+                            &paths,
+                            &secret,
+                            &mut settings,
+                            &confirmer,
+                        )
+                        .await
+                        {
+                            TurnWait::Finished(returned) => history = returned,
+                            TurnWait::Quit => break,
+                        }
+                    }
+                    TurnStart::Rejected(status) => set_status(&weak, &status),
+                }
+            }
+            UiCommand::SetVoiceEnabled(enabled) => {
+                let mut next = settings.clone();
+                next.voice.enabled = enabled;
+                match config::save_settings(&paths, &next) {
+                    Ok(()) => settings = next,
+                    Err(error) => {
+                        // 偏好没存下来不影响本次启停，但必须如实告诉用户。
+                        set_status(&weak, &format!("语音偏好保存失败：{error}"));
+                    }
+                }
+                if enabled {
+                    start_voice(
+                        &weak,
+                        &paths,
+                        &settings,
+                        &mut voice,
+                        &command_tx,
+                        active_session.clone(),
+                    );
+                } else {
+                    stop_voice(&weak, &mut voice, &active_session);
+                }
+            }
+            UiCommand::Voice(event) => {
+                if let Some(turn) = handle_voice_event(
+                    &weak,
+                    &mut voice,
+                    event,
+                    &active_session,
+                    &mut turn_cancel,
+                    &toolkit,
+                    &confirmer,
+                    &mut history,
+                    &settings,
+                    &paths,
+                    &secret,
+                ) {
+                    // 与文本输入完全相同的等待方式：取消/退出/设置照常处理。
+                    match wait_turn(
+                        &mut commands,
+                        turn,
+                        &weak,
+                        &mut turn_cancel,
+                        &paths,
+                        &secret,
+                        &mut settings,
+                        &confirmer,
+                    )
+                    .await
+                    {
+                        TurnWait::Finished(returned) => history = returned,
+                        TurnWait::Quit => break,
+                    }
                 }
             }
         }
     }
 
-    // 退出前：取消回合、清掉确认、释放子进程。
+    // 退出前：关麦克风、取消回合、清掉确认、释放子进程。
+    stop_voice(&weak, &mut voice, &active_session);
     confirmer.abort_pending();
     if let Some(token) = turn_cancel.take() {
         token.cancel();
@@ -750,6 +798,398 @@ async fn run_worker(
     if let Some(toolkit) = toolkit.take() {
         toolkit.bridge().dispose().await;
     }
+}
+
+// ---------------------------------------------------------------- 语音
+
+/// 启动语音线程。
+///
+/// 模型加载与设备打开全在新线程上：加载要几百毫秒到几秒，不能堵住这里。
+/// 失败会以 `VoiceEvent::StateChanged(Error)` 回到主循环，界面如实显示，
+/// **文本 Agent 完全不受影响**。
+fn start_voice(
+    weak: &slint::Weak<AppWindow>,
+    paths: &AppPaths,
+    settings: &Settings,
+    voice: &mut Option<VoiceHandle>,
+    command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    active: ActiveSession,
+) {
+    if voice
+        .as_ref()
+        .map(|handle| handle.is_running())
+        .unwrap_or(false)
+    {
+        set_status(weak, "麦克风已经在监听");
+        return;
+    }
+    let voice_paths = VoicePaths::resolve(paths);
+    let config = match CoordinatorConfig::resolve(&settings.voice, &voice_paths) {
+        Ok(config) => config,
+        Err(errors) => {
+            // 模型缺失：明确提示，并且**不进入监听状态**。
+            let message = errors.join("\n\n");
+            set_voice_state(weak, &VoiceState::Error("缺少语音模型".to_string()));
+            push_entry_via_weak(weak, "系统", &message, "", "#fdeeee");
+            set_status(weak, "语音模型不完整；文本模式仍然可用");
+            return;
+        }
+    };
+
+    let tx = command_tx.clone();
+    let sink = SharedSink::new(move |event| {
+        let _ = tx.send(UiCommand::Voice(event));
+    });
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    match coordinator::spawn(config, sink, active, stop) {
+        Ok(handle) => {
+            *voice = Some(handle);
+            set_voice_state(weak, &VoiceState::Loading);
+            set_status(weak, "正在启动麦克风…");
+        }
+        Err(error) => {
+            set_voice_state(weak, &VoiceState::Error(error.clone()));
+            set_status(weak, &format!("无法启动语音：{error}"));
+        }
+    }
+}
+
+/// 停止监听并释放资源（设备、模型、线程）。
+fn stop_voice(
+    weak: &slint::Weak<AppWindow>,
+    voice: &mut Option<VoiceHandle>,
+    active: &ActiveSession,
+) {
+    // 先让还在识别的结果过期，再等线程收尾：迟到的文本不会落到新一轮上。
+    active.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Some(mut handle) = voice.take() {
+        handle.stop();
+    }
+    set_voice_state(weak, &VoiceState::Off);
+}
+
+/// 处理语音线程发回的事件。
+///
+/// 这里**唯一**会触发 Agent 的是 `VoiceEvent::Final`，而且仍然走
+/// `start_turn`——也就是说权限、取消、并发约束与文本输入完全一致。
+#[allow(clippy::too_many_arguments)]
+fn handle_voice_event(
+    weak: &slint::Weak<AppWindow>,
+    voice: &mut Option<VoiceHandle>,
+    event: VoiceEvent,
+    active: &ActiveSession,
+    turn_cancel: &mut Option<CancelToken>,
+    toolkit: &Option<Arc<CuaToolkit>>,
+    confirmer: &Arc<UiConfirmer>,
+    history: &mut Vec<ChatMessage>,
+    settings: &Settings,
+    paths: &AppPaths,
+    secret: &SecretStore,
+) -> Option<tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>> {
+    match event {
+        VoiceEvent::StateChanged(state) => {
+            set_voice_state(weak, &state);
+            set_status(weak, &state.label());
+            if matches!(state, VoiceState::Off) {
+                voice.take();
+            }
+            return None;
+        }
+        VoiceEvent::Ready(info) => {
+            apply_capture_info(weak, &info);
+            return None;
+        }
+        VoiceEvent::Woke { keyword } => {
+            set_voice_state(weak, &VoiceState::Capturing);
+            set_status(weak, &format!("已唤醒（{keyword}），请说指令"));
+            return None;
+        }
+        VoiceEvent::Level { level_db, floor_db } => {
+            apply_level(weak, level_db, floor_db);
+            return None;
+        }
+        VoiceEvent::Rejected { reason, .. } => {
+            set_status(weak, &reason.message());
+            // 空转录/太短属于「没听清」，给一句可读的提示；
+            // 不需要弹窗，也不能触发工具。
+            if matches!(
+                reason,
+                RejectReason::EmptyTranscript | RejectReason::TooShort
+            ) {
+                set_status(weak, "没听清，再说一次？");
+            }
+            return None;
+        }
+        VoiceEvent::Overflow => {
+            set_status(weak, "音频积压，已丢弃这一句");
+            return None;
+        }
+        VoiceEvent::Final {
+            session_id,
+            text,
+            audio_seconds,
+            decode_ms,
+        } => {
+            // 过期结果：会话已被取消/关闭，或已经开了新一轮——直接丢弃。
+            if !crate::voice::coordinator::is_current_session(active, session_id) {
+                // 迟到的结果：会话已取消/关闭，或已经开了新一轮。丢弃，不提交。
+                set_status(weak, "这次语音已取消");
+                return None;
+            }
+            // 这一轮语音用完了：清空会话号，避免同一个结果被提交两次。
+            active.store(0, std::sync::atomic::Ordering::SeqCst);
+            set_transcript(weak, &text);
+            commit_voice_text(
+                weak,
+                text,
+                audio_seconds,
+                decode_ms,
+                turn_cancel,
+                toolkit,
+                confirmer,
+                history,
+                settings,
+                paths,
+                secret,
+            )
+        }
+    }
+}
+
+/// 语音最终文本 → 现有 Agent 入口（与文本发送同一条路径）。
+///
+/// 返回 `Some(handle)` 表示回合已启动，调用方负责等待；`None` 表示没有启动
+/// （空文本，或 Agent 忙/等待确认/正在取消）。
+#[allow(clippy::too_many_arguments)]
+fn commit_voice_text(
+    weak: &slint::Weak<AppWindow>,
+    text: String,
+    audio_seconds: f32,
+    decode_ms: u64,
+    turn_cancel: &mut Option<CancelToken>,
+    toolkit: &Option<Arc<CuaToolkit>>,
+    confirmer: &Arc<UiConfirmer>,
+    history: &mut Vec<ChatMessage>,
+    settings: &Settings,
+    paths: &AppPaths,
+    secret: &SecretStore,
+) -> Option<tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>> {
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 先把结果放进对话区：用户看得见「我听到的是这句」。
+    push_entry_via_weak(
+        weak,
+        "你（语音）",
+        &trimmed,
+        &format!("{audio_seconds:.1}s 音频 · 识别 {decode_ms} ms"),
+        "#e8f0fe",
+    );
+    match start_turn(
+        weak,
+        paths,
+        secret,
+        settings,
+        toolkit,
+        confirmer,
+        history,
+        turn_cancel,
+        trimmed,
+    ) {
+        TurnStart::Started(turn) => {
+            set_busy(weak, true);
+            set_status(weak, "正在思考…");
+            Some(turn)
+        }
+        TurnStart::Rejected(status) => {
+            // Agent 忙 / 等待点击确认 / 正在取消：**不启动第二回合**，
+            // 也不把这句话排队延后执行——明确告诉用户这句话没有执行。
+            set_status(weak, &format!("{status}；这句话没有执行"));
+            None
+        }
+    }
+}
+
+/// 把最终识别文字显示出来（只显示 Final；Preview 从不进入这里）。
+fn set_transcript(weak: &slint::Weak<AppWindow>, text: &str) {
+    let text = text.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_transcript(text.into());
+        }
+    });
+}
+
+/// 语音状态 → 界面。开关状态与状态码分开：开关反映「用户想不想听」，
+/// 状态反映「现在实际在做什么」。
+fn set_voice_state(weak: &slint::Weak<AppWindow>, state: &VoiceState) {
+    let code = state.code().to_string();
+    // 只有真正可工作的状态才算「开」：Error 时麦克风并没有在跑，
+    // 按钮要回到「打开麦克风」，让用户可以重试。
+    let enabled = state.is_active();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_state(code.into());
+            window.set_voice_enabled(enabled);
+        }
+    });
+}
+
+/// 采集信息就绪：显示设备与实际采样率（用户能据此判断「是不是选错麦」）。
+fn apply_capture_info(weak: &slint::Weak<AppWindow>, info: &CaptureInfoForUi) {
+    let text = format!(
+        "{} · {} Hz{} · 唤醒：{} · 模型：{}",
+        info.device_name,
+        info.sample_rate,
+        if info.resampled {
+            "（已重采样到 16k）"
+        } else {
+            ""
+        },
+        if info.wake_labels.is_empty() {
+            "（未配置）".to_string()
+        } else {
+            info.wake_labels.join("/")
+        },
+        if info.gpu_ready {
+            "Whisper GPU"
+        } else if !info.gpu_compiled {
+            "Whisper CPU（本构建未启用 CUDA）"
+        } else if info.gpu_requested {
+            "Whisper CPU（GPU 初始化失败）"
+        } else {
+            "Whisper CPU"
+        }
+    );
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_device(text.into());
+        }
+    });
+}
+
+/// 电平显示：只给一个粗略的相对电平，避免刷屏。
+fn apply_level(weak: &slint::Weak<AppWindow>, level_db: f32, floor_db: f32) {
+    let text = format!("电平 {level_db:.0} dBFS / 底噪 {floor_db:.0} dB");
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_voice_level(text.into());
+        }
+    });
+}
+
+/// 启动时把已保存的语音偏好同步到界面（**不**自动开麦）。
+fn seed_voice_ui(weak: &slint::Weak<AppWindow>, settings: &Settings) {
+    let weak = weak.clone();
+    let enabled = settings.voice.enabled;
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            // 偏好为 true 时仍不自动开麦：界面开关显示为关，
+            // 由用户点一下才真正启动（见 run_worker 里的说明）。
+            window.set_voice_enabled(false);
+            window.set_voice_state("off".into());
+            if enabled {
+                window.set_voice_device("上次退出时麦克风是开着的，点「打开麦克风」继续".into());
+            }
+        }
+    });
+}
+
+/// 一次回合的启动结果。
+enum TurnStart {
+    Started(tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>),
+    /// 没启动（上一轮还在跑 / 后端不可用 / 端点无效），附给用户看的原因。
+    Rejected(String),
+}
+
+/// 启动一个 Agent 回合。文本输入与语音最终文本都**只**经由这里，
+/// 所以两条路径的权限、取消与并发约束完全一致。
+#[allow(clippy::too_many_arguments)]
+fn start_turn(
+    weak: &slint::Weak<AppWindow>,
+    _paths: &AppPaths,
+    secret: &SecretStore,
+    settings: &Settings,
+    toolkit: &Option<Arc<CuaToolkit>>,
+    confirmer: &Arc<UiConfirmer>,
+    history: &mut Vec<ChatMessage>,
+    turn_cancel: &mut Option<CancelToken>,
+    input: String,
+) -> TurnStart {
+    /*
+     * 并发约束：上一轮还在跑（含等待点击确认）时**不启动第二回合**。
+     * 语音文本也走这一条——不能因为「是语音说的」就插队或排队延后执行。
+     */
+    if turn_cancel.is_some() {
+        return TurnStart::Rejected("上一轮还在跑，先取消再发新指令".to_string());
+    }
+    let Some(toolkit) = toolkit.clone() else {
+        set_busy(weak, false);
+        return TurnStart::Rejected("Computer Use 后端不可用，无法执行指令".to_string());
+    };
+
+    // 端点快照：整轮用同一套「地址 + Key + 模型 + 推理档位」。
+    // **按提供商取 Key**：当前提供商没有就拿空串，绝不借用别家的。
+    let api_key = secret
+        .load(&settings.provider_id)
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let profile = settings.profile();
+    let echo_reasoning = profile.capability.requires_reasoning_echo();
+    let llm = match LlmClient::new(profile, api_key, settings.temperature, settings.timeout_ms) {
+        Ok(client) => client,
+        Err(error) => {
+            set_busy(weak, false);
+            return TurnStart::Rejected(format!("端点配置无效：{error}"));
+        }
+    };
+    let model_context_window = crate::config::get_provider(&settings.provider_id)
+        .and_then(|provider| provider.context_window);
+    let policy = crate::context::resolve_context_policy(
+        Some(settings.context_window),
+        Some(settings.context_compress_percent),
+        model_context_window,
+    );
+    let agent_config = AgentConfig {
+        max_steps: settings.max_steps,
+        context_policy: policy,
+        system_prompt: prompt::resolve_system_prompt(settings.system_prompt.as_deref()),
+        echo_reasoning,
+    };
+    let permissions = PermissionState::new(settings.permission_mode);
+    let mut agent = Agent::new(llm, toolkit, agent_config, permissions);
+
+    let token = CancelToken::new();
+    // 记下本回合的令牌，让"取消"能作用于正在跑的这一轮。
+    *turn_cancel = Some(token.clone());
+
+    /*
+     * 回合必须跑在**独立任务**里，不能在这里直接 await。
+     *
+     * 直接 await 会把整个工作线程占住，`Cancel` / `Quit` 命令排在它后面
+     * 根本轮不到处理——用户点了"取消"却没有任何反应，直到模型自己跑完。
+     * 放到 spawn 里之后，主循环随时能拿到命令，取消也就能立刻生效。
+     */
+    let weak_events = weak.clone();
+    let settings_snapshot = settings.clone();
+    let turn_confirmer = confirmer.clone();
+    let turn_history = std::mem::take(history);
+    let turn = tokio::spawn(async move {
+        let emit = move |event: AgentEvent| {
+            apply_event(&weak_events, event);
+        };
+        let mut turn_history = turn_history;
+        let outcome = agent
+            .run(&input, &mut turn_history, &token, &turn_confirmer, &emit)
+            .await;
+        (outcome, turn_history, settings_snapshot)
+    });
+    TurnStart::Started(turn)
 }
 
 /// 等待回合结束期间的命令处理结果。
@@ -970,6 +1410,23 @@ async fn wait_turn(
                     }
                     Some(UiCommand::Send(_)) => {
                         set_status(weak, "上一轮还在跑，先取消再发新指令");
+                    }
+                    /*
+                     * 回合进行中的语音命令：
+                     *  - 开关必须能立刻生效（关麦是随时该能做到的）；
+                     *  - 语音最终文本**不能**在这里插队：`start_turn` 已经因为
+                     *    本回合在跑而拒绝它，这次也照同样口径明确告知。
+                     * 这意味着语音在这段时间里不会排队延后执行。
+                     */
+                    Some(UiCommand::SetVoiceEnabled(enabled)) => {
+                        if !enabled {
+                            set_status(weak, "麦克风已关闭（本轮继续执行）");
+                        } else {
+                            set_status(weak, "先结束当前回合再打开麦克风");
+                        }
+                    }
+                    Some(UiCommand::Voice(_event)) => {
+                        set_status(weak, "上一轮还在跑；这句话没有执行");
                     }
                     Some(UiCommand::OpenSettings) => {
                         // 执行中也能查看当前（已保存的）配置。
@@ -1227,6 +1684,71 @@ mod tests {
         let (reply, wait) = tokio::sync::oneshot::channel();
         *confirmer.pending.lock().unwrap() = Some(PendingConfirm { request_id, reply });
         wait
+    }
+
+    /// **并发约束**：回合还在跑（含等待点击确认）时，语音/文本都**不能**启动第二回合。
+    ///
+    /// 这条是任务书的硬要求：不可启动第二回合，也不可把语音排队延后执行。
+    #[test]
+    fn busy_turn_rejects_a_second_turn() {
+        let root = unique_test_root("worker-busy");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let settings = Settings::default();
+        let toolkit: Option<Arc<CuaToolkit>> = None;
+        let confirmer = Arc::new(confirmer_without_ui());
+        let mut history = Vec::new();
+
+        // 模拟「上一轮还在跑」：令牌槽位非空。
+        let mut running = Some(CancelToken::new());
+        match start_turn(
+            &slint::Weak::default(),
+            &paths,
+            &secret,
+            &settings,
+            &toolkit,
+            &confirmer,
+            &mut history,
+            &mut running,
+            "打开浏览器".to_string(),
+        ) {
+            TurnStart::Rejected(reason) => {
+                assert!(reason.contains("上一轮"), "原因必须说清楚：{reason}");
+            }
+            TurnStart::Started(_) => panic!("忙的时候绝不能启动第二回合"),
+        }
+        // 原来的令牌不能被语音/Cua 的拒绝路径换掉。
+        assert!(running.is_some(), "拒绝新回合不能清掉正在跑的那一轮");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 没有 CUA 后端时也不能启动回合，但必须给出可读原因（而不是静默失败）。
+    #[test]
+    fn missing_toolkit_rejects_with_reason() {
+        let root = unique_test_root("worker-no-toolkit");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let settings = Settings::default();
+        let toolkit: Option<Arc<CuaToolkit>> = None;
+        let confirmer = Arc::new(confirmer_without_ui());
+        let mut history = Vec::new();
+        let mut idle = None;
+        match start_turn(
+            &slint::Weak::default(),
+            &paths,
+            &secret,
+            &settings,
+            &toolkit,
+            &confirmer,
+            &mut history,
+            &mut idle,
+            "列出窗口".to_string(),
+        ) {
+            TurnStart::Rejected(reason) => assert!(reason.contains("Computer Use")),
+            TurnStart::Started(_) => panic!("没有工具后端时不该启动"),
+        }
+        assert!(idle.is_none(), "失败时不能留下取消令牌");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

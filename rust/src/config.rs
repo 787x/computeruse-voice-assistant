@@ -230,6 +230,10 @@ pub struct Settings {
     /// 自定义系统提示词；`None` = 用内置默认。
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// 语音输入设置（PR6）。**带 `serde(default)`**：
+    /// PR5 写下的配置文件没有这一节，照常可读并按默认值处理。
+    #[serde(default)]
+    pub voice: crate::voice::settings::VoiceSettings,
 }
 
 fn default_schema_version() -> u32 {
@@ -272,6 +276,7 @@ impl Default for Settings {
             reasoning_effort: ReasoningEffort::Default,
             permission_mode: PermissionMode::Standard,
             system_prompt: None,
+            voice: crate::voice::settings::VoiceSettings::default(),
         }
     }
 }
