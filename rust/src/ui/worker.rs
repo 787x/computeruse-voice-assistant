@@ -810,14 +810,22 @@ struct VoiceRoute {
     instance: Option<VoiceInstance>,
     pending: Option<VoiceTurn>,
     next_instance: VoiceInstance,
+    /// 当前实例自己的活动会话。
+    ///
+    /// 每开一次麦克风换一份新的：旧实例的线程（`shutdown` / `fail` / 迟到的
+    /// ASR 回调）只持有**旧的那份**，清不到新实例正在识别的这一句。
+    active: ActiveSession,
 }
 
 impl VoiceRoute {
-    /// 打开麦克风：分配新的实例号。旧实例的迟到事件从这里开始不再有效。
+    /// 打开麦克风：分配新的实例号与**新的**活动会话。
+    ///
+    /// 旧实例的迟到事件从这里开始不再有效；它的收尾动作也再碰不到新实例。
     fn open(&mut self) -> VoiceInstance {
         self.next_instance += 1;
         self.instance = Some(self.next_instance);
         self.pending = None;
+        self.active = ActiveSession::new();
         self.next_instance
     }
 
@@ -825,6 +833,19 @@ impl VoiceRoute {
     fn close(&mut self) {
         self.instance = None;
         self.pending = None;
+        // 只清**这一份**：让本实例的在途结果立刻过期（ASR 回调的归属核对会失败，
+        // 音频线程也会据此置位 abort）。其它时代的实例各自持有自己的会话。
+        self.active.clear();
+    }
+
+    /// 交给新实例的活动会话（内部共享同一份状态）。
+    fn active_session(&self) -> ActiveSession {
+        self.active.clone()
+    }
+
+    /// 让当前实例的在途输入过期（用户取消这一句）。
+    fn clear_active(&self) {
+        self.active.clear();
     }
 
     fn is_current(&self, instance: VoiceInstance) -> bool {
@@ -869,11 +890,10 @@ struct VoicePrompt {
     decode_ms: u64,
 }
 
-/// 语音运行时：线程句柄 + 实例路由 + 共享的「当前会话」。
+/// 语音运行时：线程句柄 + 实例路由（含当前实例自己的活动会话）。
 struct VoiceRuntime {
     handle: Option<VoiceHandle>,
     route: VoiceRoute,
-    active: ActiveSession,
 }
 
 impl VoiceRuntime {
@@ -881,7 +901,6 @@ impl VoiceRuntime {
         Self {
             handle: None,
             route: VoiceRoute::default(),
-            active: ActiveSession::new(),
         }
     }
 
@@ -909,7 +928,6 @@ impl VoiceRuntime {
         // 上一个实例（如果还有句柄）到此彻底作废：新实例不该继承任何旧会话。
         self.handle = None;
         self.route.close();
-        self.active.clear();
 
         let voice_paths = VoicePaths::resolve(paths);
         let config = match CoordinatorConfig::resolve(&settings.voice, &voice_paths) {
@@ -930,7 +948,8 @@ impl VoiceRuntime {
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let instance = self.route.open();
-        match coordinator::spawn(config, sink, self.active.clone(), stop, instance) {
+        let active = self.route.active_session();
+        match coordinator::spawn(config, sink, active, stop, instance) {
             Ok(handle) => {
                 self.handle = Some(handle);
                 set_voice_state(weak, &VoiceState::Loading);
@@ -950,7 +969,6 @@ impl VoiceRuntime {
     fn disable(&mut self, weak: &slint::Weak<AppWindow>) {
         // 先让还在识别的结果过期，再停线程：迟到的文本不会落到新实例上。
         self.route.close();
-        self.active.clear();
         if let Some(mut handle) = self.handle.take() {
             handle.stop();
         }
@@ -960,7 +978,7 @@ impl VoiceRuntime {
     /// 取消当前这一句（不关麦）：之后返回的识别结果不再提交。
     fn cancel_pending(&mut self) {
         self.route.cancel();
-        self.active.clear();
+        self.route.clear_active();
     }
 
     /// 处理一条语音事件。
@@ -984,7 +1002,6 @@ impl VoiceRuntime {
                 if !state.is_active() {
                     // 线程已结束或即将结束：释放句柄，但保留界面上的原因。
                     self.route.close();
-                    self.active.clear();
                     if let Some(mut handle) = self.handle.take() {
                         handle.stop();
                     }
@@ -2390,7 +2407,7 @@ mod tests {
         assert!(matches!(result, TurnWait::Finished(_)));
         assert!(stop.load(Ordering::SeqCst), "关麦后采集必须保持停止");
         assert!(voice.handle.is_none(), "关麦后不能继续持有采集线程");
-        assert!(voice.active.current().is_none(), "在途语音必须过期");
+        assert!(voice.route.active.current().is_none(), "在途语音必须过期");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2494,6 +2511,143 @@ mod tests {
         assert_eq!(route.pending, None);
     }
 
+    /// **旧实例收尾不能清掉新实例的活动会话**（快速关麦 / 重开的真实路径）。
+    ///
+    /// 修复前整个 `VoiceRuntime` 只有一份 `ActiveSession`，每个实例
+    /// `spawn` 时都 clone 同一份：旧线程迟到的 `shutdown()` / `fail()` 里
+    /// 的无条件 `clear()` 会把新实例正在识别的那一句抹掉 ——
+    /// 于是新实例的 Final 被当成过期丢弃（表现为「所有 Final 都无效」）。
+    ///
+    /// 这里走真实的分配路径：实例号与会话都由 `VoiceRoute::open()` 给出，
+    /// 再用两个真实的 `SessionMachine` 驱动识别与收尾。
+    #[test]
+    fn old_instance_teardown_cannot_clear_the_new_instance_session() {
+        use std::sync::Mutex;
+
+        use crate::voice::asr::{AsrError, InferenceCancel, Transcript};
+        use crate::voice::coordinator::{AsrSubmitter, ReplySink, SessionMachine};
+
+        /// 记录事件（带实例号，用来判断结果属于谁）。
+        #[derive(Clone, Default)]
+        struct Sink {
+            events: Arc<Mutex<Vec<(VoiceInstance, VoiceEventKind)>>>,
+        }
+
+        impl Sink {
+            fn shared(&self) -> SharedSink {
+                let events = self.events.clone();
+                SharedSink::new(move |event| {
+                    events.lock().unwrap().push((event.instance, event.kind))
+                })
+            }
+
+            fn finals(&self) -> Vec<(VoiceInstance, String)> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(instance, kind)| match kind {
+                        VoiceEventKind::Final { text, .. } => Some((*instance, text.clone())),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        }
+
+        /// 手动控制结果回调的假 ASR：由测试决定「推理什么时候结束」。
+        struct DeferredAsr(Arc<Mutex<Vec<(VoiceTurn, ReplySink)>>>);
+
+        impl AsrSubmitter for DeferredAsr {
+            fn submit(
+                &self,
+                turn: VoiceTurn,
+                _samples: Vec<f32>,
+                _cancel: InferenceCancel,
+                reply: ReplySink,
+            ) -> Result<(), AsrError> {
+                self.0.lock().unwrap().push((turn, reply));
+                Ok(())
+            }
+        }
+
+        fn transcript(text: &str, turn: VoiceTurn) -> Result<Transcript, AsrError> {
+            Ok(Transcript {
+                session_id: turn.session,
+                text: text.to_string(),
+                audio_seconds: 1.0,
+                decode_ms: 5,
+                language_id: 1,
+                no_speech: vec![],
+            })
+        }
+
+        let sink = Sink::default();
+        let mut route = VoiceRoute::default();
+
+        // ---- 实例 A：唤醒后进入识别（推理还没回来）----
+        let a = route.open();
+        let active_a = route.active_session();
+        let pending_a = Arc::new(Mutex::new(Vec::new()));
+        let mut machine_a = SessionMachine::new(
+            a,
+            sink.shared(),
+            active_a.clone(),
+            Box::new(DeferredAsr(pending_a.clone())),
+            0,
+        );
+        machine_a.start_listening();
+        machine_a.begin("小爱同学".to_string());
+        machine_a.finish(1.0, vec![0.1, -0.1, 0.2, -0.2]);
+        assert_eq!(machine_a.state(), &VoiceState::Transcribing);
+        assert!(active_a.current().is_some(), "A 应该有在途会话");
+
+        // ---- 用户关麦并立刻重开：B 从这里拿到**自己**的会话 ----
+        route.close();
+        let b = route.open();
+        assert_ne!(a, b, "重开必须是新实例");
+        let active_b = route.active_session();
+        let pending_b = Arc::new(Mutex::new(Vec::new()));
+        let mut machine_b = SessionMachine::new(
+            b,
+            sink.shared(),
+            active_b.clone(),
+            Box::new(DeferredAsr(pending_b.clone())),
+            0,
+        );
+        machine_b.start_listening();
+        machine_b.begin("小爱同学".to_string());
+        machine_b.finish(1.0, vec![0.1, -0.1, 0.2, -0.2]);
+        let turn_b = active_b.current().expect("B 应该有在途会话");
+        assert!(route.bind(b, turn_b));
+
+        // ---- A 的线程这时才收尾：shutdown / fail 都会无条件 clear ----
+        machine_a.shutdown();
+        machine_a.fail("麦克风错误：设备断开".to_string());
+        assert!(active_a.current().is_none(), "A 自己的会话确实被清了");
+        assert!(
+            active_b.is_current(turn_b),
+            "旧实例的收尾不能清掉新实例的活动会话"
+        );
+
+        // ---- B 的识别正常结束：Final 恰好一次，且属于 B ----
+        let (turn, reply_b) = pending_b.lock().unwrap().pop().expect("B 应有一次识别");
+        reply_b(transcript("打开浏览器", turn));
+        assert!(machine_b.poll(), "B 应该回到监听");
+        assert!(route.take(b, turn).is_some(), "B 的结果必须能提交");
+        assert!(route.take(b, turn).is_none(), "同一句只能提交一次");
+
+        // ---- A 的识别这时才回来：不能交付 ----
+        let (late, reply_a) = pending_a.lock().unwrap().pop().expect("A 应有一次识别");
+        reply_a(transcript("上一句", late));
+        assert!(route.take(a, late).is_none(), "旧实例的结果不能提交");
+
+        assert_eq!(
+            sink.finals(),
+            vec![(b, "打开浏览器".to_string())],
+            "只有新实例的这句被交付，且恰好一次"
+        );
+    }
+
     /// 旧实例的迟到事件：不改状态、不动新会话、不触发 Agent。
     #[test]
     fn stale_events_from_previous_instance_are_ignored() {
@@ -2558,7 +2712,7 @@ mod tests {
         let instance = voice.route.open();
         let stop = Arc::new(AtomicBool::new(false));
         voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
-        voice.active.begin(VoiceTurn {
+        voice.route.active.begin(VoiceTurn {
             instance,
             session: 1,
         });
@@ -2568,7 +2722,7 @@ mod tests {
 
         assert!(stop.load(Ordering::SeqCst), "关麦必须真的停止采集");
         assert!(voice.handle.is_none(), "句柄要释放，避免重复持有设备");
-        assert!(voice.active.current().is_none(), "在途识别必须过期");
+        assert!(voice.route.active.current().is_none(), "在途识别必须过期");
         assert!(
             !turn_cancel.is_cancelled(),
             "关麦不是撤销：正在执行的回合继续"
@@ -2671,7 +2825,7 @@ mod tests {
         };
         assert!(voice.route.bind(instance, turn));
         voice.cancel_pending();
-        assert!(voice.active.current().is_none());
+        assert!(voice.route.active.current().is_none());
 
         let prompt = voice.on_event(
             &weak,

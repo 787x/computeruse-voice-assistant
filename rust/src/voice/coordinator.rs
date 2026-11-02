@@ -95,10 +95,15 @@ pub struct VoiceTurn {
     pub session: u64,
 }
 
-/// 当前可提交的语音会话（跨线程共享）。
+/// 当前可提交的语音会话（同一麦克风实例内跨线程共享）。
 ///
 /// 由协调器写入（开始/结束一句），worker 可以清空它来取消当前这句。
 /// 所有清除操作都做**归属核对**：旧回合的迟到完成事件不能清掉新回合。
+///
+/// **一份 `ActiveSession` 只属于一个麦克风实例**：`clear()` 是无条件的，
+/// 若两个时代的实例共享同一份，旧线程的 `shutdown()` / `fail()` 收尾就会把
+/// 新实例正在识别的那一句抹掉（表现为新实例的 Final 被当成过期丢弃）。
+/// 调用方每次 `spawn()` 必须传一份新的；见 `ui::worker::VoiceRoute::open`。
 #[derive(Clone, Debug, Default)]
 pub struct ActiveSession(Arc<Mutex<Option<VoiceTurn>>>);
 
@@ -900,6 +905,9 @@ impl Drop for VoiceHandle {
 
 /// 启动语音线程。模型加载与设备打开在**新线程**上做，
 /// 结果通过 `sink` 回传（加载可能要几百毫秒，不能堵住 worker 主循环）。
+///
+/// `active` 必须是一个**新的** [`ActiveSession`]：它只属于这个实例，
+/// 旧实例的线程继续持有自己的那份，收尾时清不到这里。
 pub fn spawn(
     config: CoordinatorConfig,
     sink: SharedSink,

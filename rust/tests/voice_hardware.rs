@@ -175,7 +175,6 @@ fn quick_close_and_reopen_reaches_listening_again() {
         Err(errors) => panic!("模型不可用，无法做真机验收：\n{}", errors.join("\n")),
     };
 
-    let active = ActiveSession::new();
     let mut seen = Vec::new();
     for instance in [1u64, 2] {
         let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -188,9 +187,10 @@ fn quick_close_and_reopen_reaches_listening_again() {
             sink_events.lock().unwrap().push(line);
         });
         let stop = Arc::new(AtomicBool::new(false));
-        let handle =
-            coordinator::spawn(config.clone(), sink, active.clone(), stop.clone(), instance)
-                .expect("启动语音线程");
+        // 每个实例一份自己的活动会话（与 VoiceRuntime 的分配方式一致）。
+        let active = ActiveSession::new();
+        let handle = coordinator::spawn(config.clone(), sink, active, stop.clone(), instance)
+            .expect("启动语音线程");
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let prefix = format!("[{instance}] ");
