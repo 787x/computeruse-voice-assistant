@@ -24,9 +24,29 @@ use std::time::{Duration, Instant};
 
 use cuava::voice::capture::Capture;
 use cuava::voice::coordinator::{
-    self, ActiveSession, CoordinatorConfig, SharedSink, VoiceEventKind,
+    self, ActiveSession, CoordinatorConfig, SharedSink, VoiceEvent, VoiceEventKind,
 };
 use cuava::voice::settings::{VoicePaths, VoiceSettings};
+
+/// 事件 → 一行可读文本（电平事件不记录，避免刷屏）。
+fn event_line(event: &VoiceEvent) -> Option<String> {
+    let line = match &event.kind {
+        VoiceEventKind::StateChanged(state) => format!("state: {}", state.code()),
+        VoiceEventKind::Ready(info) => format!(
+            "ready: {} @ {} Hz, backend={}, fallback={:?}",
+            info.device_name,
+            info.sample_rate,
+            info.backend.code(),
+            info.fallback_reason
+        ),
+        VoiceEventKind::Woke { keyword, .. } => format!("woke: {keyword}"),
+        VoiceEventKind::Final { text, .. } => format!("final: {text}"),
+        VoiceEventKind::Rejected { reason, .. } => format!("rejected: {reason:?}"),
+        VoiceEventKind::Overflow => "overflow".to_string(),
+        VoiceEventKind::Level { .. } => return None,
+    };
+    Some(format!("[{}] {line}", event.instance))
+}
 
 fn repo_root() -> PathBuf {
     if let Some(root) = std::env::var_os("CUAVA_REPO_ROOT") {
@@ -73,20 +93,8 @@ fn real_models_and_microphone_reach_listening() {
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
     let sink = SharedSink::new(move |event| {
-        let line = match &event.kind {
-            VoiceEventKind::StateChanged(state) => format!("state: {}", state.code()),
-            VoiceEventKind::Ready(info) => format!(
-                "ready: {} @ {} Hz, backend={}, fallback={:?}",
-                info.device_name,
-                info.sample_rate,
-                info.backend.code(),
-                info.fallback_reason
-            ),
-            VoiceEventKind::Woke { keyword, .. } => format!("woke: {keyword}"),
-            VoiceEventKind::Final { text, .. } => format!("final: {text}"),
-            VoiceEventKind::Rejected { reason, .. } => format!("rejected: {reason:?}"),
-            VoiceEventKind::Overflow => "overflow".to_string(),
-            VoiceEventKind::Level { .. } => return,
+        let Some(line) = event_line(&event) else {
+            return;
         };
         eprintln!("[voice] {line}");
         sink_events.lock().unwrap().push(line);
@@ -104,8 +112,8 @@ fn real_models_and_microphone_reach_listening() {
     while Instant::now() < deadline {
         {
             let events = events.lock().unwrap();
-            if events.iter().any(|line| line.starts_with("ready: "))
-                && events.iter().any(|line| line == "state: listening")
+            if events.iter().any(|line| line.contains("ready: "))
+                && events.iter().any(|line| line.contains("state: listening"))
             {
                 listened = true;
                 break;
@@ -131,11 +139,13 @@ fn real_models_and_microphone_reach_listening() {
 
     let ready_line = snapshot
         .iter()
-        .find(|line| line.starts_with("ready: "))
+        .find(|line| line.contains("ready: "))
         .unwrap_or_else(|| panic!("模型与设备没有就绪：{snapshot:#?}"));
     println!("就绪行：{ready_line}");
     assert!(
-        snapshot.iter().any(|line| line == "state: listening"),
+        snapshot
+            .iter()
+            .any(|line| line.contains("state: listening")),
         "没有进入监听状态"
     );
     assert!(
@@ -149,4 +159,81 @@ fn real_models_and_microphone_reach_listening() {
             "CPU-only 构建不能显示 CUDA：{ready_line}"
         );
     }
+}
+
+/// **关麦后立刻重开**：设备与模型能被第二个实例重新拿到，并且都能进入监听。
+///
+/// 这条在真机上验证「停止是有上限的等待 + 旧实例不再代表当前」：
+/// 事件行带实例号，第二个实例的 ready/listening 必须属于它自己。
+#[test]
+#[ignore = "需要真实麦克风与模型"]
+fn quick_close_and_reopen_reaches_listening_again() {
+    let voice = VoiceSettings::default();
+    let paths = VoicePaths::resolve(&cuava::config::AppPaths::with_root(smoke_root()));
+    let config = match CoordinatorConfig::resolve(&voice, &paths) {
+        Ok(config) => config,
+        Err(errors) => panic!("模型不可用，无法做真机验收：\n{}", errors.join("\n")),
+    };
+
+    let active = ActiveSession::new();
+    let mut seen = Vec::new();
+    for instance in [1u64, 2] {
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let sink = SharedSink::new(move |event| {
+            let Some(line) = event_line(&event) else {
+                return;
+            };
+            eprintln!("[voice] {line}");
+            sink_events.lock().unwrap().push(line);
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle =
+            coordinator::spawn(config.clone(), sink, active.clone(), stop.clone(), instance)
+                .expect("启动语音线程");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let prefix = format!("[{instance}] ");
+        let mut listened = false;
+        while Instant::now() < deadline {
+            {
+                let events = events.lock().unwrap();
+                if events
+                    .iter()
+                    .any(|line| line.starts_with(&prefix) && line.contains("state: listening"))
+                {
+                    listened = true;
+                    break;
+                }
+                if events
+                    .iter()
+                    .any(|line| line.starts_with(&prefix) && line.contains("state: error"))
+                {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let snapshot = events.lock().unwrap().clone();
+        println!("实例 {instance} 事件：{snapshot:#?}");
+        assert!(
+            listened,
+            "实例 {instance} 没有进入监听（关麦重开后设备/模型应能重新启动）：{snapshot:#?}"
+        );
+        let ready = snapshot
+            .iter()
+            .find(|line| line.starts_with(&prefix) && line.contains("ready: "))
+            .unwrap_or_else(|| panic!("实例 {instance} 没有就绪事件：{snapshot:#?}"));
+        println!("实例 {instance} 就绪：{ready}");
+        seen.extend(snapshot);
+
+        // 立刻关闭，不等待：下个实例紧接着启动（模拟用户连续点开关）。
+        drop(handle);
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    // 两个实例的身份必须不同，避免旧事件被当成本实例的。
+    assert!(seen.iter().any(|line| line.starts_with("[1] ")));
+    assert!(seen.iter().any(|line| line.starts_with("[2] ")));
 }

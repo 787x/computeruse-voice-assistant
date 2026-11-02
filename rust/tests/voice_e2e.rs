@@ -72,6 +72,17 @@ fn require<T>(value: Option<T>, what: &str) -> Option<T> {
     value
 }
 
+/// 真实 `ggml-small` 上下文每个约占 500 MB 权重 + 上百 MB 计算缓冲。
+///
+/// `cargo test` 默认并行跑同一测试文件里的用例：三个上下文同时加载，在 16 GB
+/// 机器上会挤到内存上限，偶发出现「解码失败」。那是环境压力，不是产品行为，
+/// 但会变成红灯误报。这里把**加载真实 Whisper 模型**的部分串行化；
+/// 官方建议的 `--test-threads=1` 命令依然是最省事的跑法。
+fn whisper_model_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 用真实 KWS 模型喂一段 WAV，返回命中的关键词。
 fn detect_wake(kws: &mut Kws, wav: &Path) -> bool {
     let samples = read_wav_16k(wav).expect("读取 WAV");
@@ -190,6 +201,7 @@ fn real_vad_ends_on_silence_for_a_real_recording() {
 
 #[test]
 fn real_whisper_transcribes_chinese_command() {
+    let _serial = whisper_model_guard();
     let (Some(model), Some(wav)) = (
         require(whisper_model(), "Whisper 模型（ggml-small.bin）"),
         require(sample("asr-zh.wav"), "asr-zh.wav"),
@@ -239,6 +251,7 @@ fn real_whisper_transcribes_chinese_command() {
 /// 除了「真人对着麦克风说」以外的全部环节。
 #[test]
 fn real_session_from_wake_to_final_text() {
+    let _serial = whisper_model_guard();
     let (Some(model_dir), Some(keywords), Some(wake_wav), Some(command_wav)) = (
         require(kws_model_dir(), "KWS 模型目录"),
         require(
@@ -348,6 +361,7 @@ fn asr_worker_delivers_final_and_keeps_session_until_consumed() {
     use cuava::voice::coordinator::{ActiveSession, VoiceTurn};
     use std::sync::mpsc;
 
+    let _serial = whisper_model_guard();
     let (Some(model), Some(wav)) = (
         require(whisper_model(), "Whisper 模型"),
         require(sample("asr-zh.wav"), "asr-zh.wav"),
