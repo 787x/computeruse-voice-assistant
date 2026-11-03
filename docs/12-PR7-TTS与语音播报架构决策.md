@@ -151,19 +151,40 @@ MiMo 官方地址，Key 只出现在 Authorization 头里，不进入错误信�
 
 **怎么开启 CUDA**（默认构建仍是静态单文件 + CPU TTS）：
 
-1. `Cargo.toml` 把 `sherpa-onnx` 改成 `default-features = false, features = ["shared"]`；
-2. `SHERPA_ONNX_LIB_DIR` 指向 GPU 版 sherpa 运行时的 `lib` 目录
+链接方式现在由 crate feature 决定，**不再需要手改 `Cargo.toml`**
+（`sherpa-onnx` 的默认 feature 已关闭，否则 static 与 shared 会同时打开）：
+
+| feature | sherpa-onnx 链接 | 说明 |
+| --- | --- | --- |
+| （都不开） | 静态库（CPU） | 默认分发形态：单文件、无 DLL |
+| `tts-static` | 静态库（CPU） | 显式要求静态链接 |
+| `tts-cuda` | shared（GPU 运行时） | 本地 TTS 走 CUDA，需要 `SHERPA_ONNX_LIB_DIR` |
+
+1. `SHERPA_ONNX_LIB_DIR` 指向 GPU 版 sherpa 运行时的 `lib` 目录
    （`sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda`）；
-3. `cargo build --release --features tts-cuda`；
-4. 运行时把 `cublas64_13` / `cublasLt64_13` / `cudart64_13` / `cudnn64_9` 等 DLL
-   放进 PATH 或 exe 同目录。
-5. 配置里 `localProvider` 默认就是 `"cuda"`，不需要额外设置。
+2. `cargo build --release --features tts-cuda`；
+3. 运行时把 `cublas64_13` / `cublasLt64_13` / `cudart64_13` / `cudnn64_9` 等 DLL
+   放进 PATH 或 exe 同目录；
+4. 配置里 `localProvider` 默认就是 `"cuda"`，不需要额外设置。
 
 `tts-cuda` 打开时 `build.rs` 会检查 `SHERPA_ONNX_LIB_DIR` 里有没有
-`onnxruntime_providers_cuda.dll`，没有就直接构建失败并给出中文提示——
+`onnxruntime_providers_cuda.dll`（以及 shared 链接需要的 `sherpa-onnx-c-api.lib`），
+否则就直接构建失败并给出中文提示——
 因为 CPU 版库收到 `provider = "cuda"` 只会打印一句
 `Please compile with -DSHERPA_ONNX_ENABLE_GPU=ON ... Fallback to cpu!`
 然后**返回成功**，运行期无法可靠区分，界面就可能把 CPU 显示成 CUDA。
+`tts-static` 与 `tts-cuda` 互斥，同时开启也会在 `build.rs` 里给出可读报错。
+
+**支持状态的如实表述（重要）**：
+
+- `--features tts-cuda` 现在**可复现地切换链接模式**（不再需要改 `Cargo.toml`），
+  这一项是**已实现并验证过构建**的；
+- 但 CUDA **合成**本身仍是**实验性**：本仓库的验证环境没有可用的 cuDNN 9，
+  因此没有在真实 GPU 上端到端跑通过。构建成功只说明"链接到了 GPU 运行时"，
+  **不能**当作"已经在用 GPU"的证据；
+- 运行期拿不到 GPU 时 `LocalTts` 会回退 CPU，并把
+  `cpu（CUDA 不可用，已回退）` 写进引擎标签——不假装。
+  这条回退路径有确定性测试覆盖，与是否真的用过 CUDA 无关。
 
 没有 `tts-cuda` 的构建（默认）里，`localProvider` 即使写 `cuda` 也会直接按 CPU
 建引擎，标签显示 `cpu（本构建未启用 CUDA TTS）`——不假装。

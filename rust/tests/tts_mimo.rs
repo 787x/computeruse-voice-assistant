@@ -321,11 +321,15 @@ async fn first_chunk_arrives_before_the_stream_finishes() {
 }
 
 /// 极端分片 + 奇数字节：不能错位半帧、不能丢样本。
+///
+/// 这里用**偶数**总字节：分片边界仍然是奇数字节（1 字节 / 3 字节一块），
+/// 但整段音频是完整的，所以必须正常结束。真正的"末尾缺半个样本"由
+/// `truncated_half_sample_is_reported` 覆盖。
 #[tokio::test]
 async fn odd_byte_boundaries_do_not_corrupt_the_audio() {
     let case = "odd-bytes";
     // 每个样本 2 字节，故意让每个事件只带 1 或 3 字节。
-    let pcm: Vec<u8> = (0..41u8).collect();
+    let pcm: Vec<u8> = (0..42u8).collect();
     let mut script = Vec::new();
     for chunk in pcm.chunks(1).take(21) {
         script.push(audio_event(chunk));
@@ -343,7 +347,7 @@ async fn odd_byte_boundaries_do_not_corrupt_the_audio() {
     let (samples, failure, finished) = drain(engine.start(request(2)).unwrap()).await;
     assert!(failure.is_none(), "{failure:?}");
     assert!(finished);
-    assert_eq!(samples, pcm.len() / 2, "41 字节 = 20 个完整样本 + 1 个残留");
+    assert_eq!(samples, pcm.len() / 2, "42 字节 = 21 个完整样本");
 }
 
 /// 空 choices（只带 usage 的收尾块）、无关字段与 `[DONE]` 都要正确处理。
@@ -475,4 +479,98 @@ async fn request_uses_official_protocol_and_the_mimo_key() {
     assert_eq!(messages[1]["content"], "你好，世界。");
     // 请求体里不能出现 Key 本身（Key 只在 Authorization 头里）。
     assert!(!body.to_string().contains("sk-mimo-test-key"));
+}
+
+/// **P2 回归**：连接正常关闭（完整收尾块）但**没有** `[DONE]` 时不能报成功。
+///
+/// 这是"半句话被当成播完"的真实来源：TCP FIN 只说明对面不再发数据，
+/// 不代表模型说完了。
+#[tokio::test]
+async fn clean_close_without_done_marker_is_not_success() {
+    let case = "clean-close-no-done";
+    let engine = engine_for(
+        case,
+        // 有音频、有空 choices 收尾块、连接正常关闭，但没有 `[DONE]`。
+        Reply::Script(vec![
+            audio_event(&[0x10, 0x20, 0x30, 0x40]),
+            sse(r#"{"choices":[],"usage":{"total_tokens":6}}"#),
+        ]),
+    );
+    let (samples, failure, finished) = drain(engine.start(request(9)).unwrap()).await;
+    assert_eq!(samples, 2, "已经到达的音频照常交付");
+    assert!(!finished, "没有完成标记不能算正常播完");
+    let message = failure.expect("缺少完成标记必须如实报告");
+    assert!(message.contains("完成标记"), "{message}");
+}
+
+/// **P2 回归**：PCM16 末尾剩半个样本（奇数字节）必须报数据不完整。
+///
+/// 上一块留下的残留如果到最后还没配上，说明音频被截断——不能当成播完。
+#[tokio::test]
+async fn truncated_half_sample_is_reported() {
+    let case = "half-sample";
+    let engine = engine_for(
+        case,
+        Reply::Script(vec![
+            // 3 字节 = 1 个完整样本 + 1 个残留字节。
+            audio_event(&[0x11, 0x22, 0x33]),
+            done_event(),
+        ]),
+    );
+    let (samples, failure, finished) = drain(engine.start(request(10)).unwrap()).await;
+    assert_eq!(samples, 1, "完整的那一个样本要照常交付");
+    assert!(!finished, "缺半个样本不能算正常播完");
+    let message = failure.expect("数据不完整必须报错");
+    assert!(message.contains("不完整"), "{message}");
+    assert!(message.contains("PCM16"), "{message}");
+}
+
+/// **P2 回归**：最后一个事件的解析错误不能被忽略。
+///
+/// 这个尾事件没有以空行结尾，正好落在"循环结束后的收尾"分支里；
+/// 旧实现用 `let _ =` 丢掉了它的错误，于是坏数据被当成正常结束。
+#[tokio::test]
+async fn malformed_tail_event_is_reported() {
+    let case = "bad-tail";
+    let engine = engine_for(
+        case,
+        Reply::Script(vec![
+            audio_event(&[0x01, 0x02]),
+            // 没有 `\n\n` 结尾：最后一个事件只能由收尾逻辑处理。
+            b"data: {\"error\":{\"message\":\"upstream failed\"}}".to_vec(),
+        ]),
+    );
+    let (samples, failure, finished) = drain(engine.start(request(11)).unwrap()).await;
+    assert_eq!(samples, 1);
+    assert!(!finished, "尾事件报错不能算正常播完");
+    let message = failure.expect("尾事件的错误必须上报");
+    assert!(message.contains("upstream failed"), "{message}");
+}
+
+/// 正常结束（`[DONE]` 在最后一个没有空行结尾的事件里）仍然要成功。
+#[tokio::test]
+async fn done_marker_without_trailing_blank_line_finishes() {
+    let case = "done-tail";
+    let engine = engine_for(
+        case,
+        Reply::Script(vec![
+            audio_event(&[0x01, 0x02]),
+            b"data: [DONE]\n\n".to_vec(),
+        ]),
+    );
+    let (samples, failure, finished) = drain(engine.start(request(12)).unwrap()).await;
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(samples, 1);
+    assert!(finished);
+
+    // 只写 `[DONE]`、没有结尾空行：同样要认。
+    let case = "done-tail-2";
+    let engine = engine_for(
+        case,
+        Reply::Script(vec![audio_event(&[0x01, 0x02]), b"data: [DONE]".to_vec()]),
+    );
+    let (samples, failure, finished) = drain(engine.start(request(13)).unwrap()).await;
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(samples, 1);
+    assert!(finished, "最后一个事件就是 [DONE] 时也必须正常结束");
 }

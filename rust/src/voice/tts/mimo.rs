@@ -146,18 +146,31 @@ impl MimoTts {
         let mut events: Vec<String> = Vec::new();
         let mut decoder = Pcm16Decoder::default();
         let mut saw_audio = false;
-        let mut finished = false;
+        /*
+         * 只有**协议认可的结束信号**（`[DONE]`）才算正常合成结束。
+         *
+         * 连接被正常关闭（TCP FIN）并不等于模型说完了：把"读到 EOF"当成完成，
+         * 就会把被截断的句子当成"正常播完"，用户听到的是半句话却没有报错。
+         */
+        let mut saw_done = false;
+        let mut cancelled = false;
+        // 最后一个事件的解析错误：不能像以前那样 `let _ =` 丢掉。
+        let mut tail_error: Option<String> = None;
 
         'outer: loop {
             let idle = Duration::from_millis(self.timeout_ms);
             let chunk = tokio::select! {
                 chunk = tokio::time::timeout(idle, stream.next()) => chunk,
-                _ = request.cancel.cancelled() => break 'outer,
+                _ = request.cancel.cancelled() => {
+                    cancelled = true;
+                    break 'outer;
+                }
             };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(_) => {
                     if request.cancel.is_cancelled() {
+                        cancelled = true;
                         break 'outer;
                     }
                     return Err(format!(
@@ -171,6 +184,7 @@ impl MimoTts {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     if request.cancel.is_cancelled() {
+                        cancelled = true;
                         break 'outer;
                     }
                     return Err(format!("MiMo TTS 传输中断：{error}"));
@@ -182,46 +196,77 @@ impl MimoTts {
             while let Some((end, separator)) = crate::llm::find_event_boundary(&buffer) {
                 let raw: Vec<u8> = buffer.drain(..end).collect();
                 buffer.drain(..separator);
-                if let Ok(raw) = String::from_utf8(raw) {
-                    if pump_events(
-                        &raw,
-                        &mut events,
-                        &mut decoder,
-                        &request,
-                        &tx,
-                        &mut saw_audio,
-                    )? {
-                        finished = true;
-                        break 'outer;
-                    }
-                }
-            }
-            // 一条事件里的多个 `data:` 行要合并后再解释（SSE 允许多行 data）。
-            if request.cancel.is_cancelled() {
-                break 'outer;
-            }
-        }
-
-        if request.cancel.is_cancelled() {
-            return Ok(Outcome::Cancelled);
-        }
-        // 缓冲区里最后一个没有空行结尾的事件也要处理。
-        if !buffer.is_empty() {
-            if let Ok(raw) = String::from_utf8(std::mem::take(&mut buffer)) {
-                let _ = pump_events(
+                let raw = String::from_utf8(raw).map_err(|_| {
+                    "MiMo TTS 返回了无法解码的数据（不是有效的 SSE 文本）".to_string()
+                })?;
+                if pump_events(
                     &raw,
                     &mut events,
                     &mut decoder,
                     &request,
                     &tx,
                     &mut saw_audio,
-                );
+                )? {
+                    saw_done = true;
+                    break 'outer;
+                }
+            }
+            // 一条事件里的多个 `data:` 行要合并后再解释（SSE 允许多行 data）。
+            if request.cancel.is_cancelled() {
+                cancelled = true;
+                break 'outer;
             }
         }
-        let _ = finished;
 
+        if cancelled || request.cancel.is_cancelled() {
+            return Ok(Outcome::Cancelled);
+        }
+        /*
+         * 缓冲区里最后一个没有空行结尾的事件也要处理。
+         *
+         * 已经收到 `[DONE]` 时后面的字节属于协议尾巴，忽略；否则这个尾事件
+         * （可能是 `[DONE]`，也可能是坏 JSON）必须真的参与判定：
+         * 前者决定"是否正常结束"，后者必须报错而不是被丢掉。
+         */
+        if !saw_done && !buffer.is_empty() {
+            let raw = std::mem::take(&mut buffer);
+            match String::from_utf8(raw) {
+                Ok(raw) if raw.trim().is_empty() => {}
+                Ok(raw) => {
+                    match pump_events(
+                        &raw,
+                        &mut events,
+                        &mut decoder,
+                        &request,
+                        &tx,
+                        &mut saw_audio,
+                    ) {
+                        Ok(done) => saw_done |= done,
+                        Err(error) => tail_error = Some(error),
+                    }
+                }
+                Err(_) => {
+                    tail_error =
+                        Some("MiMo TTS 返回了无法解码的数据（不是有效的 SSE 文本）".to_string())
+                }
+            }
+        }
+
+        if let Some(error) = tail_error {
+            return Err(error);
+        }
+        // PCM16 是两个字节一个样本：末尾剩半个样本说明音频被截断，
+        // 不能把它当成"完整播完"。
+        if decoder.has_leftover() {
+            return Err("MiMo TTS 音频数据不完整（PCM16 末尾缺半个采样）".to_string());
+        }
         if !saw_audio {
             return Err("MiMo TTS 没有返回音频（请检查模型名、音色名与账户权限）".to_string());
+        }
+        if !saw_done {
+            return Err(
+                "MiMo TTS 连接在完成标记之前结束，音频可能不完整（请重试或检查网络）".to_string(),
+            );
         }
         Ok(Outcome::Finished)
     }
@@ -553,6 +598,18 @@ mod tests {
         let mut decoder = Pcm16Decoder::default();
         let error = decoder.push_base64("!!!not-base64!!!").unwrap_err();
         assert!(error.contains("损坏"), "{error}");
+    }
+
+    /// 末尾剩半个采样 = 数据不完整（不能当成完整播完）。
+    #[test]
+    fn leftover_half_sample_is_detectable() {
+        let mut decoder = Pcm16Decoder::default();
+        // 1 个完整样本 + 1 个游离字节。
+        assert_eq!(decoder.push_bytes(&[0x01, 0x02, 0x03]), 1);
+        assert!(decoder.has_leftover(), "奇数字节必须留下可检测的残留");
+        // 再补一个字节就补齐了。
+        assert_eq!(decoder.push_bytes(&[0x04]), 1);
+        assert!(!decoder.has_leftover());
     }
 
     /// SSE 负载的各种合法/异常形态。

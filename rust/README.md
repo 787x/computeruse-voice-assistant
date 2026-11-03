@@ -137,9 +137,22 @@ whisper.cpp 在请求 GPU 却找不到设备时会**静默**退回 CPU，只看�
   这种构建里本地 TTS 实际就是 CPU，标签会写 `cpu（本构建未启用 CUDA TTS）`。
   要真的用 CUDA，按下一节构建 `--features tts-cuda` 的版本。低配机器可写 `"localProvider": "cpu"`。
 
-### 本地 TTS 用 CUDA（实测 3.2× 更快）
+### 本地 TTS 用 CUDA（**实验性**，未在本仓库验证通过）
 
-RTX 5070 Laptop 实测（同一文本 ≈6.9 秒音频，同一二进制）：
+> **现状说明（请先读这一段）**
+>
+> - `--features tts-cuda` 现在**不需要手改 `Cargo.toml`**：链接方式由 feature 决定
+>   （见下），`build.rs` 会校验运行库确实是 GPU 版。
+> - **但这条路径仍未在真实 GPU 上端到端实测通过**。构建可以成功，运行期是否真的
+>   用上 CUDA 取决于本机有 cuDNN 9 与可用显存；没有时 `LocalTts` 会回退 CPU 并把
+>   `cpu（CUDA 不可用，已回退）` 写进引擎标签，**不会假装 CUDA 生效**。
+> - **"目录里有 CUDA DLL" 不等于"已经在用 GPU"**：那只是链接的前提。真正的判据是
+>   运行期创建 CUDA execution provider 成功，而这在 CPU 版库上会静默回退 CPU。
+>
+> 下表是早期在另一台机器（RTX 5070 Laptop，手工改 Cargo.toml 的 shared 构建）上的
+> 实测数据，**属于参考而非当前构建的验收结果**。
+
+RTX 5070 Laptop 参考数据（同一文本 ≈6.9 秒音频，同一二进制）：
 
 | 指标 | CPU | CUDA |
 | --- | --- | --- |
@@ -149,24 +162,33 @@ RTX 5070 Laptop 实测（同一文本 ≈6.9 秒音频，同一二进制）：
 | 热路径 RTF | 0.201 | **0.062** |
 
 首次 8.5 秒是 cuDNN 句柄与显存分配，程序启用本地 TTS 后会在**后台预热**
-（`TtsEngine::warm_up`），用户第一句回复的延迟就是 158 ms。
+（`TtsEngine::warm_up`），第一句回复的延迟因此只付一次。
 
 开启步骤（CUDA 版 sherpa 只提供 DLL，所以只能是 shared 链接，**不再是单文件**）：
 
 1. 下载 `sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda.tar.bz2`
    （CUDA 12 的机器用 `cuda-12.x` 那个包），解压；
-2. `Cargo.toml` 里 `sherpa-onnx` 改成
-   `{ version = "2.0.1", default-features = false, features = ["shared"] }`；
-3. 设 `SHERPA_ONNX_LIB_DIR=<解压目录>\lib`；
-4. 把 `cublas64_13.dll` / `cublasLt64_13.dll` / `cudart64_13.dll` 与 cuDNN 9 的
+2. 设 `SHERPA_ONNX_LIB_DIR=<解压目录>\lib`（**不需要**再改 `Cargo.toml`）；
+3. 把 `cublas64_13.dll` / `cublasLt64_13.dll` / `cudart64_13.dll` 与 cuDNN 9 的
    `cudnn64_9.dll` 等放进 PATH 或 exe 同目录（`pip download nvidia-cudnn-cu13`
    的 wheel 里就有，CUDA runtime/cuBLAS 可从 NVIDIA redist 取）；
-5. `cargo build --release --features tts-cuda`。
+4. `cargo build --release --features tts-cuda`。
 
-`build.rs` 会校验 `SHERPA_ONNX_LIB_DIR` 里确实有 `onnxruntime_providers_cuda.dll`，
-否则构建直接失败——避免出现"set provider=cuda 但实际在跑 CPU"的假象。
+链接方式由本 crate 的 feature 决定，`sherpa-onnx` 的默认 feature 已关闭：
+
+| feature | sherpa-onnx 链接 | 用途 |
+| --- | --- | --- |
+| （都不开） | 静态库（CPU） | 默认分发形态：单文件、无 DLL |
+| `tts-static` | 静态库（CPU） | 显式要求静态链接 |
+| `tts-cuda` | shared（GPU 运行时） | 本地 TTS 走 CUDA，需要 `SHERPA_ONNX_LIB_DIR` |
+
+`tts-static` 与 `tts-cuda` **互斥**，同时开会在 `build.rs` 里给出中文报错。
+`build.rs` 还会校验 `SHERPA_ONNX_LIB_DIR` 里确实有 `onnxruntime_providers_cuda.dll`
+与 `sherpa-onnx-c-api.lib`，否则构建直接失败——避免出现"set provider=cuda 但实际在跑 CPU"的假象。
+
 对比脚本：`cargo run --release --features tts-cuda --example tts_bench -- cuda`
-（`CUAVA_TTS_MODEL_DIR` 指向模型目录）。
+（`CUAVA_TTS_MODEL_DIR` 指向模型目录）。没有真实 GPU / cuDNN 时，这个基准只会
+跑出 CPU 数字，**不能当作 CUDA 验证结果**。
 - **自动播报**：可选「语音与文本 / 只播语音 / 只播文本 / 都不自动」。回合失败或中断**不播报**。
 - **只播可见正文**：思考内容（`reasoning_content`）、工具 JSON、内部提示、未完整的工具调用
   都不会被读出来。超过 400 字的回复只播前 400 字，并在状态栏说明还差多少字。

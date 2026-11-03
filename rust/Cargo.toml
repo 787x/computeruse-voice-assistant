@@ -52,9 +52,13 @@ rubato = "0.16"
 hound = "3.5"
 # 唤醒词：k2-fsa 官方 Rust 封装，有完整的流式 KWS 接口
 # （create_stream / is_ready / decode / reset / get_result）。
-# 默认 feature 是 static：产物单文件，不需要额外分发 sherpa/onnxruntime DLL。
-# 想让本地 TTS 走 CUDA，需要改成 shared 并指向 GPU 版运行时（见 README「本地 TTS 用 CUDA」）。
-sherpa-onnx = "2.0.1"
+#
+# 链接方式由本 crate 的 `tts-static` / `tts-cuda` feature 决定，所以这里
+# **关掉** sherpa-onnx 自己的默认 feature：否则默认永远带 `static`，
+# 再开 `tts-cuda` 就会同时启用 static + shared，sherpa-onnx-sys 的构建
+# 脚本会直接报 "Features `static` and `shared` cannot be enabled at the same time"。
+# 这就是"必须手改 Cargo.toml 才能切 CUDA"的根因。
+sherpa-onnx = { version = "2.0.1", default-features = false }
 # ASR：whisper.cpp 1.8.3 的 Rust 绑定（cmake 静态编译），模型进程内复用。
 # 默认构建带 CUDA（见 [features]）；没有 CUDA Toolkit 的机器用 CPU 基线构建。
 whisper-rs = "0.16"
@@ -73,11 +77,18 @@ whisper-rs-sys = { version = "0.15", default-features = false }
 # 两条路径都能运行同一份代码；运行时后端由 `voice::asr` 如实上报。
 default = ["cuda"]
 cuda = ["whisper-rs/cuda"]
-# 本地 TTS（Kokoro）走 CUDA：需要 shared 版 GPU 运行时
-# （cargo 侧还要把 sherpa-onnx 改成 features = ["shared"]，见 README）。
-# 实测热路径 CUDA RTF 0.059 vs CPU 0.157，但首次合成要付约 9 秒的
-# cuDNN/显存初始化（已用启动预热抵消）。默认关闭：默认构建是静态单文件。
-tts-cuda = []
+# 本地 TTS 的 sherpa-onnx 链接方式：**二选一**，默认静态（单文件分发）。
+tts-static = ["sherpa-onnx/static"]
+# 本地 TTS（Kokoro）走 CUDA：需要 shared 版 GPU 运行时。
+#
+# 与 Whisper 的 `cuda` 是两件独立的事：`cuda` 只影响 whisper.cpp，
+# 这里只影响 sherpa-onnx。启用后 Cargo 会把 sherpa-onnx 切成 shared，
+# 必须同时提供 `SHERPA_ONNX_LIB_DIR`（指向 GPU 版运行时的 lib 目录），
+# build.rs 会校验该目录里确实有 onnxruntime_providers_cuda.dll。
+#
+# **实验性**：本仓库的验证环境没有可用的 cuDNN 9，因此 CUDA 合成路径
+# **未在真实 GPU 上实测通过**。详见 rust/README.md「本地 TTS 用 CUDA」。
+tts-cuda = ["sherpa-onnx/shared"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -93,7 +104,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "proce
 # 语音端到端测试直接用 whisper 上下文（与工作线程同一套调用）。
 whisper-rs = "0.16"
 hound = "3.5"
-sherpa-onnx = "2.0.1"
+# 唤醒词 / 本地 TTS 用默认的静态 sherpa-onnx（与主依赖同一套 feature 选择）。
+sherpa-onnx = { version = "2.0.1", default-features = false }
 # TTS 流式协议测试要自己造 Base64 音频块（与运行期同一个解码器）。
 base64 = "0.22"
 

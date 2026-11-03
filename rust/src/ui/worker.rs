@@ -29,7 +29,7 @@ use crate::voice::{
     playback::PlaybackState,
     settings::VoicePaths,
     speech::{SpeechEvent, SpeechRuntime},
-    tts::{TtsBackend, TtsSettings, TurnId},
+    tts::{SpeechId, TtsBackend, TtsSettings, TurnId},
     CaptureInfoForUi, RejectReason, VoiceEvent, VoiceEventKind, VoiceInstance, VoiceState,
     VoiceTurn,
 };
@@ -761,6 +761,8 @@ async fn run_worker(
      */
     let (speech_tx, mut speech_rx) = tokio::sync::mpsc::unbounded_channel::<SpeechEvent>();
     let mut speech = SpeechRuntime::new(speech_tx);
+    // 界面侧的播报身份：迟到的旧播报事件不能覆盖新播报。
+    let mut speech_view = SpeechView::default();
     {
         let forward = command_tx.clone();
         tokio::spawn(async move {
@@ -860,7 +862,7 @@ async fn run_worker(
                 );
             }
             UiCommand::Speech(event) => {
-                apply_speech_event(&weak, &event);
+                apply_speech_event(&mut speech_view, &weak, &event);
             }
             UiCommand::OpenSettings => {
                 // 权威配置在工作线程：每次打开设置都按当前值回填，不用启动快照。
@@ -951,6 +953,7 @@ async fn run_worker(
                             &confirmer,
                             &mut voice,
                             &mut speech,
+                            &mut speech_view,
                             &command_tx,
                             TurnSource::Text,
                         )
@@ -1013,6 +1016,7 @@ async fn run_worker(
                             &confirmer,
                             &mut voice,
                             &mut speech,
+                            &mut speech_view,
                             &command_tx,
                             TurnSource::Voice,
                         )
@@ -1552,8 +1556,48 @@ fn set_speech_unavailable(weak: &slint::Weak<AppWindow>, reason: &str) {
     });
 }
 
+/// 界面侧的播报身份：**只有当前有效播报**的事件可以改状态、字幕和提示。
+///
+/// 复用播报层已有的 `speech_id`（单调递增，一次播报一个），不另造 generation：
+///  - 更新的 `speech_id` 自动接管（新播报开始）；
+///  - 比当前更旧的 `speech_id` 一律忽略——A 停止后立刻开始 B 时，A 迟到的
+///    `Stopped` / `Finished` / `Failed` / 字幕清空都不能覆盖 B。
+#[derive(Debug, Default)]
+struct SpeechView {
+    /// 当前（或最近一次）播报的身份；`None` = 还没有播报。
+    current: Option<SpeechId>,
+}
+
+impl SpeechView {
+    /// 这条事件是否属于当前有效播报；新播报会在这里接管界面。
+    fn accepts(&mut self, speech_id: SpeechId) -> bool {
+        match self.current {
+            Some(current) if speech_id < current => false,
+            Some(current) if speech_id == current => true,
+            _ => {
+                self.current = Some(speech_id);
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> Option<SpeechId> {
+        self.current
+    }
+}
+
 /// 播报事件 → 界面（状态、字幕、提示）。
-fn apply_speech_event(weak: &slint::Weak<AppWindow>, event: &SpeechEvent) {
+fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, event: &SpeechEvent) {
+    let speech_id = match event {
+        SpeechEvent::State { speech_id, .. }
+        | SpeechEvent::Subtitle { speech_id, .. }
+        | SpeechEvent::Notice { speech_id, .. } => *speech_id,
+    };
+    if !view.accepts(speech_id) {
+        // 旧播报的迟到事件：不改状态、不改字幕、也不弹提示。
+        return;
+    }
     match event {
         SpeechEvent::State { state, .. } => {
             let code = state.code().to_string();
@@ -2159,6 +2203,7 @@ async fn wait_turn(
     confirmer: &Arc<UiConfirmer>,
     voice: &mut VoiceRuntime,
     speech: &mut SpeechRuntime,
+    speech_view: &mut SpeechView,
     command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
     source: TurnSource,
 ) -> TurnWait {
@@ -2251,7 +2296,7 @@ async fn wait_turn(
                         );
                     }
                     Some(UiCommand::Speech(event)) => {
-                        apply_speech_event(weak, &event);
+                        apply_speech_event(speech_view, weak, &event);
                     }
                     Some(UiCommand::Quit) => {
                         if let Some(token) = turn_cancel.as_ref() {
@@ -2559,6 +2604,109 @@ mod tests {
     fn speech_without_engine() -> SpeechRuntime {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         SpeechRuntime::new(tx)
+    }
+
+    fn subtitle(text: &str, speech_id: SpeechId) -> SpeechEvent {
+        SpeechEvent::Subtitle {
+            speech_id,
+            text: text.to_string(),
+        }
+    }
+
+    fn state_event(speech_id: SpeechId, state: PlaybackState) -> SpeechEvent {
+        SpeechEvent::State {
+            speech_id,
+            turn: 1,
+            state,
+        }
+    }
+
+    /// **P1 回归**：旧播报的迟到事件不能覆盖新播报的界面状态。
+    ///
+    /// A 停止后立刻启动 B：A 迟到的 `Stopped` / `Finished` / `Failed` /
+    /// 字幕清空都必须被丢掉。
+    #[test]
+    fn late_events_from_previous_speech_do_not_reach_the_ui() {
+        let mut view = SpeechView::default();
+        // B 先接管界面。
+        assert!(view.accepts(2));
+        assert_eq!(view.current(), Some(2));
+        // A（id=1）的迟到终态与字幕清空一律不接受。
+        assert!(!view.accepts(1), "旧播报的状态不能改界面");
+        assert!(!view.accepts(1), "旧播报的字幕不能改界面");
+        assert!(!view.accepts(1), "旧播报的提示不能改界面");
+        assert_eq!(view.current(), Some(2), "旧事件不能把当前身份改回去");
+        // 同一段播报自己的事件照常接受。
+        assert!(view.accepts(2));
+        // 下一段播报（id=3）自动接管。
+        assert!(view.accepts(3));
+        assert_eq!(view.current(), Some(3));
+        assert!(!view.accepts(2), "已经结束的那一段不能再改界面");
+    }
+
+    /// 播报事件路径按 `speech_id` 归属分发：A 迟到的终态不会发出界面更新。
+    ///
+    /// 这里用一个"只记录接受与否"的替身验证调用顺序，而不是依赖真实窗口：
+    /// `apply_speech_event` 的所有副作用都在 `invoke_from_event_loop` 里，
+    /// 没有窗口时会被静默丢弃——所以断言收敛在 `SpeechView` 上。
+    #[test]
+    fn speech_event_ownership_is_checked_before_any_ui_update() {
+        let mut view = SpeechView::default();
+        // 模拟"B 已经接管"之后再收到 A 的一串事件。
+        let _ = view.accepts(7);
+        for event in [
+            state_event(6, PlaybackState::Stopped),
+            state_event(6, PlaybackState::Finished),
+            state_event(6, PlaybackState::Failed("旧失败".to_string())),
+            subtitle("", 6),
+            subtitle("旧的一句", 6),
+        ] {
+            let speech_id = match &event {
+                SpeechEvent::State { speech_id, .. }
+                | SpeechEvent::Subtitle { speech_id, .. }
+                | SpeechEvent::Notice { speech_id, .. } => *speech_id,
+            };
+            assert!(
+                !view.accepts(speech_id),
+                "旧播报的事件必须被拒绝：{event:?}"
+            );
+        }
+        assert_eq!(view.current(), Some(7));
+    }
+
+    /// 聆听模式：播报期间是打断，结束后必须回到唤醒词；挂起确认优先。
+    ///
+    /// 这条依赖 `SpeechRuntime::is_speaking()` 如实反映真实运行状态——
+    /// 只改 `sync_listen_mode` 而不收敛 `is_speaking()` 是修不好的。
+    #[tokio::test]
+    async fn listen_mode_follows_speech_and_confirmation_state() {
+        let mut voice = VoiceRuntime::new();
+        let confirmer = confirmer_without_ui();
+        let speech = speech_without_engine();
+
+        // 没有播报、没有确认：必须要求唤醒词。
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
+
+        // 有挂起的确认：听「允许 / 拒绝」，并带上请求 id。
+        let _wait = install_pending(&confirmer, 42);
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Confirm);
+        assert_eq!(voice.mode.get().1, 42);
+
+        // 确认结束后回到唤醒词。
+        confirmer.abort_pending();
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
+    }
+
+    /// `SpeechView` 的初始状态：第一条事件无条件接管。
+    #[test]
+    fn first_speech_event_takes_over_the_view() {
+        let mut view = SpeechView::default();
+        assert_eq!(view.current(), None);
+        assert!(view.accepts(1));
+        assert_eq!(view.current(), Some(1));
     }
 
     /// **并发约束**：回合还在跑（含等待点击确认）时，语音/文本都**不能**启动第二回合。
@@ -3068,6 +3216,7 @@ mod tests {
                 &confirmer,
                 &mut voice,
                 &mut speech,
+                &mut SpeechView::default(),
                 &command_tx,
                 TurnSource::Text,
             ),
@@ -3124,6 +3273,7 @@ mod tests {
 
         // 模拟用户在执行中点了「关闭麦克风」，随后又点了「取消」。
         // 两个 future 在同一个任务上交替推进（不需要 'static）。
+        let mut speech_view = SpeechView::default();
         let driver = async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = tx.send(UiCommand::SetVoiceEnabled(false));
@@ -3147,6 +3297,7 @@ mod tests {
             &confirmer,
             &mut voice,
             &mut speech,
+            &mut speech_view,
             &tx,
             TurnSource::Text,
         );

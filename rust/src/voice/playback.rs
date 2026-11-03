@@ -257,6 +257,21 @@ impl PlaybackShared {
         core.queue.clear();
     }
 
+    /// 只把**指定这一段**标记为失败。
+    ///
+    /// 旧播报的合成任务在失败时可能已经把身份让给了新播报（用户抢先说了
+    /// 下一句 / 新回合开始）：那种迟到的失败绝不能把新播报也判成失败。
+    pub fn fail_for(&self, speech_id: u64, message: String) {
+        let mut core = self.lock();
+        if core.speech_id != speech_id {
+            return;
+        }
+        if core.failed.is_none() {
+            core.failed = Some(message);
+        }
+        core.queue.clear();
+    }
+
     pub fn buffered_frames(&self) -> usize {
         self.lock().queue.len()
     }
@@ -333,6 +348,17 @@ pub struct Feed {
     converter: Option<RateConverter>,
     /// 单声道待入队样本（重采样输出）。
     pending: Vec<f32>,
+    /// 重采样器的尾部是否已经冲出过（保证只 flush 一次）。
+    finished: bool,
+}
+
+/// 一次送入的进度：**源输入**与**设备输出**分开计数，单位不同不可混用。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeedProgress {
+    /// 这一次真正被重采样器吃掉的源样本数（含多声道，按交错样本计）。
+    pub consumed: usize,
+    /// 这一次入队到设备缓冲的设备侧帧数。
+    pub queued: usize,
 }
 
 impl Feed {
@@ -343,6 +369,7 @@ impl Feed {
             source_channels: 0,
             converter: None,
             pending: Vec::new(),
+            finished: false,
         }
     }
 
@@ -350,38 +377,83 @@ impl Feed {
         self.speech_id
     }
 
-    /// 送入一个音频块（源采样率、源声道数），返回已入队到设备缓冲的设备侧帧数。
+    /// 送入一个音频块（源采样率、源声道数），返回这次的收尾进度。
     ///
-    /// 返回 0 可能表示"缓冲已满"（调用方应等待）或"这一段已被作废"——
-    /// 调用方用 [`PlaybackShared::progress`] 区分。
+    /// **每个源样本只进转换器一次**：`consumed` 是这一次真正消耗掉的源输入
+    /// 样本数，`queued` 是这一次入队到设备缓冲的**设备侧**帧数。两者单位不同
+    /// （采样率不同），绝不能互相替代——旧实现把设备侧入队帧数当成源样本数
+    /// 推进偏移，24k → 48k 时会重复重采样一半输入，表现为拖音、丢字。
+    ///
+    /// 返回的 [`FeedProgress`] 不保证一次就把 `samples` 全部吃完：缓冲满时
+    /// `consumed` 可能小于 `samples.len()`，调用方应当**只**用 `consumed`
+    /// 推进源偏移，然后等缓冲降到低水位再继续。
     pub fn push_chunk(
         &mut self,
         shared: &PlaybackShared,
         samples: &[f32],
         sample_rate: u32,
         channels: u16,
-    ) -> Result<usize, String> {
+    ) -> Result<FeedProgress, String> {
         if sample_rate == 0 || channels == 0 {
             return Err(format!("音频格式无效：{sample_rate} Hz / {channels} 声道"));
         }
         // 源格式换了：重建转换器（同一段语音里不该发生，但不同后端切换时会）。
         if self.converter.is_none() || self.source_rate != sample_rate {
+            // 旧转换器里没排空的尾部先留着：按"上一段格式"冲出来再换，
+            // 否则换格式时这些样本会被静默丢弃。
+            let tail = match self.converter.as_mut() {
+                Some(converter) => converter.flush()?,
+                None => Vec::new(),
+            };
+            self.pending.extend_from_slice(&tail);
             self.converter = Some(RateConverter::new(sample_rate, shared.device_rate())?);
             self.source_rate = sample_rate;
-            self.source_channels = channels;
-            self.pending.clear();
+            // 换了转换器 = 新的尾部，允许再 flush 一次。
+            self.finished = false;
+        }
+        self.source_channels = channels;
+
+        // 先把上一次没塞进设备缓冲的样本排出去；排不完就这一次不再碰源输入，
+        // 避免"重复转换原始输入"。
+        let queued = self.drain(shared);
+        if self.has_pending() {
+            return Ok(FeedProgress {
+                consumed: 0,
+                queued,
+            });
+        }
+
+        let frames = if channels == 1 {
+            samples.len()
+        } else {
+            samples.len() / channels as usize
+        };
+        if frames == 0 {
+            return Ok(FeedProgress {
+                consumed: 0,
+                queued,
+            });
         }
         let mono: Vec<f32> = if channels == 1 {
             samples.to_vec()
         } else {
-            crate::voice::pcm::downmix_interleaved(samples, channels as usize)
+            // 只取完整帧：残缺的最后一帧留在源缓冲里由调用方决定（这里丢掉），
+            // 但**不**把它算成已消耗，避免源偏移停在半个帧上。
+            crate::voice::pcm::downmix_interleaved(
+                &samples[..frames * channels as usize],
+                channels as usize,
+            )
         };
         let converted = self.converter.as_mut().expect("上面刚建好").push(&mono)?;
         self.pending.extend_from_slice(&converted);
-        Ok(self.drain(shared))
+        let queued = queued + self.drain(shared);
+        Ok(FeedProgress {
+            consumed: frames * channels as usize,
+            queued,
+        })
     }
 
-    /// 把 `pending` 里能放下的部分入队。
+    /// 把 `pending` 里能放下的部分入队；返回实际入队的设备侧帧数。
     fn drain(&mut self, shared: &PlaybackShared) -> usize {
         if self.pending.is_empty() {
             return 0;
@@ -394,12 +466,21 @@ impl Feed {
     }
 
     /// 这段音频结束：把重采样器里剩下的样本冲出来并入队。
+    ///
+    /// **只 flush 一次**：重复调用会二次冲刷同一个转换器（旧实现会在
+    /// `finish` 循环里反复调用），那会把尾部样本重复送进设备缓冲。
+    /// 第二次调用直接返回"没有新样本"。
     pub fn finish(&mut self, shared: &PlaybackShared) -> Result<usize, String> {
-        let tail = match self.converter.as_mut() {
-            Some(converter) => converter.flush()?,
-            None => Vec::new(),
-        };
-        self.pending.extend_from_slice(&tail);
+        if !self.finished {
+            let tail = match self.converter.as_mut() {
+                Some(converter) => converter.flush()?,
+                None => Vec::new(),
+            };
+            self.pending.extend_from_slice(&tail);
+            self.finished = true;
+        }
+        // 排不完的留在 `pending`，调用方按 `has_pending()` 等到有空位再调一次
+        // 本函数（此时不会再 flush，只是继续排出已经转换好的样本）。
         Ok(self.drain(shared))
     }
 
@@ -663,18 +744,38 @@ mod tests {
         let mut offset = 0;
         // 缓冲有界：接不下就"等设备消费一点"，与真实生产端行为一致。
         let mut guard = 0;
-        while offset < samples.len() {
-            let accepted = feed
+        while offset < samples.len() || feed.has_pending() {
+            let progress = feed
                 .push_chunk(shared, &samples[offset..], 48_000, 1)
                 .unwrap();
-            offset += accepted;
-            if accepted == 0 {
+            offset += progress.consumed;
+            if segment_stalled(progress) {
                 let mut sink = vec![0.0; 480];
                 shared.pull(&mut sink);
                 guard += 1;
                 assert!(guard < 10_000, "缓冲一直满，生产端会永远等下去");
             }
         }
+    }
+
+    /// 生产端这一轮什么都没推进（缓冲满）：需要等设备消费。
+    fn segment_stalled(progress: FeedProgress) -> bool {
+        progress.consumed == 0 && progress.queued == 0
+    }
+
+    /// 把重采样尾部与剩余的已转换样本全部排进设备缓冲。
+    fn finish_all(feed: &mut Feed, shared: &PlaybackShared, pull_frames: usize) -> usize {
+        let mut queued = 0usize;
+        let mut guard = 0usize;
+        queued += feed.finish(shared).unwrap();
+        while feed.has_pending() {
+            let mut sink = vec![0.0f32; pull_frames];
+            shared.pull(&mut sink);
+            queued += feed.finish(shared).unwrap();
+            guard += 1;
+            assert!(guard < 100_000, "收尾时缓冲一直满");
+        }
+        queued
     }
 
     /// **核心**：「播完」以队列真正排空为准——标记结束但缓冲里还有样本时不能算完。
@@ -730,8 +831,7 @@ mod tests {
         assert!(!shared.progress().drained());
 
         // 停止后旧身份一个样本都不许进队。
-        assert_eq!(shared.push(3, &[0.5; 100]), 0);
-        // 新语音可以正常开始。
+        assert_eq!(shared.push(3, &[0.5; 100]), 0); // 新语音可以正常开始。
         shared.begin(4);
         assert_eq!(shared.push(4, &[0.5; 100]), 100);
     }
@@ -746,10 +846,10 @@ mod tests {
         shared.begin(11);
 
         // 旧那一段还在往外吐音频：一律被播放层丢掉，一个样本都不许进队。
-        let accepted = stale
+        let progress = stale
             .push_chunk(&shared, &[0.2f32; 480], 48_000, 1)
             .expect("格式合法");
-        assert_eq!(accepted, 0, "旧语音不能入队");
+        assert_eq!(progress.queued, 0, "旧语音不能入队");
         assert_eq!(shared.buffered_frames(), 0, "旧语音不能入队");
         // 新那一段照常进队。
         assert_eq!(shared.push(11, &[0.1; 10]), 10);
@@ -781,30 +881,196 @@ mod tests {
             .collect();
         // 一次性送完整段：重采样输出比设备缓冲先满时会留在 `pending` 里，
         // 这里像真实生产端那样"等设备消费一点再继续入队"。
-        let mut buffered = feed.push_chunk(&shared, &interleaved, 24_000, 2).unwrap();
+        let mut buffered = 0usize;
+        let progress = feed.push_chunk(&shared, &interleaved, 24_000, 2).unwrap();
+        buffered += progress.queued;
         let mut guard = 0;
-        while feed.has_pending() {
-            let mut sink = vec![0.0; 480];
-            shared.pull(&mut sink);
-            buffered += feed.push_chunk(&shared, &[], 24_000, 2).unwrap();
-            guard += 1;
-            assert!(guard < 10_000, "缓冲一直满，生产端会永远等下去");
-        }
-        // 收尾（重采样滤波延迟）同样要排空。
-        buffered += feed.finish(&shared).unwrap();
         while feed.has_pending() {
             let mut sink = vec![0.0; 480];
             shared.pull(&mut sink);
             buffered += feed.finish(&shared).unwrap();
             guard += 1;
-            assert!(guard < 20_000, "收尾时缓冲一直满");
+            assert!(guard < 10_000, "缓冲一直满，生产端会永远等下去");
         }
+        // 收尾（重采样滤波延迟）同样要排空。
+        buffered += finish_all(&mut feed, &shared, 480);
         let expected = 4800;
         assert!(
             (buffered as f64 - expected as f64).abs() < expected as f64 * 0.03,
             "24k/100ms 转 48k 后应约 {expected} 帧，实际 {buffered}"
         );
         assert!(!feed.has_pending() || feed.pending_len() < 64);
+    }
+
+    /// **回归（P1）**：24k → 48k 时，连续**小于重采样块**的小分片输入
+    /// 不能重复、不能丢失。
+    ///
+    /// 旧实现把 `push_chunk` 返回的**设备侧入队帧数**当成源样本数推进偏移：
+    /// 24k → 48k 时它是源样本数的两倍，于是每一轮都会把已经送过的源音频
+    /// 再送一遍（重复重采样），同时源偏移提前越界（后面的音频被跳过）。
+    /// 这里用 37 个样本这种"远小于 640 帧处理块"的分片，逐块断言：
+    ///  - 返回的 `consumed` 永远等于**送进去的源样本数**，不多不少；
+    ///  - 最终设备侧总帧数 = 源时长 × 2（允许 sinc 边界的少量误差）。
+    #[test]
+    fn small_chunks_are_not_resampled_twice_at_double_rate() {
+        let shared = fake_shared(); // 48k
+        shared.begin(20);
+        let mut feed = Feed::new(20);
+        // 24k、2400 个样本 = 100ms；切成 37 个样本一块（小于 640 帧处理块）。
+        let source: Vec<f32> = (0..2400).map(|i| (i as f32 * 0.05).sin() * 0.4).collect();
+        let mut offset = 0usize;
+        let mut total_queued = 0usize;
+        let mut guard = 0usize;
+        while offset < source.len() {
+            let end = (offset + 37).min(source.len());
+            let progress = feed
+                .push_chunk(&shared, &source[offset..end], 24_000, 1)
+                .unwrap();
+            // 每个源样本只进转换器一次：消耗量必须等于这一片的大小。
+            assert_eq!(
+                progress.consumed,
+                end - offset,
+                "每个源样本必须只被消耗一次"
+            );
+            offset += progress.consumed;
+            total_queued += progress.queued;
+            // 缓冲满时只能**等设备消费**，然后继续排出已经转换好的样本；
+            // 这里不能调用 `finish()`（那会提前 flush 重采样器，属于流结束）。
+            while feed.has_pending() {
+                let mut sink = vec![0.0f32; 480];
+                shared.pull(&mut sink);
+                // 再送一次空输入：只把 pending 里已经转换好的样本排出去。
+                let more = feed.push_chunk(&shared, &[], 24_000, 1).unwrap();
+                assert_eq!(more.consumed, 0, "空输入不消耗源样本");
+                total_queued += more.queued;
+                guard += 1;
+                assert!(guard < 10_000, "缓冲一直满");
+            }
+        }
+        total_queued += finish_all(&mut feed, &shared, 480);
+        let expected = 4800.0; // 100ms @48k
+        assert!(
+            (total_queued as f64 - expected).abs() < expected * 0.03,
+            "24k/100ms → 48k 应约 {expected} 帧，实际 {total_queued}"
+        );
+    }
+
+    /// 缓冲满时只等设备消费，**不重复转换原始输入**：再次调用同一个分片时
+    /// 不应该把它再喂一遍转换器。
+    #[test]
+    fn full_buffer_waits_without_reconverting_source() {
+        let shared = fake_shared();
+        shared.begin(21);
+        let mut feed = Feed::new(21);
+        // 先把缓冲填到接近上限。
+        let capacity = (48_000.0 * MAX_BUFFER_SECONDS) as usize;
+        shared.push(21, &vec![0.25; capacity]);
+        let source = vec![0.5f32; 480];
+        let first = feed.push_chunk(&shared, &source, 48_000, 1).unwrap();
+        // 缓冲已满：转换结果留在 pending 里，源样本**不算被丢弃**但这一次
+        // 也没有真正入队；后续必须只排出已转换的 PCM。
+        assert_eq!(shared.buffered_frames(), capacity);
+        while feed.has_pending() {
+            let mut sink = vec![0.0f32; 480];
+            shared.pull(&mut sink);
+            feed.finish(&shared).unwrap();
+        }
+        assert_eq!(first.consumed, source.len(), "源样本应当只被消耗一次");
+        // 音频顺序：队列里先出现的是填充值，然后是这一段。
+        let mut sink = vec![0.0f32; 480];
+        let head = shared.pull(&mut sink);
+        assert!(head > 0);
+        assert!(sink[..head]
+            .iter()
+            .all(|value| (*value - 0.25).abs() < 1e-6 || (*value - 0.5).abs() < 1e-6));
+    }
+
+    /// 重采样尾部只 flush 一次：重复 `finish()` 不会往缓冲里塞重复的尾音。
+    #[test]
+    fn finish_flushes_the_tail_only_once() {
+        let shared = fake_shared();
+        shared.begin(22);
+        let mut feed = Feed::new(22);
+        // 不足一个处理块（640 帧 @24k）：全部内容都要靠 flush 才会出来。
+        feed.push_chunk(&shared, &[0.3f32; 300], 24_000, 1).unwrap();
+        let first = feed.finish(&shared).unwrap();
+        let second = feed.finish(&shared).unwrap();
+        assert!(first > 0, "不足一块的尾部必须被冲出来");
+        assert_eq!(second, 0, "第二次 finish 不能重复 flush");
+        assert_eq!(shared.buffered_frames(), first);
+        let third = feed.finish(&shared).unwrap();
+        assert_eq!(third, 0, "重复 flush 会往缓冲里塞重复的尾音");
+        assert_eq!(shared.buffered_frames(), first);
+    }
+
+    /// 旧播报的合成失败不能把新播报判成失败。
+    #[test]
+    fn stale_failure_does_not_fail_the_new_speech() {
+        let shared = fake_shared();
+        shared.begin(30);
+        shared.stop();
+        shared.begin(31);
+        shared.fail_for(30, "旧的失败".to_string());
+        let progress = shared.progress();
+        assert_eq!(progress.speech_id, 31);
+        assert!(progress.failed.is_none(), "旧播报的失败不能污染新播报");
+        // 当前这一段的失败照常生效。
+        shared.fail_for(31, "设备断开".to_string());
+        assert_eq!(shared.progress().failed.as_deref(), Some("设备断开"));
+    }
+
+    /// **回归（P1）**：不同采样率组合 + 小分片，样本数按比例、内容不重复。
+    ///
+    /// 覆盖真实会出现的三种链路：MiMo 24k → 48k 设备、本地 22.05k → 44.1k 设备、
+    /// 以及向下的 24k → 16k。分片故意小于重采样处理块（640 帧），
+    /// 这样"用设备侧帧数推进源偏移"的错误一定会暴露成样本数不对。
+    #[test]
+    fn small_chunks_resample_correctly_at_all_device_rates() {
+        for (source_rate, device_rate) in [
+            (24_000u32, 48_000u32),
+            (22_050, 44_100),
+            (24_000, 16_000),
+            (48_000, 16_000),
+        ] {
+            let shared = Arc::new(PlaybackShared::new(device_rate, 1));
+            shared.begin(40);
+            let mut feed = Feed::new(40);
+            // 100ms 的源音频，按 37 个样本切片。
+            let frames = (source_rate / 10) as usize;
+            let source: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.4).collect();
+            let mut offset = 0usize;
+            let mut total_queued = 0usize;
+            let mut guard = 0usize;
+            while offset < source.len() {
+                let end = (offset + 37).min(source.len());
+                let progress = feed
+                    .push_chunk(&shared, &source[offset..end], source_rate, 1)
+                    .unwrap();
+                assert_eq!(
+                    progress.consumed,
+                    end - offset,
+                    "{source_rate}→{device_rate}：每个源样本只能消耗一次"
+                );
+                offset += progress.consumed;
+                total_queued += progress.queued;
+                while feed.has_pending() {
+                    let mut sink = vec![0.0f32; 512];
+                    shared.pull(&mut sink);
+                    // 同上：只排出已转换的样本，不提前 flush 重采样尾部。
+                    let more = feed.push_chunk(&shared, &[], source_rate, 1).unwrap();
+                    assert_eq!(more.consumed, 0, "空输入不消耗源样本");
+                    total_queued += more.queued;
+                    guard += 1;
+                    assert!(guard < 100_000, "{source_rate}→{device_rate}：缓冲一直满");
+                }
+            }
+            total_queued += finish_all(&mut feed, &shared, 512);
+            let expected = frames as f64 * device_rate as f64 / source_rate as f64;
+            assert!(
+                (total_queued as f64 - expected).abs() < expected * 0.03,
+                "{source_rate}→{device_rate}：应约 {expected:.0} 帧，实际 {total_queued}"
+            );
+        }
     }
 
     #[test]
