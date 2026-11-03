@@ -316,6 +316,8 @@ export component AppWindow inherits Window {
     in-out property <string> settings-error: "";
     // 是否有未保存的修改（任何输入框/下拉变化置真，保存或取消后清零）。
     in-out property <bool> settings-dirty: false;
+    // 保存进行中：禁用保存按钮，避免重复提交；结果回来前界面照常可交互。
+    in-out property <bool> settings-saving: false;
 
     // 权限确认（ask）
     in-out property <bool> confirm-open: false;
@@ -366,7 +368,7 @@ export component AppWindow inherits Window {
     callback open-settings();
     // **一次保存**：模型端点与语音播报一起提交，由 Rust 侧当作一个事务处理。
     // 返回是否整体成功（Slint 的 callback 可以有返回值，用于就地显示错误）。
-    callback save-all(provider-index: int, base-url: string, model-name: string, api-key: string, permission-index: int, tts-enabled: bool, tts-backend-index: int, tts-mimo-voice: string, tts-mimo-style: string, tts-local-dir: string, tts-local-sid: string, tts-local-speed: string, tts-speak-mode: int) -> bool;
+    callback save-all(provider-index: int, base-url: string, model-name: string, api-key: string, permission-index: int, tts-enabled: bool, tts-backend-index: int, tts-mimo-voice: string, tts-mimo-style: string, tts-local-dir: string, tts-local-sid: string, tts-local-speed: string, tts-speak-mode: int);
     // 关闭设置面板（取消）：丢弃界面上的未保存修改。
     callback cancel-settings();
     // 带上界面当前选中的提供商索引：清除的是**用户看到的**那一家，
@@ -775,7 +777,11 @@ export component AppWindow inherits Window {
                             Text { text: "提供商"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
                                 options: ["mimo", "deepseek", "openai-compatible"];
-                                index: root.provider-index;
+                                // 注意 `index:` 是**单向**绑定：下拉自己会先改内部的
+                                // `index`，这里必须同时把值写回 `root.provider-index`，
+                                // 否则界面显示的提供商与保存出去的 provider_id 会不一致
+                                // （选 DeepSeek 却存成 MiMo，Key 也会写到错误的那家名下）。
+                                index <=> root.provider-index;
                                 picked(index) => {
                                     root.settings-dirty = true;
                                     root.settings-error = "";
@@ -820,9 +826,8 @@ export component AppWindow inherits Window {
                             Text { text: "权限档位"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
                                 options: ["standard", "conservative", "permissive"];
-                                index: root.permission-index;
+                                index <=> root.permission-index;
                                 picked(index) => {
-                                    root.permission-index = index;
                                     root.settings-dirty = true;
                                     root.settings-error = "";
                                 }
@@ -850,9 +855,8 @@ export component AppWindow inherits Window {
                             Text { text: "播报后端"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
                                 options: ["关闭", "MiMo 云端", "本地 ONNX"];
-                                index: root.tts-backend-index;
+                                index <=> root.tts-backend-index;
                                 picked(index) => {
-                                    root.tts-backend-index = index;
                                     root.tts-enabled = index != 0;
                                     root.settings-dirty = true;
                                     root.settings-error = "";
@@ -927,9 +931,8 @@ export component AppWindow inherits Window {
                             Text { text: "自动播报"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
                                 options: ["语音与文本", "只播语音", "只播文本", "都不自动"];
-                                index: root.tts-speak-mode;
+                                index <=> root.tts-speak-mode;
                                 picked(index) => {
-                                    root.tts-speak-mode = index;
                                     root.settings-dirty = true;
                                     root.settings-error = "";
                                 }
@@ -1011,12 +1014,17 @@ export component AppWindow inherits Window {
                         }
 
                         AppButton {
-                            label: "保存";
+                            // 保存是**异步**的：点击后立刻置「保存中」并禁用按钮，
+                            // 结果由 Rust 侧回填（成功关面板 / 失败就地显示原因）。
+                            // 不在 UI 线程上等待，否则落盘和重建 TTS 会卡住界面。
+                            label: root.settings-saving ? "保存中…" : "保存";
                             primary: true;
+                            enabled: !root.settings-saving;
                             clicked => {
                                 // **一次**提交：模型端点 + 播报设置一起交给 Rust，
                                 // 由它按"要么都生效、要么如实报错"处理。
-                                if (root.save-all(
+                                root.settings-saving = true;
+                                root.save-all(
                                     root.provider-index,
                                     root.base-url,
                                     root.model-name,
@@ -1030,11 +1038,7 @@ export component AppWindow inherits Window {
                                     root.tts-local-sid,
                                     root.tts-local-speed,
                                     root.tts-speak-mode
-                                )) {
-                                    // 成功后由 Rust 侧回填"已生效"的值并关闭面板；
-                                    // 这里只清掉本地的脏标记。
-                                    root.settings-dirty = false;
-                                }
+                                );
                             }
                         }
                     }
