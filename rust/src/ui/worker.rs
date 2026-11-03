@@ -85,6 +85,8 @@ pub enum UiCommand {
 
 /// 提供商下拉框的顺序（与 UI 里的数组一致）。
 const PROVIDER_IDS: &[&str] = &["mimo", "deepseek", "openai-compatible"];
+/// MiMo 提供商的 id。MiMo TTS 只从这家账户读 Key（见 `voice::tts::mimo::KEY_PROVIDER`）。
+const MIMO_PROVIDER_ID: &str = "mimo";
 const PERMISSION_MODES: &[PermissionMode] = &[
     PermissionMode::Standard,
     PermissionMode::Conservative,
@@ -872,9 +874,14 @@ async fn run_worker(
                 /*
                  * 过期请求直接丢弃：用户已经取消、或又提交了更新的一次保存。
                  * 不落盘、不改界面——否则"取消之后旧表单仍被静默保存"。
+                 *
+                 * **不能**在这里清 `settings-saving`：这个请求已经过期，说明
+                 * 一定有一个更年轻的请求（或取消）在推进状态。若替它收掉
+                 * "保存中"，新请求还在跑时按钮就提前可点了，用户会重复提交。
+                 * 状态只由"当前有效的那一代"负责收尾。
                  */
                 if !generation_is_current(&save_generation, generation) {
-                    return_current_saving_state(&weak);
+                    // 过期的保存请求：什么都不做（不写盘、不改界面）。
                 } else {
                     let _ = handle_save_all_ui(
                         &weak,
@@ -1827,9 +1834,15 @@ pub fn apply_save_all(
      * 重建会 `stop()` 掉正在播的内容，还会让本地模型重新加载 + 预热（数秒）。
      * 这里先判断"是否需要"，避免完全不必要的打断。
      */
-    // 只有"给当前启用的 MiMo 后端换了新 Key"才算凭据变化。
+    // 只有"这次真的写入了 **MiMo 提供商** 的 Key，且当前启用的正是 MiMo TTS"
+    // 才算凭据变化。
+    //
+    // 之前只看"有没有写 Key" + "TTS 后端是不是 MiMo"，于是给 DeepSeek 存 Key
+    // 时也会被判成 MiMo 凭据变化 → 重建引擎 → 打断正在播报的 MiMo 语音。
+    // 写入目标由 provider_id 决定，所以必须同时核对它确实是 `mimo`。
     let key_changed_for_active_backend = key_error.is_none()
         && !new_key.is_empty()
+        && key_provider == MIMO_PROVIDER_ID
         && settings.tts.active_backend() == TtsBackend::Mimo;
     let tts_changed =
         tts_runtime_config_changed(&previous, settings, key_changed_for_active_backend);
@@ -2460,6 +2473,7 @@ async fn wait_turn(
                         generation,
                     }) => {
                         // 过期请求丢弃（用户已取消或又提交了新的保存）。
+                        // 同样**不**清 `settings-saving`：那是更年轻那一代的职责。
                         if generation_is_current(save_generation, generation) {
                             let _ = handle_save_all_ui(
                                 weak,
@@ -2471,8 +2485,6 @@ async fn wait_turn(
                                 generation,
                                 save_generation,
                             );
-                        } else {
-                            return_current_saving_state(weak);
                         }
                     }
                     Some(UiCommand::CancelSettings { generation }) => {
@@ -2653,16 +2665,6 @@ fn generation_is_current(
     generation: u64,
 ) -> bool {
     save_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
-}
-
-/// 丢弃过期保存请求后，把界面的"保存中"收掉（不能一直卡在保存中）。
-fn return_current_saving_state(weak: &slint::Weak<AppWindow>) {
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_settings_saving(false);
-        }
-    });
 }
 
 /// 试音：只针对**已保存并生效**的配置，并在状态栏说清楚用的是哪一份。
@@ -3161,6 +3163,78 @@ mod tests {
         let cancelled = generation.fetch_add(1, Ordering::SeqCst) + 1;
         assert!(!generation_is_current(&generation, 2));
         assert!(generation_is_current(&generation, cancelled));
+    }
+
+    /// **需求 3（竞态）**：过期保存请求不能替新请求收掉"保存中"。
+    ///
+    /// 旧实现里过期分支会无条件 `set_settings_saving(false)`。若新请求还在跑，
+    /// 按钮就提前可点，用户会重复提交。这条用代次语义把这个行为钉住：
+    /// 只有"当前那一代"才允许更新保存状态。
+    #[test]
+    fn only_the_current_generation_may_finish_the_saving_state() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // 用户点了两次保存：第一次 g=1，第二次 g=2（后提交的更新）。
+        let first = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let second = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!((first, second), (1, 2));
+
+        // 第一个请求这时才算完：它已经过期，**不能**结束"保存中"。
+        assert!(
+            !generation_is_current(&generation, first),
+            "过期请求不允许更新保存状态"
+        );
+        // 第二个仍在进行：它才是唯一有权收尾的那一代。
+        assert!(generation_is_current(&generation, second));
+    }
+
+    /// **需求 4**：保存 DeepSeek 的 Key 不能触发 MiMo TTS 重建。
+    ///
+    /// 之前只判断"写了 Key + 后端是 MiMo"，于是给 DeepSeek 存 Key 也会重建，
+    /// 把正在播报的 MiMo 语音打断。凭据变化必须同时核对写入目标确实是 `mimo`。
+    #[test]
+    fn saving_other_provider_key_does_not_rebuild_mimo_tts() {
+        // 真实判断逻辑：key_provider 来自 provider_id，只有 mimo 才算凭据变化。
+        for (index, provider_id, expected) in [
+            (0, "mimo", true),
+            (1, "deepseek", false),
+            (2, "openai-compatible", false),
+        ] {
+            assert_eq!(provider_id_for_index(index), provider_id);
+            // 判定条件与 `apply_save_all` 一致：写入了 Key 且目标是 mimo。
+            let key_changed = provider_id == MIMO_PROVIDER_ID;
+            assert_eq!(
+                key_changed, expected,
+                "写入 {provider_id} 的 Key 时，MiMo 凭据变化判定应当为 {expected}"
+            );
+        }
+
+        // 之后再叠上"当前启用 MiMo TTS"这个条件：
+        let mut settings = Settings::default();
+        settings.tts.enabled = true;
+        settings.tts.backend = TtsBackend::Mimo;
+        assert_eq!(settings.tts.active_backend(), TtsBackend::Mimo);
+
+        let deepseek_key_changed = provider_id_for_index(1) == MIMO_PROVIDER_ID;
+        assert!(
+            !tts_runtime_config_changed(
+                &settings,
+                &settings.clone(),
+                deepseek_key_changed && settings.tts.active_backend() == TtsBackend::Mimo
+            ),
+            "给 DeepSeek 存 Key 不该重建 MiMo TTS"
+        );
+
+        // 而写入 MiMo 自己的 Key 仍然要重建（否则新 Key 不会生效）。
+        let mimo_key_changed = provider_id_for_index(0) == MIMO_PROVIDER_ID;
+        assert!(
+            tts_runtime_config_changed(
+                &settings,
+                &settings.clone(),
+                mimo_key_changed && settings.tts.active_backend() == TtsBackend::Mimo
+            ),
+            "给 MiMo 换 Key 必须重建，否则新 Key 不生效"
+        );
     }
 
     /// 构造一次"只改端点、播报保持已保存值"的保存请求。

@@ -776,6 +776,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "提供商"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
+                                enabled: !root.settings-saving;
                                 options: ["mimo", "deepseek", "openai-compatible"];
                                 // 注意 `index:` 是**单向**绑定：下拉自己会先改内部的
                                 // `index`，这里必须同时把值写回 `root.provider-index`，
@@ -794,6 +795,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "地址"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.base-url;
                                 placeholder-text: "https://…";
                                 edited => { root.settings-dirty = true; root.settings-error = ""; }
@@ -804,6 +806,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "模型"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.model-name;
                                 placeholder-text: "模型名";
                                 edited => { root.settings-dirty = true; root.settings-error = ""; }
@@ -814,6 +817,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "API Key"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.api-key-input;
                                 placeholder-text: root.has-key ? "已保存（留空则不修改）" : "未保存";
                                 input-type-password: true;
@@ -825,6 +829,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "权限档位"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
+                                enabled: !root.settings-saving;
                                 options: ["standard", "conservative", "permissive"];
                                 index <=> root.permission-index;
                                 picked(index) => {
@@ -854,6 +859,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "播报后端"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
+                                enabled: !root.settings-saving;
                                 options: ["关闭", "MiMo 云端", "本地 ONNX"];
                                 index <=> root.tts-backend-index;
                                 picked(index) => {
@@ -883,6 +889,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "云端音色"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.tts-mimo-voice;
                                 placeholder-text: "留空 = 服务端默认预置音色";
                                 edited => { root.settings-dirty = true; root.settings-error = ""; }
@@ -893,6 +900,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "风格指令"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.tts-mimo-style;
                                 placeholder-text: "可选，例如：语速稍快，语气自然（<120 字）";
                                 edited => { root.settings-dirty = true; root.settings-error = ""; }
@@ -903,6 +911,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "本地模型"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.tts-local-dir;
                                 placeholder-text: "留空 = 数据目录 models/kokoro-multi-lang-v1_0";
                                 edited => { root.settings-dirty = true; root.settings-error = ""; }
@@ -913,12 +922,14 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "音色/语速"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.tts-local-sid;
                                 placeholder-text: "音色编号";
                                 width: 110px;
                                 edited => { root.settings-dirty = true; root.settings-error = ""; }
                             }
                             AppLineEdit {
+                                enabled: !root.settings-saving;
                                 text <=> root.tts-local-speed;
                                 placeholder-text: "语速 0.5~2.0";
                                 width: 130px;
@@ -930,6 +941,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Text { text: "自动播报"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
                             AppComboBox {
+                                enabled: !root.settings-saving;
                                 options: ["语音与文本", "只播语音", "只播文本", "都不自动"];
                                 index <=> root.tts-speak-mode;
                                 picked(index) => {
@@ -984,7 +996,7 @@ export component AppWindow inherits Window {
                             label: "试音";
                             // 试音只作用于**已保存生效**的配置：未保存的选择不会生效，
                             // 也不能让"改了下拉就试音"制造出与实际播报不符的假象。
-                            enabled: root.tts-active-ready && !root.settings-dirty;
+                            enabled: root.tts-active-ready && !root.settings-dirty && !root.settings-saving;
                             clicked => { root.test-voice(); }
                         }
 
@@ -996,7 +1008,7 @@ export component AppWindow inherits Window {
 
                         AppButton {
                             label: "清除已保存的 Key";
-                            enabled: root.has-key;
+                            enabled: root.has-key && !root.settings-saving;
                             clicked => { root.clear-api-key(root.provider-index); }
                         }
 
@@ -1010,11 +1022,14 @@ export component AppWindow inherits Window {
 
                         AppButton {
                             label: "取消";
+                            // 保存进行中禁用：已经开始执行的保存无法撤销，
+                            // 允许点击会造成"取消了但配置仍被写入"的假象。
+                            enabled: !root.settings-saving;
                             clicked => { root.cancel-settings(); }
                         }
 
                         AppButton {
-                            // 保存是**异步**的：点击后立刻置「保存中」并禁用按钮，
+                            // 保存是**异步**的：点击后立刻置「保存中」并禁用相关控件，
                             // 结果由 Rust 侧回填（成功关面板 / 失败就地显示原因）。
                             // 不在 UI 线程上等待，否则落盘和重建 TTS 会卡住界面。
                             label: root.settings-saving ? "保存中…" : "保存";
