@@ -144,6 +144,25 @@ export component AppWindow inherits Window {
     in-out property <string> voice-level: "";
     in-out property <string> voice-transcript: "";
 
+    // 语音播报（PR7）：设置项 + 播放状态 + 字幕。
+    in-out property <bool> tts-enabled: false;
+    // 0 = 关闭（不播报），1 = MiMo 云端，2 = 本地 ONNX
+    in-out property <int> tts-backend-index: 0;
+    in-out property <string> tts-mimo-voice: "";
+    in-out property <string> tts-mimo-style: "";
+    in-out property <string> tts-local-dir: "";
+    in-out property <string> tts-local-sid: "0";
+    in-out property <string> tts-local-speed: "1.0";
+    // 0 = 语音与文本都播报，1 = 只播语音提问，2 = 只播文本输入，3 = 都不自动播报
+    in-out property <int> tts-speak-mode: 0;
+    // 引擎是否可用（缺 Key / 缺模型时为 false，但设置仍然保留）
+    in-out property <bool> tts-backend-ready: false;
+    // idle | synthesizing | buffering | playing | finished | stopped | failed | unavailable
+    in-out property <string> speech-state: "idle";
+    in-out property <string> speech-detail: "";
+    in-out property <string> speech-subtitle: "";
+    in-out property <bool> speech-active: false;
+
     // ---- 回调（Rust 侧实现） ----
     callback send(text: string);
     callback cancel-turn();
@@ -155,6 +174,10 @@ export component AppWindow inherits Window {
     callback provider-changed(provider-index: int);
     callback confirm-decision(request-id: int, allow: bool);
     callback set-voice-enabled(enabled: bool);
+    // 播报设置与播报控制（与模型端点设置分开：互不覆盖）。
+    callback save-tts-settings(enabled: bool, backend-index: int, mimo-voice: string, mimo-style: string, local-dir: string, local-sid: string, local-speed: string, speak-voice: bool, speak-text: bool);
+    callback test-voice();
+    callback stop-speaking();
     callback quit-app();
 
     // 状态 → 用户能看懂的中文（与 Rust 侧 VoiceState::label 保持一致的口径）。
@@ -201,6 +224,13 @@ export component AppWindow inherits Window {
                     label: root.voice-enabled ? "关闭麦克风" : "打开麦克风";
                     primary: root.voice-enabled;
                     clicked => { root.set-voice-enabled(!root.voice-enabled); }
+                }
+
+                // 只停声音：旁边的「取消」才会取消 Agent 任务。
+                AppButton {
+                    label: "停止播报";
+                    enabled: root.speech-active;
+                    clicked => { root.stop-speaking(); }
                 }
 
                 AppButton {
@@ -299,6 +329,38 @@ export component AppWindow inherits Window {
                             color: #1f1f22;
                             vertical-alignment: center;
                             overflow: elide;
+                        }
+                    }
+                }
+
+                // 播报状态 + 字幕（简洁一行，不做完整 HUD）
+                if root.speech-detail != "" || root.speech-subtitle != "" : Rectangle {
+                    height: speech-row.preferred-height + 12px;
+                    border-radius: 6px;
+                    background: root.speech-state == "failed" ? #fdeeee : #ffffff;
+                    border-width: 1px;
+                    border-color: #e3e3e6;
+
+                    speech-row := HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 10px;
+
+                        Text {
+                            text: root.speech-detail;
+                            font-size: 12px;
+                            color: root.speech-state == "failed" ? #a02020 : #1f1f22;
+                            vertical-alignment: center;
+                        }
+                        if root.speech-subtitle != "" : Text {
+                            text: "“" + root.speech-subtitle + "”";
+                            font-size: 12px;
+                            color: #55555c;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
                         }
                     }
                 }
@@ -504,6 +566,114 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
 
+                Rectangle { height: 1px; background: #e3e3e6; }
+
+                Text {
+                    color: Theme.text-color;
+                    text: "语音播报";
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "播报后端"; width: 80px; vertical-alignment: center; }
+                    Choice {
+                        options: ["关闭", "MiMo 云端", "本地 ONNX"];
+                        index: root.tts-backend-index;
+                        picked(value) => {
+                            root.tts-backend-index = self.index;
+                            root.tts-enabled = self.index != 0;
+                        }
+                    }
+                    Text {
+                        text: root.tts-backend-ready ? "可用" : "不可用";
+                        font-size: 11px;
+                        color: root.tts-backend-ready ? #1f7a3a : #a02020;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "云端音色"; width: 80px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.tts-mimo-voice;
+                        placeholder-text: "留空 = 服务端默认预置音色";
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "风格指令"; width: 80px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.tts-mimo-style;
+                        placeholder-text: "可选，例如：语速稍快，语气自然（<120 字）";
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "本地模型"; width: 80px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.tts-local-dir;
+                        placeholder-text: "留空 = 数据目录 models/kokoro-multi-lang-v1_0";
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "音色/语速"; width: 80px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.tts-local-sid;
+                        placeholder-text: "音色编号";
+                        width: 90px;
+                    }
+                    LineEdit {
+                        text <=> root.tts-local-speed;
+                        placeholder-text: "语速 0.5~2.0";
+                        width: 110px;
+                    }
+                    Text {
+                        text: "自动播报";
+                        width: 70px;
+                        vertical-alignment: center;
+                    }
+                    Choice {
+                        options: ["语音与文本", "只播语音", "只播文本", "都不自动"];
+                        index: root.tts-speak-mode;
+                        picked(value) => { root.tts-speak-mode = self.index; }
+                    }
+                }
+
+                Text {
+                    text: "云端模式会把助手回复的正文发送给 MiMo 合成语音（需要 MiMo 账户的 Key，不会借用其它提供商的 Key）；本地 ONNX 模式不联网，但需要自己准备模型文件。播报设置与模型端点设置互不覆盖。";
+                    font-size: 11px;
+                    color: #8a8a90;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    AppButton {
+                        label: "试音";
+                        enabled: root.tts-backend-ready;
+                        clicked => { root.test-voice(); }
+                    }
+
+                    AppButton {
+                        label: "停止播报";
+                        enabled: root.speech-active;
+                        clicked => { root.stop-speaking(); }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
                 HorizontalLayout {
                     spacing: 8px;
 
@@ -530,6 +700,17 @@ export component AppWindow inherits Window {
                                 root.model-name,
                                 root.api-key-input,
                                 root.permission-index
+                            );
+                            root.save-tts-settings(
+                                root.tts-backend-index != 0,
+                                root.tts-backend-index,
+                                root.tts-mimo-voice,
+                                root.tts-mimo-style,
+                                root.tts-local-dir,
+                                root.tts-local-sid,
+                                root.tts-local-speed,
+                                root.tts-speak-mode == 0 || root.tts-speak-mode == 1,
+                                root.tts-speak-mode == 0 || root.tts-speak-mode == 2
                             );
                         }
                     }

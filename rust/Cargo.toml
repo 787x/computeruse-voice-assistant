@@ -53,6 +53,7 @@ hound = "3.5"
 # 唤醒词：k2-fsa 官方 Rust 封装，有完整的流式 KWS 接口
 # （create_stream / is_ready / decode / reset / get_result）。
 # 默认 feature 是 static：产物单文件，不需要额外分发 sherpa/onnxruntime DLL。
+# 想让本地 TTS 走 CUDA，需要改成 shared 并指向 GPU 版运行时（见 README「本地 TTS 用 CUDA」）。
 sherpa-onnx = "2.0.1"
 # ASR：whisper.cpp 1.8.3 的 Rust 绑定（cmake 静态编译），模型进程内复用。
 # 默认构建带 CUDA（见 [features]）；没有 CUDA Toolkit 的机器用 CPU 基线构建。
@@ -72,6 +73,11 @@ whisper-rs-sys = { version = "0.15", default-features = false }
 # 两条路径都能运行同一份代码；运行时后端由 `voice::asr` 如实上报。
 default = ["cuda"]
 cuda = ["whisper-rs/cuda"]
+# 本地 TTS（Kokoro）走 CUDA：需要 shared 版 GPU 运行时
+# （cargo 侧还要把 sherpa-onnx 改成 features = ["shared"]，见 README）。
+# 实测热路径 CUDA RTF 0.059 vs CPU 0.157，但首次合成要付约 9 秒的
+# cuDNN/显存初始化（已用启动预热抵消）。默认关闭：默认构建是静态单文件。
+tts-cuda = []
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -88,6 +94,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "proce
 whisper-rs = "0.16"
 hound = "3.5"
 sherpa-onnx = "2.0.1"
+# TTS 流式协议测试要自己造 Base64 音频块（与运行期同一个解码器）。
+base64 = "0.22"
 
 # 构建注意（写在这里，比 README 更靠近构建系统）：
 # whisper-rs-sys 用 CMake + Ninja 现场编译 whisper.cpp，MSVC 在**很长的中文路径**

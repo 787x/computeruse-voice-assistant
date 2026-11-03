@@ -1,12 +1,15 @@
 # cuava（Rust + Slint 原生桌面程序）
 
-PR6 的纵向功能切片：**语音/文本指令 → LLM Agent → 权限判断 → Windows Computer Use → 界面展示结果**。
+PR7 的纵向功能切片：**语音/文本指令 → LLM Agent → 权限判断 → Windows Computer Use →
+界面展示结果 → 语音播报（可选 MiMo 云端 / 本地 ONNX）**。
 
-语音链路完全本地：麦克风（cpal/WASAPI）→ 唤醒词（sherpa-onnx KWS）→ 端点（自适应 VAD）
-→ whisper.cpp 转录 → 交给现有 Agent。**不运行 Electron / WebView / Node / Python。**
+语音输入链路完全本地：麦克风（cpal/WASAPI）→ 唤醒词（sherpa-onnx KWS）→ 端点（自适应 VAD）
+→ whisper.cpp 转录 → 交给现有 Agent。语音输出是**可选**的：默认关闭，启用后才合成。
+**不运行 Electron / WebView / Node / Python。**
 
-这不是 Electron 版本的替代品：语音合成、HUD、安装器与音乐模块还没进来（见文末"已支持 / 未支持"）。
-架构取舍与实测数据见 [`docs/10-PR6-语音输入架构决策.md`](../docs/10-PR6-语音输入架构决策.md)。
+这不是 Electron 版本的替代品：完整 HUD、托盘、安装器与音乐模块还没进来（见文末"已支持 / 未支持"）。
+架构取舍见 [`docs/10-PR6-语音输入架构决策.md`](../docs/10-PR6-语音输入架构决策.md)（输入）与
+[`docs/12-PR7-TTS与语音播报架构决策.md`](../docs/12-PR7-TTS与语音播报架构决策.md)（输出）。
 
 ## 构建与运行
 
@@ -108,6 +111,83 @@ whisper.cpp 在请求 GPU 却找不到设备时会**静默**退回 CPU，只看�
 - 设置里关掉 GPU（`voice.useGpu = false`）时就只用 CPU，状态条不会显示 CUDA。
 
 开发期直接 `cargo run` 也可以。**不需要**安装或启动 Electron、WebView、Node 或 Python。
+
+### 语音播报（PR7）
+
+**默认关闭**：新安装不会自动联网播报，也不会占用扬声器。启用方式：
+顶栏「设置」→ 下半部分「语音播报」→ 选后端（关闭 / MiMo 云端 / 本地 ONNX）→ 保存。
+
+两个正式后端，只支持这两种：
+
+| 后端 | 需要 | 联网 | 说明 |
+| --- | --- | --- | --- |
+| MiMo 云端 | MiMo 账户的 Key（设置里 **提供商 = mimo** 保存） | 会 | 把**助手回复的正文**发给 MiMo 合成语音；24kHz 单声道 PCM16 流式返回 |
+| 本地 ONNX | Kokoro 多语言模型目录 | 不会 | sherpa-onnx `OfflineTts`，默认请求 CUDA、不可用时回退 CPU，中英混读 |
+
+- **Key 归属**：云端模式只用 **MiMo 账户**的 Key，绝不借用 DeepSeek / 自定义端点的 Key，
+  也绝不把 Key 发到自定义地址。错误信息与日志里不出现 Key、Authorization 或整段音频。
+- **云端音色/风格**：`云端音色` 留空 = 不发送 `audio.voice`，由服务端默认预置音色决定；
+  `风格指令` 是可选的短句（≤120 字），放在 `user` 消息里。
+- **本地模型**：把 Kokoro 多语言模型目录放到 `%APPDATA%\cuava\models\kokoro-multi-lang-v1_0\`
+  （需要 `model.onnx` / `voices.bin` / `tokens.txt`，有 `lexicon-us-en.txt`、`lexicon-zh.txt`、
+  `espeak-ng-data/` 就一并带上），或在设置里直接指定目录。**模型不随源码提交、不自动下载。**
+  音色编号（sid）与语速（0.5~2.0）可调；缺文件/编号越界会明确报错，不会假装成功。
+- **执行提供者**：配置项 `localProvider` 默认 `"cuda"`。
+  默认构建链接的是**静态 CPU 版** sherpa-onnx（整个程序是单文件、不带 DLL），
+  这种构建里本地 TTS 实际就是 CPU，标签会写 `cpu（本构建未启用 CUDA TTS）`。
+  要真的用 CUDA，按下一节构建 `--features tts-cuda` 的版本。低配机器可写 `"localProvider": "cpu"`。
+
+### 本地 TTS 用 CUDA（实测 3.2× 更快）
+
+RTX 5070 Laptop 实测（同一文本 ≈6.9 秒音频，同一二进制）：
+
+| 指标 | CPU | CUDA |
+| --- | --- | --- |
+| 预热（一次性） | 1.7 s | 8.5 s |
+| 预热后首句首音 | 459 ms | **158 ms** |
+| 预热后首句总耗时 | 1 387 ms | **411 ms** |
+| 热路径 RTF | 0.201 | **0.062** |
+
+首次 8.5 秒是 cuDNN 句柄与显存分配，程序启用本地 TTS 后会在**后台预热**
+（`TtsEngine::warm_up`），用户第一句回复的延迟就是 158 ms。
+
+开启步骤（CUDA 版 sherpa 只提供 DLL，所以只能是 shared 链接，**不再是单文件**）：
+
+1. 下载 `sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda.tar.bz2`
+   （CUDA 12 的机器用 `cuda-12.x` 那个包），解压；
+2. `Cargo.toml` 里 `sherpa-onnx` 改成
+   `{ version = "2.0.1", default-features = false, features = ["shared"] }`；
+3. 设 `SHERPA_ONNX_LIB_DIR=<解压目录>\lib`；
+4. 把 `cublas64_13.dll` / `cublasLt64_13.dll` / `cudart64_13.dll` 与 cuDNN 9 的
+   `cudnn64_9.dll` 等放进 PATH 或 exe 同目录（`pip download nvidia-cudnn-cu13`
+   的 wheel 里就有，CUDA runtime/cuBLAS 可从 NVIDIA redist 取）；
+5. `cargo build --release --features tts-cuda`。
+
+`build.rs` 会校验 `SHERPA_ONNX_LIB_DIR` 里确实有 `onnxruntime_providers_cuda.dll`，
+否则构建直接失败——避免出现"set provider=cuda 但实际在跑 CPU"的假象。
+对比脚本：`cargo run --release --features tts-cuda --example tts_bench -- cuda`
+（`CUAVA_TTS_MODEL_DIR` 指向模型目录）。
+- **自动播报**：可选「语音与文本 / 只播语音 / 只播文本 / 都不自动」。回合失败或中断**不播报**。
+- **只播可见正文**：思考内容（`reasoning_content`）、工具 JSON、内部提示、未完整的工具调用
+  都不会被读出来。超过 400 字的回复只播前 400 字，并在状态栏说明还差多少字。
+- **三种"停"互不混淆**：
+  - 顶栏 / 设置里的 **停止播报**：只停声音，任务继续；
+  - **取消**：取消 Agent 任务，同时停掉本回合声音；
+  - **拒绝**（权限确认）：只结算这一次请求，工具不执行。
+- **播放状态**：`正在合成 / 正在缓冲 / 正在播报 / 播报结束 / 已停止 / 播报失败`，
+  界面同时显示当前正在播的那一句（字幕）。"播报结束"以播放缓冲**真正排空**为准，
+  不是"HTTP 结束"或"合成结束"。
+- **语音打断**：播报期间可以直接说 **等一下 / 停一下 / 别说了 …**（不需要唤醒词），
+  识别到就停止播报。判定是「ASR 文本命中 + 有声音」而不是音量阈值；
+  同时有回声防护——助手自己朗读出的「等一下」不会让它自我打断。
+  打断词不会被当成新指令，用户需要再说一次指令。
+- **语音确认**：出现权限确认框时，可以直接说 **可以 / 允许 / 同意** 或
+  **不可以 / 不要 / 不同意 / 别执行**，与点击按钮竞争结算同一个请求。
+  「不可以」绝不会被当成同意；含糊、疑问（`可以吗`）、过期请求、重复答复都不会结算，
+  仍然保持等待点击或重说。
+
+任一后端不可用（缺 Key、缺模型、设备不可用）时，**只禁用播报**：
+文本 Agent、Computer Use、权限判断完全不受影响，界面显示具体原因。
 
 ### 配置
 

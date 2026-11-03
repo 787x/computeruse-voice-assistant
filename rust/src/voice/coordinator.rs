@@ -82,6 +82,84 @@ impl VoiceState {
     }
 }
 
+/// 这一轮聆听的**目的**。
+///
+/// PR6 只有一种聆听方式：必须听到唤醒词才开始录指令。PR7 需要两种"直通"聆听：
+///  - 播报期间听打断词（用户说「等一下」不该先说唤醒词）；
+///  - 权限确认期间听「允许 / 拒绝」。
+///
+/// 直通模式**只在明确的时刻**打开（正在播报 / 有挂起的确认请求），
+/// 其它时候仍然要求唤醒词——否则等于让麦克风一直把环境语音送去识别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListenPurpose {
+    /// 常规：必须听到唤醒词。
+    #[default]
+    Wake,
+    /// 播报期间听打断短语。
+    BargeIn,
+    /// 权限确认期间听「允许 / 拒绝」。
+    Confirm,
+}
+
+impl ListenPurpose {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Wake => "wake",
+            Self::BargeIn => "barge-in",
+            Self::Confirm => "confirm",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Wake => "唤醒词",
+            Self::BargeIn => "打断聆听",
+            Self::Confirm => "语音确认",
+        }
+    }
+
+    /// 是否**不要求**唤醒词。
+    pub fn is_direct(&self) -> bool {
+        !matches!(self, Self::Wake)
+    }
+}
+
+/// 聆听模式：工作线程写、音频线程读。
+///
+/// 用共享状态而不是通道：模式是"当前值"，音频线程每个音频块都读一次，
+/// 通道会让"切回唤醒词模式"这种操作在队列里延迟生效。
+///
+/// `request_id` 只在 [`ListenPurpose::Confirm`] 时非零，用来把这一轮识别
+/// **绑定到具体的确认请求**上：请求结束后迟到的识别结果不能被当成
+/// 下一个请求的答复。
+#[derive(Clone, Debug, Default)]
+pub struct ListenMode(Arc<Mutex<(ListenPurpose, u64)>>);
+
+impl ListenMode {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, purpose: ListenPurpose, request_id: u64) {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = (purpose, request_id);
+    }
+
+    pub fn get(&self) -> (ListenPurpose, u64) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn purpose(&self) -> ListenPurpose {
+        self.get().0
+    }
+}
+
 /// 麦克风实例号：每次「打开麦克风」分配一个新的。
 ///
 /// 用来区分**不同**的采集实例：关麦后立刻重开时，旧线程还可能吐出
@@ -166,12 +244,25 @@ pub enum VoiceEventKind {
         turn: VoiceTurn,
         keyword: String,
     },
+    /// 直通聆听开始（打断词 / 语音确认），没有唤醒词。
+    DirectStarted {
+        turn: VoiceTurn,
+        purpose: ListenPurpose,
+        /// 绑定的确认请求 id（`ListenPurpose::BargeIn` 时为 0）。
+        request_id: u64,
+    },
     /// 识别出的最终文本（**只有它会提交给 Agent**）。
+    ///
+    /// `purpose` 是**开始录这一句时**的聆听目的（不是现在的模式）：
+    /// 模式可能在识别期间变化，结果必须按"当时为什么听"来处置。
     Final {
         turn: VoiceTurn,
         text: String,
         audio_seconds: f32,
         decode_ms: u64,
+        purpose: ListenPurpose,
+        /// 这一句绑定到的确认请求 id（`Confirm` 之外为 0）。
+        request_id: u64,
     },
     /// 一次语音会话结束但没有可提交文本（附原因，给用户看）。
     Rejected {
@@ -342,6 +433,9 @@ pub struct SessionMachine {
     min_speech_ms: u32,
     /// 正在录的这一句。
     session: Option<VoiceTurn>,
+    /// 这一句的聆听目的与绑定的确认请求 id（开始录时快照，之后不再变）。
+    purpose: ListenPurpose,
+    request_id: u64,
     /// 已提交、等结果的那一句。
     inflight: Option<Inflight>,
     completion: AsrCompletion,
@@ -365,12 +459,19 @@ impl SessionMachine {
             asr,
             min_speech_ms,
             session: None,
+            purpose: ListenPurpose::Wake,
+            request_id: 0,
             inflight: None,
             completion: AsrCompletion::default(),
             next_session: 0,
             state: VoiceState::Loading,
             dropped: 0,
         }
+    }
+
+    /// 当前这一句的聆听目的（诊断/测试用）。
+    pub fn purpose(&self) -> ListenPurpose {
+        self.purpose
     }
 
     pub fn state(&self) -> &VoiceState {
@@ -421,10 +522,37 @@ impl SessionMachine {
         self.set_state(VoiceState::Error(message));
     }
 
-    /// 唤醒：开始录一句。
+    /// 唤醒：开始录一句（常规路径，必须已经听到唤醒词）。
     pub fn begin(&mut self, keyword: String) {
-        if self.state != VoiceState::Listening {
+        let Some(turn) = self.open_session(ListenPurpose::Wake, 0) else {
             return;
+        };
+        self.emit(VoiceEventKind::Woke { turn, keyword });
+    }
+
+    /// 直通聆听：不要求唤醒词，直接开始录一句。
+    ///
+    /// 只在「正在播报（听打断词）」与「有挂起的权限确认（听允许/拒绝）」时使用。
+    /// 返回 `false` 表示当前状态不允许开始（不在 Listening / 已有一句在录）。
+    pub fn begin_direct(&mut self, purpose: ListenPurpose, request_id: u64) -> bool {
+        if !purpose.is_direct() {
+            return false;
+        }
+        let Some(turn) = self.open_session(purpose, request_id) else {
+            return false;
+        };
+        self.emit(VoiceEventKind::DirectStarted {
+            turn,
+            purpose,
+            request_id,
+        });
+        true
+    }
+
+    /// 分配会话号、登记归属并进入 Capturing。状态不对时返回 `None`。
+    fn open_session(&mut self, purpose: ListenPurpose, request_id: u64) -> Option<VoiceTurn> {
+        if self.state != VoiceState::Listening {
+            return None;
         }
         self.next_session += 1;
         let turn = VoiceTurn {
@@ -432,9 +560,15 @@ impl SessionMachine {
             session: self.next_session,
         };
         self.session = Some(turn);
+        self.purpose = purpose;
+        self.request_id = if purpose == ListenPurpose::Confirm {
+            request_id
+        } else {
+            0
+        };
         self.active.begin(turn);
-        self.emit(VoiceEventKind::Woke { turn, keyword });
         self.set_state(VoiceState::Capturing);
+        Some(turn)
     }
 
     /// 端点到了：太短就丢弃，否则交给 ASR。
@@ -454,7 +588,7 @@ impl SessionMachine {
         }
 
         let cancel = InferenceCancel::new();
-        let reply = self.reply_sink(turn);
+        let reply = self.reply_sink(turn, self.purpose, self.request_id);
         self.inflight = Some(Inflight {
             turn,
             cancel: cancel.clone(),
@@ -537,7 +671,7 @@ impl SessionMachine {
         }
     }
 
-    fn reply_sink(&self, turn: VoiceTurn) -> ReplySink {
+    fn reply_sink(&self, turn: VoiceTurn, purpose: ListenPurpose, request_id: u64) -> ReplySink {
         let sink = self.sink.clone();
         let active = self.active.clone();
         let completion = self.completion.clone();
@@ -551,6 +685,8 @@ impl SessionMachine {
                         text: transcript.text,
                         audio_seconds: transcript.audio_seconds,
                         decode_ms: transcript.decode_ms,
+                        purpose,
+                        request_id,
                     },
                     Ok(_) => VoiceEventKind::Rejected {
                         turn,
@@ -595,6 +731,8 @@ pub struct Coordinator {
     /// VAD 一直运行：空闲时用来给 KWS 提供「现在是不是说话起点」。
     detector: EndpointDetector,
     last_level_at: Option<Instant>,
+    /// 聆听模式（唤醒词 / 打断 / 语音确认），由工作线程设置。
+    mode: ListenMode,
     /// worker 要求停止时置位；音频线程在每个循环检查。
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -610,6 +748,7 @@ impl Coordinator {
         active: ActiveSession,
         stop: Arc<std::sync::atomic::AtomicBool>,
         instance: VoiceInstance,
+        mode: ListenMode,
     ) -> Result<(Self, CaptureInfoForUi, AsrReady), String> {
         let mut capture =
             Capture::start(&config.voice.input_device).map_err(|error| match error {
@@ -671,6 +810,7 @@ impl Coordinator {
             kws,
             machine,
             last_level_at: None,
+            mode,
             stop,
         };
         Ok((coordinator, ui, asr_ready))
@@ -751,9 +891,25 @@ impl Coordinator {
                 .iter()
                 .any(|event| matches!(event, VadEvent::SpeechStarted));
 
-            // 空闲时才听唤醒词；会话期间 KWS 不参与（避免自己打断自己）。
+            /*
+             * 空闲时才开始新的一句。两种入口：
+             *  - 常规：**必须**听到唤醒词（KWS），会话期间 KWS 不参与（避免自己打断自己）；
+             *  - 直通（打断聆听 / 语音确认）：VAD 的说话起点就是开始，
+             *    否则用户得先喊唤醒词才能让助手停下来说话。
+             *
+             * 直通模式只在「正在播报」或「有挂起的确认」时打开（见 worker）。
+             */
             if !self.machine.has_session() {
-                if let Some(hit) = self.kws.accept(&samples, speech_started) {
+                let (purpose, request_id) = self.mode.get();
+                if purpose.is_direct() {
+                    if speech_started && self.machine.begin_direct(purpose, request_id) {
+                        // 从说话起点重新计一句：起点之前那段静音/回声不算进这一句。
+                        self.detector.start_utterance();
+                        self.kws.reset();
+                        // 这一块里的 VAD 事件属于开头，不能立刻当成端点。
+                        continue;
+                    }
+                } else if let Some(hit) = self.kws.accept(&samples, speech_started) {
                     // 从唤醒这一刻重新开始计一句：唤醒词本身那段音频不进指令。
                     self.detector.start_utterance();
                     self.kws.reset();
@@ -914,6 +1070,7 @@ pub fn spawn(
     active: ActiveSession,
     stop: Arc<std::sync::atomic::AtomicBool>,
     instance: VoiceInstance,
+    mode: ListenMode,
 ) -> Result<VoiceHandle, String> {
     // 设备与模型必须在同一个线程里创建并持有：`cpal::Stream` 不是 `Send`。
     //
@@ -930,7 +1087,14 @@ pub fn spawn(
                 instance,
                 kind: VoiceEventKind::StateChanged(VoiceState::Loading),
             });
-            match Coordinator::start(config, sink_loading.clone(), active, stop_thread, instance) {
+            match Coordinator::start(
+                config,
+                sink_loading.clone(),
+                active,
+                stop_thread,
+                instance,
+                mode,
+            ) {
                 Ok((coordinator, info, _asr_ready)) => {
                     sink_loading.emit(VoiceEvent {
                         instance,
@@ -1198,6 +1362,103 @@ mod tests {
         // 同一个结果不会再次被接受（poll 不会重复发事件）。
         assert!(!machine.poll());
         assert_eq!(recorder.finals().len(), 1);
+    }
+
+    /// 直通聆听（打断词）：不需要唤醒词，Final 必须带上当时的目的。
+    #[test]
+    fn direct_listening_does_not_require_wake_word() {
+        let recorder = Recorder::default();
+        let active = ActiveSession::new();
+        let asr = FakeAsr {
+            immediate: Some(Ok("等一下".to_string())),
+            ..FakeAsr::new()
+        };
+        let mut machine = machine_with(9, &recorder, &active, asr);
+        machine.start_listening();
+        assert!(machine.begin_direct(ListenPurpose::BargeIn, 0));
+        assert_eq!(machine.state(), &VoiceState::Capturing);
+        assert_eq!(machine.purpose(), ListenPurpose::BargeIn);
+        machine.finish(1.0, AUDIO.to_vec());
+        assert!(machine.poll());
+        assert_eq!(machine.state(), &VoiceState::Listening);
+
+        let finals: Vec<(ListenPurpose, u64)> = recorder
+            .kinds()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                VoiceEventKind::Final {
+                    purpose,
+                    request_id,
+                    ..
+                } => Some((purpose, request_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finals, vec![(ListenPurpose::BargeIn, 0)]);
+        // 直通开始事件也要发给界面（否则提示还停在「正在监听唤醒词」）。
+        assert!(recorder.kinds().iter().any(|kind| matches!(
+            kind,
+            VoiceEventKind::DirectStarted {
+                purpose: ListenPurpose::BargeIn,
+                ..
+            }
+        )));
+    }
+
+    /// 语音确认：请求 id 原样带回，worker 据此拒绝过期答复。
+    #[test]
+    fn confirm_session_carries_the_request_id() {
+        let recorder = Recorder::default();
+        let active = ActiveSession::new();
+        let asr = FakeAsr {
+            immediate: Some(Ok("不可以".to_string())),
+            ..FakeAsr::new()
+        };
+        let mut machine = machine_with(11, &recorder, &active, asr);
+        machine.start_listening();
+        assert!(machine.begin_direct(ListenPurpose::Confirm, 42));
+        machine.finish(1.0, AUDIO.to_vec());
+        assert!(machine.poll());
+
+        let finals: Vec<(ListenPurpose, u64)> = recorder
+            .kinds()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                VoiceEventKind::Final {
+                    purpose,
+                    request_id,
+                    ..
+                } => Some((purpose, request_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finals, vec![(ListenPurpose::Confirm, 42)]);
+    }
+
+    /// 直通入口不能被用来绕过唤醒词之外的约束：`Wake` 只能走 `begin`。
+    #[test]
+    fn direct_entry_rejects_wake_purpose() {
+        let recorder = Recorder::default();
+        let active = ActiveSession::new();
+        let mut machine = machine_with(5, &recorder, &active, FakeAsr::new());
+        machine.start_listening();
+        assert!(!machine.begin_direct(ListenPurpose::Wake, 0));
+        assert_eq!(machine.state(), &VoiceState::Listening);
+        // 不在 Listening 时也不能开始。
+        machine.shutdown();
+        assert!(!machine.begin_direct(ListenPurpose::BargeIn, 0));
+    }
+
+    /// 聆听模式是共享的当前值（工作线程写、音频线程读）。
+    #[test]
+    fn listen_mode_roundtrip() {
+        let mode = ListenMode::new();
+        assert_eq!(mode.get(), (ListenPurpose::Wake, 0));
+        mode.set(ListenPurpose::Confirm, 7);
+        assert_eq!(mode.get(), (ListenPurpose::Confirm, 7));
+        assert!(mode.purpose().is_direct());
+        mode.set(ListenPurpose::Wake, 0);
+        assert!(!mode.purpose().is_direct());
     }
 
     /// 空转录：走 Rejected，并**恢复监听**（这是原来会卡死的路径）。

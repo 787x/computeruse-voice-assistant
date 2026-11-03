@@ -21,8 +21,15 @@ use crate::prompt;
 use crate::secret::SecretStore;
 use crate::voice::{
     asr::AsrBackend,
-    coordinator::{self, ActiveSession, CoordinatorConfig, SharedSink, VoiceHandle},
+    bargein,
+    confirm::{self, ConfirmDecision},
+    coordinator::{
+        self, ActiveSession, CoordinatorConfig, ListenMode, ListenPurpose, SharedSink, VoiceHandle,
+    },
+    playback::PlaybackState,
     settings::VoicePaths,
+    speech::{SpeechEvent, SpeechRuntime},
+    tts::{TtsBackend, TtsSettings, TurnId},
     CaptureInfoForUi, RejectReason, VoiceEvent, VoiceEventKind, VoiceInstance, VoiceState,
     VoiceTurn,
 };
@@ -36,8 +43,12 @@ use crate::AppWindow;
 pub enum UiCommand {
     /// 用户发出一条指令。
     Send(String),
-    /// 取消当前回合。
+    /// 取消当前回合（同时停止这一回合的播报）。
     Cancel,
+    /// 只停止播报：不取消 Agent 回合，不结算任何权限请求。
+    StopSpeaking,
+    /// 试音：合成一句固定的话（验证后端/设备，不产生 Agent 回合）。
+    SpeakTest,
     /// 保存设置（含可选的新 Key）。
     SaveSettings {
         provider_index: i32,
@@ -45,6 +56,18 @@ pub enum UiCommand {
         model: String,
         api_key: String,
         permission_index: i32,
+    },
+    /// 保存语音合成设置（独立入口：与模型端点设置互不覆盖）。
+    SaveTtsSettings {
+        enabled: bool,
+        backend_index: i32,
+        mimo_voice: String,
+        mimo_style: String,
+        local_dir: String,
+        local_sid: i32,
+        local_speed: f32,
+        speak_voice_turns: bool,
+        speak_text_turns: bool,
     },
     /// 清除**指定提供商**的 Key（界面当前选中的那一家）。
     ///
@@ -59,6 +82,8 @@ pub enum UiCommand {
     SetVoiceEnabled(bool),
     /// 语音线程发回的事件（内部消息，不是用户动作）。
     Voice(VoiceEvent),
+    /// 播报层发回的事件（状态/字幕/提示）。
+    Speech(SpeechEvent),
     /// 退出。
     Quit,
 }
@@ -242,6 +267,52 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 立即反映开关状态；真正的启动/停止由工作线程完成，失败会回报原因。
             let _ = tx.send(UiCommand::SetVoiceEnabled(enabled));
         });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_stop_speaking(move || {
+            let _ = tx.send(UiCommand::StopSpeaking);
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_test_voice(move || {
+            let _ = tx.send(UiCommand::SpeakTest);
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_save_tts_settings(
+            move |enabled,
+                  backend_index,
+                  mimo_voice,
+                  mimo_style,
+                  local_dir,
+                  local_sid,
+                  local_speed,
+                  speak_voice,
+                  speak_text| {
+                // 音色编号/语速是文本输入：解析失败按"无效值"处理，
+                // 由 `TtsSettings::normalized` 给出可读错误，而不是静默改成默认值。
+                let sid = local_sid.to_string().trim().parse::<i32>().unwrap_or(-1);
+                let speed = local_speed
+                    .to_string()
+                    .trim()
+                    .parse::<f32>()
+                    .unwrap_or(f32::NAN);
+                let _ = tx.send(UiCommand::SaveTtsSettings {
+                    enabled,
+                    backend_index,
+                    mimo_voice: mimo_voice.to_string(),
+                    mimo_style: mimo_style.to_string(),
+                    local_dir: local_dir.to_string(),
+                    local_sid: sid,
+                    local_speed: speed,
+                    speak_voice_turns: speak_voice,
+                    speak_text_turns: speak_text,
+                });
+            },
+        );
     }
     {
         let tx = command_tx.clone();
@@ -447,6 +518,14 @@ struct UiConfirmer {
     /// 当前挂起的确认（最多一个：权限门是串行询问的）。
     pending: Arc<std::sync::Mutex<Option<PendingConfirm>>>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// 当前挂起的 `request_id`（0 = 没有）。
+    ///
+    /// 与 `pending` 的互斥锁分开保存，是为了让**音频线程侧**（工作线程的
+    /// 每秒若干次的聆听模式同步）读取时不需要碰确认通道的锁。
+    pending_id: Arc<std::sync::atomic::AtomicU64>,
+    /// 挂起状态变化时唤醒工作线程：否则等待点击确认期间没有命令进来，
+    /// 语音确认模式永远进不去。
+    changed: Arc<tokio::sync::Notify>,
     /// 用户多久不点就自动拒绝——避免"确认框一直开着，回合永远不结束"。
     timeout: std::time::Duration,
 }
@@ -457,8 +536,33 @@ impl UiConfirmer {
             weak,
             pending: Arc::new(std::sync::Mutex::new(None)),
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            pending_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            changed: Arc::new(tokio::sync::Notify::new()),
             timeout: std::time::Duration::from_secs(120),
         }
+    }
+
+    /// 当前挂起的确认请求 id（`None` = 没有）。
+    ///
+    /// **语音确认只在这之后才允许进入**：没有挂起请求时说话不能结算任何东西。
+    fn pending_request(&self) -> Option<u64> {
+        match self.pending_id.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// 挂起状态变化的通知句柄（工作线程用它唤醒自己的 select）。
+    fn changes(&self) -> Arc<tokio::sync::Notify> {
+        self.changed.clone()
+    }
+
+    fn publish_pending(&self, request_id: u64) {
+        self.pending_id
+            .store(request_id, std::sync::atomic::Ordering::SeqCst);
+        // `notify_waiters` 只唤醒**已经**在等的人；调用方会在每个循环开头
+        // 重新读一次 `pending_request()`，所以不会因为错过通知而卡住。
+        self.changed.notify_waiters();
     }
 
     /// 立即中止当前挂起的确认（退出时用）。
@@ -472,6 +576,8 @@ impl UiConfirmer {
         if let Some(pending) = guard.take() {
             let _ = pending.reply.send(ConfirmAnswer::deny_click());
         }
+        drop(guard);
+        self.publish_pending(0);
     }
 
     /// 在接受界面发来的一次答复。**只有** id 与当前挂起请求一致的才生效。
@@ -493,7 +599,32 @@ impl UiConfirmer {
             return false;
         };
         // 一次性通道：发送成功才算这次确认被消费。
-        pending.reply.send(answer).is_ok()
+        let accepted = pending.reply.send(answer).is_ok();
+        drop(guard);
+        if accepted {
+            clear_pending_id(&self.pending_id, &self.changed, request_id);
+        }
+        accepted
+    }
+}
+
+/// 只清掉**匹配的**挂起 id（不误伤已经开始的下一次确认）。
+fn clear_pending_id(
+    pending_id: &Arc<std::sync::atomic::AtomicU64>,
+    changed: &Arc<tokio::sync::Notify>,
+    request_id: u64,
+) {
+    if request_id != 0
+        && pending_id
+            .compare_exchange(
+                request_id,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    {
+        changed.notify_waiters();
     }
 }
 
@@ -505,6 +636,8 @@ impl Confirmer for UiConfirmer {
     ) -> ConfirmFuture<'a> {
         let weak = self.weak.clone();
         let pending = self.pending.clone();
+        let pending_id = self.pending_id.clone();
+        let changed = self.changed.clone();
         let request_id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -528,6 +661,10 @@ impl Confirmer for UiConfirmer {
                 }
                 Err(_) => return ConfirmAnswer::deny_click(),
             }
+            // 对外公布"现在挂起的是哪一次"：语音确认据此绑定请求 id，
+            // 工作线程据此切换到语音确认聆听模式。
+            pending_id.store(request_id, std::sync::atomic::Ordering::SeqCst);
+            changed.notify_waiters();
 
             let weak_for_ui = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -560,6 +697,9 @@ impl Confirmer for UiConfirmer {
                     *guard = None;
                 }
             }
+            // 只有仍是这一次时才对外宣布"没有挂起请求"
+            // （避免把紧接着出现的下一次确认也一起清掉）。
+            clear_pending_id(&pending_id, &changed, request_id);
             let weak_for_close = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = weak_for_close.upgrade() {
@@ -606,10 +746,36 @@ async fn run_worker(
     // 会话历史由回合任务持有并送回：回合在工作线程之外跑，主循环仍要能响应取消。
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut turn_cancel: Option<CancelToken> = None;
+    // 回合身份：每个 Agent 回合一个，播报据此判断"这段音频属于哪一轮"。
+    let mut next_turn_id: TurnId = 0;
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
     // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
     let mut voice = VoiceRuntime::new();
+
+    /*
+     * 播报层（PR7）：引擎与设备都懒加载，事件同样回到这条命令通道。
+     *
+     * 用一条独立的转发任务而不是让播报层直接持有 `UiCommand` 发送端：
+     * 播报层不依赖界面类型，可以脱离 Slint 单独测试。
+     */
+    let (speech_tx, mut speech_rx) = tokio::sync::mpsc::unbounded_channel::<SpeechEvent>();
+    let mut speech = SpeechRuntime::new(speech_tx);
+    {
+        let forward = command_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = speech_rx.recv().await {
+                if forward.send(UiCommand::Speech(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // 启用过的配置在启动时就尝试建立引擎：缺 Key / 缺模型时**只禁用播报**，
+    // 界面显示原因，文本与 CUA 完全不受影响。
+    if let Err(error) = speech.apply_settings(&settings.tts, &secret) {
+        eprintln!("[tts] 播报不可用：{error}");
+    }
 
     /*
      * 已保存的启用偏好在启动时**不自动开麦**：
@@ -617,8 +783,12 @@ async fn run_worker(
      * 偏好只在用户点了开关之后才写回。
      */
     seed_voice_ui(&weak, &settings);
+    seed_tts_ui(&weak, &settings, &speech);
 
     loop {
+        // 每一轮都按"当前是否在播报 / 是否有挂起的确认"重新决定聆听模式：
+        // 只有播报期间与等待确认期间才允许不喊唤醒词。
+        sync_listen_mode(&mut voice, &speech, &confirmer);
         let Some(command) = commands.recv().await else {
             break;
         };
@@ -630,6 +800,8 @@ async fn run_worker(
                     token.cancel();
                 }
                 confirmer.abort_pending();
+                // 退出先停声音再关麦：不留一段没人管的音频在网络/设备上跑。
+                speech.shutdown();
                 voice.disable(&weak);
                 break;
             }
@@ -638,9 +810,57 @@ async fn run_worker(
                     token.cancel();
                     set_status(&weak, "正在中断…");
                 }
+                // 取消任务 = 取消 Agent **并且**停掉本回合的声音。
+                speech.stop();
                 // 取消也作用于「正在录/正在识别的那一句」：之后返回的结果不提交。
                 // 已经开始的 Agent 回合仍按原有取消语义处理。
                 voice.cancel_pending();
+            }
+            UiCommand::StopSpeaking => {
+                // **只停声音**：不取消回合、不结算权限请求、不关麦克风。
+                if speech.is_speaking() {
+                    speech.stop();
+                    set_status(&weak, "已停止播报（任务继续）");
+                } else {
+                    set_status(&weak, "当前没有在播报");
+                }
+            }
+            UiCommand::SpeakTest => match speech.speak(TEST_SPEECH_TURN, TEST_SPEECH_TEXT) {
+                Ok(_) => set_status(&weak, "正在试音…"),
+                Err(error) => set_status(&weak, &format!("试音失败：{error}")),
+            },
+            UiCommand::SaveTtsSettings {
+                enabled,
+                backend_index,
+                mimo_voice,
+                mimo_style,
+                local_dir,
+                local_sid,
+                local_speed,
+                speak_voice_turns,
+                speak_text_turns,
+            } => {
+                apply_tts_settings(
+                    &weak,
+                    &paths,
+                    &secret,
+                    &mut settings,
+                    &mut speech,
+                    TtsSaveRequest {
+                        enabled,
+                        backend_index,
+                        mimo_voice,
+                        mimo_style,
+                        local_dir,
+                        local_sid,
+                        local_speed,
+                        speak_voice_turns,
+                        speak_text_turns,
+                    },
+                );
+            }
+            UiCommand::Speech(event) => {
+                apply_speech_event(&weak, &event);
             }
             UiCommand::OpenSettings => {
                 // 权威配置在工作线程：每次打开设置都按当前值回填，不用启动快照。
@@ -703,6 +923,9 @@ async fn run_worker(
                 }
             }
             UiCommand::Send(input) => {
+                // 新一轮开始：上一轮的声音立刻停下，绝不接在旧音频后面。
+                speech.stop();
+                next_turn_id += 1;
                 match start_turn(
                     &weak,
                     &paths,
@@ -713,6 +936,7 @@ async fn run_worker(
                     &mut history,
                     &mut turn_cancel,
                     input,
+                    next_turn_id,
                 ) {
                     TurnStart::Started(turn) => {
                         // 等待结束，但**同时**继续处理取消/退出/设置命令。
@@ -726,7 +950,9 @@ async fn run_worker(
                             &mut settings,
                             &confirmer,
                             &mut voice,
+                            &mut speech,
                             &command_tx,
+                            TurnSource::Text,
                         )
                         .await
                         {
@@ -748,8 +974,18 @@ async fn run_worker(
                 );
             }
             UiCommand::Voice(event) => {
-                let prompt = voice.on_event(&weak, event, turn_cancel.is_some());
+                let prompt = handle_voice_event(
+                    &weak,
+                    &mut voice,
+                    &confirmer,
+                    &mut speech,
+                    event,
+                    turn_cancel.is_some(),
+                );
                 if let Some(prompt) = prompt {
+                    // 语音指令也是一轮新的回合：先把上一轮的声音停掉。
+                    speech.stop();
+                    next_turn_id += 1;
                     let turn = commit_voice_text(
                         &weak,
                         prompt.text,
@@ -762,6 +998,7 @@ async fn run_worker(
                         &settings,
                         &paths,
                         &secret,
+                        next_turn_id,
                     );
                     if let Some(turn) = turn {
                         // 与文本输入完全相同的等待方式：取消/退出/设置照常处理。
@@ -775,7 +1012,9 @@ async fn run_worker(
                             &mut settings,
                             &confirmer,
                             &mut voice,
+                            &mut speech,
                             &command_tx,
+                            TurnSource::Voice,
                         )
                         .await
                         {
@@ -788,7 +1027,8 @@ async fn run_worker(
         }
     }
 
-    // 退出前：关麦克风、取消回合、清掉确认、释放子进程。
+    // 退出前：停播报、关麦克风、取消回合、清掉确认、释放子进程。
+    speech.shutdown();
     voice.disable(&weak);
     confirmer.abort_pending();
     if let Some(token) = turn_cancel.take() {
@@ -890,10 +1130,35 @@ struct VoicePrompt {
     decode_ms: u64,
 }
 
+/// 一条语音事件处理完之后，工作线程该做什么。
+enum VoiceOutcome {
+    /// 只更新了界面状态。
+    None,
+    /// 可提交的指令（与文本输入走同一个 Agent 入口）。
+    Prompt(VoicePrompt),
+    /// 播报期间的识别结果：可能是打断词（是否真打断由工作线程结合回声判定）。
+    BargeIn { heard: String },
+    /// 权限确认期间的识别结果，已绑定到具体请求 id。
+    Confirm { request_id: u64, text: String },
+}
+
+impl VoiceOutcome {
+    /// 只有"要启动一个 Agent 回合"的那一种才算可提交。
+    #[cfg(test)]
+    fn into_prompt(self) -> Option<VoicePrompt> {
+        match self {
+            VoiceOutcome::Prompt(prompt) => Some(prompt),
+            _ => None,
+        }
+    }
+}
+
 /// 语音运行时：线程句柄 + 实例路由（含当前实例自己的活动会话）。
 struct VoiceRuntime {
     handle: Option<VoiceHandle>,
     route: VoiceRoute,
+    /// 聆听模式（唤醒词 / 打断 / 语音确认）：音频线程读取。
+    mode: ListenMode,
 }
 
 impl VoiceRuntime {
@@ -901,7 +1166,13 @@ impl VoiceRuntime {
         Self {
             handle: None,
             route: VoiceRoute::default(),
+            mode: ListenMode::new(),
         }
+    }
+
+    /// 设置聆听模式（关麦时也会记下来，重开麦后沿用当前值）。
+    fn set_listen_mode(&self, purpose: ListenPurpose, request_id: u64) {
+        self.mode.set(purpose, request_id);
     }
 
     /// 打开麦克风。
@@ -949,7 +1220,7 @@ impl VoiceRuntime {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let instance = self.route.open();
         let active = self.route.active_session();
-        match coordinator::spawn(config, sink, active, stop, instance) {
+        match coordinator::spawn(config, sink, active, stop, instance, self.mode.clone()) {
             Ok(handle) => {
                 self.handle = Some(handle);
                 set_voice_state(weak, &VoiceState::Loading);
@@ -990,10 +1261,10 @@ impl VoiceRuntime {
         weak: &slint::Weak<AppWindow>,
         event: VoiceEvent,
         agent_busy: bool,
-    ) -> Option<VoicePrompt> {
+    ) -> VoiceOutcome {
         // 旧实例的迟到事件：不改界面状态、不动新会话、不触发任何工具。
         if !self.route.is_current(event.instance) {
-            return None;
+            return VoiceOutcome::None;
         }
         match event.kind {
             VoiceEventKind::StateChanged(state) => {
@@ -1006,26 +1277,48 @@ impl VoiceRuntime {
                         handle.stop();
                     }
                 }
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Ready(info) => {
                 apply_capture_info(weak, &info);
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Woke { turn, keyword } => {
                 self.route.bind(event.instance, turn);
                 set_voice_state(weak, &VoiceState::Capturing);
                 set_status(weak, &format!("已唤醒（{keyword}），请说指令"));
-                None
+                VoiceOutcome::None
+            }
+            VoiceEventKind::DirectStarted {
+                turn,
+                purpose,
+                request_id,
+            } => {
+                self.route.bind(event.instance, turn);
+                set_voice_state(weak, &VoiceState::Capturing);
+                match purpose {
+                    ListenPurpose::BargeIn => {
+                        set_status(weak, "正在听打断词（说「等一下」可以停止播报）")
+                    }
+                    ListenPurpose::Confirm => {
+                        let _ = request_id;
+                        set_status(weak, "请说「允许」或「拒绝」（也可以直接点按钮）")
+                    }
+                    ListenPurpose::Wake => {}
+                }
+                VoiceOutcome::None
             }
             VoiceEventKind::Level { level_db, floor_db } => {
                 apply_level(weak, level_db, floor_db);
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Rejected { turn, reason } => {
                 self.route.release(event.instance, turn);
                 // 空转录/太短属于「没听清」，给一句可读的提示；
-                // 不需要弹窗，也不能触发工具。
+                // 不需要弹窗，也不能触发工具。直通聆听时保持安静更合适。
+                if self.mode.purpose().is_direct() {
+                    return VoiceOutcome::None;
+                }
                 if matches!(
                     reason,
                     RejectReason::EmptyTranscript | RejectReason::TooShort
@@ -1034,35 +1327,388 @@ impl VoiceRuntime {
                 } else {
                     set_status(weak, &reason.message());
                 }
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Overflow => {
                 set_status(weak, "音频积压，已丢弃这一句");
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Final {
                 turn,
                 text,
                 audio_seconds,
                 decode_ms,
+                purpose,
+                request_id,
             } => {
                 // 归属核对 + 一次性消费：过期/重复的结果绝不提交。
                 if self.route.take(event.instance, turn).is_none() {
-                    set_status(weak, "这次语音已取消");
-                    return None;
+                    if !purpose.is_direct() {
+                        set_status(weak, "这次语音已取消");
+                    }
+                    return VoiceOutcome::None;
                 }
                 set_transcript(weak, &text);
-                if agent_busy {
-                    set_status(weak, "上一轮还在跑；这句话没有执行");
-                    return None;
+                match purpose {
+                    ListenPurpose::Wake => {
+                        if agent_busy {
+                            set_status(weak, "上一轮还在跑；这句话没有执行");
+                            return VoiceOutcome::None;
+                        }
+                        VoiceOutcome::Prompt(VoicePrompt {
+                            text,
+                            audio_seconds,
+                            decode_ms,
+                        })
+                    }
+                    // 打断词**不会**被当成新指令送进 Agent：只用于停止播报。
+                    ListenPurpose::BargeIn => VoiceOutcome::BargeIn { heard: text },
+                    ListenPurpose::Confirm => VoiceOutcome::Confirm { request_id, text },
                 }
-                Some(VoicePrompt {
-                    text,
-                    audio_seconds,
-                    decode_ms,
-                })
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- 播报
+
+/// 试音用的固定文本与"回合身份"（不产生 Agent 回合，也不进会话历史）。
+const TEST_SPEECH_TURN: TurnId = 0;
+const TEST_SPEECH_TEXT: &str = "语音播报已就绪。这是一次试音，数字 123，mixed English 也能读。";
+
+/// 一次回合的输入来源：决定这条回复要不要自动播报。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnSource {
+    Text,
+    Voice,
+}
+
+impl TurnSource {
+    fn is_voice(&self) -> bool {
+        matches!(self, Self::Voice)
+    }
+}
+
+/// 播报设置下拉框的顺序（与界面数组一致）。
+const TTS_BACKENDS: &[TtsBackend] = &[TtsBackend::Off, TtsBackend::Mimo, TtsBackend::Local];
+
+fn tts_backend_for_index(index: i32) -> TtsBackend {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| TTS_BACKENDS.get(index).copied())
+        .unwrap_or(TtsBackend::Off)
+}
+
+fn tts_backend_index(backend: TtsBackend) -> i32 {
+    TTS_BACKENDS
+        .iter()
+        .position(|candidate| *candidate == backend)
+        .unwrap_or(0) as i32
+}
+
+/// 按"当前在播报 / 有挂起的确认"决定聆听模式。
+///
+/// 这是"什么时候可以不喊唤醒词"的**唯一**开关：
+///  - 有挂起的 `ask` → 听「允许 / 拒绝」，并绑定该请求 id；
+///  - 正在播报 → 听打断词；
+///  - 其它时候 → 必须唤醒词（与 PR6 一致）。
+fn sync_listen_mode(voice: &mut VoiceRuntime, speech: &SpeechRuntime, confirmer: &UiConfirmer) {
+    let desired = if let Some(request_id) = confirmer.pending_request() {
+        (ListenPurpose::Confirm, request_id)
+    } else if speech.is_speaking() {
+        (ListenPurpose::BargeIn, 0)
+    } else {
+        (ListenPurpose::Wake, 0)
+    };
+    if voice.mode.get() != desired {
+        voice.set_listen_mode(desired.0, desired.1);
+    }
+}
+
+/// 处理一条语音事件：只更新状态 / 提交指令 / 停止播报 / 结算语音确认。
+///
+/// 返回 `Some(prompt)` 表示**要启动一个 Agent 回合**（只有常规唤醒路径会这样）。
+fn handle_voice_event(
+    weak: &slint::Weak<AppWindow>,
+    voice: &mut VoiceRuntime,
+    confirmer: &Arc<UiConfirmer>,
+    speech: &mut SpeechRuntime,
+    event: VoiceEvent,
+    agent_busy: bool,
+) -> Option<VoicePrompt> {
+    match voice.on_event(weak, event, agent_busy) {
+        VoiceOutcome::None => None,
+        VoiceOutcome::Prompt(prompt) => Some(prompt),
+        VoiceOutcome::BargeIn { heard } => {
+            /*
+             * 打断判定：识别文本命中打断词，且不是我们自己正在播的内容。
+             *
+             * 旧版实测的教训：只靠能量阈值会被咳嗽/笑声打断；
+             * 这里的"有声判断"由 VAD 的有声时长与端点检测把关（能进到这里
+             * 就说明真的有人说了话），词语判断由 ASR 文本负责。
+             */
+            let verdict = bargein::judge(&heard, &speech.recent_sentences());
+            match verdict.reason {
+                bargein::BargeReason::Matched => {
+                    speech.stop();
+                    set_status(
+                        weak,
+                        &format!("已停止播报（听到「{}」）", verdict.word.unwrap_or_default()),
+                    );
+                }
+                bargein::BargeReason::Echo => {
+                    // 自己读出来的内容被麦克风收回来：静默忽略，不能自我打断。
+                }
+                bargein::BargeReason::NoWord => {
+                    set_status(
+                        weak,
+                        &format!("听到「{heard}」，没有打断词；说「等一下」可以停止播报"),
+                    );
+                }
+            }
+            None
+        }
+        VoiceOutcome::Confirm { request_id, text } => {
+            settle_voice_confirmation(weak, confirmer, request_id, &text);
+            None
+        }
+    }
+}
+
+/// 用一句识别文本结算挂起的权限确认。返回是否真的结算了。
+///
+/// 绑定规则由 [`confirm::resolve`] 保证：过期请求、重复答复、旧麦克风实例
+/// 的结果都不会批准别的请求。
+fn settle_voice_confirmation(
+    weak: &slint::Weak<AppWindow>,
+    confirmer: &Arc<UiConfirmer>,
+    bound_request: u64,
+    text: &str,
+) -> bool {
+    match confirm::resolve(confirmer.pending_request(), bound_request, text) {
+        ConfirmDecision::Allow(id) => {
+            if confirmer.submit(id, ConfirmAnswer::allow_voice()) {
+                set_status(weak, "已用语音允许这一次操作");
+                true
+            } else {
+                set_status(weak, "这次确认已经结束");
+                false
+            }
+        }
+        ConfirmDecision::Deny(id) => {
+            if confirmer.submit(id, ConfirmAnswer::deny_voice("用户用语音拒绝了这一次操作"))
+            {
+                set_status(weak, "已用语音拒绝这一次操作");
+                true
+            } else {
+                set_status(weak, "这次确认已经结束");
+                false
+            }
+        }
+        ConfirmDecision::Ignore(reason) => {
+            set_status(weak, &reason);
+            false
+        }
+    }
+}
+
+/// 回合正常完成后播报可见回复。
+///
+/// 只播 `TurnOutcome::text`（经过 Agent 汇总的**用户可见**文本）：
+/// 思考内容、工具 JSON、内部提示都不在这里，也不可能从这里漏出去。
+fn maybe_speak(
+    weak: &slint::Weak<AppWindow>,
+    speech: &mut SpeechRuntime,
+    settings: &Settings,
+    outcome: &TurnOutcome,
+    turn_id: TurnId,
+    source: TurnSource,
+) {
+    if outcome.cancelled || outcome.failed {
+        // 失败/中断的回合不播报：把"已中断"读出来只会让人更困惑。
+        return;
+    }
+    if !settings.tts.speaks(source.is_voice()) {
+        return;
+    }
+    let text = outcome.text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if let Err(error) = speech.speak(turn_id, text) {
+        // 播报不可用只影响声音：文本已经在界面上，工具结果也已经落定。
+        set_speech_unavailable(weak, &error);
+    }
+}
+
+fn set_speech_unavailable(weak: &slint::Weak<AppWindow>, reason: &str) {
+    let reason = reason.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_speech_state("unavailable".into());
+            window.set_speech_detail(format!("播报不可用：{reason}").into());
+        }
+    });
+}
+
+/// 播报事件 → 界面（状态、字幕、提示）。
+fn apply_speech_event(weak: &slint::Weak<AppWindow>, event: &SpeechEvent) {
+    match event {
+        SpeechEvent::State { state, .. } => {
+            let code = state.code().to_string();
+            let label = state.label();
+            let label_for_loop = label.clone();
+            let active = state.is_active();
+            let failed = matches!(state, PlaybackState::Failed(_));
+            let weak_ui = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak_ui.upgrade() {
+                    window.set_speech_state(code.into());
+                    window.set_speech_detail(label_for_loop.into());
+                    window.set_speech_active(active);
+                    if !active {
+                        window.set_speech_subtitle("".into());
+                    }
+                }
+            });
+            if failed {
+                set_status(weak, &label);
+            }
+        }
+        SpeechEvent::Subtitle { text, .. } => {
+            let text = text.to_string();
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_speech_subtitle(text.into());
+                }
+            });
+        }
+        SpeechEvent::Notice { text, .. } => {
+            set_status(weak, text);
+            let detail = text.clone();
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_speech_detail(detail.into());
+                }
+            });
+        }
+    }
+}
+
+/// 一次"保存语音播报设置"请求。
+struct TtsSaveRequest {
+    enabled: bool,
+    backend_index: i32,
+    mimo_voice: String,
+    mimo_style: String,
+    local_dir: String,
+    local_sid: i32,
+    local_speed: f32,
+    speak_voice_turns: bool,
+    speak_text_turns: bool,
+}
+
+/// 保存语音播报设置，并按新配置重建引擎。
+///
+/// 规则与模型端点设置一致：**先落盘，再生效**；写盘失败不改内存配置、也不假装成功。
+/// 引擎建立失败（缺 Key / 缺模型 / 设备不可用）**不回滚用户的选择**，
+/// 只把播报标记为不可用并说明原因——文本 Agent 不受影响。
+fn apply_tts_settings(
+    weak: &slint::Weak<AppWindow>,
+    paths: &AppPaths,
+    secret: &SecretStore,
+    settings: &mut Settings,
+    speech: &mut SpeechRuntime,
+    request: TtsSaveRequest,
+) {
+    let mut next = settings.clone();
+    next.tts.enabled = request.enabled;
+    next.tts.backend = tts_backend_for_index(request.backend_index);
+    next.tts.mimo_voice = request.mimo_voice;
+    next.tts.mimo_style = request.mimo_style;
+    next.tts.local_model_dir = request.local_dir;
+    next.tts.local_sid = request.local_sid;
+    next.tts.local_speed = request.local_speed;
+    next.tts.speak_voice_turns = request.speak_voice_turns;
+    next.tts.speak_text_turns = request.speak_text_turns;
+
+    match next.tts.clone().normalized() {
+        Ok(tts) => next.tts = tts,
+        Err(error) => {
+            set_status(weak, &format!("语音播报设置无效：{error}"));
+            return;
+        }
+    }
+    if let Err(error) = config::save_settings(paths, &next) {
+        set_status(weak, &format!("保存语音播报设置失败：{error}"));
+        return;
+    }
+    *settings = next;
+
+    match speech.apply_settings(&settings.tts, secret) {
+        Ok(()) => {
+            let label = speech
+                .engine_label()
+                .unwrap_or_else(|| "关闭（不播报）".to_string());
+            set_status(weak, &format!("语音播报设置已保存：{label}"));
+        }
+        Err(error) => {
+            set_status(weak, &format!("语音播报设置已保存，但当前不可用：{error}"));
+        }
+    }
+    publish_tts_ui(weak, &settings.tts, speech);
+}
+
+/// 启动时把已保存的播报偏好同步到界面（**不**自动试音）。
+fn seed_tts_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, speech: &SpeechRuntime) {
+    publish_tts_ui(weak, &settings.tts, speech);
+    if let Some(error) = speech.engine_error() {
+        set_speech_unavailable(weak, error);
+    }
+}
+
+/// 把播报配置与当前可用性推给界面。
+fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &SpeechRuntime) {
+    let backend_index = tts_backend_index(tts.backend);
+    let enabled = tts.enabled;
+    let mimo_voice = tts.mimo_voice.clone();
+    let mimo_style = tts.mimo_style.clone();
+    let local_dir = tts.local_model_dir.clone();
+    let local_sid = tts.local_sid.to_string();
+    let local_speed = format!("{:.1}", tts.local_speed);
+    let speak_mode = speak_mode_code(tts.speak_voice_turns, tts.speak_text_turns);
+    let available = speech.is_available();
+    let detail = speech
+        .engine_label()
+        .or_else(|| speech.engine_error().map(str::to_string))
+        .unwrap_or_else(|| "未启用播报".to_string());
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_tts_enabled(enabled);
+            window.set_tts_backend_index(backend_index);
+            window.set_tts_mimo_voice(mimo_voice.into());
+            window.set_tts_mimo_style(mimo_style.into());
+            window.set_tts_local_dir(local_dir.into());
+            window.set_tts_local_sid(local_sid.into());
+            window.set_tts_local_speed(local_speed.into());
+            window.set_tts_speak_mode(speak_mode);
+            window.set_tts_backend_ready(available);
+            window.set_speech_detail(detail.into());
+        }
+    });
+}
+
+/// 两个"是否自动播报"的开关 → 界面上的单一选项（0=都播，1=只语音，2=只文本，3=都不）。
+fn speak_mode_code(voice: bool, text: bool) -> i32 {
+    match (voice, text) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
     }
 }
 
@@ -1095,7 +1741,7 @@ fn apply_voice_enabled(
 
 /// 语音最终文本 → 现有 Agent 入口（与文本发送同一条路径）。
 ///
-/// 返回 `Some(handle)` 表示回合已启动，调用方负责等待；`None` 表示没有启动
+/// 返回 `Some(turn)` 表示回合已启动，调用方负责等待；`None` 表示没有启动
 /// （空文本，或 Agent 忙/等待确认/正在取消）。
 #[allow(clippy::too_many_arguments)]
 fn commit_voice_text(
@@ -1110,7 +1756,8 @@ fn commit_voice_text(
     settings: &Settings,
     paths: &AppPaths,
     secret: &SecretStore,
-) -> Option<tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>> {
+    turn_id: TurnId,
+) -> Option<RunningTurn> {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return None;
@@ -1133,6 +1780,7 @@ fn commit_voice_text(
         history,
         turn_cancel,
         trimmed,
+        turn_id,
     ) {
         TurnStart::Started(turn) => {
             set_busy(weak, true);
@@ -1240,9 +1888,18 @@ fn seed_voice_ui(weak: &slint::Weak<AppWindow>, settings: &Settings) {
     });
 }
 
+/// 正在跑的一轮：任务句柄 + 回合身份。
+///
+/// 回合身份是播报层"这段音频属于哪个 Agent 回合"的依据：新回合一开始就换号，
+/// 旧回合迟到的音频不会串到新回合里。
+struct RunningTurn {
+    task: tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>,
+    turn_id: TurnId,
+}
+
 /// 一次回合的启动结果。
 enum TurnStart {
-    Started(tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>),
+    Started(RunningTurn),
     /// 没启动（上一轮还在跑 / 后端不可用 / 端点无效），附给用户看的原因。
     Rejected(String),
 }
@@ -1260,6 +1917,7 @@ fn start_turn(
     history: &mut Vec<ChatMessage>,
     turn_cancel: &mut Option<CancelToken>,
     input: String,
+    turn_id: TurnId,
 ) -> TurnStart {
     /*
      * 并发约束：上一轮还在跑（含等待点击确认）时**不启动第二回合**。
@@ -1329,7 +1987,10 @@ fn start_turn(
             .await;
         (outcome, turn_history, settings_snapshot)
     });
-    TurnStart::Started(turn)
+    TurnStart::Started(RunningTurn {
+        task: turn,
+        turn_id,
+    })
 }
 
 /// 等待回合结束期间的命令处理结果。
@@ -1489,23 +2150,35 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
 #[allow(clippy::too_many_arguments)]
 async fn wait_turn(
     commands: &mut tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
-    mut turn: tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>,
+    turn: RunningTurn,
     weak: &slint::Weak<AppWindow>,
     turn_cancel: &mut Option<CancelToken>,
     paths: &AppPaths,
     secret: &SecretStore,
     settings: &mut Settings,
-    confirmer: &UiConfirmer,
+    confirmer: &Arc<UiConfirmer>,
     voice: &mut VoiceRuntime,
+    speech: &mut SpeechRuntime,
     command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    source: TurnSource,
 ) -> TurnWait {
+    let RunningTurn { mut task, turn_id } = turn;
+    /*
+     * 确认请求出现/结束时也要**立刻**切换聆听模式：
+     * 否则回合卡在"等点击"的这段时间里，语音确认永远进不去（没有人按按钮，
+     * 也没有命令进来唤醒这个 select）。
+     */
+    let pending_changes = confirmer.changes();
     loop {
+        // 每一轮重新决定聆听模式（播报中 = 听打断词，等待确认 = 听允许/拒绝）。
+        sync_listen_mode(voice, speech, confirmer);
         tokio::select! {
-            joined = &mut turn => {
+            joined = &mut task => {
                 *turn_cancel = None;
                 match joined {
                     Ok((outcome, history, settings_snapshot)) => {
                         finish_turn(weak, &outcome, &settings_snapshot);
+                        maybe_speak(weak, speech, &settings_snapshot, &outcome, turn_id, source);
                         return TurnWait::Finished(history);
                     }
                     Err(error) => {
@@ -1520,6 +2193,9 @@ async fn wait_turn(
                     }
                 }
             }
+            _ = pending_changes.notified() => {
+                // 只是唤醒一次循环：下一轮一开头会重新同步聆听模式。
+            }
             command = commands.recv() => {
                 match command {
                     Some(UiCommand::Cancel) => {
@@ -1527,14 +2203,62 @@ async fn wait_turn(
                             token.cancel();
                             set_status(weak, "正在中断…");
                         }
+                        // 取消任务 = 取消 Agent **并且**停掉本回合的声音。
+                        speech.stop();
                         // 语音输入也一并取消（不再提交），但不影响已开始回合的收尾。
                         voice.cancel_pending();
+                    }
+                    Some(UiCommand::StopSpeaking) => {
+                        if speech.is_speaking() {
+                            speech.stop();
+                            set_status(weak, "已停止播报（任务继续）");
+                        } else {
+                            set_status(weak, "当前没有在播报");
+                        }
+                    }
+                    Some(UiCommand::SpeakTest) => match speech.speak(TEST_SPEECH_TURN, TEST_SPEECH_TEXT) {
+                        Ok(_) => set_status(weak, "正在试音…"),
+                        Err(error) => set_status(weak, &format!("试音失败：{error}")),
+                    },
+                    Some(UiCommand::SaveTtsSettings {
+                        enabled,
+                        backend_index,
+                        mimo_voice,
+                        mimo_style,
+                        local_dir,
+                        local_sid,
+                        local_speed,
+                        speak_voice_turns,
+                        speak_text_turns,
+                    }) => {
+                        apply_tts_settings(
+                            weak,
+                            paths,
+                            secret,
+                            settings,
+                            speech,
+                            TtsSaveRequest {
+                                enabled,
+                                backend_index,
+                                mimo_voice,
+                                mimo_style,
+                                local_dir,
+                                local_sid,
+                                local_speed,
+                                speak_voice_turns,
+                                speak_text_turns,
+                            },
+                        );
+                    }
+                    Some(UiCommand::Speech(event)) => {
+                        apply_speech_event(weak, &event);
                     }
                     Some(UiCommand::Quit) => {
                         if let Some(token) = turn_cancel.as_ref() {
                             token.cancel();
                         }
                         confirmer.abort_pending();
+                        speech.shutdown();
                         set_status(weak, "正在退出…");
                         /*
                          * 回合会在下一个检查点结束；等它真的收尾再交回主循环，
@@ -1546,7 +2270,7 @@ async fn wait_turn(
                          */
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            &mut turn,
+                            &mut task,
                         )
                         .await;
                         *turn_cancel = None;
@@ -1561,13 +2285,14 @@ async fn wait_turn(
                      *    偏好保存失败也不妨碍本次关麦；开麦同理立即生效。
                      *  - 语音最终文本不在这里插队：`on_event(agent_busy = true)`
                      *    只更新状态、不启动第二回合，也不排队延后执行。
+                     *  - 打断词与语音确认**照常生效**：它们不启动回合。
                      *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
                      */
                     Some(UiCommand::SetVoiceEnabled(enabled)) => {
                         apply_voice_enabled(weak, paths, settings, voice, command_tx, enabled);
                     }
                     Some(UiCommand::Voice(event)) => {
-                        let _ = voice.on_event(weak, event, true);
+                        let _ = handle_voice_event(weak, voice, confirmer, speech, event, true);
                     }
                     Some(UiCommand::OpenSettings) => {
                         // 执行中也能查看当前（已保存的）配置。
@@ -1813,6 +2538,8 @@ mod tests {
             weak: slint::Weak::default(),
             pending: Arc::new(std::sync::Mutex::new(None)),
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            pending_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            changed: Arc::new(tokio::sync::Notify::new()),
             timeout: std::time::Duration::from_secs(5),
         }
     }
@@ -1824,7 +2551,14 @@ mod tests {
     ) -> tokio::sync::oneshot::Receiver<ConfirmAnswer> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         *confirmer.pending.lock().unwrap() = Some(PendingConfirm { request_id, reply });
+        confirmer.publish_pending(request_id);
         wait
+    }
+
+    /// 测试用播报运行时：没有引擎、没有设备（只验证"不播报"的路径）。
+    fn speech_without_engine() -> SpeechRuntime {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SpeechRuntime::new(tx)
     }
 
     /// **并发约束**：回合还在跑（含等待点击确认）时，语音/文本都**不能**启动第二回合。
@@ -1852,6 +2586,7 @@ mod tests {
             &mut history,
             &mut running,
             "打开浏览器".to_string(),
+            1,
         ) {
             TurnStart::Rejected(reason) => {
                 assert!(reason.contains("上一轮"), "原因必须说清楚：{reason}");
@@ -1884,6 +2619,7 @@ mod tests {
             &mut history,
             &mut idle,
             "列出窗口".to_string(),
+            1,
         ) {
             TurnStart::Rejected(reason) => assert!(reason.contains("Computer Use")),
             TurnStart::Started(_) => panic!("没有工具后端时不该启动"),
@@ -2311,15 +3047,19 @@ mod tests {
         let secret = SecretStore::new(paths.secret_file());
         let mut settings = Settings::default();
         let mut cancel_slot = Some(turn_cancel.clone());
-        let confirmer = confirmer_without_ui();
+        let confirmer = Arc::new(confirmer_without_ui());
 
         let mut voice = VoiceRuntime::new();
+        let mut speech = speech_without_engine();
         let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             wait_turn(
                 &mut commands,
-                turn,
+                RunningTurn {
+                    task: turn,
+                    turn_id: 1,
+                },
                 &slint::Weak::default(),
                 &mut cancel_slot,
                 &paths,
@@ -2327,7 +3067,9 @@ mod tests {
                 &mut settings,
                 &confirmer,
                 &mut voice,
+                &mut speech,
                 &command_tx,
+                TurnSource::Text,
             ),
         )
         .await
@@ -2372,9 +3114,10 @@ mod tests {
         let secret = SecretStore::new(paths.secret_file());
         let mut settings = Settings::default();
         let mut cancel_slot = Some(watch.clone());
-        let confirmer = confirmer_without_ui();
+        let confirmer = Arc::new(confirmer_without_ui());
 
         let mut voice = VoiceRuntime::new();
+        let mut speech = speech_without_engine();
         let instance = voice.route.open();
         let stop = Arc::new(AtomicBool::new(false));
         voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
@@ -2392,7 +3135,10 @@ mod tests {
         let weak = slint::Weak::default();
         let wait = wait_turn(
             &mut commands,
-            turn,
+            RunningTurn {
+                task: turn,
+                turn_id: 1,
+            },
             &weak,
             &mut cancel_slot,
             &paths,
@@ -2400,7 +3146,9 @@ mod tests {
             &mut settings,
             &confirmer,
             &mut voice,
+            &mut speech,
             &tx,
+            TurnSource::Text,
         );
         let (result, ()) = tokio::join!(wait, driver);
 
@@ -2681,6 +3429,8 @@ mod tests {
                 text: "打开浏览器".to_string(),
                 audio_seconds: 1.0,
                 decode_ms: 1,
+                purpose: ListenPurpose::Wake,
+                request_id: 0,
             },
             VoiceEventKind::Rejected {
                 turn: old_turn,
@@ -2696,7 +3446,7 @@ mod tests {
                 },
                 false,
             );
-            assert!(prompt.is_none(), "旧实例的事件不得触发 Agent");
+            assert!(prompt.into_prompt().is_none(), "旧实例的事件不得触发 Agent");
         }
         // 新实例的这一句仍在等结果，不能被旧事件清掉。
         assert_eq!(voice.route.pending, Some(new_turn));
@@ -2748,10 +3498,15 @@ mod tests {
                 text: "打开浏览器".to_string(),
                 audio_seconds: 1.0,
                 decode_ms: 5,
+                purpose: ListenPurpose::Wake,
+                request_id: 0,
             },
         };
         assert!(
-            voice.on_event(&weak, final_event.clone(), true).is_none(),
+            voice
+                .on_event(&weak, final_event.clone(), true)
+                .into_prompt()
+                .is_none(),
             "Agent 忙时不能启动第二回合"
         );
         assert!(voice.route.pending.is_none(), "这句话不能排队延后执行");
@@ -2767,6 +3522,7 @@ mod tests {
                 },
                 true,
             )
+            .into_prompt()
             .is_none());
         assert!(voice
             .on_event(
@@ -2777,6 +3533,7 @@ mod tests {
                 },
                 true,
             )
+            .into_prompt()
             .is_none());
     }
 
@@ -2798,17 +3555,20 @@ mod tests {
                 text: "打开记事本".to_string(),
                 audio_seconds: 1.2,
                 decode_ms: 9,
+                purpose: ListenPurpose::Wake,
+                request_id: 0,
             },
         };
 
         let prompt = voice
             .on_event(&weak, event.clone(), false)
+            .into_prompt()
             .expect("空闲时有效 Final 应当提交");
         assert_eq!(prompt.text, "打开记事本");
         assert!((prompt.audio_seconds - 1.2).abs() < f32::EPSILON);
 
         assert!(
-            voice.on_event(&weak, event, false).is_none(),
+            voice.on_event(&weak, event, false).into_prompt().is_none(),
             "同一结果不得提交第二次"
         );
     }
@@ -2836,11 +3596,13 @@ mod tests {
                     text: "打开浏览器".to_string(),
                     audio_seconds: 1.0,
                     decode_ms: 5,
+                    purpose: ListenPurpose::Wake,
+                    request_id: 0,
                 },
             },
             false,
         );
-        assert!(prompt.is_none(), "取消之后的结果不得提交");
+        assert!(prompt.into_prompt().is_none(), "取消之后的结果不得提交");
     }
 
     /// 旧实例的 Final 不得冒充新实例的会话（两者 session 号可能相同）。
@@ -2871,10 +3633,13 @@ mod tests {
                         text: "上一句".to_string(),
                         audio_seconds: 1.0,
                         decode_ms: 5,
+                        purpose: ListenPurpose::Wake,
+                        request_id: 0,
                     },
                 },
                 false,
             )
+            .into_prompt()
             .is_none());
         assert_eq!(voice.route.pending, Some(new_turn));
     }
