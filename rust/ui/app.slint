@@ -8,7 +8,20 @@
 //! 取消语义：`取消` 只置一次取消标记，不打断正在跑的进程读写；
 //! 等工作线程把"已中断"回报上来再恢复界面，避免界面说"停了"但后台还在动作。
 
-import { LineEdit, ScrollView } from "std-widgets.slint";
+// 只从 std-widgets 取 **ScrollView**（它只是 Flickable + 滚动条的组合，
+// 不依赖主题调色板）。输入框与下拉框**自己实现**：
+//
+//   - `std-widgets` 的 `LineEdit` 把背景、边框、文字色**全部**取自主题
+//     （`FluentPalette.control-background` / `foreground` …）。本项目**没有**
+//     启用任何样式 feature（只有 `renderer-winit-software`），这些调色板值是
+//     空的，于是输入框渲染成"看不见的框"、无边框、也就点不准。
+//     这正是任务里"输入框必须始终可见并有点击区域"的根因。
+//   - 同理，`Button` 也早就因为同样原因被换成了自绘的 `AppButton`。
+//
+// 现在统一改用内置的 `TextInput`（真实的文本编辑元素：支持输入法、复制粘贴、
+// 选区、Tab 焦点链、password 类型），外面套一层我们自己画边框和焦点态的
+// `AppLineEdit`。下拉框用 `PopupWindow` 展开完整列表并支持键盘上下选择。
+import { ScrollView } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------------
 // 数据模型
@@ -30,30 +43,202 @@ export struct ToolCard {
     tint: color,
 }
 
-/// 简单下拉（PR5 只需在少数固定选项间切换，不值得引入更重的控件）。
-component Choice inherits Rectangle {
-    in property <[string]> options: [];
-    in-out property <int> index: 0;
-    callback picked(string);
-    height: 28px;
-    border-radius: 4px;
-    border-width: 1px;
-    border-color: #d8d8dd;
-    background: #ffffff;
-    horizontal-stretch: 1;
+/// 自绘文本框：内置 `TextInput` 负责真正的编辑行为（输入法、复制粘贴、
+/// 选区、Tab 焦点链、password），这里只画**边框、焦点态与点击区域**。
+///
+/// 为什么要自绘外壳：`std-widgets` 的 `LineEdit` 完全依赖主题调色板，
+/// 本项目未启用样式 feature，结果是没有边框、文字不可见、也没有明确的可点区域。
+/// `TextInput` 是内置元素（与样式无关），我们给它的 `color` 显式赋值，
+/// 所以软件渲染器下也一定能看见。
+component AppLineEdit inherits Rectangle {
+    in-out property <string> text: "";
+    in property <string> placeholder-text: "";
+    in property <bool> input-type-password: false;
+    in property <bool> enabled: true;
+    callback accepted();
+    // 用户真的改过内容（含输入法上屏、粘贴）；外层据此标记"未保存"。
+    callback edited();
 
-    Text {
-        x: 8px;
-        vertical-alignment: center;
-        text: options.length > 0 ? options[index] : "";
+    height: 32px;
+    border-radius: 5px;
+    border-width: 1px;
+    // 焦点边框用主色，未聚焦用中性色：焦点状态一眼可见。
+    border-color: !enabled ? #e3e3e6 : (input.has-focus ? #1f6feb : #c9c9d0);
+    background: !enabled ? #f5f5f7 : #ffffff;
+    horizontal-stretch: 1;
+    // 整个矩形都是输入区域：不用找特定像素，点哪里都能聚焦。
+    forward-focus: input;
+    accessible-role: text-input;
+    accessible-value <=> input.text;
+    accessible-placeholder-text: placeholder-text;
+    accessible-enabled: enabled;
+
+    input := TextInput {
+        x: 9px;
+        y: 0px;
+        width: parent.width - 18px;
+        height: parent.height;
+        text <=> root.text;
+        enabled: root.enabled;
         color: #1f1f22;
+        selection-background-color: #cfe2ff;
+        selection-foreground-color: #1f1f22;
+        text-cursor-width: 1px;
+        // 内置 `TextInput` 没有 `input-type` 之外的重置手段，枚举值写作
+        // `InputType.password`（大小写敏感）。
+        input-type: root.input-type-password ? InputType.password : InputType.text;
+        font-size: 13px;
+        vertical-alignment: center;
+
+        accepted => { root.accepted(); }
+        edited => { root.edited(); }
     }
 
-    picker := TouchArea {
-        clicked => {
-            if (options.length > 0) {
-                index = Math.mod(index + 1, options.length);
-                picked(options[index]);
+    // 占位提示：`TextInput` 不提供 placeholder，这里在**文本为空**时叠一层
+    // 灰色文字。它不接收点击（不挡输入），点它等于点下面的输入区。
+    if root.text == "" && root.placeholder-text != "" : Text {
+        x: 9px;
+        width: parent.width - 18px;
+        height: parent.height;
+        text: root.placeholder-text;
+        color: #a8a8b0;
+        font-size: 13px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+/// 一个"选项列表"下拉框：点开后展示**完整列表**（而不是逐个循环）。
+///
+/// 用 `PopupWindow` 承载列表（Slint 内置浮层，可超出父元素边界），
+/// 选项用 `TouchArea` 自绘：不依赖 `ListView` 的主题样式。
+/// 支持键盘：空格/回车展开，上下移动，回车确认，Esc 关闭。
+component AppComboBox inherits Rectangle {
+    in property <[string]> options: [];
+    in-out property <int> index: 0;
+    in property <bool> enabled: true;
+    callback picked(int);
+
+    height: 32px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: !enabled ? #e3e3e6 : (touch.has-hover ? #9aa4b2 : #c9c9d0);
+    background: !enabled ? #f5f5f7 : #ffffff;
+    horizontal-stretch: 1;
+    forward-focus: keys;
+    accessible-role: combobox;
+    accessible-enabled: enabled;
+    accessible-value: options.length > 0 && index >= 0 && index < options.length ? options[index] : "";
+
+    function current-text() -> string {
+        return (options.length > 0 && index >= 0 && index < options.length) ? options[index] : "";
+    }
+    function open() {
+        if (enabled && options.length > 0) {
+            popup.show();
+        }
+    }
+
+    // 当前值
+    Text {
+        x: 9px;
+        width: parent.width - 34px;
+        height: parent.height;
+        text: current-text();
+        color: enabled ? #1f1f22 : #a8a8b0;
+        font-size: 13px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    // 展开箭头：直接用字形，不依赖图标主题或外部资源。
+    Text {
+        x: parent.width - 24px;
+        width: 16px;
+        height: parent.height;
+        text: "▾";
+        color: enabled ? #6b6b73 : #c0c0c6;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.open(); }
+    }
+
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            // Slint 把不可打印键映射到 `Key` 命名空间的私有码点；
+            // 这里只认空格/回车/上下箭头，其余放行（Tab 仍走焦点链）。
+            if (event.text == " " || event.text == "\n") {
+                root.open();
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                if (root.index < root.options.length - 1) {
+                    root.index = root.index + 1;
+                    root.picked(root.index);
+                }
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                if (root.index > 0) {
+                    root.index = root.index - 1;
+                    root.picked(root.index);
+                }
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    popup := PopupWindow {
+        width: max(root.width, 180px);
+        // 列表最多 8 项，超出由内部滚动（与设置面板一样不依赖 ScrollView）。
+        height: min(list-layout.preferred-height, 8 * 30px) + 8px;
+        x: 0;
+        y: root.height + 2px;
+        // 点列表项时由我们主动 close()；点外面则自动关闭。
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #ffffff;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #c9c9d0;
+
+            list-layout := VerticalLayout {
+                padding: 4px;
+
+                for option[index] in root.options: Rectangle {
+                    height: 30px;
+                    border-radius: 4px;
+                    background: option-touch.has-hover ? #eef3ff : (index == root.index ? #e6efff : transparent);
+
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: option;
+                        color: #1f1f22;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    option-touch := TouchArea {
+                        clicked => {
+                            root.index = index;
+                            root.picked(index);
+                            popup.close();
+                        }
+                    }
+                }
             }
         }
     }
@@ -126,6 +311,13 @@ export component AppWindow inherits Window {
     in-out property <string> api-key-input: "";
     in-out property <bool> has-key: false;
     in-out property <int> permission-index: 0;
+    // 保存失败的具体原因（空 = 没有错误）。设置页会把它显示在按钮上方，
+    // 并且**不**关闭面板、**不**清空用户已输入的内容。
+    in-out property <string> settings-error: "";
+    // 是否有未保存的修改（任何输入框/下拉变化置真，保存或取消后清零）。
+    in-out property <bool> settings-dirty: false;
+    // 保存进行中：禁用保存按钮，避免重复提交；结果回来前界面照常可交互。
+    in-out property <bool> settings-saving: false;
 
     // 权限确认（ask）
     in-out property <bool> confirm-open: false;
@@ -144,17 +336,49 @@ export component AppWindow inherits Window {
     in-out property <string> voice-level: "";
     in-out property <string> voice-transcript: "";
 
+    // 语音播报（PR7）：设置项 + 播放状态 + 字幕。
+    in-out property <bool> tts-enabled: false;
+    // 0 = 关闭（不播报），1 = MiMo 云端，2 = 本地 ONNX
+    in-out property <int> tts-backend-index: 0;
+    in-out property <string> tts-mimo-voice: "";
+    in-out property <string> tts-mimo-style: "";
+    in-out property <string> tts-local-dir: "";
+    in-out property <string> tts-local-sid: "0";
+    in-out property <string> tts-local-speed: "1.0";
+    // 0 = 语音与文本都播报，1 = 只播语音提问，2 = 只播文本输入，3 = 都不自动播报
+    in-out property <int> tts-speak-mode: 0;
+    // 引擎是否可用（缺 Key / 缺模型时为 false，但设置仍然保留）
+    in-out property <bool> tts-backend-ready: false;
+    // **已保存并生效**的后端索引（与界面上的 tts-backend-index 区分：
+    // 后者是用户当前的选择，可能还没保存）。试音据此说明用的是哪一份配置。
+    in-out property <int> tts-active-backend-index: 0;
+    // 已生效配置的文字描述（例如「MiMo mimo-v2.5-tts」/「关闭（不播报）」）。
+    in-out property <string> tts-active-label: "";
+    // 已生效配置是否可用（false = 引擎没建起来，试音会被拒绝）。
+    in-out property <bool> tts-active-ready: false;
+    // idle | synthesizing | buffering | playing | finished | stopped | failed | unavailable
+    in-out property <string> speech-state: "idle";
+    in-out property <string> speech-detail: "";
+    in-out property <string> speech-subtitle: "";
+    in-out property <bool> speech-active: false;
+
     // ---- 回调（Rust 侧实现） ----
     callback send(text: string);
     callback cancel-turn();
     callback open-settings();
-    callback save-settings(provider-index: int, base-url: string, model-name: string, api-key: string, permission-index: int);
+    // **一次保存**：模型端点与语音播报一起提交，由 Rust 侧当作一个事务处理。
+    // 返回是否整体成功（Slint 的 callback 可以有返回值，用于就地显示错误）。
+    callback save-all(provider-index: int, base-url: string, model-name: string, api-key: string, permission-index: int, tts-enabled: bool, tts-backend-index: int, tts-mimo-voice: string, tts-mimo-style: string, tts-local-dir: string, tts-local-sid: string, tts-local-speed: string, tts-speak-mode: int);
+    // 关闭设置面板（取消）：丢弃界面上的未保存修改。
+    callback cancel-settings();
     // 带上界面当前选中的提供商索引：清除的是**用户看到的**那一家，
     // 不是已保存配置里的那一家。
     callback clear-api-key(provider-index: int);
     callback provider-changed(provider-index: int);
     callback confirm-decision(request-id: int, allow: bool);
     callback set-voice-enabled(enabled: bool);
+    callback test-voice();
+    callback stop-speaking();
     callback quit-app();
 
     // 状态 → 用户能看懂的中文（与 Rust 侧 VoiceState::label 保持一致的口径）。
@@ -170,9 +394,14 @@ export component AppWindow inherits Window {
     // ---- 布局 ----
     VerticalLayout {
         // 顶栏
+        //
+        // 高度用**固定值**而不是 `top-bar.preferred-height + 20px`：
+        // 后者会让「父矩形高度 ← 子布局首选高度 ← 子布局受父高度约束」形成
+        // binding loop（Slint 会警告"可能 panic"）。按钮本身固定 30px 高，
+        // 加上下各 10px 内边距 = 50px，写死即可，也更稳定。
         Rectangle {
             background: #ffffff;
-            height: top-bar.preferred-height + 20px;
+            height: 50px;
 
             top-bar := HorizontalLayout {
                 padding-left: 16px;
@@ -191,16 +420,31 @@ export component AppWindow inherits Window {
 
                 Rectangle { horizontal-stretch: 1; }
 
+                // 端点摘要只是提示信息，按钮才是入口。它必须能被压缩：
+                // `Text` 默认坚持自己的首选宽度，最小窗口（720px 逻辑宽）时会把
+                // 「设置 / 退出」挤出右边缘——按钮就点不到了。
+                // 用 `overflow: elide` + `min-width: 0px` 让它先让位。
+                // 注意不要用 `if root.width >= …` 控制可见性：那会让布局反过来
+                // 依赖窗口宽度，形成 layoutinfo binding loop（Slint 会警告可能 panic）。
                 Text {
                     text: root.endpoint-text;
                     color: #666666;
                     vertical-alignment: center;
+                    overflow: elide;
+                    min-width: 0px;
                 }
 
                 AppButton {
                     label: root.voice-enabled ? "关闭麦克风" : "打开麦克风";
                     primary: root.voice-enabled;
                     clicked => { root.set-voice-enabled(!root.voice-enabled); }
+                }
+
+                // 只停声音：旁边的「取消」才会取消 Agent 任务。
+                AppButton {
+                    label: "停止播报";
+                    enabled: root.speech-active;
+                    clicked => { root.stop-speaking(); }
                 }
 
                 AppButton {
@@ -303,18 +547,49 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                // 播报状态 + 字幕（简洁一行，不做完整 HUD）
+                if root.speech-detail != "" || root.speech-subtitle != "" : Rectangle {
+                    height: speech-row.preferred-height + 12px;
+                    border-radius: 6px;
+                    background: root.speech-state == "failed" ? #fdeeee : #ffffff;
+                    border-width: 1px;
+                    border-color: #e3e3e6;
+
+                    speech-row := HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 10px;
+
+                        Text {
+                            text: root.speech-detail;
+                            font-size: 12px;
+                            color: root.speech-state == "failed" ? #a02020 : #1f1f22;
+                            vertical-alignment: center;
+                        }
+                        if root.speech-subtitle != "" : Text {
+                            text: "“" + root.speech-subtitle + "”";
+                            font-size: 12px;
+                            color: #55555c;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+
                 // 输入区
                 HorizontalLayout {
                     spacing: 8px;
 
-                    LineEdit {
+                    AppLineEdit {
                         text <=> root.draft;
                         placeholder-text: root.busy ? "正在执行…" : "说点什么，例如：列出当前窗口";
                         enabled: !root.busy;
-                        horizontal-stretch: 1;
-                        accepted(text) => {
-                            if (!root.busy && text != "") {
-                                root.send(text);
+                        accepted => {
+                            if (!root.busy && root.draft != "") {
+                                root.send(root.draft);
                             }
                         }
                     }
@@ -420,117 +695,366 @@ export component AppWindow inherits Window {
         }
     }
 
+
     // ---- 设置面板（覆盖层） ----
+    //
+    // 布局要点（对应任务书第 3 条）：
+    //  - 主体内容放进 **Flickable**，窗口变矮或高 DPI 放大时整页可滚动；
+    //  - 底部操作栏（取消/保存/错误提示）**固定**在面板底部，永远可见；
+    //  - 面板高度取 min(内容高度, 可用高度)，不会撑出窗口，也不会把
+    //    正在编辑的输入框顶到不可见处；
+    //  - 半透明遮罩本身接收点击，避免误触到后面的对话区。
     if root.settings-open : Rectangle {
         background: #00000055;
+        // 吃掉落在遮罩上的点击：设置打开时不应"点穿"到下面的对话区。
+        TouchArea { }
 
-        Rectangle {
-            width: min(560px, parent.width - 64px);
-            height: settings-layout.preferred-height + 40px;
+        panel := Rectangle {
+            width: min(600px, parent.width - 48px);
+            // 高度用**固定上限**而不是"内容首选高度"：`ScrollView` 不会把内部
+            // 内容的 preferred-height 传播出来（它只报自己的最小值），
+            // 用内容高度算会把面板压扁、把下面的字段裁掉。
+            // 取 min(期望高度, 窗口可用高度)，保证：
+            //  - 窗口够大时面板高度稳定，主体区域有足够可视高度；
+            //  - 窗口变矮 / 高 DPI 放大时面板仍然整体在窗口内，内容改为滚动。
+            height: min(700px, parent.height - 48px);
             border-radius: 10px;
             background: #ffffff;
             border-width: 1px;
             border-color: #d8d8dd;
 
-            settings-layout := VerticalLayout {
-                padding: 20px;
-                spacing: 10px;
+            VerticalLayout {
+                // 标题栏（固定）
+                Rectangle {
+                    background: #ffffff;
+                    height: 52px;
 
-                Text {
-                    color: Theme.text-color;
-                    text: "模型端点";
-                    font-size: 15px;
-                    font-weight: 600;
-                }
+                    HorizontalLayout {
+                        padding-left: 20px;
+                        padding-right: 16px;
+                        spacing: 8px;
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "提供商"; width: 80px; vertical-alignment: center; }
-                    Choice {
-                        options: ["mimo", "deepseek", "openai-compatible"];
-                        index: root.provider-index;
-                        picked(value) => {
-                            root.provider-index = self.index;
-                            root.provider-changed(self.index);
+                        Text {
+                            color: Theme.text-color;
+                            text: "设置";
+                            font-size: 16px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+
+                        if root.settings-dirty : Text {
+                            text: "未保存";
+                            font-size: 11px;
+                            color: #a05a00;
+                            vertical-alignment: center;
                         }
                     }
                 }
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "地址"; width: 80px; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.base-url;
-                        horizontal-stretch: 1;
-                    }
-                }
+                Rectangle { height: 1px; background: #e3e3e6; }
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "模型"; width: 80px; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.model-name;
-                        horizontal-stretch: 1;
-                    }
-                }
+                // 可滚动主体
+                settings-scroll := ScrollView {
+                    vertical-stretch: 1;
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "API Key"; width: 80px; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.api-key-input;
-                        placeholder-text: root.has-key ? "已保存（留空则不修改）" : "未保存";
-                        input-type: password;
-                        horizontal-stretch: 1;
-                    }
-                }
+                    settings-body := VerticalLayout {
+                        padding-left: 20px;
+                        padding-right: 20px;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        spacing: 10px;
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "权限档位"; width: 80px; vertical-alignment: center; }
-                    Choice {
-                        options: ["standard", "conservative", "permissive"];
-                        index: root.permission-index;
-                        picked(value) => {
-                            root.permission-index = self.index;
+                        Text {
+                            color: Theme.text-color;
+                            text: "模型端点";
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "提供商"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppComboBox {
+                                enabled: !root.settings-saving;
+                                options: ["mimo", "deepseek", "openai-compatible"];
+                                // 注意 `index:` 是**单向**绑定：下拉自己会先改内部的
+                                // `index`，这里必须同时把值写回 `root.provider-index`，
+                                // 否则界面显示的提供商与保存出去的 provider_id 会不一致
+                                // （选 DeepSeek 却存成 MiMo，Key 也会写到错误的那家名下）。
+                                index <=> root.provider-index;
+                                picked(index) => {
+                                    root.settings-dirty = true;
+                                    root.settings-error = "";
+                                    root.provider-changed(index);
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "地址"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.base-url;
+                                placeholder-text: "https://…";
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "模型"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.model-name;
+                                placeholder-text: "模型名";
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "API Key"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.api-key-input;
+                                placeholder-text: root.has-key ? "已保存（留空则不修改）" : "未保存";
+                                input-type-password: true;
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "权限档位"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppComboBox {
+                                enabled: !root.settings-saving;
+                                options: ["standard", "conservative", "permissive"];
+                                index <=> root.permission-index;
+                                picked(index) => {
+                                    root.settings-dirty = true;
+                                    root.settings-error = "";
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "Key 用 Windows DPAPI 以当前用户身份加密后保存在本程序自己的数据目录；配置文件里不含密钥，日志里也不出现明文。";
+                            font-size: 11px;
+                            color: #8a8a90;
+                            wrap: word-wrap;
+                        }
+
+                        Rectangle { height: 1px; background: #e3e3e6; }
+
+                        Text {
+                            color: Theme.text-color;
+                            text: "语音播报";
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "播报后端"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppComboBox {
+                                enabled: !root.settings-saving;
+                                options: ["关闭", "MiMo 云端", "本地 ONNX"];
+                                index <=> root.tts-backend-index;
+                                picked(index) => {
+                                    root.tts-enabled = index != 0;
+                                    root.settings-dirty = true;
+                                    root.settings-error = "";
+                                }
+                            }
+                            Text {
+                                text: root.tts-backend-ready ? "可用" : "不可用";
+                                font-size: 11px;
+                                color: root.tts-backend-ready ? #1f7a3a : #a02020;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // 明确区分「当前生效」与「尚未保存的选择」：
+                        // 上面下拉是用户的选择，这一行是真正在跑的那份配置。
+                        if root.settings-dirty : Text {
+                            text: "当前生效：" + root.tts-active-label;
+                            font-size: 11px;
+                            color: #a05a00;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "云端音色"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.tts-mimo-voice;
+                                placeholder-text: "留空 = 服务端默认预置音色";
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "风格指令"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.tts-mimo-style;
+                                placeholder-text: "可选，例如：语速稍快，语气自然（<120 字）";
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "本地模型"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.tts-local-dir;
+                                placeholder-text: "留空 = 数据目录 models/kokoro-multi-lang-v1_0";
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "音色/语速"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.tts-local-sid;
+                                placeholder-text: "音色编号";
+                                width: 110px;
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                            AppLineEdit {
+                                enabled: !root.settings-saving;
+                                text <=> root.tts-local-speed;
+                                placeholder-text: "语速 0.5~2.0";
+                                width: 130px;
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "自动播报"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppComboBox {
+                                enabled: !root.settings-saving;
+                                options: ["语音与文本", "只播语音", "只播文本", "都不自动"];
+                                index <=> root.tts-speak-mode;
+                                picked(index) => {
+                                    root.settings-dirty = true;
+                                    root.settings-error = "";
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "云端模式会把助手回复的正文发送给 MiMo 合成语音（需要 MiMo 账户的 Key，不会借用其它提供商的 Key）；本地 ONNX 模式不联网，但需要自己准备模型文件。模型端点与语音播报在同一份配置里，一次保存生效。";
+                            font-size: 11px;
+                            color: #8a8a90;
+                            wrap: word-wrap;
                         }
                     }
                 }
 
-                Text {
-                    text: "Key 用 Windows DPAPI 以当前用户身份加密后保存在本程序自己的数据目录；配置文件里不含密钥，日志里也不出现明文。";
-                    font-size: 11px;
-                    color: #8a8a90;
-                    wrap: word-wrap;
-                }
+                Rectangle { height: 1px; background: #e3e3e6; }
 
-                HorizontalLayout {
+                // 固定底部操作栏：错误提示 + 试音 + 清除 Key + 取消/保存
+                footer := VerticalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    padding-top: 10px;
+                    padding-bottom: 14px;
                     spacing: 8px;
 
-                    AppButton {
-                        label: "清除已保存的 Key";
-                        enabled: root.has-key;
-                        clicked => { root.clear-api-key(root.provider-index); }
+                    // 保存失败的具体原因：就地显示，不关闭面板、不清空输入。
+                    if root.settings-error != "" : Rectangle {
+                        height: error-text.preferred-height + 12px;
+                        border-radius: 5px;
+                        background: #fdeeee;
+                        border-width: 1px;
+                        border-color: #f0c0c0;
+
+                        error-text := Text {
+                            x: 8px;
+                            y: 6px;
+                            width: parent.width - 16px;
+                            text: root.settings-error;
+                            font-size: 12px;
+                            color: #a02020;
+                            wrap: word-wrap;
+                        }
                     }
 
-                    Rectangle { horizontal-stretch: 1; }
+                    HorizontalLayout {
+                        spacing: 8px;
 
-                    AppButton {
-                        label: "取消";
-                        clicked => { root.settings-open = false; }
+                        AppButton {
+                            label: "试音";
+                            // 试音只作用于**已保存生效**的配置：未保存的选择不会生效，
+                            // 也不能让"改了下拉就试音"制造出与实际播报不符的假象。
+                            enabled: root.tts-active-ready && !root.settings-dirty && !root.settings-saving;
+                            clicked => { root.test-voice(); }
+                        }
+
+                        AppButton {
+                            label: "停止播报";
+                            enabled: root.speech-active;
+                            clicked => { root.stop-speaking(); }
+                        }
+
+                        AppButton {
+                            label: "清除已保存的 Key";
+                            enabled: root.has-key && !root.settings-saving;
+                            clicked => { root.clear-api-key(root.provider-index); }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
                     }
 
-                    AppButton {
-                        label: "保存";
-                        primary: true;
-                        clicked => {
-                            root.save-settings(
-                                root.provider-index,
-                                root.base-url,
-                                root.model-name,
-                                root.api-key-input,
-                                root.permission-index
-                            );
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        AppButton {
+                            label: "取消";
+                            // 保存进行中禁用：已经开始执行的保存无法撤销，
+                            // 允许点击会造成"取消了但配置仍被写入"的假象。
+                            enabled: !root.settings-saving;
+                            clicked => { root.cancel-settings(); }
+                        }
+
+                        AppButton {
+                            // 保存是**异步**的：点击后立刻置「保存中」并禁用相关控件，
+                            // 结果由 Rust 侧回填（成功关面板 / 失败就地显示原因）。
+                            // 不在 UI 线程上等待，否则落盘和重建 TTS 会卡住界面。
+                            label: root.settings-saving ? "保存中…" : "保存";
+                            primary: true;
+                            enabled: !root.settings-saving;
+                            clicked => {
+                                // **一次**提交：模型端点 + 播报设置一起交给 Rust，
+                                // 由它按"要么都生效、要么如实报错"处理。
+                                root.settings-saving = true;
+                                root.save-all(
+                                    root.provider-index,
+                                    root.base-url,
+                                    root.model-name,
+                                    root.api-key-input,
+                                    root.permission-index,
+                                    root.tts-backend-index != 0,
+                                    root.tts-backend-index,
+                                    root.tts-mimo-voice,
+                                    root.tts-mimo-style,
+                                    root.tts-local-dir,
+                                    root.tts-local-sid,
+                                    root.tts-local-speed,
+                                    root.tts-speak-mode
+                                );
+                            }
                         }
                     }
                 }

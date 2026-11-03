@@ -234,6 +234,10 @@ pub struct Settings {
     /// PR5 写下的配置文件没有这一节，照常可读并按默认值处理。
     #[serde(default)]
     pub voice: crate::voice::settings::VoiceSettings,
+    /// 语音合成设置（PR7）。同样带 `serde(default)`：PR5/PR6 的配置照常可读，
+    /// 并且**默认关闭**（新安装不会把回复文本发到云端）。
+    #[serde(default)]
+    pub tts: crate::voice::tts::TtsSettings,
 }
 
 fn default_schema_version() -> u32 {
@@ -277,6 +281,7 @@ impl Default for Settings {
             permission_mode: PermissionMode::Standard,
             system_prompt: None,
             voice: crate::voice::settings::VoiceSettings::default(),
+            tts: crate::voice::tts::TtsSettings::default(),
         }
     }
 }
@@ -319,6 +324,8 @@ impl Settings {
                 self.system_prompt = None;
             }
         }
+        // 语音播报设置同样只做"夹到能工作的范围"，非法值拒绝落盘。
+        self.tts = std::mem::take(&mut self.tts).normalized()?;
         Ok(self)
     }
 

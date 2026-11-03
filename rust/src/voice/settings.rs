@@ -524,7 +524,10 @@ pub fn keyword_labels(path: &Path) -> Vec<String> {
 }
 
 /// 开发机上找仓库根：当前目录或 exe 目录逐级向上，直到看到 `models/` 与 `packages/`。
-fn find_repo_models() -> Option<PathBuf> {
+///
+/// 供语音输入（KWS/Whisper）与本地 TTS 共用：两边的模型都遵循
+/// 「显式配置 → 数据目录 → 仓库 `models/`」这一条查找顺序，不各写一份。
+pub(crate) fn find_repo_models() -> Option<PathBuf> {
     let mut starts: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         starts.push(cwd);

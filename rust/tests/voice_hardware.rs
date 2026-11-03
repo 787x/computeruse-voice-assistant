@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use cuava::voice::capture::Capture;
 use cuava::voice::coordinator::{
-    self, ActiveSession, CoordinatorConfig, SharedSink, VoiceEvent, VoiceEventKind,
+    self, ActiveSession, CoordinatorConfig, ListenMode, SharedSink, VoiceEvent, VoiceEventKind,
 };
 use cuava::voice::settings::{VoicePaths, VoiceSettings};
 
@@ -43,6 +43,7 @@ fn event_line(event: &VoiceEvent) -> Option<String> {
         VoiceEventKind::Final { text, .. } => format!("final: {text}"),
         VoiceEventKind::Rejected { reason, .. } => format!("rejected: {reason:?}"),
         VoiceEventKind::Overflow => "overflow".to_string(),
+        VoiceEventKind::DirectStarted { .. } => "direct-started".to_string(),
         VoiceEventKind::Level { .. } => return None,
     };
     Some(format!("[{}] {line}", event.instance))
@@ -103,8 +104,15 @@ fn real_models_and_microphone_reach_listening() {
     let active = ActiveSession::new();
     let stop = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
-    let handle =
-        coordinator::spawn(config, sink, active.clone(), stop.clone(), 1).expect("启动语音线程");
+    let handle = coordinator::spawn(
+        config,
+        sink,
+        active.clone(),
+        stop.clone(),
+        1,
+        ListenMode::new(),
+    )
+    .expect("启动语音线程");
 
     // 等到「就绪 + 监听」或超时。
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -189,8 +197,15 @@ fn quick_close_and_reopen_reaches_listening_again() {
         let stop = Arc::new(AtomicBool::new(false));
         // 每个实例一份自己的活动会话（与 VoiceRuntime 的分配方式一致）。
         let active = ActiveSession::new();
-        let handle = coordinator::spawn(config.clone(), sink, active, stop.clone(), instance)
-            .expect("启动语音线程");
+        let handle = coordinator::spawn(
+            config.clone(),
+            sink,
+            active,
+            stop.clone(),
+            instance,
+            ListenMode::new(),
+        )
+        .expect("启动语音线程");
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let prefix = format!("[{instance}] ");

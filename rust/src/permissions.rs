@@ -469,6 +469,25 @@ impl ConfirmAnswer {
             reason: "用户没有确认".to_string(),
         }
     }
+
+    /// 语音说出的明确肯定（PR7）。只有**明确**的肯定才会构造它：
+    /// 含糊、混合、疑问一律走 [`Self::deny_voice`]，不会被当成同意。
+    pub fn allow_voice() -> Self {
+        Self {
+            allow: true,
+            channel: "voice",
+            reason: String::new(),
+        }
+    }
+
+    /// 语音说出的否定或无法确认。`reason` 会作为拒绝原因写进历史。
+    pub fn deny_voice(reason: &str) -> Self {
+        Self {
+            allow: false,
+            channel: "voice",
+            reason: reason.to_string(),
+        }
+    }
 }
 
 /// 权限门：所有工具调用的唯一入口。
@@ -883,6 +902,66 @@ mod tests {
             )
             .await;
         assert!(decision.allow);
+    }
+
+    /// 语音答复走**同一个**权限门：明确肯定才放行，否定与"不明确"都拒绝。
+    #[tokio::test]
+    async fn voice_answers_settle_the_gate() {
+        struct Voice(bool);
+        impl Confirmer for Voice {
+            fn confirm<'a>(
+                &'a self,
+                _request: ConfirmRequest,
+                _cancel: &'a crate::cancel::CancelToken,
+            ) -> ConfirmFuture<'a> {
+                let answer = if self.0 {
+                    ConfirmAnswer::allow_voice()
+                } else {
+                    ConfirmAnswer::deny_voice("用户用语音拒绝了这一次操作")
+                };
+                Box::pin(async move { answer })
+            }
+        }
+
+        let state = gate(PermissionMode::Standard);
+        let allowed = PermissionGate::new(&state)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                Some(&Voice(true)),
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(allowed.allow);
+        assert_eq!(allowed.channel, "voice", "语音允许要如实记下通道");
+
+        let denied = PermissionGate::new(&state)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                Some(&Voice(false)),
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!denied.allow);
+        assert!(denied.reason.contains("语音拒绝"));
+    }
+
+    /// 语音通道也不能绕过"取消即终态"：取消后迟到的语音允许不生效。
+    #[tokio::test]
+    async fn cancelled_turn_ignores_a_late_voice_allow() {
+        let state = gate(PermissionMode::Standard);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let decision = PermissionGate::new(&state)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                Some(&YES),
+                &cancel,
+            )
+            .await;
+        assert!(!decision.allow);
     }
 
     #[test]

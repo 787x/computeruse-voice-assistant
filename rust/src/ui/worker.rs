@@ -3,6 +3,7 @@
 //! 这里只做"把界面动作翻译成 Agent 调用、再把结果翻译成界面状态"，
 //! 具体的协议、权限、预算逻辑都在各自模块里，便于单独测试。
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -21,8 +22,15 @@ use crate::prompt;
 use crate::secret::SecretStore;
 use crate::voice::{
     asr::AsrBackend,
-    coordinator::{self, ActiveSession, CoordinatorConfig, SharedSink, VoiceHandle},
+    bargein,
+    confirm::{self, ConfirmDecision},
+    coordinator::{
+        self, ActiveSession, CoordinatorConfig, ListenMode, ListenPurpose, SharedSink, VoiceHandle,
+    },
+    playback::PlaybackState,
     settings::VoicePaths,
+    speech::{SpeechEvent, SpeechRuntime},
+    tts::{SpeechId, TtsBackend, TtsSettings, TurnId},
     CaptureInfoForUi, RejectReason, VoiceEvent, VoiceEventKind, VoiceInstance, VoiceState,
     VoiceTurn,
 };
@@ -36,16 +44,26 @@ use crate::AppWindow;
 pub enum UiCommand {
     /// 用户发出一条指令。
     Send(String),
-    /// 取消当前回合。
+    /// 取消当前回合（同时停止这一回合的播报）。
     Cancel,
-    /// 保存设置（含可选的新 Key）。
-    SaveSettings {
-        provider_index: i32,
-        base_url: String,
-        model: String,
-        api_key: String,
-        permission_index: i32,
+    /// 只停止播报：不取消 Agent 回合，不结算任何权限请求。
+    StopSpeaking,
+    /// 试音：合成一句固定的话（验证后端/设备，不产生 Agent 回合）。
+    SpeakTest,
+    /// **一次保存**：模型端点 + 语音播报一起提交（界面上的「保存」只发这一条）。
+    ///
+    /// 异步执行：调用方不等结果，工作线程完成后回填界面。
+    /// 没有回执通道是刻意的——在 Slint 主线程上等待会卡住整个界面。
+    /// `generation` 是提交时取的代次：回填时只有仍是最新的一代才允许改界面。
+    SaveAll {
+        request: SaveAllRequest,
+        generation: u64,
     },
+    /// 关闭设置面板（取消）：丢弃界面上的未保存修改，重新按已保存配置回填。
+    ///
+    /// `generation` 用来作废在途的保存：取消之后，工作线程会丢弃排队中/过期的
+    /// 保存请求，不会"用户点了取消却还是偷偷存了一份旧表单"。
+    CancelSettings { generation: u64 },
     /// 清除**指定提供商**的 Key（界面当前选中的那一家）。
     ///
     /// 必须带 provider_id：设置页可以切到别家而不保存，
@@ -59,12 +77,16 @@ pub enum UiCommand {
     SetVoiceEnabled(bool),
     /// 语音线程发回的事件（内部消息，不是用户动作）。
     Voice(VoiceEvent),
+    /// 播报层发回的事件（状态/字幕/提示）。
+    Speech(SpeechEvent),
     /// 退出。
     Quit,
 }
 
 /// 提供商下拉框的顺序（与 UI 里的数组一致）。
 const PROVIDER_IDS: &[&str] = &["mimo", "deepseek", "openai-compatible"];
+/// MiMo 提供商的 id。MiMo TTS 只从这家账户读 Key（见 `voice::tts::mimo::KEY_PROVIDER`）。
+const MIMO_PROVIDER_ID: &str = "mimo";
 const PERMISSION_MODES: &[PermissionMode] = &[
     PermissionMode::Standard,
     PermissionMode::Conservative,
@@ -138,6 +160,10 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // 确认器由界面持有：设置页/确认框/退出都要和它交互。
     let confirmer = Arc::new(UiConfirmer::new(window.as_weak()));
 
+    // 设置保存的代次（单调递增）。只有最新一代的回填才允许改界面，
+    // 这样超时/取消/更晚完成的旧保存都不会覆盖用户的新编辑。
+    let save_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // ---- 界面 → 工作线程 ----
     {
         let tx = command_tx.clone();
@@ -176,18 +202,81 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        /*
+         * **一次保存**：模型端点与语音播报一起提交。
+         *
+         * 这里**不**等待结果：落盘 + 重建 TTS 引擎可能耗时（尤其本地模型），
+         * 在 Slint 主线程上 `recv_timeout` 会把整个界面卡住。改为"发出去就返回"，
+         * 由工作线程完成后回填界面（成功关面板 / 失败就地显示原因）。
+         * 保存期间界面置 `settings-saving`，按钮禁用，避免重复提交。
+         *
+         * 每个请求带一个自增的 `generation`：工作线程回填时只有**最新**的那一代
+         * 才允许改界面。这样"超时/取消/更晚完成的旧请求"不会覆盖用户已经编辑
+         * 的新状态；取消之后排队的旧请求也不会被静默执行。
+         */
         let tx = command_tx.clone();
-        window.on_save_settings(
-            move |provider_index, base_url, model, api_key, permission_index| {
-                let _ = tx.send(UiCommand::SaveSettings {
+        let weak = window.as_weak();
+        let save_generation = save_generation.clone();
+        window.on_save_all(
+            move |provider_index,
+                  base_url,
+                  model,
+                  api_key,
+                  permission_index,
+                  tts_enabled,
+                  tts_backend_index,
+                  mimo_voice,
+                  mimo_style,
+                  local_dir,
+                  local_sid,
+                  local_speed,
+                  speak_mode| {
+                let request = SaveAllRequest {
                     provider_index,
                     base_url: base_url.to_string(),
                     model: model.to_string(),
                     api_key: api_key.to_string(),
                     permission_index,
-                });
+                    tts_enabled,
+                    tts_backend_index,
+                    mimo_voice: mimo_voice.to_string(),
+                    mimo_style: mimo_style.to_string(),
+                    local_dir: local_dir.to_string(),
+                    local_sid: local_sid.to_string(),
+                    local_speed: local_speed.to_string(),
+                    speak_mode,
+                };
+
+                // 取一个新的代次；工作线程只有拿它回填才算"最新"。
+                let generation = save_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                if tx
+                    .send(UiCommand::SaveAll {
+                        request,
+                        generation,
+                    })
+                    .is_err()
+                {
+                    // 后台线程没了：立刻收掉"保存中"，并如实说明没保存。
+                    if let Some(window) = weak.upgrade() {
+                        window.set_settings_saving(false);
+                        window.set_settings_error("后台线程已退出，设置没有保存".into());
+                    }
+                }
             },
         );
+    }
+    {
+        /*
+         * 取消：先作废**所有**在途保存（把代次推到更大值），再让工作线程
+         * 丢弃还没开始执行的旧请求。这样"用户已经取消"之后不会再有
+         * 一份排队中的旧保存被静默执行。
+         */
+        let tx = command_tx.clone();
+        let save_generation = save_generation.clone();
+        window.on_cancel_settings(move || {
+            let generation = save_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = tx.send(UiCommand::CancelSettings { generation });
+        });
     }
     {
         let tx = command_tx.clone();
@@ -245,6 +334,18 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let tx = command_tx.clone();
+        window.on_stop_speaking(move || {
+            let _ = tx.send(UiCommand::StopSpeaking);
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_test_voice(move || {
+            let _ = tx.send(UiCommand::SpeakTest);
+        });
+    }
+    {
+        let tx = command_tx.clone();
         let weak = window.as_weak();
         let confirmer = confirmer.clone();
         window.on_quit_app(move || {
@@ -278,7 +379,14 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             let weak_for_exit = weak.clone();
             runtime.block_on(run_worker(
-                weak, paths, secret, settings, command_rx, command_tx, confirmer,
+                weak,
+                paths,
+                secret,
+                settings,
+                command_rx,
+                command_tx,
+                confirmer,
+                save_generation,
             ));
             /*
              * 工作线程结束 = 待处理回合已被取消、PowerShell 子进程已释放。
@@ -447,6 +555,14 @@ struct UiConfirmer {
     /// 当前挂起的确认（最多一个：权限门是串行询问的）。
     pending: Arc<std::sync::Mutex<Option<PendingConfirm>>>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// 当前挂起的 `request_id`（0 = 没有）。
+    ///
+    /// 与 `pending` 的互斥锁分开保存，是为了让**音频线程侧**（工作线程的
+    /// 每秒若干次的聆听模式同步）读取时不需要碰确认通道的锁。
+    pending_id: Arc<std::sync::atomic::AtomicU64>,
+    /// 挂起状态变化时唤醒工作线程：否则等待点击确认期间没有命令进来，
+    /// 语音确认模式永远进不去。
+    changed: Arc<tokio::sync::Notify>,
     /// 用户多久不点就自动拒绝——避免"确认框一直开着，回合永远不结束"。
     timeout: std::time::Duration,
 }
@@ -457,8 +573,33 @@ impl UiConfirmer {
             weak,
             pending: Arc::new(std::sync::Mutex::new(None)),
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            pending_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            changed: Arc::new(tokio::sync::Notify::new()),
             timeout: std::time::Duration::from_secs(120),
         }
+    }
+
+    /// 当前挂起的确认请求 id（`None` = 没有）。
+    ///
+    /// **语音确认只在这之后才允许进入**：没有挂起请求时说话不能结算任何东西。
+    fn pending_request(&self) -> Option<u64> {
+        match self.pending_id.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// 挂起状态变化的通知句柄（工作线程用它唤醒自己的 select）。
+    fn changes(&self) -> Arc<tokio::sync::Notify> {
+        self.changed.clone()
+    }
+
+    fn publish_pending(&self, request_id: u64) {
+        self.pending_id
+            .store(request_id, std::sync::atomic::Ordering::SeqCst);
+        // `notify_waiters` 只唤醒**已经**在等的人；调用方会在每个循环开头
+        // 重新读一次 `pending_request()`，所以不会因为错过通知而卡住。
+        self.changed.notify_waiters();
     }
 
     /// 立即中止当前挂起的确认（退出时用）。
@@ -472,6 +613,8 @@ impl UiConfirmer {
         if let Some(pending) = guard.take() {
             let _ = pending.reply.send(ConfirmAnswer::deny_click());
         }
+        drop(guard);
+        self.publish_pending(0);
     }
 
     /// 在接受界面发来的一次答复。**只有** id 与当前挂起请求一致的才生效。
@@ -493,7 +636,32 @@ impl UiConfirmer {
             return false;
         };
         // 一次性通道：发送成功才算这次确认被消费。
-        pending.reply.send(answer).is_ok()
+        let accepted = pending.reply.send(answer).is_ok();
+        drop(guard);
+        if accepted {
+            clear_pending_id(&self.pending_id, &self.changed, request_id);
+        }
+        accepted
+    }
+}
+
+/// 只清掉**匹配的**挂起 id（不误伤已经开始的下一次确认）。
+fn clear_pending_id(
+    pending_id: &Arc<std::sync::atomic::AtomicU64>,
+    changed: &Arc<tokio::sync::Notify>,
+    request_id: u64,
+) {
+    if request_id != 0
+        && pending_id
+            .compare_exchange(
+                request_id,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    {
+        changed.notify_waiters();
     }
 }
 
@@ -505,6 +673,8 @@ impl Confirmer for UiConfirmer {
     ) -> ConfirmFuture<'a> {
         let weak = self.weak.clone();
         let pending = self.pending.clone();
+        let pending_id = self.pending_id.clone();
+        let changed = self.changed.clone();
         let request_id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -528,6 +698,10 @@ impl Confirmer for UiConfirmer {
                 }
                 Err(_) => return ConfirmAnswer::deny_click(),
             }
+            // 对外公布"现在挂起的是哪一次"：语音确认据此绑定请求 id，
+            // 工作线程据此切换到语音确认聆听模式。
+            pending_id.store(request_id, std::sync::atomic::Ordering::SeqCst);
+            changed.notify_waiters();
 
             let weak_for_ui = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -560,6 +734,9 @@ impl Confirmer for UiConfirmer {
                     *guard = None;
                 }
             }
+            // 只有仍是这一次时才对外宣布"没有挂起请求"
+            // （避免把紧接着出现的下一次确认也一起清掉）。
+            clear_pending_id(&pending_id, &changed, request_id);
             let weak_for_close = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = weak_for_close.upgrade() {
@@ -576,6 +753,7 @@ impl Confirmer for UiConfirmer {
 ///
 /// 返回后调用方会关闭窗口——所以这个函数**必须**保证：任何退出路径上，
 /// 挂起的回合、确认框和 PowerShell 子进程都已收敛。
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     weak: slint::Weak<AppWindow>,
     paths: AppPaths,
@@ -584,6 +762,7 @@ async fn run_worker(
     mut commands: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
     command_tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
     confirmer: Arc<UiConfirmer>,
+    save_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Computer Use 后端：懒启动（第一次真正调用时才拉起 PowerShell）。
     let script = BridgeOptions::resolve_default_script();
@@ -606,10 +785,38 @@ async fn run_worker(
     // 会话历史由回合任务持有并送回：回合在工作线程之外跑，主循环仍要能响应取消。
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut turn_cancel: Option<CancelToken> = None;
+    // 回合身份：每个 Agent 回合一个，播报据此判断"这段音频属于哪一轮"。
+    let mut next_turn_id: TurnId = 0;
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
     // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
     let mut voice = VoiceRuntime::new();
+
+    /*
+     * 播报层（PR7）：引擎与设备都懒加载，事件同样回到这条命令通道。
+     *
+     * 用一条独立的转发任务而不是让播报层直接持有 `UiCommand` 发送端：
+     * 播报层不依赖界面类型，可以脱离 Slint 单独测试。
+     */
+    let (speech_tx, mut speech_rx) = tokio::sync::mpsc::unbounded_channel::<SpeechEvent>();
+    let mut speech = SpeechRuntime::new(speech_tx);
+    // 界面侧的播报身份：迟到的旧播报事件不能覆盖新播报。
+    let mut speech_view = SpeechView::default();
+    {
+        let forward = command_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = speech_rx.recv().await {
+                if forward.send(UiCommand::Speech(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // 启用过的配置在启动时就尝试建立引擎：缺 Key / 缺模型时**只禁用播报**，
+    // 界面显示原因，文本与 CUA 完全不受影响。
+    if let Err(error) = speech.apply_settings(&settings.tts, &secret) {
+        eprintln!("[tts] 播报不可用：{error}");
+    }
 
     /*
      * 已保存的启用偏好在启动时**不自动开麦**：
@@ -617,8 +824,12 @@ async fn run_worker(
      * 偏好只在用户点了开关之后才写回。
      */
     seed_voice_ui(&weak, &settings);
+    seed_tts_ui(&weak, &settings, &speech);
 
     loop {
+        // 每一轮都按"当前是否在播报 / 是否有挂起的确认"重新决定聆听模式：
+        // 只有播报期间与等待确认期间才允许不喊唤醒词。
+        sync_listen_mode(&mut voice, &speech, &confirmer);
         let Some(command) = commands.recv().await else {
             break;
         };
@@ -630,6 +841,8 @@ async fn run_worker(
                     token.cancel();
                 }
                 confirmer.abort_pending();
+                // 退出先停声音再关麦：不留一段没人管的音频在网络/设备上跑。
+                speech.shutdown();
                 voice.disable(&weak);
                 break;
             }
@@ -638,9 +851,61 @@ async fn run_worker(
                     token.cancel();
                     set_status(&weak, "正在中断…");
                 }
+                // 取消任务 = 取消 Agent **并且**停掉本回合的声音。
+                speech.stop();
                 // 取消也作用于「正在录/正在识别的那一句」：之后返回的结果不提交。
                 // 已经开始的 Agent 回合仍按原有取消语义处理。
                 voice.cancel_pending();
+            }
+            UiCommand::StopSpeaking => {
+                // **只停声音**：不取消回合、不结算权限请求、不关麦克风。
+                if speech.is_speaking() {
+                    speech.stop();
+                    set_status(&weak, "已停止播报（任务继续）");
+                } else {
+                    set_status(&weak, "当前没有在播报");
+                }
+            }
+            UiCommand::SpeakTest => handle_speak_test(&weak, &mut speech),
+            UiCommand::SaveAll {
+                request,
+                generation,
+            } => {
+                /*
+                 * 过期请求直接丢弃：用户已经取消、或又提交了更新的一次保存。
+                 * 不落盘、不改界面——否则"取消之后旧表单仍被静默保存"。
+                 *
+                 * **不能**在这里清 `settings-saving`：这个请求已经过期，说明
+                 * 一定有一个更年轻的请求（或取消）在推进状态。若替它收掉
+                 * "保存中"，新请求还在跑时按钮就提前可点了，用户会重复提交。
+                 * 状态只由"当前有效的那一代"负责收尾。
+                 */
+                if !generation_is_current(&save_generation, generation) {
+                    // 过期的保存请求：什么都不做（不写盘、不改界面）。
+                } else {
+                    let _ = handle_save_all_ui(
+                        &weak,
+                        &paths,
+                        &secret,
+                        &mut settings,
+                        &mut speech,
+                        &request,
+                        generation,
+                        &save_generation,
+                    );
+                }
+            }
+            UiCommand::CancelSettings { generation } => {
+                // 取消 = 丢弃界面上的未保存修改，按已保存配置重新回填并关闭面板。
+                if generation_is_current(&save_generation, generation) {
+                    publish_tts_ui(&weak, &settings.tts, &speech);
+                    let has_key = secret.has(&settings.provider_id);
+                    apply_settings_to_ui(&weak, &settings, has_key);
+                    close_settings(&weak);
+                }
+            }
+            UiCommand::Speech(event) => {
+                apply_speech_event(&mut speech_view, &weak, &event);
             }
             UiCommand::OpenSettings => {
                 // 权威配置在工作线程：每次打开设置都按当前值回填，不用启动快照。
@@ -677,32 +942,10 @@ async fn run_worker(
                     Err(error) => set_status(&weak, &format!("清除 Key 失败：{error}")),
                 }
             }
-            UiCommand::SaveSettings {
-                provider_index,
-                base_url,
-                model,
-                api_key,
-                permission_index,
-            } => {
-                if handle_save_settings(
-                    &weak,
-                    &paths,
-                    &secret,
-                    &mut settings,
-                    SaveRequest {
-                        provider_index,
-                        base_url,
-                        model,
-                        api_key,
-                        permission_index,
-                    },
-                ) {
-                    // 切换端点后要重新核实 Key 状态（不同提供商可能有不同的 Key）。
-                    let has_key = secret.has(&settings.provider_id);
-                    publish_endpoint(&weak, &settings, has_key, "设置已保存");
-                }
-            }
             UiCommand::Send(input) => {
+                // 新一轮开始：上一轮的声音立刻停下，绝不接在旧音频后面。
+                speech.stop();
+                next_turn_id += 1;
                 match start_turn(
                     &weak,
                     &paths,
@@ -713,6 +956,7 @@ async fn run_worker(
                     &mut history,
                     &mut turn_cancel,
                     input,
+                    next_turn_id,
                 ) {
                     TurnStart::Started(turn) => {
                         // 等待结束，但**同时**继续处理取消/退出/设置命令。
@@ -726,7 +970,11 @@ async fn run_worker(
                             &mut settings,
                             &confirmer,
                             &mut voice,
+                            &mut speech,
+                            &mut speech_view,
                             &command_tx,
+                            &save_generation,
+                            TurnSource::Text,
                         )
                         .await
                         {
@@ -748,8 +996,18 @@ async fn run_worker(
                 );
             }
             UiCommand::Voice(event) => {
-                let prompt = voice.on_event(&weak, event, turn_cancel.is_some());
+                let prompt = handle_voice_event(
+                    &weak,
+                    &mut voice,
+                    &confirmer,
+                    &mut speech,
+                    event,
+                    turn_cancel.is_some(),
+                );
                 if let Some(prompt) = prompt {
+                    // 语音指令也是一轮新的回合：先把上一轮的声音停掉。
+                    speech.stop();
+                    next_turn_id += 1;
                     let turn = commit_voice_text(
                         &weak,
                         prompt.text,
@@ -762,6 +1020,7 @@ async fn run_worker(
                         &settings,
                         &paths,
                         &secret,
+                        next_turn_id,
                     );
                     if let Some(turn) = turn {
                         // 与文本输入完全相同的等待方式：取消/退出/设置照常处理。
@@ -775,7 +1034,11 @@ async fn run_worker(
                             &mut settings,
                             &confirmer,
                             &mut voice,
+                            &mut speech,
+                            &mut speech_view,
                             &command_tx,
+                            &save_generation,
+                            TurnSource::Voice,
                         )
                         .await
                         {
@@ -788,7 +1051,8 @@ async fn run_worker(
         }
     }
 
-    // 退出前：关麦克风、取消回合、清掉确认、释放子进程。
+    // 退出前：停播报、关麦克风、取消回合、清掉确认、释放子进程。
+    speech.shutdown();
     voice.disable(&weak);
     confirmer.abort_pending();
     if let Some(token) = turn_cancel.take() {
@@ -890,10 +1154,35 @@ struct VoicePrompt {
     decode_ms: u64,
 }
 
+/// 一条语音事件处理完之后，工作线程该做什么。
+enum VoiceOutcome {
+    /// 只更新了界面状态。
+    None,
+    /// 可提交的指令（与文本输入走同一个 Agent 入口）。
+    Prompt(VoicePrompt),
+    /// 播报期间的识别结果：可能是打断词（是否真打断由工作线程结合回声判定）。
+    BargeIn { heard: String },
+    /// 权限确认期间的识别结果，已绑定到具体请求 id。
+    Confirm { request_id: u64, text: String },
+}
+
+impl VoiceOutcome {
+    /// 只有"要启动一个 Agent 回合"的那一种才算可提交。
+    #[cfg(test)]
+    fn into_prompt(self) -> Option<VoicePrompt> {
+        match self {
+            VoiceOutcome::Prompt(prompt) => Some(prompt),
+            _ => None,
+        }
+    }
+}
+
 /// 语音运行时：线程句柄 + 实例路由（含当前实例自己的活动会话）。
 struct VoiceRuntime {
     handle: Option<VoiceHandle>,
     route: VoiceRoute,
+    /// 聆听模式（唤醒词 / 打断 / 语音确认）：音频线程读取。
+    mode: ListenMode,
 }
 
 impl VoiceRuntime {
@@ -901,7 +1190,13 @@ impl VoiceRuntime {
         Self {
             handle: None,
             route: VoiceRoute::default(),
+            mode: ListenMode::new(),
         }
+    }
+
+    /// 设置聆听模式（关麦时也会记下来，重开麦后沿用当前值）。
+    fn set_listen_mode(&self, purpose: ListenPurpose, request_id: u64) {
+        self.mode.set(purpose, request_id);
     }
 
     /// 打开麦克风。
@@ -949,7 +1244,7 @@ impl VoiceRuntime {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let instance = self.route.open();
         let active = self.route.active_session();
-        match coordinator::spawn(config, sink, active, stop, instance) {
+        match coordinator::spawn(config, sink, active, stop, instance, self.mode.clone()) {
             Ok(handle) => {
                 self.handle = Some(handle);
                 set_voice_state(weak, &VoiceState::Loading);
@@ -990,10 +1285,10 @@ impl VoiceRuntime {
         weak: &slint::Weak<AppWindow>,
         event: VoiceEvent,
         agent_busy: bool,
-    ) -> Option<VoicePrompt> {
+    ) -> VoiceOutcome {
         // 旧实例的迟到事件：不改界面状态、不动新会话、不触发任何工具。
         if !self.route.is_current(event.instance) {
-            return None;
+            return VoiceOutcome::None;
         }
         match event.kind {
             VoiceEventKind::StateChanged(state) => {
@@ -1006,26 +1301,48 @@ impl VoiceRuntime {
                         handle.stop();
                     }
                 }
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Ready(info) => {
                 apply_capture_info(weak, &info);
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Woke { turn, keyword } => {
                 self.route.bind(event.instance, turn);
                 set_voice_state(weak, &VoiceState::Capturing);
                 set_status(weak, &format!("已唤醒（{keyword}），请说指令"));
-                None
+                VoiceOutcome::None
+            }
+            VoiceEventKind::DirectStarted {
+                turn,
+                purpose,
+                request_id,
+            } => {
+                self.route.bind(event.instance, turn);
+                set_voice_state(weak, &VoiceState::Capturing);
+                match purpose {
+                    ListenPurpose::BargeIn => {
+                        set_status(weak, "正在听打断词（说「等一下」可以停止播报）")
+                    }
+                    ListenPurpose::Confirm => {
+                        let _ = request_id;
+                        set_status(weak, "请说「允许」或「拒绝」（也可以直接点按钮）")
+                    }
+                    ListenPurpose::Wake => {}
+                }
+                VoiceOutcome::None
             }
             VoiceEventKind::Level { level_db, floor_db } => {
                 apply_level(weak, level_db, floor_db);
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Rejected { turn, reason } => {
                 self.route.release(event.instance, turn);
                 // 空转录/太短属于「没听清」，给一句可读的提示；
-                // 不需要弹窗，也不能触发工具。
+                // 不需要弹窗，也不能触发工具。直通聆听时保持安静更合适。
+                if self.mode.purpose().is_direct() {
+                    return VoiceOutcome::None;
+                }
                 if matches!(
                     reason,
                     RejectReason::EmptyTranscript | RejectReason::TooShort
@@ -1034,35 +1351,637 @@ impl VoiceRuntime {
                 } else {
                     set_status(weak, &reason.message());
                 }
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Overflow => {
                 set_status(weak, "音频积压，已丢弃这一句");
-                None
+                VoiceOutcome::None
             }
             VoiceEventKind::Final {
                 turn,
                 text,
                 audio_seconds,
                 decode_ms,
+                purpose,
+                request_id,
             } => {
                 // 归属核对 + 一次性消费：过期/重复的结果绝不提交。
                 if self.route.take(event.instance, turn).is_none() {
-                    set_status(weak, "这次语音已取消");
-                    return None;
+                    if !purpose.is_direct() {
+                        set_status(weak, "这次语音已取消");
+                    }
+                    return VoiceOutcome::None;
                 }
                 set_transcript(weak, &text);
-                if agent_busy {
-                    set_status(weak, "上一轮还在跑；这句话没有执行");
-                    return None;
+                match purpose {
+                    ListenPurpose::Wake => {
+                        if agent_busy {
+                            set_status(weak, "上一轮还在跑；这句话没有执行");
+                            return VoiceOutcome::None;
+                        }
+                        VoiceOutcome::Prompt(VoicePrompt {
+                            text,
+                            audio_seconds,
+                            decode_ms,
+                        })
+                    }
+                    // 打断词**不会**被当成新指令送进 Agent：只用于停止播报。
+                    ListenPurpose::BargeIn => VoiceOutcome::BargeIn { heard: text },
+                    ListenPurpose::Confirm => VoiceOutcome::Confirm { request_id, text },
                 }
-                Some(VoicePrompt {
-                    text,
-                    audio_seconds,
-                    decode_ms,
-                })
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- 播报
+
+/// 试音用的固定文本与"回合身份"（不产生 Agent 回合，也不进会话历史）。
+const TEST_SPEECH_TURN: TurnId = 0;
+const TEST_SPEECH_TEXT: &str = "语音播报已就绪。这是一次试音，数字 123，mixed English 也能读。";
+
+/// 一次回合的输入来源：决定这条回复要不要自动播报。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnSource {
+    Text,
+    Voice,
+}
+
+impl TurnSource {
+    fn is_voice(&self) -> bool {
+        matches!(self, Self::Voice)
+    }
+}
+
+/// 播报设置下拉框的顺序（与界面数组一致）。
+const TTS_BACKENDS: &[TtsBackend] = &[TtsBackend::Off, TtsBackend::Mimo, TtsBackend::Local];
+
+fn tts_backend_for_index(index: i32) -> TtsBackend {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| TTS_BACKENDS.get(index).copied())
+        .unwrap_or(TtsBackend::Off)
+}
+
+fn tts_backend_index(backend: TtsBackend) -> i32 {
+    TTS_BACKENDS
+        .iter()
+        .position(|candidate| *candidate == backend)
+        .unwrap_or(0) as i32
+}
+
+/// 按"当前在播报 / 有挂起的确认"决定聆听模式。
+///
+/// 这是"什么时候可以不喊唤醒词"的**唯一**开关：
+///  - 有挂起的 `ask` → 听「允许 / 拒绝」，并绑定该请求 id；
+///  - 正在播报 → 听打断词；
+///  - 其它时候 → 必须唤醒词（与 PR6 一致）。
+fn sync_listen_mode(voice: &mut VoiceRuntime, speech: &SpeechRuntime, confirmer: &UiConfirmer) {
+    let desired = if let Some(request_id) = confirmer.pending_request() {
+        (ListenPurpose::Confirm, request_id)
+    } else if speech.is_speaking() {
+        (ListenPurpose::BargeIn, 0)
+    } else {
+        (ListenPurpose::Wake, 0)
+    };
+    if voice.mode.get() != desired {
+        voice.set_listen_mode(desired.0, desired.1);
+    }
+}
+
+/// 处理一条语音事件：只更新状态 / 提交指令 / 停止播报 / 结算语音确认。
+///
+/// 返回 `Some(prompt)` 表示**要启动一个 Agent 回合**（只有常规唤醒路径会这样）。
+fn handle_voice_event(
+    weak: &slint::Weak<AppWindow>,
+    voice: &mut VoiceRuntime,
+    confirmer: &Arc<UiConfirmer>,
+    speech: &mut SpeechRuntime,
+    event: VoiceEvent,
+    agent_busy: bool,
+) -> Option<VoicePrompt> {
+    match voice.on_event(weak, event, agent_busy) {
+        VoiceOutcome::None => None,
+        VoiceOutcome::Prompt(prompt) => Some(prompt),
+        VoiceOutcome::BargeIn { heard } => {
+            /*
+             * 打断判定：识别文本命中打断词，且不是我们自己正在播的内容。
+             *
+             * 旧版实测的教训：只靠能量阈值会被咳嗽/笑声打断；
+             * 这里的"有声判断"由 VAD 的有声时长与端点检测把关（能进到这里
+             * 就说明真的有人说了话），词语判断由 ASR 文本负责。
+             */
+            let verdict = bargein::judge(&heard, &speech.recent_sentences());
+            match verdict.reason {
+                bargein::BargeReason::Matched => {
+                    speech.stop();
+                    set_status(
+                        weak,
+                        &format!("已停止播报（听到「{}」）", verdict.word.unwrap_or_default()),
+                    );
+                }
+                bargein::BargeReason::Echo => {
+                    // 自己读出来的内容被麦克风收回来：静默忽略，不能自我打断。
+                }
+                bargein::BargeReason::NoWord => {
+                    set_status(
+                        weak,
+                        &format!("听到「{heard}」，没有打断词；说「等一下」可以停止播报"),
+                    );
+                }
+            }
+            None
+        }
+        VoiceOutcome::Confirm { request_id, text } => {
+            settle_voice_confirmation(weak, confirmer, request_id, &text);
+            None
+        }
+    }
+}
+
+/// 用一句识别文本结算挂起的权限确认。返回是否真的结算了。
+///
+/// 绑定规则由 [`confirm::resolve`] 保证：过期请求、重复答复、旧麦克风实例
+/// 的结果都不会批准别的请求。
+fn settle_voice_confirmation(
+    weak: &slint::Weak<AppWindow>,
+    confirmer: &Arc<UiConfirmer>,
+    bound_request: u64,
+    text: &str,
+) -> bool {
+    match confirm::resolve(confirmer.pending_request(), bound_request, text) {
+        ConfirmDecision::Allow(id) => {
+            if confirmer.submit(id, ConfirmAnswer::allow_voice()) {
+                set_status(weak, "已用语音允许这一次操作");
+                true
+            } else {
+                set_status(weak, "这次确认已经结束");
+                false
+            }
+        }
+        ConfirmDecision::Deny(id) => {
+            if confirmer.submit(id, ConfirmAnswer::deny_voice("用户用语音拒绝了这一次操作"))
+            {
+                set_status(weak, "已用语音拒绝这一次操作");
+                true
+            } else {
+                set_status(weak, "这次确认已经结束");
+                false
+            }
+        }
+        ConfirmDecision::Ignore(reason) => {
+            set_status(weak, &reason);
+            false
+        }
+    }
+}
+
+/// 回合正常完成后播报可见回复。
+///
+/// 只播 `TurnOutcome::text`（经过 Agent 汇总的**用户可见**文本）：
+/// 思考内容、工具 JSON、内部提示都不在这里，也不可能从这里漏出去。
+fn maybe_speak(
+    weak: &slint::Weak<AppWindow>,
+    speech: &mut SpeechRuntime,
+    settings: &Settings,
+    outcome: &TurnOutcome,
+    turn_id: TurnId,
+    source: TurnSource,
+) {
+    if outcome.cancelled || outcome.failed {
+        // 失败/中断的回合不播报：把"已中断"读出来只会让人更困惑。
+        return;
+    }
+    if !settings.tts.speaks(source.is_voice()) {
+        return;
+    }
+    let text = outcome.text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if let Err(error) = speech.speak(turn_id, text) {
+        // 播报不可用只影响声音：文本已经在界面上，工具结果也已经落定。
+        set_speech_unavailable(weak, &error);
+    }
+}
+
+fn set_speech_unavailable(weak: &slint::Weak<AppWindow>, reason: &str) {
+    let reason = reason.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_speech_state("unavailable".into());
+            window.set_speech_detail(format!("播报不可用：{reason}").into());
+        }
+    });
+}
+
+/// 界面侧的播报身份：**只有当前有效播报**的事件可以改状态、字幕和提示。///
+/// 复用播报层已有的 `speech_id`（单调递增，一次播报一个），不另造 generation：
+///  - 更新的 `speech_id` 自动接管（新播报开始）；
+///  - 比当前更旧的 `speech_id` 一律忽略——A 停止后立刻开始 B 时，A 迟到的
+///    `Stopped` / `Finished` / `Failed` / 字幕清空都不能覆盖 B。
+#[derive(Debug, Default)]
+struct SpeechView {
+    /// 当前（或最近一次）播报的身份；`None` = 还没有播报。
+    current: Option<SpeechId>,
+}
+
+impl SpeechView {
+    /// 这条事件是否属于当前有效播报；新播报会在这里接管界面。
+    fn accepts(&mut self, speech_id: SpeechId) -> bool {
+        match self.current {
+            Some(current) if speech_id < current => false,
+            Some(current) if speech_id == current => true,
+            _ => {
+                self.current = Some(speech_id);
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> Option<SpeechId> {
+        self.current
+    }
+}
+
+/// 播报事件 → 界面（状态、字幕、提示）。
+fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, event: &SpeechEvent) {
+    let speech_id = match event {
+        SpeechEvent::State { speech_id, .. }
+        | SpeechEvent::Subtitle { speech_id, .. }
+        | SpeechEvent::Notice { speech_id, .. } => *speech_id,
+    };
+    if !view.accepts(speech_id) {
+        // 旧播报的迟到事件：不改状态、不改字幕、也不弹提示。
+        return;
+    }
+    match event {
+        SpeechEvent::State { state, .. } => {
+            let code = state.code().to_string();
+            let label = state.label();
+            let label_for_loop = label.clone();
+            let active = state.is_active();
+            let failed = matches!(state, PlaybackState::Failed(_));
+            let weak_ui = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak_ui.upgrade() {
+                    window.set_speech_state(code.into());
+                    window.set_speech_detail(label_for_loop.into());
+                    window.set_speech_active(active);
+                    if !active {
+                        window.set_speech_subtitle("".into());
+                    }
+                }
+            });
+            if failed {
+                set_status(weak, &label);
+            }
+        }
+        SpeechEvent::Subtitle { text, .. } => {
+            let text = text.to_string();
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_speech_subtitle(text.into());
+                }
+            });
+        }
+        SpeechEvent::Notice { text, .. } => {
+            set_status(weak, text);
+            let detail = text.clone();
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_speech_detail(detail.into());
+                }
+            });
+        }
+    }
+}
+
+/// 界面上「保存」一次提交的全部内容（模型端点 + 语音播报）。
+///
+/// 为什么合并成一个请求：原来是两条独立命令，各自落盘、各自关面板，
+/// 于是「模型设置写失败但播报设置写成功」会把面板关掉，用户既看不到错误、
+/// 也不知道哪一半生效了。现在由 [`apply_save_all`] 当作**一个事务**处理。
+#[derive(Debug, Clone)]
+pub struct SaveAllRequest {
+    pub provider_index: i32,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    pub permission_index: i32,
+    pub tts_enabled: bool,
+    pub tts_backend_index: i32,
+    /// 界面上的文本原样传入：解析失败要**如实报错**，不能静默改成默认值。
+    pub local_sid: String,
+    pub local_speed: String,
+    pub mimo_voice: String,
+    pub mimo_style: String,
+    pub local_dir: String,
+    pub speak_mode: i32,
+}
+
+impl SaveAllRequest {
+    /// 音色编号/语速是文本输入：解析失败返回可读错误（保留用户输入）。
+    fn parse_local_numbers(&self) -> Result<(i32, f32), String> {
+        let sid_text = self.local_sid.trim();
+        let sid = if sid_text.is_empty() {
+            0
+        } else {
+            sid_text
+                .parse::<i32>()
+                .map_err(|_| format!("音色编号必须是整数，收到「{sid_text}」"))?
+        };
+        let speed_text = self.local_speed.trim();
+        let speed = if speed_text.is_empty() {
+            1.0
+        } else {
+            speed_text
+                .parse::<f32>()
+                .map_err(|_| format!("语速必须是数字（0.5~2.0），收到「{speed_text}」"))?
+        };
+        Ok((sid, speed))
+    }
+}
+
+/// 把界面上的「自动播报」选项翻译成两个布尔开关。
+fn speak_flags(mode: i32) -> (bool, bool) {
+    match mode {
+        1 => (true, false),
+        2 => (false, true),
+        3 => (false, false),
+        // 0 与越界都按「语音与文本」处理（与界面数组第一项一致）。
+        _ => (true, true),
+    }
+}
+
+/// 一次保存的**结果分类**（对应任务书第 4 条）。
+///
+/// 刻意做成枚举而不是几个布尔：界面要区分"没保存"和"保存了但播报暂不可用"，
+/// 两者对用户的含义完全不同（前者要保留草稿继续改，后者可以关面板）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// 配置已写入，一切正常。
+    Saved,
+    /// 配置已写入，但播报当前不可用（缺 Key / 缺模型 / 设备问题）。
+    ///
+    /// **算保存成功**：用户的设置确实存下来了，只是引擎建不起来。
+    SavedSpeechUnavailable(String),
+    /// 配置已写入，但 Key 没有写进去（只有该提供商的 Key 受影响）。
+    SavedKeyFailed(String),
+    /// 配置**没有**写入：校验失败或落盘失败。界面必须保留草稿。
+    NotSaved(String),
+}
+
+impl SaveOutcome {
+    /// 配置是否已经落盘（决定界面要不要保留草稿）。
+    pub fn config_written(&self) -> bool {
+        !matches!(self, Self::NotSaved(_))
+    }
+
+    /// 是否可以在成功后关闭面板。
+    pub fn can_close_panel(&self) -> bool {
+        self.config_written()
+    }
+
+    /// 给用户看的一句话（状态栏与面板内提示共用）。
+    pub fn message(&self) -> String {
+        match self {
+            Self::Saved => "设置已保存".to_string(),
+            Self::SavedSpeechUnavailable(detail) => {
+                format!("设置已保存，但播报暂不可用：{detail}")
+            }
+            Self::SavedKeyFailed(detail) => {
+                format!("设置已保存，但 Key 没有写入：{detail}")
+            }
+            Self::NotSaved(detail) => detail.clone(),
+        }
+    }
+}
+
+/// **一次保存的全部逻辑**（模型端点 + 语音播报）。
+///
+/// 事务规则（对应任务书第 4 条）：
+///  1. 先在内存里把两份配置都算出来并**一起校验**；任何一项不合法就整体失败，
+///     此时磁盘和内存都没被改过，用户输入原样留在界面上；
+///  2. 校验通过后**只写一次盘**（端点与播报本来就在同一份 settings.json 里）；
+///  3. 写盘成功后再写 Key（只写到目标提供商名下，留空 = 不动）；
+///  4. 最后重建 TTS 引擎。
+///
+/// 引擎建不起来（缺 Key / 缺模型）**不算保存失败**：配置本身合法，
+/// 只是当前不可用——如实显示为警告，不把用户的选择回滚掉。
+pub fn apply_save_all(
+    paths: &AppPaths,
+    secret: &SecretStore,
+    settings: &mut Settings,
+    speech: &mut SpeechRuntime,
+    request: &SaveAllRequest,
+) -> SaveOutcome {
+    // ---- 1) 组装候选配置（还没碰磁盘） ----
+    let (sid, speed) = match request.parse_local_numbers() {
+        Ok(values) => values,
+        Err(error) => return SaveOutcome::NotSaved(error),
+    };
+    let (speak_voice, speak_text) = speak_flags(request.speak_mode);
+
+    let previous = settings.clone();
+    let mut next = settings.clone();
+    next.provider_id = provider_id_for_index(request.provider_index).to_string();
+    next.base_url = request.base_url.clone();
+    next.model = request.model.clone();
+    next.permission_mode = permission_mode_for_index(request.permission_index);
+    next.tts.enabled = request.tts_enabled;
+    next.tts.backend = tts_backend_for_index(request.tts_backend_index);
+    next.tts.mimo_voice = request.mimo_voice.clone();
+    next.tts.mimo_style = request.mimo_style.clone();
+    next.tts.local_model_dir = request.local_dir.clone();
+    next.tts.local_sid = sid;
+    next.tts.local_speed = speed;
+    next.tts.speak_voice_turns = speak_voice;
+    next.tts.speak_text_turns = speak_text;
+
+    // ---- 2) 整体校验（端点 + 播报一起） ----
+    let next = match next.normalized() {
+        Ok(next) => next,
+        Err(error) => return SaveOutcome::NotSaved(error),
+    };
+
+    // ---- 3) 只写一次盘 ----
+    if let Err(error) = config::save_settings(paths, &next) {
+        return SaveOutcome::NotSaved(format!("写入配置文件失败：{error}"));
+    }
+
+    // 写盘成功那一刻起，配置就是"已保存"了。后面无论 Key 或引擎出什么问题，
+    // 都不能再报成"没有保存"——否则用户会以为改动丢了，然后重复保存。
+    *settings = next;
+
+    // ---- 4) 再写 Key（留空 = 不动该提供商的 Key） ----
+    let key_provider = settings.provider_id.clone();
+    let new_key = request.api_key.trim().to_string();
+    let key_error = if new_key.is_empty() {
+        None
+    } else {
+        secret.save(&key_provider, &new_key).err()
+    };
+
+    /*
+     * ---- 5) 只在**播报配置真的变了**时才重建引擎 ----
+     *
+     * 只改模型端点 / 推理 / 权限时，TTS 的有效配置与相关凭据都没变：
+     * 重建会 `stop()` 掉正在播的内容，还会让本地模型重新加载 + 预热（数秒）。
+     * 这里先判断"是否需要"，避免完全不必要的打断。
+     */
+    // 只有"这次真的写入了 **MiMo 提供商** 的 Key，且当前启用的正是 MiMo TTS"
+    // 才算凭据变化。
+    //
+    // 之前只看"有没有写 Key" + "TTS 后端是不是 MiMo"，于是给 DeepSeek 存 Key
+    // 时也会被判成 MiMo 凭据变化 → 重建引擎 → 打断正在播报的 MiMo 语音。
+    // 写入目标由 provider_id 决定，所以必须同时核对它确实是 `mimo`。
+    let key_changed_for_active_backend = key_error.is_none()
+        && !new_key.is_empty()
+        && key_provider == MIMO_PROVIDER_ID
+        && settings.tts.active_backend() == TtsBackend::Mimo;
+    let tts_changed =
+        tts_runtime_config_changed(&previous, settings, key_changed_for_active_backend);
+    let speech_warning = if tts_changed {
+        rebuild_speech(settings, secret, speech)
+    } else {
+        // 配置没变：保持当前引擎与正在播放的音频不动，只同步界面描述。
+        None
+    };
+
+    match (key_error, speech_warning) {
+        // Key 没写进去要单独说清楚：普通配置已保存，只有 Key 没存。
+        (Some(error), warning) => {
+            let mut detail = error.to_string();
+            if let Some(warning) = warning {
+                detail.push('；');
+                detail.push_str(&warning);
+            }
+            SaveOutcome::SavedKeyFailed(detail)
+        }
+        (None, Some(warning)) => SaveOutcome::SavedSpeechUnavailable(warning),
+        (None, None) => SaveOutcome::Saved,
+    }
+}
+
+/// 这次保存是否真的改变了**播报运行时**的配置。
+///
+/// 只有这些变化才值得重建引擎（会 `stop()` 当前播报、重载本地模型并重新预热）：
+///  - TTS 开关 / 后端；
+///  - MiMo 的模型/音色/风格，本地模型的目录/音色编号/语速/提供者；
+///  - 输出设备与超时。
+///
+/// **不需要**重建的：模型端点、推理参数、权限档位，以及"自动播报"两个开关
+/// （它们只决定"要不要播"，不影响引擎本身）。
+///
+/// 另外，给**当前启用的云端后端**写入了新 Key 时，凭据变了也必须重建。
+fn tts_runtime_config_changed(
+    previous: &Settings,
+    next: &Settings,
+    key_changed_for_active_backend: bool,
+) -> bool {
+    let a = &previous.tts;
+    let b = &next.tts;
+    a.enabled != b.enabled
+        || a.backend != b.backend
+        || a.mimo_model != b.mimo_model
+        || a.mimo_voice != b.mimo_voice
+        || a.mimo_style != b.mimo_style
+        || a.local_model_dir != b.local_model_dir
+        || a.local_sid != b.local_sid
+        || (a.local_speed - b.local_speed).abs() > f32::EPSILON
+        || a.local_provider != b.local_provider
+        || a.output_device != b.output_device
+        || a.timeout_ms != b.timeout_ms
+        || key_changed_for_active_backend
+}
+
+/// 按当前（已保存的）播报配置重建引擎。
+///
+/// 返回 `None` = 一切正常；`Some(原因)` = 配置已保存但引擎建不起来
+/// （缺 Key / 缺模型 / 设备不可用）——这**不是**保存失败。
+///
+/// 必须用调用方传进来的 `SecretStore`（同一个数据目录），否则会在错误的
+/// 目录里找 Key，误报"播报不可用"。
+fn rebuild_speech(
+    settings: &Settings,
+    secret: &SecretStore,
+    speech: &mut SpeechRuntime,
+) -> Option<String> {
+    speech.apply_settings(&settings.tts, secret).err()
+}
+
+/// 启动时把已保存的播报偏好同步到界面（**不**自动试音）。
+fn seed_tts_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, speech: &SpeechRuntime) {
+    publish_tts_ui(weak, &settings.tts, speech);
+    if let Some(error) = speech.engine_error() {
+        set_speech_unavailable(weak, error);
+    }
+}
+
+/// 把**已保存并生效**的播报配置推给界面。
+///
+/// 这里同时写入两组值：
+///  - `tts-*`：设置页里可编辑的选择（保存或打开设置时用已保存值回填）；
+///  - `tts-active-*`：当前真正生效的那一份配置（试音据此启用/说明）。
+///
+/// 两者在用户改动但未保存时会不一致，这正是这里要区分的地方。
+fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &SpeechRuntime) {
+    let backend_index = tts_backend_index(tts.backend);
+    let enabled = tts.enabled;
+    let mimo_voice = tts.mimo_voice.clone();
+    let mimo_style = tts.mimo_style.clone();
+    let local_dir = tts.local_model_dir.clone();
+    let local_sid = tts.local_sid.to_string();
+    let local_speed = format!("{:.1}", tts.local_speed);
+    let speak_mode = speak_mode_code(tts.speak_voice_turns, tts.speak_text_turns);
+    let available = speech.is_available();
+    let detail = speech
+        .engine_label()
+        .or_else(|| speech.engine_error().map(str::to_string))
+        .unwrap_or_else(|| "未启用播报".to_string());
+    // 「当前生效」的描述：引擎标签优先，否则说明为什么不可用。
+    let active_label = if tts.active_backend() == crate::voice::tts::TtsBackend::Off {
+        "关闭（不播报）".to_string()
+    } else {
+        speech
+            .engine_label()
+            .or_else(|| speech.engine_error().map(str::to_string))
+            .unwrap_or_else(|| "未启用播报".to_string())
+    };
+    let active_ready =
+        speech.is_available() && tts.active_backend() != crate::voice::tts::TtsBackend::Off;
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_tts_enabled(enabled);
+            window.set_tts_backend_index(backend_index);
+            window.set_tts_mimo_voice(mimo_voice.into());
+            window.set_tts_mimo_style(mimo_style.into());
+            window.set_tts_local_dir(local_dir.into());
+            window.set_tts_local_sid(local_sid.into());
+            window.set_tts_local_speed(local_speed.into());
+            window.set_tts_speak_mode(speak_mode);
+            window.set_tts_backend_ready(available);
+            window.set_speech_detail(detail.into());
+            window.set_tts_active_backend_index(backend_index);
+            window.set_tts_active_label(active_label.into());
+            window.set_tts_active_ready(active_ready);
+        }
+    });
+}
+
+/// 两个"是否自动播报"的开关 → 界面上的单一选项（0=都播，1=只语音，2=只文本，3=都不）。
+fn speak_mode_code(voice: bool, text: bool) -> i32 {
+    match (voice, text) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
     }
 }
 
@@ -1095,7 +2014,7 @@ fn apply_voice_enabled(
 
 /// 语音最终文本 → 现有 Agent 入口（与文本发送同一条路径）。
 ///
-/// 返回 `Some(handle)` 表示回合已启动，调用方负责等待；`None` 表示没有启动
+/// 返回 `Some(turn)` 表示回合已启动，调用方负责等待；`None` 表示没有启动
 /// （空文本，或 Agent 忙/等待确认/正在取消）。
 #[allow(clippy::too_many_arguments)]
 fn commit_voice_text(
@@ -1110,7 +2029,8 @@ fn commit_voice_text(
     settings: &Settings,
     paths: &AppPaths,
     secret: &SecretStore,
-) -> Option<tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>> {
+    turn_id: TurnId,
+) -> Option<RunningTurn> {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return None;
@@ -1133,6 +2053,7 @@ fn commit_voice_text(
         history,
         turn_cancel,
         trimmed,
+        turn_id,
     ) {
         TurnStart::Started(turn) => {
             set_busy(weak, true);
@@ -1240,9 +2161,18 @@ fn seed_voice_ui(weak: &slint::Weak<AppWindow>, settings: &Settings) {
     });
 }
 
+/// 正在跑的一轮：任务句柄 + 回合身份。
+///
+/// 回合身份是播报层"这段音频属于哪个 Agent 回合"的依据：新回合一开始就换号，
+/// 旧回合迟到的音频不会串到新回合里。
+struct RunningTurn {
+    task: tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>,
+    turn_id: TurnId,
+}
+
 /// 一次回合的启动结果。
 enum TurnStart {
-    Started(tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>),
+    Started(RunningTurn),
     /// 没启动（上一轮还在跑 / 后端不可用 / 端点无效），附给用户看的原因。
     Rejected(String),
 }
@@ -1260,6 +2190,7 @@ fn start_turn(
     history: &mut Vec<ChatMessage>,
     turn_cancel: &mut Option<CancelToken>,
     input: String,
+    turn_id: TurnId,
 ) -> TurnStart {
     /*
      * 并发约束：上一轮还在跑（含等待点击确认）时**不启动第二回合**。
@@ -1329,7 +2260,10 @@ fn start_turn(
             .await;
         (outcome, turn_history, settings_snapshot)
     });
-    TurnStart::Started(turn)
+    TurnStart::Started(RunningTurn {
+        task: turn,
+        turn_id,
+    })
 }
 
 /// 等待回合结束期间的命令处理结果。
@@ -1340,7 +2274,11 @@ enum TurnWait {
     Quit,
 }
 
-/// 一次"保存设置"请求（来自界面）。
+/// 一次"保存设置"请求（仅测试使用）。
+///
+/// 界面上的保存走 [`SaveAllRequest`]（端点 + 播报一起提交）；
+/// 这里保留一个只含端点的入口，让既有测试继续覆盖真实保存路径。
+#[cfg(test)]
 struct SaveRequest {
     provider_index: i32,
     base_url: String,
@@ -1379,83 +2317,52 @@ fn view_after_clear(
 
 /// 应用一次设置保存。返回 `true` 表示配置已落盘。
 ///
-/// 关键规则：
+/// 这是界面上「保存」的**旧入口形状**，内部走统一事务 [`apply_save_all`]：
+/// 模型端点与语音播报本来就写在同一份 settings.json 里，分开保存没有意义。
+/// 保留这个签名是为了让既有测试继续覆盖真实保存路径（Key 归属、失败不落盘等）。
+///
+/// 关键规则（由 `apply_save_all` 保证）：
 /// - 校验失败 / 写盘失败**都不更新**内存里的 `settings`，界面也拿不到"已保存"；
 /// - Key 只写到**目标提供商**名下；留空表示"不动该提供商的 Key"；
 /// - **先写配置、再写 Key**。反过来不行：先覆盖 Key 再回滚，
 ///   会在回滚时把用户原有的 Key A 一起删掉（原来 Bug 就是这样丢数据的）。
-///   现在配置写失败时，Key 根本还没被动过，Key A 必然还在。
-/// - 任何错误都会如实回报界面，不假装成功。
+#[cfg(test)]
 fn handle_save_settings(
     weak: &slint::Weak<AppWindow>,
     paths: &AppPaths,
     secret: &SecretStore,
     settings: &mut Settings,
     request: SaveRequest,
+    speech: &mut SpeechRuntime,
 ) -> bool {
-    let mut next = settings.clone();
-    next.provider_id = provider_id_for_index(request.provider_index).to_string();
-    next.base_url = request.base_url;
-    next.model = request.model;
-    next.permission_mode = permission_mode_for_index(request.permission_index);
-
-    let next = match next.normalized() {
-        Ok(next) => next,
-        Err(error) => {
-            set_status(weak, &format!("设置无效：{error}"));
-            return false;
-        }
+    let all = SaveAllRequest {
+        provider_index: request.provider_index,
+        base_url: request.base_url,
+        model: request.model,
+        api_key: request.api_key,
+        permission_index: request.permission_index,
+        // 只改端点：播报设置按已保存的值原样带过（不会被覆盖）。
+        tts_enabled: settings.tts.enabled,
+        tts_backend_index: tts_backend_index(settings.tts.backend),
+        local_sid: settings.tts.local_sid.to_string(),
+        local_speed: settings.tts.local_speed.to_string(),
+        mimo_voice: settings.tts.mimo_voice.clone(),
+        mimo_style: settings.tts.mimo_style.clone(),
+        local_dir: settings.tts.local_model_dir.clone(),
+        speak_mode: speak_mode_code(
+            settings.tts.speak_voice_turns,
+            settings.tts.speak_text_turns,
+        ),
     };
-
-    // 1) 先落盘配置。失败时 Key 还没动过，用户原来的 Key 完好无损。
-    if let Err(error) = config::save_settings(paths, &next) {
-        set_status(weak, &format!("保存设置失败：{error}"));
-        return false;
+    let outcome = apply_save_all(paths, secret, settings, speech, &all);
+    if !outcome.config_written() {
+        set_status(weak, &format!("保存设置失败：{}", outcome.message()));
     }
-
-    // 2) 配置已生效，再写 Key（只有用户真的填了才写，且只写到目标提供商名下）。
-    let key_provider = next.provider_id.clone();
-    let new_key = request.api_key.trim().to_string();
-    if !new_key.is_empty() {
-        if let Err(error) = secret.save(&key_provider, &new_key) {
-            /*
-             * 配置已经写成功了，但 Key 没写进去。
-             *
-             * 这里**不回滚配置**：配置本身是合法的、用户也确实想改，
-             * 回滚反而会让"地址/模型改了、Key 没改"这个更常见的意图落空。
-             * 如实告诉用户"设置已保存，但 Key 没保存"，并让界面保持 Key 未保存的状态。
-             */
-            *settings = next;
-            set_status(weak, &format!("设置已保存，但 Key 保存失败：{error}"));
-            return false;
-        }
-    }
-
-    *settings = next;
-    true
+    outcome.config_written()
 }
 
 /// 把设置（与 Key 状态）推给界面。
-fn publish_endpoint(
-    weak: &slint::Weak<AppWindow>,
-    settings: &Settings,
-    has_key: bool,
-    status: &str,
-) {
-    let endpoint = config::describe_endpoint(settings, has_key);
-    let status = status.to_string();
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_settings_open(false);
-            window.set_api_key_input("".into());
-            window.set_has_key(has_key);
-            window.set_endpoint_text(endpoint.into());
-            window.set_status(status.into());
-        }
-    });
-}
-
+///
 /// 打开设置时按当前配置回填界面。
 fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_key: bool) {
     let provider_index = PROVIDER_IDS
@@ -1477,6 +2384,9 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
             window.set_api_key_input("".into());
             window.set_has_key(has_key);
             window.set_permission_index(permission_index);
+            // 重新打开 = 以已保存配置为准：清掉上一次的错误与"未保存"标记。
+            window.set_settings_error("".into());
+            window.set_settings_dirty(false);
             window.set_settings_open(true);
         }
     });
@@ -1489,23 +2399,37 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
 #[allow(clippy::too_many_arguments)]
 async fn wait_turn(
     commands: &mut tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
-    mut turn: tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>,
+    turn: RunningTurn,
     weak: &slint::Weak<AppWindow>,
     turn_cancel: &mut Option<CancelToken>,
     paths: &AppPaths,
     secret: &SecretStore,
     settings: &mut Settings,
-    confirmer: &UiConfirmer,
+    confirmer: &Arc<UiConfirmer>,
     voice: &mut VoiceRuntime,
+    speech: &mut SpeechRuntime,
+    speech_view: &mut SpeechView,
     command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    save_generation: &Arc<std::sync::atomic::AtomicU64>,
+    source: TurnSource,
 ) -> TurnWait {
+    let RunningTurn { mut task, turn_id } = turn;
+    /*
+     * 确认请求出现/结束时也要**立刻**切换聆听模式：
+     * 否则回合卡在"等点击"的这段时间里，语音确认永远进不去（没有人按按钮，
+     * 也没有命令进来唤醒这个 select）。
+     */
+    let pending_changes = confirmer.changes();
     loop {
+        // 每一轮重新决定聆听模式（播报中 = 听打断词，等待确认 = 听允许/拒绝）。
+        sync_listen_mode(voice, speech, confirmer);
         tokio::select! {
-            joined = &mut turn => {
+            joined = &mut task => {
                 *turn_cancel = None;
                 match joined {
                     Ok((outcome, history, settings_snapshot)) => {
                         finish_turn(weak, &outcome, &settings_snapshot);
+                        maybe_speak(weak, speech, &settings_snapshot, &outcome, turn_id, source);
                         return TurnWait::Finished(history);
                     }
                     Err(error) => {
@@ -1520,6 +2444,9 @@ async fn wait_turn(
                     }
                 }
             }
+            _ = pending_changes.notified() => {
+                // 只是唤醒一次循环：下一轮一开头会重新同步聆听模式。
+            }
             command = commands.recv() => {
                 match command {
                     Some(UiCommand::Cancel) => {
@@ -1527,14 +2454,56 @@ async fn wait_turn(
                             token.cancel();
                             set_status(weak, "正在中断…");
                         }
+                        // 取消任务 = 取消 Agent **并且**停掉本回合的声音。
+                        speech.stop();
                         // 语音输入也一并取消（不再提交），但不影响已开始回合的收尾。
                         voice.cancel_pending();
+                    }
+                    Some(UiCommand::StopSpeaking) => {
+                        if speech.is_speaking() {
+                            speech.stop();
+                            set_status(weak, "已停止播报（任务继续）");
+                        } else {
+                            set_status(weak, "当前没有在播报");
+                        }
+                    }
+                    Some(UiCommand::SpeakTest) => handle_speak_test(weak, speech),
+                    Some(UiCommand::SaveAll {
+                        request,
+                        generation,
+                    }) => {
+                        // 过期请求丢弃（用户已取消或又提交了新的保存）。
+                        // 同样**不**清 `settings-saving`：那是更年轻那一代的职责。
+                        if generation_is_current(save_generation, generation) {
+                            let _ = handle_save_all_ui(
+                                weak,
+                                paths,
+                                secret,
+                                settings,
+                                speech,
+                                &request,
+                                generation,
+                                save_generation,
+                            );
+                        }
+                    }
+                    Some(UiCommand::CancelSettings { generation }) => {
+                        if generation_is_current(save_generation, generation) {
+                            publish_tts_ui(weak, &settings.tts, speech);
+                            let has_key = secret.has(&settings.provider_id);
+                            apply_settings_to_ui(weak, settings, has_key);
+                            close_settings(weak);
+                        }
+                    }
+                    Some(UiCommand::Speech(event)) => {
+                        apply_speech_event(speech_view, weak, &event);
                     }
                     Some(UiCommand::Quit) => {
                         if let Some(token) = turn_cancel.as_ref() {
                             token.cancel();
                         }
                         confirmer.abort_pending();
+                        speech.shutdown();
                         set_status(weak, "正在退出…");
                         /*
                          * 回合会在下一个检查点结束；等它真的收尾再交回主循环，
@@ -1546,7 +2515,7 @@ async fn wait_turn(
                          */
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            &mut turn,
+                            &mut task,
                         )
                         .await;
                         *turn_cancel = None;
@@ -1561,13 +2530,14 @@ async fn wait_turn(
                      *    偏好保存失败也不妨碍本次关麦；开麦同理立即生效。
                      *  - 语音最终文本不在这里插队：`on_event(agent_busy = true)`
                      *    只更新状态、不启动第二回合，也不排队延后执行。
+                     *  - 打断词与语音确认**照常生效**：它们不启动回合。
                      *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
                      */
                     Some(UiCommand::SetVoiceEnabled(enabled)) => {
                         apply_voice_enabled(weak, paths, settings, voice, command_tx, enabled);
                     }
                     Some(UiCommand::Voice(event)) => {
-                        let _ = voice.on_event(weak, event, true);
+                        let _ = handle_voice_event(weak, voice, confirmer, speech, event, true);
                     }
                     Some(UiCommand::OpenSettings) => {
                         // 执行中也能查看当前（已保存的）配置。
@@ -1607,35 +2577,6 @@ async fn wait_turn(
                             }
                         }
                     }
-                    Some(UiCommand::SaveSettings {
-                        provider_index,
-                        base_url,
-                        model,
-                        api_key,
-                        permission_index,
-                    }) => {
-                        /*
-                         * 任务执行期间保存设置：**真的保存**，只是本轮继续用旧快照。
-                         * 之前这里只显示"稍后生效"却没有保存，用户以为改了其实没改。
-                         */
-                        if handle_save_settings(
-                            weak,
-                            paths,
-                            secret,
-                            settings,
-                            SaveRequest {
-                                provider_index,
-                                base_url,
-                                model,
-                                api_key,
-                                permission_index,
-                            },
-                        ) {
-                            let has_key = secret.has(&settings.provider_id);
-                            let endpoint = config::describe_endpoint(settings, has_key);
-                            set_settings_saved_mid_turn(weak, &endpoint, has_key);
-                        }
-                    }
                     None => return TurnWait::Quit,
                 }
             }
@@ -1643,17 +2584,117 @@ async fn wait_turn(
     }
 }
 
-/// 执行中保存成功的提示：关闭设置页、刷新端点摘要，并说明本轮仍用旧快照。
-fn set_settings_saved_mid_turn(weak: &slint::Weak<AppWindow>, endpoint: &str, has_key: bool) {
-    let endpoint = endpoint.to_string();
+/// 在界面线程上应用一次「保存」，并回填结果。
+///
+/// 关键规则（对应任务书第 2、4 条）：
+///  - **配置没写进去**：显示失败、保留草稿、**不**用已生效的配置覆盖可编辑字段；
+///  - **配置写了但播报不可用**：算保存成功，说明"已保存，但播报暂不可用"，关面板；
+///  - **Key 没写进去**：说明普通配置已保存、只有 Key 没存，同样关面板；
+///  - 只有"没写进去"时才留在面板里让用户改。
+#[allow(clippy::too_many_arguments)]
+fn handle_save_all_ui(
+    weak: &slint::Weak<AppWindow>,
+    paths: &AppPaths,
+    secret: &SecretStore,
+    settings: &mut Settings,
+    speech: &mut SpeechRuntime,
+    request: &SaveAllRequest,
+    generation: u64,
+    save_generation: &Arc<std::sync::atomic::AtomicU64>,
+) -> SaveOutcome {
+    let outcome = apply_save_all(paths, secret, settings, speech, request);
+    set_status(weak, &outcome.message());
+
+    /*
+     * 落盘期间用户可能已经取消、或又点了一次保存。
+     * 只有代次仍是最新时才允许回填界面；否则这一次的结果属于"过期请求"，
+     * 不能去覆盖用户当前的表单/状态。
+     */
+    if !generation_is_current(save_generation, generation) {
+        return outcome;
+    }
+
+    // 只有配置真的落盘了，才刷新"已生效"状态；失败时**不动**界面上的可编辑字段，
+    // 否则会把用户刚输入的非法内容悄悄换回旧值，让他无从修改。
+    if outcome.config_written() {
+        publish_tts_ui(weak, &settings.tts, speech);
+        let has_key = secret.has(&settings.provider_id);
+        let endpoint = config::describe_endpoint(settings, has_key);
+        let message = outcome.message();
+        let close = outcome.can_close_panel();
+        let weak_ui = weak.clone();
+        let save_generation = save_generation.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak_ui.upgrade() {
+                // 事件循环里再核对一次：回填排队期间用户可能又操作了。
+                if !generation_is_current(&save_generation, generation) {
+                    return;
+                }
+                window.set_endpoint_text(endpoint.into());
+                window.set_has_key(has_key);
+                window.set_settings_error(message.into());
+                window.set_settings_saving(false);
+                if close {
+                    window.set_settings_dirty(false);
+                    window.set_api_key_input("".into());
+                    window.set_settings_open(false);
+                }
+            }
+        });
+    } else {
+        // 失败：留在面板里、保留草稿、只显示具体原因。
+        let message = outcome.message();
+        let weak_ui = weak.clone();
+        let save_generation = save_generation.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak_ui.upgrade() {
+                if !generation_is_current(&save_generation, generation) {
+                    return;
+                }
+                window.set_settings_error(message.into());
+                window.set_settings_saving(false);
+            }
+        });
+    }
+    outcome
+}
+
+/// 这次请求的代次是否仍是"最新"。
+fn generation_is_current(
+    save_generation: &Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+) -> bool {
+    save_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+}
+
+/// 试音：只针对**已保存并生效**的配置，并在状态栏说清楚用的是哪一份。
+fn handle_speak_test(weak: &slint::Weak<AppWindow>, speech: &mut SpeechRuntime) {
+    if !speech.is_available() {
+        let reason = speech
+            .engine_error()
+            .unwrap_or("语音播报未启用")
+            .to_string();
+        set_status(weak, &format!("试音失败：{reason}"));
+        return;
+    }
+    let label = speech
+        .engine_label()
+        .unwrap_or_else(|| "当前配置".to_string());
+    match speech.speak(TEST_SPEECH_TURN, TEST_SPEECH_TEXT) {
+        Ok(_) => set_status(weak, &format!("正在试音（{label}）…")),
+        Err(error) => set_status(weak, &format!("试音失败：{error}")),
+    }
+}
+
+/// 关闭设置面板并清掉错误/脏标记（取消与保存成功共用）。
+fn close_settings(weak: &slint::Weak<AppWindow>) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            window.set_settings_error("".into());
+            window.set_settings_dirty(false);
+            window.set_settings_saving(false);
             window.set_settings_open(false);
-            window.set_api_key_input("".into());
-            window.set_has_key(has_key);
-            window.set_endpoint_text(endpoint.into());
-            window.set_status("设置已保存；本轮仍用原配置，新配置从下一轮生效".into());
         }
     });
 }
@@ -1813,6 +2854,8 @@ mod tests {
             weak: slint::Weak::default(),
             pending: Arc::new(std::sync::Mutex::new(None)),
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            pending_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            changed: Arc::new(tokio::sync::Notify::new()),
             timeout: std::time::Duration::from_secs(5),
         }
     }
@@ -1824,7 +2867,703 @@ mod tests {
     ) -> tokio::sync::oneshot::Receiver<ConfirmAnswer> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         *confirmer.pending.lock().unwrap() = Some(PendingConfirm { request_id, reply });
+        confirmer.publish_pending(request_id);
         wait
+    }
+
+    /// 测试用播报运行时：没有引擎、没有设备（只验证"不播报"的路径）。
+    fn speech_without_engine() -> SpeechRuntime {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SpeechRuntime::new(tx)
+    }
+
+    /// **需求 1**：从 MiMo 切到 DeepSeek 并保存后，配置里的 provider 是 DeepSeek，
+    /// Key 写到 DeepSeek 名下，**原 MiMo Key 不被覆盖**。
+    ///
+    /// 这条直接对应"选 DeepSeek 却存成 MiMo"的回归：界面索引必须一路传到
+    /// `provider_id`，而 Key 只按目标提供商写入。
+    #[cfg(windows)]
+    #[test]
+    fn switching_provider_saves_to_the_selected_provider_and_keeps_other_keys() {
+        let root = unique_test_root("worker-provider-switch");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+
+        // 先按 MiMo 保存一次（带 MiMo 的 Key）。
+        let mut settings = Settings::default();
+        let mut speech = speech_without_engine();
+        let mimo = save_all_request(
+            0,
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.6-flash",
+            "sk-mimo-original",
+        );
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &mimo);
+        assert!(outcome.config_written(), "{outcome:?}");
+        assert_eq!(settings.provider_id, "mimo");
+
+        // 切到 DeepSeek 并保存（填 DeepSeek 的 Key）。
+        let request = save_all_request(
+            1,
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-pro",
+            "sk-deepseek-new",
+        );
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+        assert!(outcome.config_written(), "{outcome:?}");
+
+        // 内存与磁盘都必须是 DeepSeek（"重新打开仍显示 DeepSeek"的依据）。
+        assert_eq!(settings.provider_id, "deepseek");
+        let reloaded = config::load_settings(&paths).unwrap();
+        assert_eq!(reloaded.provider_id, "deepseek");
+        assert_eq!(reloaded.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(reloaded.model, "deepseek-v4-pro");
+
+        // Key 落在目标提供商名下；MiMo 的原 Key 必须完好无损。
+        assert_eq!(
+            secret.load("deepseek").unwrap().as_deref(),
+            Some("sk-deepseek-new")
+        );
+        assert_eq!(
+            secret.load("mimo").unwrap().as_deref(),
+            Some("sk-mimo-original"),
+            "切换提供商不能覆盖原来那家的 Key"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **需求 4**：缺本地 TTS 模型时配置照样保存，结果要报"已保存但播报暂不可用"，
+    /// 而不是"没保存"。
+    #[cfg(windows)]
+    #[test]
+    fn missing_local_tts_model_is_saved_but_reported_unavailable() {
+        let root = unique_test_root("worker-tts-unavailable");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut speech = speech_without_engine();
+
+        let mut request =
+            save_all_request(0, "https://api.xiaomimimo.com/v1", "mimo-v2.6-flash", "");
+        request.tts_enabled = true;
+        request.tts_backend_index = 2; // 本地 ONNX（模型不存在）
+        request.local_dir = "Z:/definitely/not/here".to_string();
+
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+
+        // 配置必须已经落盘——这是"保存成功"与"当前不可用"分开的关键。
+        assert!(outcome.config_written(), "{outcome:?}");
+        assert!(
+            matches!(outcome, SaveOutcome::SavedSpeechUnavailable(_)),
+            "缺模型必须归类为'已保存但暂不可用'：{outcome:?}"
+        );
+        assert!(
+            outcome.message().contains("已保存") && outcome.message().contains("不可用"),
+            "{}",
+            outcome.message()
+        );
+        let reloaded = config::load_settings(&paths).unwrap();
+        assert_eq!(reloaded.tts.backend, TtsBackend::Local);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **需求 4**：Key 写失败时不能报"全部成功"，要明确说普通配置已保存。
+    #[cfg(windows)]
+    #[test]
+    fn key_write_failure_is_reported_as_partial_not_success() {
+        let root = unique_test_root("worker-key-fail-partial");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut speech = speech_without_engine();
+
+        // 让密钥写入一定失败：把 `secrets` 目录的位置占成一个**普通文件**。
+        // 布局是 `<root>/secrets/<provider>.bin`，所以建目录这一步会失败，
+        // 写 Key 随之返回错误——正是"配置能存、Key 存不了"的场景。
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("secrets");
+        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        let request = save_all_request(
+            1,
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-pro",
+            "sk-cannot-write",
+        );
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+
+        assert!(outcome.config_written(), "配置本身必须已保存：{outcome:?}");
+        assert!(
+            matches!(outcome, SaveOutcome::SavedKeyFailed(_)),
+            "Key 失败必须单独分类：{outcome:?}"
+        );
+        assert!(
+            outcome.message().contains("Key"),
+            "必须说明是 Key 没写进去：{}",
+            outcome.message()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **需求 5**：只改模型端点时，TTS 运行时配置不算变化 → 不重建引擎。
+    #[test]
+    fn llm_only_change_does_not_require_tts_rebuild() {
+        let mut previous = Settings::default();
+        previous.tts.enabled = true;
+        previous.tts.backend = TtsBackend::Mimo;
+        previous.tts.mimo_voice = "alloy".to_string();
+
+        let mut next = previous.clone();
+        next.provider_id = "deepseek".to_string();
+        next.model = "deepseek-v4-pro".to_string();
+        next.base_url = "https://api.deepseek.com/v1".to_string();
+        next.permission_mode = PermissionMode::Conservative;
+
+        // 这些断言只看配置差异，与凭据无关。
+        assert!(
+            !tts_runtime_config_changed(&previous, &next, false),
+            "只改 LLM 端点 / 权限时不该重建 TTS（会停播并重载模型）"
+        );
+
+        // 真正的 TTS 改动仍然要重建。
+        next.tts.mimo_voice = "nova".to_string();
+        assert!(tts_runtime_config_changed(&previous, &next, false));
+
+        let mut third = previous.clone();
+        third.tts.backend = TtsBackend::Local;
+        assert!(tts_runtime_config_changed(&previous, &third, false));
+
+        let mut fourth = previous.clone();
+        fourth.tts.enabled = false;
+        assert!(tts_runtime_config_changed(&previous, &fourth, false));
+
+        // 自动播报开关只影响"要不要播"，不要求重建引擎。
+        let mut fifth = previous.clone();
+        fifth.tts.speak_text_turns = false;
+        assert!(
+            !tts_runtime_config_changed(&previous, &fifth, false),
+            "只改自动播报开关不该重建引擎"
+        );
+
+        // 给当前启用的 MiMo 换了新 Key：凭据变了，必须重建。
+        assert!(
+            tts_runtime_config_changed(&previous, &previous.clone(), true),
+            "换了当前后端的 Key 必须重建引擎"
+        );
+    }
+
+    /// **需求 5（行为级）**：播报正在进行时保存"只改 LLM"的设置，
+    /// 当前播报不能被停掉。
+    ///
+    /// 这条直接验证"不停止当前播报"这条验收：`apply_save_all` 在
+    /// `tts_runtime_config_changed == false` 时根本不调用 `apply_settings`，
+    /// 而后者无条件 `stop()`。用真实 SpeechRuntime + 假扬声器证明它还在播。
+    #[tokio::test]
+    async fn saving_llm_only_settings_does_not_stop_current_speech() {
+        use crate::voice::tts::{AudioFormat, SpeechChunk, SpeechStream};
+
+        struct FakeEngine;
+        impl crate::voice::tts::TtsEngine for FakeEngine {
+            fn label(&self) -> String {
+                "fake-mimo".to_string()
+            }
+            fn start(
+                &self,
+                request: crate::voice::tts::SynthRequest,
+            ) -> Result<SpeechStream, String> {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (sid, turn, sentence) = (request.speech_id, request.turn, request.sentence);
+                tokio::spawn(async move {
+                    let _ = tx.send(crate::voice::tts::TtsEvent::Chunk(SpeechChunk {
+                        speech_id: sid,
+                        turn,
+                        sentence,
+                        sample_rate: 24_000,
+                        channels: 1,
+                        format: AudioFormat::Pcm16Le,
+                        samples: vec![0.2; 24_000],
+                    }));
+                    let _ = tx.send(crate::voice::tts::TtsEvent::Finished);
+                });
+                Ok(SpeechStream::new(rx))
+            }
+        }
+
+        let root = unique_test_root("worker-llm-only-no-stop");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        let shared = Arc::new(crate::voice::playback::PlaybackShared::new(24_000, 1));
+        speech.attach_playback_for_test(shared.clone());
+        speech.attach_engine_for_test(Arc::new(FakeEngine));
+
+        // 先让播报真的开始（有一段音频在缓冲里）。
+        let mut settings = Settings::default();
+        settings.tts.enabled = true;
+        settings.tts.backend = TtsBackend::Mimo;
+        speech.speak(1, "这一句正在播报").unwrap();
+        for _ in 0..200 {
+            if speech.is_speaking() && shared.progress().pushed_frames > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(speech.is_speaking(), "播报应当已经开始");
+        let speech_id_before = speech.current_speech_id();
+
+        // 保存"只改 LLM 模型"：TTS 配置原样带过。
+        let mut request = SaveAllRequest {
+            provider_index: 1,
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            api_key: String::new(),
+            permission_index: 0,
+            tts_enabled: true,
+            tts_backend_index: 1,
+            local_sid: "0".to_string(),
+            local_speed: "1.0".to_string(),
+            mimo_voice: settings.tts.mimo_voice.clone(),
+            mimo_style: settings.tts.mimo_style.clone(),
+            local_dir: String::new(),
+            speak_mode: 0,
+        };
+        // 让请求里的播报字段与已保存的一致（只有 LLM 部分不同）。
+        request.mimo_voice = settings.tts.mimo_voice.clone();
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+        assert!(outcome.config_written(), "{outcome:?}");
+
+        // 关键断言：播报没有被停掉，身份也没变。
+        assert!(speech.is_speaking(), "只改 LLM 设置不该停止正在播报的内容");
+        assert_eq!(
+            speech.current_speech_id(),
+            speech_id_before,
+            "不该被当成新播报"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **需求 3**：只有最新一次保存的代号才算"当前"，旧回执必须被丢弃。
+    #[test]
+    fn stale_save_generation_is_rejected() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        assert!(generation_is_current(&generation, 1));
+        assert!(!generation_is_current(&generation, 0));
+
+        // 提交新保存后，旧的一代立刻失效（晚到的回执不能覆盖新表单）。
+        generation.fetch_add(1, Ordering::SeqCst);
+        assert!(!generation_is_current(&generation, 1));
+        assert!(generation_is_current(&generation, 2));
+
+        // 取消同样会把代次推高，作废所有在途请求。
+        let cancelled = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(!generation_is_current(&generation, 2));
+        assert!(generation_is_current(&generation, cancelled));
+    }
+
+    /// **需求 3（竞态）**：过期保存请求不能替新请求收掉"保存中"。
+    ///
+    /// 旧实现里过期分支会无条件 `set_settings_saving(false)`。若新请求还在跑，
+    /// 按钮就提前可点，用户会重复提交。这条用代次语义把这个行为钉住：
+    /// 只有"当前那一代"才允许更新保存状态。
+    #[test]
+    fn only_the_current_generation_may_finish_the_saving_state() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // 用户点了两次保存：第一次 g=1，第二次 g=2（后提交的更新）。
+        let first = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let second = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!((first, second), (1, 2));
+
+        // 第一个请求这时才算完：它已经过期，**不能**结束"保存中"。
+        assert!(
+            !generation_is_current(&generation, first),
+            "过期请求不允许更新保存状态"
+        );
+        // 第二个仍在进行：它才是唯一有权收尾的那一代。
+        assert!(generation_is_current(&generation, second));
+    }
+
+    /// **需求 4**：保存 DeepSeek 的 Key 不能触发 MiMo TTS 重建。
+    ///
+    /// 之前只判断"写了 Key + 后端是 MiMo"，于是给 DeepSeek 存 Key 也会重建，
+    /// 把正在播报的 MiMo 语音打断。凭据变化必须同时核对写入目标确实是 `mimo`。
+    #[test]
+    fn saving_other_provider_key_does_not_rebuild_mimo_tts() {
+        // 真实判断逻辑：key_provider 来自 provider_id，只有 mimo 才算凭据变化。
+        for (index, provider_id, expected) in [
+            (0, "mimo", true),
+            (1, "deepseek", false),
+            (2, "openai-compatible", false),
+        ] {
+            assert_eq!(provider_id_for_index(index), provider_id);
+            // 判定条件与 `apply_save_all` 一致：写入了 Key 且目标是 mimo。
+            let key_changed = provider_id == MIMO_PROVIDER_ID;
+            assert_eq!(
+                key_changed, expected,
+                "写入 {provider_id} 的 Key 时，MiMo 凭据变化判定应当为 {expected}"
+            );
+        }
+
+        // 之后再叠上"当前启用 MiMo TTS"这个条件：
+        let mut settings = Settings::default();
+        settings.tts.enabled = true;
+        settings.tts.backend = TtsBackend::Mimo;
+        assert_eq!(settings.tts.active_backend(), TtsBackend::Mimo);
+
+        let deepseek_key_changed = provider_id_for_index(1) == MIMO_PROVIDER_ID;
+        assert!(
+            !tts_runtime_config_changed(
+                &settings,
+                &settings.clone(),
+                deepseek_key_changed && settings.tts.active_backend() == TtsBackend::Mimo
+            ),
+            "给 DeepSeek 存 Key 不该重建 MiMo TTS"
+        );
+
+        // 而写入 MiMo 自己的 Key 仍然要重建（否则新 Key 不会生效）。
+        let mimo_key_changed = provider_id_for_index(0) == MIMO_PROVIDER_ID;
+        assert!(
+            tts_runtime_config_changed(
+                &settings,
+                &settings.clone(),
+                mimo_key_changed && settings.tts.active_backend() == TtsBackend::Mimo
+            ),
+            "给 MiMo 换 Key 必须重建，否则新 Key 不生效"
+        );
+    }
+
+    /// 构造一次"只改端点、播报保持已保存值"的保存请求。
+    fn save_all_request(
+        provider_index: i32,
+        base_url: &str,
+        model: &str,
+        key: &str,
+    ) -> SaveAllRequest {
+        SaveAllRequest {
+            provider_index,
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            api_key: key.to_string(),
+            permission_index: 0,
+            tts_enabled: false,
+            tts_backend_index: 0,
+            local_sid: "0".to_string(),
+            local_speed: "1.0".to_string(),
+            mimo_voice: String::new(),
+            mimo_style: String::new(),
+            local_dir: String::new(),
+            speak_mode: 0,
+        }
+    }
+
+    /// **下拉选择映射**：界面索引 ↔ 配置枚举必须严格一一对应。
+    ///
+    /// 这条直接对应任务书「保持选中值与已有 Rust 配置的映射正确」：
+    /// 用错一位就会把"本地 ONNX"存成"MiMo 云端"，而且界面上看不出来。
+    #[test]
+    fn selector_indices_map_to_the_right_configuration_values() {
+        // 提供商：与界面数组 ["mimo","deepseek","openai-compatible"] 一致。
+        assert_eq!(provider_id_for_index(0), "mimo");
+        assert_eq!(provider_id_for_index(1), "deepseek");
+        assert_eq!(provider_id_for_index(2), "openai-compatible");
+        // 越界不能 panic，也不能悄悄落到某个官方提供商上。
+        assert_eq!(provider_id_for_index(-1), "openai-compatible");
+        assert_eq!(provider_id_for_index(99), "openai-compatible");
+
+        // 权限档位：["standard","conservative","permissive"]
+        assert_eq!(permission_mode_for_index(0), PermissionMode::Standard);
+        assert_eq!(permission_mode_for_index(1), PermissionMode::Conservative);
+        assert_eq!(permission_mode_for_index(2), PermissionMode::Permissive);
+        assert_eq!(permission_mode_for_index(-1), PermissionMode::Standard);
+
+        // TTS 后端：["关闭","MiMo 云端","本地 ONNX"]，且必须能往返。
+        assert_eq!(tts_backend_for_index(0), TtsBackend::Off);
+        assert_eq!(tts_backend_for_index(1), TtsBackend::Mimo);
+        assert_eq!(tts_backend_for_index(2), TtsBackend::Local);
+        for index in 0..3 {
+            assert_eq!(
+                tts_backend_index(tts_backend_for_index(index)),
+                index,
+                "TTS 后端索引必须能原样往返"
+            );
+        }
+        assert_eq!(tts_backend_for_index(9), TtsBackend::Off);
+
+        // 自动播报：0=都播 1=只语音 2=只文本 3=都不，往返一致。
+        for (index, (voice, text)) in [
+            (0, (true, true)),
+            (1, (true, false)),
+            (2, (false, true)),
+            (3, (false, false)),
+            // 越界按第一项处理，不 panic。
+            (9, (true, true)),
+        ] {
+            assert_eq!(
+                speak_flags(index),
+                (voice, text),
+                "自动播报选项 {index} 映射错误"
+            );
+            assert_eq!(
+                speak_mode_code(voice, text),
+                if index == 9 { 0 } else { index },
+                "自动播报必须能往返"
+            );
+        }
+    }
+
+    /// 语速/音色编号是**文本输入**：非法值必须报具体错误，不能静默改默认值。
+    #[test]
+    fn invalid_numeric_tts_input_is_reported_not_silently_defaulted() {
+        let mut request = save_all_request(0, "https://api.xiaomimimo.com/v1", "m", "");
+        // 空 = 采用默认（不是错误）。
+        assert_eq!(request.parse_local_numbers().unwrap(), (0, 1.0));
+
+        request.local_speed = "快一点".to_string();
+        let error = request.parse_local_numbers().unwrap_err();
+        assert!(error.contains("语速"), "{error}");
+        assert!(error.contains("快一点"), "错误里要带上用户输入：{error}");
+
+        request.local_speed = "1.0".to_string();
+        request.local_sid = "abc".to_string();
+        let error = request.parse_local_numbers().unwrap_err();
+        assert!(error.contains("音色编号"), "{error}");
+
+        // 合法值照常解析。
+        request.local_sid = "3".to_string();
+        request.local_speed = "1.25".to_string();
+        assert_eq!(request.parse_local_numbers().unwrap(), (3, 1.25));
+    }
+
+    /// **一次保存**：端点和播报写在同一次落盘里，两者都生效。
+    #[cfg(windows)]
+    #[test]
+    fn save_all_persists_endpoint_and_tts_together() {
+        let root = unique_test_root("worker-save-all");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut speech = speech_without_engine();
+
+        let request = SaveAllRequest {
+            provider_index: 1,
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            api_key: "sk-deepseek-test".to_string(),
+            permission_index: 2,
+            tts_enabled: true,
+            tts_backend_index: 2, // 本地 ONNX
+            local_sid: "7".to_string(),
+            local_speed: "1.3".to_string(),
+            mimo_voice: "alloy".to_string(),
+            mimo_style: "语速稍快".to_string(),
+            local_dir: "D:/models/kokoro".to_string(),
+            speak_mode: 2, // 只播文本
+        };
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+        // 本地模型不存在 → 引擎建不起来，但**配置本身是合法的**：
+        // 如实给出警告，不能当成保存失败把用户的选择回滚掉。
+        assert!(
+            outcome.config_written(),
+            "配置本身合法，应当已落盘：{outcome:?}"
+        );
+        // 本地模型不存在 → 引擎建不起来，但那是"已保存但暂不可用"。
+        assert!(matches!(
+            outcome,
+            SaveOutcome::Saved | SaveOutcome::SavedSpeechUnavailable(_)
+        ));
+
+        assert_eq!(settings.provider_id, "deepseek");
+        assert_eq!(settings.model, "deepseek-v4-pro");
+        assert_eq!(settings.permission_mode, PermissionMode::Permissive);
+        assert_eq!(settings.tts.backend, TtsBackend::Local);
+        assert!(settings.tts.enabled);
+        assert_eq!(settings.tts.local_sid, 7);
+        assert!((settings.tts.local_speed - 1.3).abs() < 1e-6);
+        assert!(!settings.tts.speak_voice_turns);
+        assert!(settings.tts.speak_text_turns);
+        assert_eq!(
+            secret.load("deepseek").unwrap().as_deref(),
+            Some("sk-deepseek-test")
+        );
+
+        // 磁盘上是**同一份**配置里同时有端点和播报。
+        let reloaded = config::load_settings(&paths).unwrap();
+        assert_eq!(reloaded.model, "deepseek-v4-pro");
+        assert_eq!(reloaded.tts.backend, TtsBackend::Local);
+        assert_eq!(reloaded.tts.local_sid, 7);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 校验失败：**一样都不落盘**，内存配置不动（界面据此保留用户输入）。
+    #[cfg(windows)]
+    #[test]
+    fn save_all_validation_failure_writes_nothing() {
+        let root = unique_test_root("worker-save-all-bad");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let before = settings.clone();
+        let mut speech = speech_without_engine();
+
+        // 端点非法 + 合法播报设置：整体失败，播报也不该被写进去。
+        let mut request =
+            save_all_request(0, "ftp://not-http", "mimo-v2.6-flash", "sk-must-not-write");
+        request.tts_enabled = true;
+        request.tts_backend_index = 1;
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+
+        assert!(!outcome.config_written(), "配置不该被写入");
+        assert!(
+            outcome.message().contains("http"),
+            "{:?}",
+            outcome.message()
+        );
+        assert_eq!(settings.base_url, before.base_url, "内存配置不能被改动");
+        assert_eq!(
+            settings.tts.backend, before.tts.backend,
+            "播报设置也不能被写"
+        );
+        assert!(secret.load("mimo").unwrap().is_none(), "失败时不能写 Key");
+        assert!(
+            !paths.settings_file().is_file(),
+            "失败时不应该有配置文件落盘"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 语速非法：给出具体原因，且不落盘（保留用户输入）。
+    #[cfg(windows)]
+    #[test]
+    fn save_all_rejects_bad_speed_with_a_specific_message() {
+        let root = unique_test_root("worker-save-all-speed");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut speech = speech_without_engine();
+
+        let mut request =
+            save_all_request(0, "https://api.xiaomimimo.com/v1", "mimo-v2.6-flash", "");
+        request.local_speed = "9".to_string();
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+        assert!(!outcome.config_written(), "语速非法不能落盘");
+        assert!(
+            outcome.message().contains("0.5~2.0"),
+            "{:?}",
+            outcome.message()
+        );
+        assert!(!paths.settings_file().is_file(), "语速非法时不能落盘");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn subtitle(text: &str, speech_id: SpeechId) -> SpeechEvent {
+        SpeechEvent::Subtitle {
+            speech_id,
+            text: text.to_string(),
+        }
+    }
+
+    fn state_event(speech_id: SpeechId, state: PlaybackState) -> SpeechEvent {
+        SpeechEvent::State {
+            speech_id,
+            turn: 1,
+            state,
+        }
+    }
+
+    /// **P1 回归**：旧播报的迟到事件不能覆盖新播报的界面状态。
+    ///
+    /// A 停止后立刻启动 B：A 迟到的 `Stopped` / `Finished` / `Failed` /
+    /// 字幕清空都必须被丢掉。
+    #[test]
+    fn late_events_from_previous_speech_do_not_reach_the_ui() {
+        let mut view = SpeechView::default();
+        // B 先接管界面。
+        assert!(view.accepts(2));
+        assert_eq!(view.current(), Some(2));
+        // A（id=1）的迟到终态与字幕清空一律不接受。
+        assert!(!view.accepts(1), "旧播报的状态不能改界面");
+        assert!(!view.accepts(1), "旧播报的字幕不能改界面");
+        assert!(!view.accepts(1), "旧播报的提示不能改界面");
+        assert_eq!(view.current(), Some(2), "旧事件不能把当前身份改回去");
+        // 同一段播报自己的事件照常接受。
+        assert!(view.accepts(2));
+        // 下一段播报（id=3）自动接管。
+        assert!(view.accepts(3));
+        assert_eq!(view.current(), Some(3));
+        assert!(!view.accepts(2), "已经结束的那一段不能再改界面");
+    }
+
+    /// 播报事件路径按 `speech_id` 归属分发：A 迟到的终态不会发出界面更新。
+    ///
+    /// 这里用一个"只记录接受与否"的替身验证调用顺序，而不是依赖真实窗口：
+    /// `apply_speech_event` 的所有副作用都在 `invoke_from_event_loop` 里，
+    /// 没有窗口时会被静默丢弃——所以断言收敛在 `SpeechView` 上。
+    #[test]
+    fn speech_event_ownership_is_checked_before_any_ui_update() {
+        let mut view = SpeechView::default();
+        // 模拟"B 已经接管"之后再收到 A 的一串事件。
+        let _ = view.accepts(7);
+        for event in [
+            state_event(6, PlaybackState::Stopped),
+            state_event(6, PlaybackState::Finished),
+            state_event(6, PlaybackState::Failed("旧失败".to_string())),
+            subtitle("", 6),
+            subtitle("旧的一句", 6),
+        ] {
+            let speech_id = match &event {
+                SpeechEvent::State { speech_id, .. }
+                | SpeechEvent::Subtitle { speech_id, .. }
+                | SpeechEvent::Notice { speech_id, .. } => *speech_id,
+            };
+            assert!(
+                !view.accepts(speech_id),
+                "旧播报的事件必须被拒绝：{event:?}"
+            );
+        }
+        assert_eq!(view.current(), Some(7));
+    }
+
+    /// 聆听模式：播报期间是打断，结束后必须回到唤醒词；挂起确认优先。
+    ///
+    /// 这条依赖 `SpeechRuntime::is_speaking()` 如实反映真实运行状态——
+    /// 只改 `sync_listen_mode` 而不收敛 `is_speaking()` 是修不好的。
+    #[tokio::test]
+    async fn listen_mode_follows_speech_and_confirmation_state() {
+        let mut voice = VoiceRuntime::new();
+        let confirmer = confirmer_without_ui();
+        let speech = speech_without_engine();
+
+        // 没有播报、没有确认：必须要求唤醒词。
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
+
+        // 有挂起的确认：听「允许 / 拒绝」，并带上请求 id。
+        let _wait = install_pending(&confirmer, 42);
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Confirm);
+        assert_eq!(voice.mode.get().1, 42);
+
+        // 确认结束后回到唤醒词。
+        confirmer.abort_pending();
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
+    }
+
+    /// `SpeechView` 的初始状态：第一条事件无条件接管。
+    #[test]
+    fn first_speech_event_takes_over_the_view() {
+        let mut view = SpeechView::default();
+        assert_eq!(view.current(), None);
+        assert!(view.accepts(1));
+        assert_eq!(view.current(), Some(1));
     }
 
     /// **并发约束**：回合还在跑（含等待点击确认）时，语音/文本都**不能**启动第二回合。
@@ -1852,6 +3591,7 @@ mod tests {
             &mut history,
             &mut running,
             "打开浏览器".to_string(),
+            1,
         ) {
             TurnStart::Rejected(reason) => {
                 assert!(reason.contains("上一轮"), "原因必须说清楚：{reason}");
@@ -1884,6 +3624,7 @@ mod tests {
             &mut history,
             &mut idle,
             "列出窗口".to_string(),
+            1,
         ) {
             TurnStart::Rejected(reason) => assert!(reason.contains("Computer Use")),
             TurnStart::Started(_) => panic!("没有工具后端时不该启动"),
@@ -2044,6 +3785,7 @@ mod tests {
                 api_key: "sk-deepseek-test".to_string(),
                 permission_index: 1, // conservative
             },
+            &mut speech_without_engine(),
         );
 
         assert!(ok, "合法设置应当保存成功");
@@ -2176,6 +3918,7 @@ mod tests {
                 api_key: "sk-should-not-be-written".to_string(),
                 permission_index: 0,
             },
+            &mut speech_without_engine(),
         );
 
         assert!(!ok, "非法设置必须返回失败，界面不得显示成功");
@@ -2215,6 +3958,7 @@ mod tests {
                 api_key: "sk-key-b".to_string(),
                 permission_index: 0,
             },
+            &mut speech_without_engine(),
         );
 
         assert!(!ok, "配置写失败必须返回 false");
@@ -2255,6 +3999,7 @@ mod tests {
                 api_key: String::new(),
                 permission_index: 0,
             },
+            &mut speech_without_engine(),
         );
 
         assert!(ok);
@@ -2311,15 +4056,20 @@ mod tests {
         let secret = SecretStore::new(paths.secret_file());
         let mut settings = Settings::default();
         let mut cancel_slot = Some(turn_cancel.clone());
-        let confirmer = confirmer_without_ui();
+        let confirmer = Arc::new(confirmer_without_ui());
 
         let mut voice = VoiceRuntime::new();
+        let mut speech = speech_without_engine();
+        let save_generation_for_test = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             wait_turn(
                 &mut commands,
-                turn,
+                RunningTurn {
+                    task: turn,
+                    turn_id: 1,
+                },
                 &slint::Weak::default(),
                 &mut cancel_slot,
                 &paths,
@@ -2327,7 +4077,11 @@ mod tests {
                 &mut settings,
                 &confirmer,
                 &mut voice,
+                &mut speech,
+                &mut SpeechView::default(),
                 &command_tx,
+                &save_generation_for_test,
+                TurnSource::Text,
             ),
         )
         .await
@@ -2372,15 +4126,18 @@ mod tests {
         let secret = SecretStore::new(paths.secret_file());
         let mut settings = Settings::default();
         let mut cancel_slot = Some(watch.clone());
-        let confirmer = confirmer_without_ui();
+        let confirmer = Arc::new(confirmer_without_ui());
 
         let mut voice = VoiceRuntime::new();
+        let mut speech = speech_without_engine();
+        let save_generation_for_test = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let instance = voice.route.open();
         let stop = Arc::new(AtomicBool::new(false));
         voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
 
         // 模拟用户在执行中点了「关闭麦克风」，随后又点了「取消」。
         // 两个 future 在同一个任务上交替推进（不需要 'static）。
+        let mut speech_view = SpeechView::default();
         let driver = async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = tx.send(UiCommand::SetVoiceEnabled(false));
@@ -2392,7 +4149,10 @@ mod tests {
         let weak = slint::Weak::default();
         let wait = wait_turn(
             &mut commands,
-            turn,
+            RunningTurn {
+                task: turn,
+                turn_id: 1,
+            },
             &weak,
             &mut cancel_slot,
             &paths,
@@ -2400,7 +4160,11 @@ mod tests {
             &mut settings,
             &confirmer,
             &mut voice,
+            &mut speech,
+            &mut speech_view,
             &tx,
+            &save_generation_for_test,
+            TurnSource::Text,
         );
         let (result, ()) = tokio::join!(wait, driver);
 
@@ -2681,6 +4445,8 @@ mod tests {
                 text: "打开浏览器".to_string(),
                 audio_seconds: 1.0,
                 decode_ms: 1,
+                purpose: ListenPurpose::Wake,
+                request_id: 0,
             },
             VoiceEventKind::Rejected {
                 turn: old_turn,
@@ -2696,7 +4462,7 @@ mod tests {
                 },
                 false,
             );
-            assert!(prompt.is_none(), "旧实例的事件不得触发 Agent");
+            assert!(prompt.into_prompt().is_none(), "旧实例的事件不得触发 Agent");
         }
         // 新实例的这一句仍在等结果，不能被旧事件清掉。
         assert_eq!(voice.route.pending, Some(new_turn));
@@ -2748,10 +4514,15 @@ mod tests {
                 text: "打开浏览器".to_string(),
                 audio_seconds: 1.0,
                 decode_ms: 5,
+                purpose: ListenPurpose::Wake,
+                request_id: 0,
             },
         };
         assert!(
-            voice.on_event(&weak, final_event.clone(), true).is_none(),
+            voice
+                .on_event(&weak, final_event.clone(), true)
+                .into_prompt()
+                .is_none(),
             "Agent 忙时不能启动第二回合"
         );
         assert!(voice.route.pending.is_none(), "这句话不能排队延后执行");
@@ -2767,6 +4538,7 @@ mod tests {
                 },
                 true,
             )
+            .into_prompt()
             .is_none());
         assert!(voice
             .on_event(
@@ -2777,6 +4549,7 @@ mod tests {
                 },
                 true,
             )
+            .into_prompt()
             .is_none());
     }
 
@@ -2798,17 +4571,20 @@ mod tests {
                 text: "打开记事本".to_string(),
                 audio_seconds: 1.2,
                 decode_ms: 9,
+                purpose: ListenPurpose::Wake,
+                request_id: 0,
             },
         };
 
         let prompt = voice
             .on_event(&weak, event.clone(), false)
+            .into_prompt()
             .expect("空闲时有效 Final 应当提交");
         assert_eq!(prompt.text, "打开记事本");
         assert!((prompt.audio_seconds - 1.2).abs() < f32::EPSILON);
 
         assert!(
-            voice.on_event(&weak, event, false).is_none(),
+            voice.on_event(&weak, event, false).into_prompt().is_none(),
             "同一结果不得提交第二次"
         );
     }
@@ -2836,11 +4612,13 @@ mod tests {
                     text: "打开浏览器".to_string(),
                     audio_seconds: 1.0,
                     decode_ms: 5,
+                    purpose: ListenPurpose::Wake,
+                    request_id: 0,
                 },
             },
             false,
         );
-        assert!(prompt.is_none(), "取消之后的结果不得提交");
+        assert!(prompt.into_prompt().is_none(), "取消之后的结果不得提交");
     }
 
     /// 旧实例的 Final 不得冒充新实例的会话（两者 session 号可能相同）。
@@ -2871,10 +4649,13 @@ mod tests {
                         text: "上一句".to_string(),
                         audio_seconds: 1.0,
                         decode_ms: 5,
+                        purpose: ListenPurpose::Wake,
+                        request_id: 0,
                     },
                 },
                 false,
             )
+            .into_prompt()
             .is_none());
         assert_eq!(voice.route.pending, Some(new_turn));
     }

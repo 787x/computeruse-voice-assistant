@@ -72,43 +72,51 @@ use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-/// 流式重采样器：44.1k / 48k / 32k 等设备采样率 → 16k。
+/// rubato 每次处理的输入帧数。40ms（16k 下）一块：延迟可控，CPU 也不至于每 10ms 跑一次滤波。
+const RESAMPLE_CHUNK_FRAMES: usize = 640;
+
+/// 任意采样率之间的流式重采样（带抗混叠低通的加窗 sinc）。
 ///
 /// 用 rubato 的 `SincFixedIn`（固定输入块、变化输出块）。它内部保留滤波器状态，
 /// 所以可以一块一块地喂，块边界不会有咔哒声或相位跳变。
 ///
-/// 采样率本来就是 16k 时不构造重采样器，直接透传（避免无意义开销与延迟）。
-pub struct StreamingResampler {
+/// 两个用途共用同一份实现，避免出现两套质量不一致的重采样：
+///  - 采集：设备采样率 → 16k（[`StreamingResampler`] 是它在采集链路上的薄封装）；
+///  - 播放：TTS 的源采样率（MiMo 24k / 本地模型 22.05k 或 24k）→ 输出设备采样率。
+///
+/// 输入输出采样率相同时不构造重采样器，直接透传（避免无意义开销与延迟）。
+pub struct RateConverter {
     inner: Option<SincFixedIn<f32>>,
     /// 攒够一个输入块才送进 rubato；不足的部分留在缓冲里。
     pending: Vec<f32>,
     /// rubato 当前要求的输入帧数（构造时固定）。
     chunk_frames: usize,
     input_rate: u32,
-    /// 已丢弃的样本数（输出端）。设备失效重建时用于对齐时间。
+    output_rate: u32,
     total_in: u64,
     total_out: u64,
 }
 
-/// rubato 每次处理的输入帧数。40ms 一块：延迟可控，CPU 也不至于每 10ms 跑一次滤波。
-const RESAMPLE_CHUNK_FRAMES: usize = 640;
-
-impl StreamingResampler {
-    pub fn new(input_rate: u32) -> Result<Self, String> {
+impl RateConverter {
+    pub fn new(input_rate: u32, output_rate: u32) -> Result<Self, String> {
         if input_rate == 0 {
-            return Err("设备采样率无效（0）".to_string());
+            return Err("源采样率无效（0）".to_string());
         }
-        if input_rate == TARGET_SAMPLE_RATE {
+        if output_rate == 0 {
+            return Err("目标采样率无效（0）".to_string());
+        }
+        if input_rate == output_rate {
             return Ok(Self {
                 inner: None,
                 pending: Vec::new(),
                 chunk_frames: RESAMPLE_CHUNK_FRAMES,
                 input_rate,
+                output_rate,
                 total_in: 0,
                 total_out: 0,
             });
         }
-        let ratio = TARGET_SAMPLE_RATE as f64 / input_rate as f64;
+        let ratio = output_rate as f64 / input_rate as f64;
         let parameters = SincInterpolationParameters {
             sinc_len: 128,
             f_cutoff: 0.925,
@@ -117,12 +125,15 @@ impl StreamingResampler {
             window: WindowFunction::BlackmanHarris2,
         };
         let inner = SincFixedIn::<f32>::new(ratio, 1.0, parameters, RESAMPLE_CHUNK_FRAMES, 1)
-            .map_err(|error| format!("无法构造重采样器（{input_rate} → 16000）：{error}"))?;
+            .map_err(|error| {
+                format!("无法构造重采样器（{input_rate} → {output_rate}）：{error}")
+            })?;
         Ok(Self {
             inner: Some(inner),
             pending: Vec::with_capacity(RESAMPLE_CHUNK_FRAMES * 2),
             chunk_frames: RESAMPLE_CHUNK_FRAMES,
             input_rate,
+            output_rate,
             total_in: 0,
             total_out: 0,
         })
@@ -132,11 +143,15 @@ impl StreamingResampler {
         self.input_rate
     }
 
+    pub fn output_rate(&self) -> u32 {
+        self.output_rate
+    }
+
     pub fn is_passthrough(&self) -> bool {
         self.inner.is_none()
     }
 
-    /// 喂一块**单声道**样本（已下混），返回这次能输出的 16k 样本。
+    /// 喂一块**单声道**样本（已下混），返回这次能输出的样本。
     ///
     /// 输出长度不固定（与输入块长度、滤波延迟有关），调用方不要假设一一对应。
     pub fn push(&mut self, mono: &[f32]) -> Result<Vec<f32>, String> {
@@ -161,7 +176,7 @@ impl StreamingResampler {
         Ok(out)
     }
 
-    /// 收尾：把滤波延迟里剩下的样本冲出来。停止采集时调用一次。
+    /// 收尾：把滤波延迟里剩下的样本冲出来。一段音频结束时调用一次。
     pub fn flush(&mut self) -> Result<Vec<f32>, String> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(Vec::new());
@@ -187,6 +202,39 @@ impl StreamingResampler {
 
     pub fn totals(&self) -> (u64, u64) {
         (self.total_in, self.total_out)
+    }
+}
+
+/// 采集链路的重采样器：设备采样率 → 16k。
+///
+/// 只是 [`RateConverter`] 在语音输入上的固定目标封装，行为与原来完全一致。
+pub struct StreamingResampler(RateConverter);
+
+impl StreamingResampler {
+    pub fn new(input_rate: u32) -> Result<Self, String> {
+        Ok(Self(RateConverter::new(input_rate, TARGET_SAMPLE_RATE)?))
+    }
+
+    pub fn input_rate(&self) -> u32 {
+        self.0.input_rate()
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        self.0.is_passthrough()
+    }
+
+    /// 喂一块**单声道**样本（已下混），返回这次能输出的 16k 样本。
+    pub fn push(&mut self, mono: &[f32]) -> Result<Vec<f32>, String> {
+        self.0.push(mono)
+    }
+
+    /// 收尾：把滤波延迟里剩下的样本冲出来。停止采集时调用一次。
+    pub fn flush(&mut self) -> Result<Vec<f32>, String> {
+        self.0.flush()
+    }
+
+    pub fn totals(&self) -> (u64, u64) {
+        self.0.totals()
     }
 }
 
@@ -357,5 +405,53 @@ mod tests {
         let mut resampler = StreamingResampler::new(16_000).unwrap();
         let _ = resampler.push(&vec![0.1; 160]).unwrap();
         assert_eq!(resampler.totals(), (160, 160));
+    }
+
+    /// 播放链路要处理的组合：TTS 24k / 本地模型 22.05k → 设备 48k / 44.1k，
+    /// 以及向下（24k → 16k）。长度按比例、能量不塌、峰值正常。
+    #[test]
+    fn rate_converter_handles_tts_and_device_rates() {
+        for (from, to) in [
+            (24_000u32, 48_000u32),
+            (22_050, 44_100),
+            (24_000, 16_000),
+            (32_000, 48_000),
+        ] {
+            let input = sine(440.0, from, 1.0);
+            let mut converter = RateConverter::new(from, to).unwrap();
+            assert!(!converter.is_passthrough());
+            let mut out = Vec::new();
+            // 模拟网络/模型的不均匀分片：故意用与设备无关的块长。
+            for chunk in input.chunks(1023) {
+                out.extend(converter.push(chunk).unwrap());
+            }
+            out.extend(converter.flush().unwrap());
+
+            let expected = input.len() as f64 * to as f64 / from as f64;
+            assert!(
+                (out.len() as f64 - expected).abs() < expected * 0.02,
+                "{from} → {to}: 输出 {} 帧，期望约 {expected:.0}",
+                out.len()
+            );
+            let mid = &out[out.len() / 4..out.len() * 3 / 4];
+            let ratio = energy(mid) / energy(&input[input.len() / 4..input.len() * 3 / 4]);
+            assert!(
+                (ratio - 1.0).abs() < 0.15,
+                "{from} → {to}: 能量比 {ratio:.3} 偏离过大"
+            );
+            assert!(peak(mid) < 0.8, "{from} → {to}: 峰值 {} 异常", peak(mid));
+        }
+    }
+
+    #[test]
+    fn rate_converter_passes_through_equal_rates() {
+        let mut converter = RateConverter::new(24_000, 24_000).unwrap();
+        assert!(converter.is_passthrough());
+        let input = vec![0.25f32; 480];
+        assert_eq!(converter.push(&input).unwrap(), input);
+        assert_eq!(converter.output_rate(), 24_000);
+        assert!(converter.flush().unwrap().is_empty());
+        assert!(RateConverter::new(0, 48_000).is_err());
+        assert!(RateConverter::new(24_000, 0).is_err());
     }
 }

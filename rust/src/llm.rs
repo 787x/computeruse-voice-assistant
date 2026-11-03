@@ -837,7 +837,7 @@ impl LlmClient {
 ///
 /// 返回 `(事件结束位置, 分隔符长度)`。SSE 允许 `\n\n`、`\r\n\r\n` 以及混合写法，
 /// 这里按字节匹配，因此即使分隔符本身被拆在两个网络块之间也能正确识别。
-fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     for index in 0..buffer.len() {
         // \n\n
         if buffer[index] == b'\n' && buffer.get(index + 1) == Some(&b'\n') {
