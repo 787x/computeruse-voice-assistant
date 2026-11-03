@@ -49,26 +49,15 @@ pub enum UiCommand {
     StopSpeaking,
     /// 试音：合成一句固定的话（验证后端/设备，不产生 Agent 回合）。
     SpeakTest,
-    /// 保存设置（含可选的新 Key）。
-    SaveSettings {
-        provider_index: i32,
-        base_url: String,
-        model: String,
-        api_key: String,
-        permission_index: i32,
+    /// **一次保存**：模型端点 + 语音播报一起提交（界面上的「保存」只发这一条）。
+    SaveAll {
+        request: SaveAllRequest,
+        /// 回执：`true` = 已落盘并生效，`false` = 失败（原因已写进界面）。
+        /// 用同步通道是因为 Slint 的保存回调需要**当场**返回结果。
+        reply: std::sync::mpsc::Sender<bool>,
     },
-    /// 保存语音合成设置（独立入口：与模型端点设置互不覆盖）。
-    SaveTtsSettings {
-        enabled: bool,
-        backend_index: i32,
-        mimo_voice: String,
-        mimo_style: String,
-        local_dir: String,
-        local_sid: i32,
-        local_speed: f32,
-        speak_voice_turns: bool,
-        speak_text_turns: bool,
-    },
+    /// 关闭设置面板（取消）：丢弃界面上的未保存修改，重新按已保存配置回填。
+    CancelSettings,
     /// 清除**指定提供商**的 Key（界面当前选中的那一家）。
     ///
     /// 必须带 provider_id：设置页可以切到别家而不保存，
@@ -201,18 +190,69 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        /*
+         * **一次保存**：模型端点与语音播报一起提交。
+         *
+         * 这里必须同步返回结果，因为 Slint 侧用它决定"要不要清脏标记、
+         * 要不要关面板"——异步命令会导致"按钮点了没反应"或"关了面板但没保存"。
+         * 工作线程持有权威配置，所以走 `SaveAll` 命令并在通道上等待回执。
+         */
         let tx = command_tx.clone();
-        window.on_save_settings(
-            move |provider_index, base_url, model, api_key, permission_index| {
-                let _ = tx.send(UiCommand::SaveSettings {
+        let weak = window.as_weak();
+        window.on_save_all(
+            move |provider_index,
+                  base_url,
+                  model,
+                  api_key,
+                  permission_index,
+                  tts_enabled,
+                  tts_backend_index,
+                  mimo_voice,
+                  mimo_style,
+                  local_dir,
+                  local_sid,
+                  local_speed,
+                  speak_mode| {
+                let request = SaveAllRequest {
                     provider_index,
                     base_url: base_url.to_string(),
                     model: model.to_string(),
                     api_key: api_key.to_string(),
                     permission_index,
-                });
+                    tts_enabled,
+                    tts_backend_index,
+                    mimo_voice: mimo_voice.to_string(),
+                    mimo_style: mimo_style.to_string(),
+                    local_dir: local_dir.to_string(),
+                    local_sid: local_sid.to_string(),
+                    local_speed: local_speed.to_string(),
+                    speak_mode,
+                };
+                let (reply, wait) = std::sync::mpsc::channel();
+                if tx.send(UiCommand::SaveAll { request, reply }).is_err() {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_settings_error("后台线程已退出，设置没有保存".into());
+                    }
+                    return false;
+                }
+                // 工作线程会先回填界面（成功即关闭面板），再回执。
+                match wait.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(saved) => saved,
+                    Err(_) => {
+                        if let Some(window) = weak.upgrade() {
+                            window.set_settings_error("保存超时：设置可能没有生效，请重试".into());
+                        }
+                        false
+                    }
+                }
             },
         );
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_cancel_settings(move || {
+            let _ = tx.send(UiCommand::CancelSettings);
+        });
     }
     {
         let tx = command_tx.clone();
@@ -279,40 +319,6 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         window.on_test_voice(move || {
             let _ = tx.send(UiCommand::SpeakTest);
         });
-    }
-    {
-        let tx = command_tx.clone();
-        window.on_save_tts_settings(
-            move |enabled,
-                  backend_index,
-                  mimo_voice,
-                  mimo_style,
-                  local_dir,
-                  local_sid,
-                  local_speed,
-                  speak_voice,
-                  speak_text| {
-                // 音色编号/语速是文本输入：解析失败按"无效值"处理，
-                // 由 `TtsSettings::normalized` 给出可读错误，而不是静默改成默认值。
-                let sid = local_sid.to_string().trim().parse::<i32>().unwrap_or(-1);
-                let speed = local_speed
-                    .to_string()
-                    .trim()
-                    .parse::<f32>()
-                    .unwrap_or(f32::NAN);
-                let _ = tx.send(UiCommand::SaveTtsSettings {
-                    enabled,
-                    backend_index,
-                    mimo_voice: mimo_voice.to_string(),
-                    mimo_style: mimo_style.to_string(),
-                    local_dir: local_dir.to_string(),
-                    local_sid: sid,
-                    local_speed: speed,
-                    speak_voice_turns: speak_voice,
-                    speak_text_turns: speak_text,
-                });
-            },
-        );
     }
     {
         let tx = command_tx.clone();
@@ -827,39 +833,24 @@ async fn run_worker(
                     set_status(&weak, "当前没有在播报");
                 }
             }
-            UiCommand::SpeakTest => match speech.speak(TEST_SPEECH_TURN, TEST_SPEECH_TEXT) {
-                Ok(_) => set_status(&weak, "正在试音…"),
-                Err(error) => set_status(&weak, &format!("试音失败：{error}")),
-            },
-            UiCommand::SaveTtsSettings {
-                enabled,
-                backend_index,
-                mimo_voice,
-                mimo_style,
-                local_dir,
-                local_sid,
-                local_speed,
-                speak_voice_turns,
-                speak_text_turns,
-            } => {
-                apply_tts_settings(
+            UiCommand::SpeakTest => handle_speak_test(&weak, &mut speech),
+            UiCommand::SaveAll { request, reply } => {
+                let outcome = handle_save_all_ui(
                     &weak,
                     &paths,
                     &secret,
                     &mut settings,
                     &mut speech,
-                    TtsSaveRequest {
-                        enabled,
-                        backend_index,
-                        mimo_voice,
-                        mimo_style,
-                        local_dir,
-                        local_sid,
-                        local_speed,
-                        speak_voice_turns,
-                        speak_text_turns,
-                    },
+                    &request,
                 );
+                let _ = reply.send(outcome);
+            }
+            UiCommand::CancelSettings => {
+                // 取消 = 丢弃界面上的未保存修改，按已保存配置重新回填并关闭面板。
+                publish_tts_ui(&weak, &settings.tts, &speech);
+                let has_key = secret.has(&settings.provider_id);
+                apply_settings_to_ui(&weak, &settings, has_key);
+                close_settings(&weak);
             }
             UiCommand::Speech(event) => {
                 apply_speech_event(&mut speech_view, &weak, &event);
@@ -897,31 +888,6 @@ async fn run_worker(
                         });
                     }
                     Err(error) => set_status(&weak, &format!("清除 Key 失败：{error}")),
-                }
-            }
-            UiCommand::SaveSettings {
-                provider_index,
-                base_url,
-                model,
-                api_key,
-                permission_index,
-            } => {
-                if handle_save_settings(
-                    &weak,
-                    &paths,
-                    &secret,
-                    &mut settings,
-                    SaveRequest {
-                        provider_index,
-                        base_url,
-                        model,
-                        api_key,
-                        permission_index,
-                    },
-                ) {
-                    // 切换端点后要重新核实 Key 状态（不同提供商可能有不同的 Key）。
-                    let has_key = secret.has(&settings.provider_id);
-                    publish_endpoint(&weak, &settings, has_key, "设置已保存");
                 }
             }
             UiCommand::Send(input) => {
@@ -1642,68 +1608,190 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
     }
 }
 
-/// 一次"保存语音播报设置"请求。
-struct TtsSaveRequest {
-    enabled: bool,
-    backend_index: i32,
-    mimo_voice: String,
-    mimo_style: String,
-    local_dir: String,
-    local_sid: i32,
-    local_speed: f32,
-    speak_voice_turns: bool,
-    speak_text_turns: bool,
+/// 界面上「保存」一次提交的全部内容（模型端点 + 语音播报）。
+///
+/// 为什么合并成一个请求：原来是两条独立命令，各自落盘、各自关面板，
+/// 于是「模型设置写失败但播报设置写成功」会把面板关掉，用户既看不到错误、
+/// 也不知道哪一半生效了。现在由 [`apply_save_all`] 当作**一个事务**处理。
+#[derive(Debug, Clone)]
+pub struct SaveAllRequest {
+    pub provider_index: i32,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    pub permission_index: i32,
+    pub tts_enabled: bool,
+    pub tts_backend_index: i32,
+    /// 界面上的文本原样传入：解析失败要**如实报错**，不能静默改成默认值。
+    pub local_sid: String,
+    pub local_speed: String,
+    pub mimo_voice: String,
+    pub mimo_style: String,
+    pub local_dir: String,
+    pub speak_mode: i32,
 }
 
-/// 保存语音播报设置，并按新配置重建引擎。
+impl SaveAllRequest {
+    /// 音色编号/语速是文本输入：解析失败返回可读错误（保留用户输入）。
+    fn parse_local_numbers(&self) -> Result<(i32, f32), String> {
+        let sid_text = self.local_sid.trim();
+        let sid = if sid_text.is_empty() {
+            0
+        } else {
+            sid_text
+                .parse::<i32>()
+                .map_err(|_| format!("音色编号必须是整数，收到「{sid_text}」"))?
+        };
+        let speed_text = self.local_speed.trim();
+        let speed = if speed_text.is_empty() {
+            1.0
+        } else {
+            speed_text
+                .parse::<f32>()
+                .map_err(|_| format!("语速必须是数字（0.5~2.0），收到「{speed_text}」"))?
+        };
+        Ok((sid, speed))
+    }
+}
+
+/// 把界面上的「自动播报」选项翻译成两个布尔开关。
+fn speak_flags(mode: i32) -> (bool, bool) {
+    match mode {
+        1 => (true, false),
+        2 => (false, true),
+        3 => (false, false),
+        // 0 与越界都按「语音与文本」处理（与界面数组第一项一致）。
+        _ => (true, true),
+    }
+}
+
+/// 一次保存的结果：成功与否、具体错误、以及"部分生效"的警告。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SaveOutcome {
+    pub ok: bool,
+    /// 给用户看的**具体**原因（空 = 没有错误）。
+    pub error: String,
+    /// 已保存但有附带问题（例如配置写成功、Key 没写进去）。
+    pub warning: String,
+}
+
+impl SaveOutcome {
+    fn success() -> Self {
+        Self {
+            ok: true,
+            ..Self::default()
+        }
+    }
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: message.into(),
+            warning: String::new(),
+        }
+    }
+
+    fn partial(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: String::new(),
+            warning: message.into(),
+        }
+    }
+}
+
+/// **一次保存的全部逻辑**（模型端点 + 语音播报）。
 ///
-/// 规则与模型端点设置一致：**先落盘，再生效**；写盘失败不改内存配置、也不假装成功。
-/// 引擎建立失败（缺 Key / 缺模型 / 设备不可用）**不回滚用户的选择**，
-/// 只把播报标记为不可用并说明原因——文本 Agent 不受影响。
-fn apply_tts_settings(
-    weak: &slint::Weak<AppWindow>,
+/// 事务规则（对应任务书第 4 条）：
+///  1. 先在内存里把两份配置都算出来并**一起校验**；任何一项不合法就整体失败，
+///     此时磁盘和内存都没被改过，用户输入原样留在界面上；
+///  2. 校验通过后**只写一次盘**（端点与播报本来就在同一份 settings.json 里）；
+///  3. 写盘成功后再写 Key（只写到目标提供商名下，留空 = 不动）；
+///  4. 最后重建 TTS 引擎。
+///
+/// 引擎建不起来（缺 Key / 缺模型）**不算保存失败**：配置本身合法，
+/// 只是当前不可用——如实显示为警告，不把用户的选择回滚掉。
+pub fn apply_save_all(
     paths: &AppPaths,
     secret: &SecretStore,
     settings: &mut Settings,
     speech: &mut SpeechRuntime,
-    request: TtsSaveRequest,
-) {
+    request: &SaveAllRequest,
+) -> SaveOutcome {
+    // ---- 1) 组装候选配置（还没碰磁盘） ----
+    let (sid, speed) = match request.parse_local_numbers() {
+        Ok(values) => values,
+        Err(error) => return SaveOutcome::failure(error),
+    };
+    let (speak_voice, speak_text) = speak_flags(request.speak_mode);
+
     let mut next = settings.clone();
-    next.tts.enabled = request.enabled;
-    next.tts.backend = tts_backend_for_index(request.backend_index);
-    next.tts.mimo_voice = request.mimo_voice;
-    next.tts.mimo_style = request.mimo_style;
-    next.tts.local_model_dir = request.local_dir;
-    next.tts.local_sid = request.local_sid;
-    next.tts.local_speed = request.local_speed;
-    next.tts.speak_voice_turns = request.speak_voice_turns;
-    next.tts.speak_text_turns = request.speak_text_turns;
+    next.provider_id = provider_id_for_index(request.provider_index).to_string();
+    next.base_url = request.base_url.clone();
+    next.model = request.model.clone();
+    next.permission_mode = permission_mode_for_index(request.permission_index);
+    next.tts.enabled = request.tts_enabled;
+    next.tts.backend = tts_backend_for_index(request.tts_backend_index);
+    next.tts.mimo_voice = request.mimo_voice.clone();
+    next.tts.mimo_style = request.mimo_style.clone();
+    next.tts.local_model_dir = request.local_dir.clone();
+    next.tts.local_sid = sid;
+    next.tts.local_speed = speed;
+    next.tts.speak_voice_turns = speak_voice;
+    next.tts.speak_text_turns = speak_text;
 
-    match next.tts.clone().normalized() {
-        Ok(tts) => next.tts = tts,
-        Err(error) => {
-            set_status(weak, &format!("语音播报设置无效：{error}"));
-            return;
-        }
-    }
+    // ---- 2) 整体校验（端点 + 播报一起） ----
+    let next = match next.normalized() {
+        Ok(next) => next,
+        Err(error) => return SaveOutcome::failure(error),
+    };
+
+    // ---- 3) 只写一次盘 ----
     if let Err(error) = config::save_settings(paths, &next) {
-        set_status(weak, &format!("保存语音播报设置失败：{error}"));
-        return;
+        return SaveOutcome::failure(format!("写入配置文件失败：{error}"));
     }
-    *settings = next;
 
-    match speech.apply_settings(&settings.tts, secret) {
-        Ok(()) => {
-            let label = speech
-                .engine_label()
-                .unwrap_or_else(|| "关闭（不播报）".to_string());
-            set_status(weak, &format!("语音播报设置已保存：{label}"));
-        }
-        Err(error) => {
-            set_status(weak, &format!("语音播报设置已保存，但当前不可用：{error}"));
+    // ---- 4) 配置已生效，再写 Key（留空 = 不动） ----
+    let key_provider = next.provider_id.clone();
+    let new_key = request.api_key.trim().to_string();
+    if !new_key.is_empty() {
+        if let Err(error) = secret.save(&key_provider, &new_key) {
+            /*
+             * 配置已经写成功了，但 Key 没写进去。
+             *
+             * **不回滚配置**：地址/模型/播报的修改本身合法，用户也确实想要；
+             * 回滚会让"改了端点但 Key 没存"这个更常见的意图也落空。
+             * 但必须如实告诉用户 Key 没保存成功（否则他以为已经存好了）。
+             */
+            *settings = next;
+            let warning = rebuild_speech(settings, secret, speech);
+            let mut message = format!("设置已保存，但 Key 没有写入：{error}");
+            if !warning.is_empty() {
+                message.push('；');
+                message.push_str(&warning);
+            }
+            return SaveOutcome::partial(message);
         }
     }
-    publish_tts_ui(weak, &settings.tts, speech);
+
+    *settings = next;
+    let warning = rebuild_speech(settings, secret, speech);
+    if warning.is_empty() {
+        SaveOutcome::success()
+    } else {
+        SaveOutcome::partial(warning)
+    }
+}
+
+/// 按当前（已保存的）播报配置重建引擎，返回给用户看的警告（空 = 一切正常）。
+///
+/// 必须用调用方传进来的 `SecretStore`（同一个数据目录），否则会在错误的
+/// 目录里找 Key，误报"播报不可用"。
+fn rebuild_speech(settings: &Settings, secret: &SecretStore, speech: &mut SpeechRuntime) -> String {
+    match speech.apply_settings(&settings.tts, secret) {
+        Ok(()) => String::new(),
+        Err(error) => format!("播报设置已保存，但当前不可用：{error}"),
+    }
 }
 
 /// 启动时把已保存的播报偏好同步到界面（**不**自动试音）。
@@ -1714,7 +1802,13 @@ fn seed_tts_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, speech: &Spee
     }
 }
 
-/// 把播报配置与当前可用性推给界面。
+/// 把**已保存并生效**的播报配置推给界面。
+///
+/// 这里同时写入两组值：
+///  - `tts-*`：设置页里可编辑的选择（保存或打开设置时用已保存值回填）；
+///  - `tts-active-*`：当前真正生效的那一份配置（试音据此启用/说明）。
+///
+/// 两者在用户改动但未保存时会不一致，这正是这里要区分的地方。
 fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &SpeechRuntime) {
     let backend_index = tts_backend_index(tts.backend);
     let enabled = tts.enabled;
@@ -1729,6 +1823,17 @@ fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &Spe
         .engine_label()
         .or_else(|| speech.engine_error().map(str::to_string))
         .unwrap_or_else(|| "未启用播报".to_string());
+    // 「当前生效」的描述：引擎标签优先，否则说明为什么不可用。
+    let active_label = if tts.active_backend() == crate::voice::tts::TtsBackend::Off {
+        "关闭（不播报）".to_string()
+    } else {
+        speech
+            .engine_label()
+            .or_else(|| speech.engine_error().map(str::to_string))
+            .unwrap_or_else(|| "未启用播报".to_string())
+    };
+    let active_ready =
+        speech.is_available() && tts.active_backend() != crate::voice::tts::TtsBackend::Off;
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
@@ -1742,6 +1847,9 @@ fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &Spe
             window.set_tts_speak_mode(speak_mode);
             window.set_tts_backend_ready(available);
             window.set_speech_detail(detail.into());
+            window.set_tts_active_backend_index(backend_index);
+            window.set_tts_active_label(active_label.into());
+            window.set_tts_active_ready(active_ready);
         }
     });
 }
@@ -2045,7 +2153,11 @@ enum TurnWait {
     Quit,
 }
 
-/// 一次"保存设置"请求（来自界面）。
+/// 一次"保存设置"请求（仅测试使用）。
+///
+/// 界面上的保存走 [`SaveAllRequest`]（端点 + 播报一起提交）；
+/// 这里保留一个只含端点的入口，让既有测试继续覆盖真实保存路径。
+#[cfg(test)]
 struct SaveRequest {
     provider_index: i32,
     base_url: String,
@@ -2084,83 +2196,57 @@ fn view_after_clear(
 
 /// 应用一次设置保存。返回 `true` 表示配置已落盘。
 ///
-/// 关键规则：
+/// 这是界面上「保存」的**旧入口形状**，内部走统一事务 [`apply_save_all`]：
+/// 模型端点与语音播报本来就写在同一份 settings.json 里，分开保存没有意义。
+/// 保留这个签名是为了让既有测试继续覆盖真实保存路径（Key 归属、失败不落盘等）。
+///
+/// 关键规则（由 `apply_save_all` 保证）：
 /// - 校验失败 / 写盘失败**都不更新**内存里的 `settings`，界面也拿不到"已保存"；
 /// - Key 只写到**目标提供商**名下；留空表示"不动该提供商的 Key"；
 /// - **先写配置、再写 Key**。反过来不行：先覆盖 Key 再回滚，
 ///   会在回滚时把用户原有的 Key A 一起删掉（原来 Bug 就是这样丢数据的）。
-///   现在配置写失败时，Key 根本还没被动过，Key A 必然还在。
-/// - 任何错误都会如实回报界面，不假装成功。
+#[cfg(test)]
 fn handle_save_settings(
     weak: &slint::Weak<AppWindow>,
     paths: &AppPaths,
     secret: &SecretStore,
     settings: &mut Settings,
     request: SaveRequest,
+    speech: &mut SpeechRuntime,
 ) -> bool {
-    let mut next = settings.clone();
-    next.provider_id = provider_id_for_index(request.provider_index).to_string();
-    next.base_url = request.base_url;
-    next.model = request.model;
-    next.permission_mode = permission_mode_for_index(request.permission_index);
-
-    let next = match next.normalized() {
-        Ok(next) => next,
-        Err(error) => {
-            set_status(weak, &format!("设置无效：{error}"));
-            return false;
-        }
+    let all = SaveAllRequest {
+        provider_index: request.provider_index,
+        base_url: request.base_url,
+        model: request.model,
+        api_key: request.api_key,
+        permission_index: request.permission_index,
+        // 只改端点：播报设置按已保存的值原样带过（不会被覆盖）。
+        tts_enabled: settings.tts.enabled,
+        tts_backend_index: tts_backend_index(settings.tts.backend),
+        local_sid: settings.tts.local_sid.to_string(),
+        local_speed: settings.tts.local_speed.to_string(),
+        mimo_voice: settings.tts.mimo_voice.clone(),
+        mimo_style: settings.tts.mimo_style.clone(),
+        local_dir: settings.tts.local_model_dir.clone(),
+        speak_mode: speak_mode_code(
+            settings.tts.speak_voice_turns,
+            settings.tts.speak_text_turns,
+        ),
     };
-
-    // 1) 先落盘配置。失败时 Key 还没动过，用户原来的 Key 完好无损。
-    if let Err(error) = config::save_settings(paths, &next) {
-        set_status(weak, &format!("保存设置失败：{error}"));
-        return false;
+    let outcome = apply_save_all(paths, secret, settings, speech, &all);
+    if !outcome.ok {
+        let message = if outcome.error.is_empty() {
+            outcome.warning
+        } else {
+            outcome.error
+        };
+        set_status(weak, &format!("保存设置失败：{message}"));
     }
-
-    // 2) 配置已生效，再写 Key（只有用户真的填了才写，且只写到目标提供商名下）。
-    let key_provider = next.provider_id.clone();
-    let new_key = request.api_key.trim().to_string();
-    if !new_key.is_empty() {
-        if let Err(error) = secret.save(&key_provider, &new_key) {
-            /*
-             * 配置已经写成功了，但 Key 没写进去。
-             *
-             * 这里**不回滚配置**：配置本身是合法的、用户也确实想改，
-             * 回滚反而会让"地址/模型改了、Key 没改"这个更常见的意图落空。
-             * 如实告诉用户"设置已保存，但 Key 没保存"，并让界面保持 Key 未保存的状态。
-             */
-            *settings = next;
-            set_status(weak, &format!("设置已保存，但 Key 保存失败：{error}"));
-            return false;
-        }
-    }
-
-    *settings = next;
-    true
+    outcome.ok
 }
 
 /// 把设置（与 Key 状态）推给界面。
-fn publish_endpoint(
-    weak: &slint::Weak<AppWindow>,
-    settings: &Settings,
-    has_key: bool,
-    status: &str,
-) {
-    let endpoint = config::describe_endpoint(settings, has_key);
-    let status = status.to_string();
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_settings_open(false);
-            window.set_api_key_input("".into());
-            window.set_has_key(has_key);
-            window.set_endpoint_text(endpoint.into());
-            window.set_status(status.into());
-        }
-    });
-}
-
+///
 /// 打开设置时按当前配置回填界面。
 fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_key: bool) {
     let provider_index = PROVIDER_IDS
@@ -2182,6 +2268,9 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
             window.set_api_key_input("".into());
             window.set_has_key(has_key);
             window.set_permission_index(permission_index);
+            // 重新打开 = 以已保存配置为准：清掉上一次的错误与"未保存"标记。
+            window.set_settings_error("".into());
+            window.set_settings_dirty(false);
             window.set_settings_open(true);
         }
     });
@@ -2261,39 +2350,23 @@ async fn wait_turn(
                             set_status(weak, "当前没有在播报");
                         }
                     }
-                    Some(UiCommand::SpeakTest) => match speech.speak(TEST_SPEECH_TURN, TEST_SPEECH_TEXT) {
-                        Ok(_) => set_status(weak, "正在试音…"),
-                        Err(error) => set_status(weak, &format!("试音失败：{error}")),
-                    },
-                    Some(UiCommand::SaveTtsSettings {
-                        enabled,
-                        backend_index,
-                        mimo_voice,
-                        mimo_style,
-                        local_dir,
-                        local_sid,
-                        local_speed,
-                        speak_voice_turns,
-                        speak_text_turns,
-                    }) => {
-                        apply_tts_settings(
+                    Some(UiCommand::SpeakTest) => handle_speak_test(weak, speech),
+                    Some(UiCommand::SaveAll { request, reply }) => {
+                        let outcome = handle_save_all_ui(
                             weak,
                             paths,
                             secret,
                             settings,
                             speech,
-                            TtsSaveRequest {
-                                enabled,
-                                backend_index,
-                                mimo_voice,
-                                mimo_style,
-                                local_dir,
-                                local_sid,
-                                local_speed,
-                                speak_voice_turns,
-                                speak_text_turns,
-                            },
+                            &request,
                         );
+                        let _ = reply.send(outcome);
+                    }
+                    Some(UiCommand::CancelSettings) => {
+                        publish_tts_ui(weak, &settings.tts, speech);
+                        let has_key = secret.has(&settings.provider_id);
+                        apply_settings_to_ui(weak, settings, has_key);
+                        close_settings(weak);
                     }
                     Some(UiCommand::Speech(event)) => {
                         apply_speech_event(speech_view, weak, &event);
@@ -2377,35 +2450,6 @@ async fn wait_turn(
                             }
                         }
                     }
-                    Some(UiCommand::SaveSettings {
-                        provider_index,
-                        base_url,
-                        model,
-                        api_key,
-                        permission_index,
-                    }) => {
-                        /*
-                         * 任务执行期间保存设置：**真的保存**，只是本轮继续用旧快照。
-                         * 之前这里只显示"稍后生效"却没有保存，用户以为改了其实没改。
-                         */
-                        if handle_save_settings(
-                            weak,
-                            paths,
-                            secret,
-                            settings,
-                            SaveRequest {
-                                provider_index,
-                                base_url,
-                                model,
-                                api_key,
-                                permission_index,
-                            },
-                        ) {
-                            let has_key = secret.has(&settings.provider_id);
-                            let endpoint = config::describe_endpoint(settings, has_key);
-                            set_settings_saved_mid_turn(weak, &endpoint, has_key);
-                        }
-                    }
                     None => return TurnWait::Quit,
                 }
             }
@@ -2413,17 +2457,85 @@ async fn wait_turn(
     }
 }
 
-/// 执行中保存成功的提示：关闭设置页、刷新端点摘要，并说明本轮仍用旧快照。
-fn set_settings_saved_mid_turn(weak: &slint::Weak<AppWindow>, endpoint: &str, has_key: bool) {
-    let endpoint = endpoint.to_string();
+/// 在界面线程上应用一次「保存」：执行事务、回填结果、并在成功后关面板。
+///
+/// 返回是否**整体成功**（Slint 的保存回调据此决定要不要清脏标记）。
+/// 失败时：面板**不关闭**、用户输入**不清空**、`settings-error` 显示具体原因。
+fn handle_save_all_ui(
+    weak: &slint::Weak<AppWindow>,
+    paths: &AppPaths,
+    secret: &SecretStore,
+    settings: &mut Settings,
+    speech: &mut SpeechRuntime,
+    request: &SaveAllRequest,
+) -> bool {
+    let outcome = apply_save_all(paths, secret, settings, speech, request);
+
+    if outcome.ok {
+        set_status(weak, "设置已保存");
+    } else if !outcome.error.is_empty() {
+        set_status(weak, &format!("保存设置失败：{}", outcome.error));
+    } else {
+        set_status(weak, &outcome.warning);
+    }
+
+    // 无论成败都按**已生效**的配置刷新状态与「当前生效」描述。
+    publish_tts_ui(weak, &settings.tts, speech);
+
+    let message = if !outcome.error.is_empty() {
+        outcome.error.clone()
+    } else {
+        outcome.warning.clone()
+    };
+    let ok = outcome.ok;
+    let has_key = secret.has(&settings.provider_id);
+    let endpoint = config::describe_endpoint(settings, has_key);
+    let weak_ui = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak_ui.upgrade() {
+            window.set_endpoint_text(endpoint.into());
+            window.set_has_key(has_key);
+            if ok {
+                window.set_settings_error("".into());
+                window.set_settings_dirty(false);
+                window.set_api_key_input("".into());
+                window.set_settings_open(false);
+            } else {
+                // 失败：留在面板里，保留用户输入，只显示具体原因。
+                window.set_settings_error(message.into());
+            }
+        }
+    });
+    ok
+}
+
+/// 试音：只针对**已保存并生效**的配置，并在状态栏说清楚用的是哪一份。
+fn handle_speak_test(weak: &slint::Weak<AppWindow>, speech: &mut SpeechRuntime) {
+    if !speech.is_available() {
+        let reason = speech
+            .engine_error()
+            .unwrap_or("语音播报未启用")
+            .to_string();
+        set_status(weak, &format!("试音失败：{reason}"));
+        return;
+    }
+    let label = speech
+        .engine_label()
+        .unwrap_or_else(|| "当前配置".to_string());
+    match speech.speak(TEST_SPEECH_TURN, TEST_SPEECH_TEXT) {
+        Ok(_) => set_status(weak, &format!("正在试音（{label}）…")),
+        Err(error) => set_status(weak, &format!("试音失败：{error}")),
+    }
+}
+
+/// 关闭设置面板并清掉错误/脏标记（取消与保存成功共用）。
+fn close_settings(weak: &slint::Weak<AppWindow>) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            window.set_settings_error("".into());
+            window.set_settings_dirty(false);
             window.set_settings_open(false);
-            window.set_api_key_input("".into());
-            window.set_has_key(has_key);
-            window.set_endpoint_text(endpoint.into());
-            window.set_status("设置已保存；本轮仍用原配置，新配置从下一轮生效".into());
         }
     });
 }
@@ -2604,6 +2716,216 @@ mod tests {
     fn speech_without_engine() -> SpeechRuntime {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         SpeechRuntime::new(tx)
+    }
+
+    /// 构造一次"只改端点、播报保持已保存值"的保存请求。
+    fn save_all_request(
+        provider_index: i32,
+        base_url: &str,
+        model: &str,
+        key: &str,
+    ) -> SaveAllRequest {
+        SaveAllRequest {
+            provider_index,
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            api_key: key.to_string(),
+            permission_index: 0,
+            tts_enabled: false,
+            tts_backend_index: 0,
+            local_sid: "0".to_string(),
+            local_speed: "1.0".to_string(),
+            mimo_voice: String::new(),
+            mimo_style: String::new(),
+            local_dir: String::new(),
+            speak_mode: 0,
+        }
+    }
+
+    /// **下拉选择映射**：界面索引 ↔ 配置枚举必须严格一一对应。
+    ///
+    /// 这条直接对应任务书「保持选中值与已有 Rust 配置的映射正确」：
+    /// 用错一位就会把"本地 ONNX"存成"MiMo 云端"，而且界面上看不出来。
+    #[test]
+    fn selector_indices_map_to_the_right_configuration_values() {
+        // 提供商：与界面数组 ["mimo","deepseek","openai-compatible"] 一致。
+        assert_eq!(provider_id_for_index(0), "mimo");
+        assert_eq!(provider_id_for_index(1), "deepseek");
+        assert_eq!(provider_id_for_index(2), "openai-compatible");
+        // 越界不能 panic，也不能悄悄落到某个官方提供商上。
+        assert_eq!(provider_id_for_index(-1), "openai-compatible");
+        assert_eq!(provider_id_for_index(99), "openai-compatible");
+
+        // 权限档位：["standard","conservative","permissive"]
+        assert_eq!(permission_mode_for_index(0), PermissionMode::Standard);
+        assert_eq!(permission_mode_for_index(1), PermissionMode::Conservative);
+        assert_eq!(permission_mode_for_index(2), PermissionMode::Permissive);
+        assert_eq!(permission_mode_for_index(-1), PermissionMode::Standard);
+
+        // TTS 后端：["关闭","MiMo 云端","本地 ONNX"]，且必须能往返。
+        assert_eq!(tts_backend_for_index(0), TtsBackend::Off);
+        assert_eq!(tts_backend_for_index(1), TtsBackend::Mimo);
+        assert_eq!(tts_backend_for_index(2), TtsBackend::Local);
+        for index in 0..3 {
+            assert_eq!(
+                tts_backend_index(tts_backend_for_index(index)),
+                index,
+                "TTS 后端索引必须能原样往返"
+            );
+        }
+        assert_eq!(tts_backend_for_index(9), TtsBackend::Off);
+
+        // 自动播报：0=都播 1=只语音 2=只文本 3=都不，往返一致。
+        for (index, (voice, text)) in [
+            (0, (true, true)),
+            (1, (true, false)),
+            (2, (false, true)),
+            (3, (false, false)),
+            // 越界按第一项处理，不 panic。
+            (9, (true, true)),
+        ] {
+            assert_eq!(
+                speak_flags(index),
+                (voice, text),
+                "自动播报选项 {index} 映射错误"
+            );
+            assert_eq!(
+                speak_mode_code(voice, text),
+                if index == 9 { 0 } else { index },
+                "自动播报必须能往返"
+            );
+        }
+    }
+
+    /// 语速/音色编号是**文本输入**：非法值必须报具体错误，不能静默改默认值。
+    #[test]
+    fn invalid_numeric_tts_input_is_reported_not_silently_defaulted() {
+        let mut request = save_all_request(0, "https://api.xiaomimimo.com/v1", "m", "");
+        // 空 = 采用默认（不是错误）。
+        assert_eq!(request.parse_local_numbers().unwrap(), (0, 1.0));
+
+        request.local_speed = "快一点".to_string();
+        let error = request.parse_local_numbers().unwrap_err();
+        assert!(error.contains("语速"), "{error}");
+        assert!(error.contains("快一点"), "错误里要带上用户输入：{error}");
+
+        request.local_speed = "1.0".to_string();
+        request.local_sid = "abc".to_string();
+        let error = request.parse_local_numbers().unwrap_err();
+        assert!(error.contains("音色编号"), "{error}");
+
+        // 合法值照常解析。
+        request.local_sid = "3".to_string();
+        request.local_speed = "1.25".to_string();
+        assert_eq!(request.parse_local_numbers().unwrap(), (3, 1.25));
+    }
+
+    /// **一次保存**：端点和播报写在同一次落盘里，两者都生效。
+    #[cfg(windows)]
+    #[test]
+    fn save_all_persists_endpoint_and_tts_together() {
+        let root = unique_test_root("worker-save-all");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut speech = speech_without_engine();
+
+        let request = SaveAllRequest {
+            provider_index: 1,
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            api_key: "sk-deepseek-test".to_string(),
+            permission_index: 2,
+            tts_enabled: true,
+            tts_backend_index: 2, // 本地 ONNX
+            local_sid: "7".to_string(),
+            local_speed: "1.3".to_string(),
+            mimo_voice: "alloy".to_string(),
+            mimo_style: "语速稍快".to_string(),
+            local_dir: "D:/models/kokoro".to_string(),
+            speak_mode: 2, // 只播文本
+        };
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+        // 本地模型不存在 → 引擎建不起来，但**配置本身是合法的**：
+        // 如实给出警告，不能当成保存失败把用户的选择回滚掉。
+        assert!(outcome.error.is_empty(), "不该报保存失败：{outcome:?}");
+
+        assert_eq!(settings.provider_id, "deepseek");
+        assert_eq!(settings.model, "deepseek-v4-pro");
+        assert_eq!(settings.permission_mode, PermissionMode::Permissive);
+        assert_eq!(settings.tts.backend, TtsBackend::Local);
+        assert!(settings.tts.enabled);
+        assert_eq!(settings.tts.local_sid, 7);
+        assert!((settings.tts.local_speed - 1.3).abs() < 1e-6);
+        assert!(!settings.tts.speak_voice_turns);
+        assert!(settings.tts.speak_text_turns);
+        assert_eq!(
+            secret.load("deepseek").unwrap().as_deref(),
+            Some("sk-deepseek-test")
+        );
+
+        // 磁盘上是**同一份**配置里同时有端点和播报。
+        let reloaded = config::load_settings(&paths).unwrap();
+        assert_eq!(reloaded.model, "deepseek-v4-pro");
+        assert_eq!(reloaded.tts.backend, TtsBackend::Local);
+        assert_eq!(reloaded.tts.local_sid, 7);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 校验失败：**一样都不落盘**，内存配置不动（界面据此保留用户输入）。
+    #[cfg(windows)]
+    #[test]
+    fn save_all_validation_failure_writes_nothing() {
+        let root = unique_test_root("worker-save-all-bad");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let before = settings.clone();
+        let mut speech = speech_without_engine();
+
+        // 端点非法 + 合法播报设置：整体失败，播报也不该被写进去。
+        let mut request =
+            save_all_request(0, "ftp://not-http", "mimo-v2.6-flash", "sk-must-not-write");
+        request.tts_enabled = true;
+        request.tts_backend_index = 1;
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+
+        assert!(!outcome.ok);
+        assert!(outcome.error.contains("http"), "{:?}", outcome.error);
+        assert_eq!(settings.base_url, before.base_url, "内存配置不能被改动");
+        assert_eq!(
+            settings.tts.backend, before.tts.backend,
+            "播报设置也不能被写"
+        );
+        assert!(secret.load("mimo").unwrap().is_none(), "失败时不能写 Key");
+        assert!(
+            !paths.settings_file().is_file(),
+            "失败时不应该有配置文件落盘"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 语速非法：给出具体原因，且不落盘（保留用户输入）。
+    #[cfg(windows)]
+    #[test]
+    fn save_all_rejects_bad_speed_with_a_specific_message() {
+        let root = unique_test_root("worker-save-all-speed");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut speech = speech_without_engine();
+
+        let mut request =
+            save_all_request(0, "https://api.xiaomimimo.com/v1", "mimo-v2.6-flash", "");
+        request.local_speed = "9".to_string();
+        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
+        assert!(!outcome.ok);
+        assert!(outcome.error.contains("0.5~2.0"), "{:?}", outcome.error);
+        assert!(!paths.settings_file().is_file(), "语速非法时不能落盘");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn subtitle(text: &str, speech_id: SpeechId) -> SpeechEvent {
@@ -2928,6 +3250,7 @@ mod tests {
                 api_key: "sk-deepseek-test".to_string(),
                 permission_index: 1, // conservative
             },
+            &mut speech_without_engine(),
         );
 
         assert!(ok, "合法设置应当保存成功");
@@ -3060,6 +3383,7 @@ mod tests {
                 api_key: "sk-should-not-be-written".to_string(),
                 permission_index: 0,
             },
+            &mut speech_without_engine(),
         );
 
         assert!(!ok, "非法设置必须返回失败，界面不得显示成功");
@@ -3099,6 +3423,7 @@ mod tests {
                 api_key: "sk-key-b".to_string(),
                 permission_index: 0,
             },
+            &mut speech_without_engine(),
         );
 
         assert!(!ok, "配置写失败必须返回 false");
@@ -3139,6 +3464,7 @@ mod tests {
                 api_key: String::new(),
                 permission_index: 0,
             },
+            &mut speech_without_engine(),
         );
 
         assert!(ok);
