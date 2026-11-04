@@ -96,3 +96,28 @@ main 入口及失败类别追加至 LOCALAPPDATA/cuava/startup.log（限长）�
 - 安装器 SHA-256：3274BC3FE90EDF07B444E10C94704AFE2DCF949F3DD4DF0CB36E83614D74ED9C
 
 此前 PID 33788 对应本轮中间候选，不能归为上述最终 SHA 的安装验收。最终候选安装/便携启动验收仍为未执行。
+
+## 继续验收：本机安装/便携的实际成功证据
+
+在 35cd59a 上继续，修复托盘首次创建：此前先 new() 后赋图标会遇到 Slint 1.18.1 初次空图标失败，初始化 tracker 不会自动重试。现在编译内嵌默认 PNG，创建时即有有效图标，不再依赖事后补入。仍然使用同一后台命令路径。
+安装器新增阶段/PID/目标日志；启动前以独占写句柄检测本安装 EXE 占用，拒绝并返回 2，不强杀；解包失败不再继续登记成功。
+
+实际成功流程（这是有开发工具链的本机，不是干净 VM）：
+
+- 首次可追踪安装 PID 31608、退出 0，日志 success，目标 exe/cua.ps1 存在；Start Menu 快捷方式指向该目录，HKCU InstallLocation 正确。
+- 正常退出开发 PID 30708 后，安装版从 C:\Windows、仅 Windows PATH 独立启动为 PID 8024。不是旧实例转发。CUA 脚本 BOM=EF-BB-BF，真实桥接只读测试 probe 成功（PowerShell 5.1.26100.9711），list_windows 返回 9 个窗口，测试通过并 dispose 子进程。
+- 托盘图标修复后安装版 --background 独立运行 PID 14580，无主窗口；便携 ZIP 解压出的 EXE --settings 启动 PID 3644 后退出 0，保留原 PID；真实截图确认安装版设置页打开。
+- 正常退出安装版后，便携 EXE 从 C:\Windows、仅 Windows PATH 独立启动为 PID 30272，进程路径确认是解压目录，主窗口可见。之后通过主窗口退出；最终无残留 cuava 进程。
+- 安装版卸载 PID 33092/退出 0，安装 EXE 移除，隔离 Session/模型标记保留。临时设置为便携路径的 HKCU Run 值未被卸载删除，便携进程未被结束；测试后恢复注册表原值。
+- 最终候选再安装 PID 38608/退出 0，安装 payload 哈希和 release 完全一致；模拟 EXE 被文件占用时安装 PID 37476/退出 2、日志 blocked-in-use；释放句柄后卸载退出 0、EXE 移除、Session/模型标记保留。机器可读结果见 verification/pr9-local-install.json。
+- 从 dist-rust 位置直接启动的部分早期检查曾无目标文件，原因尚未证实。本次成功安装使用复制到 .tmp 的同字节安装器；复制前后 SHA 相同。不能将早期退出码或旧日志追溯认定为成功。
+
+最终产物 SHA-256（覆盖此前候选）：
+
+- setup：88A17A360E0FF80BD7DA4E6B026B087838EA2E54A0EC27A2A12FA96854B9C67E
+- ZIP：27C8272D3AE9C0C933B13FC2775F90E15BD46CF8DB3FF490F3FA4F487EAAA023
+
+本轮 fmt、CPU release、clippy all-targets、48 项 UI 单测通过（1 项图形测试默认 ignored，其先前显式运行结果单列）。没有重跑未受影响的整个旧版或全部 Rust 测试。
+
+用户选择「暂不方便，先完成其他验收」，因此未开启麦克风，真实 KWS/TTS/打断验收暂缓。准备本地 Mock 文本闭环时，写入隔离配置并启动 EXE 的命令被自动审批以 blocked by policy 拒绝；未绕过，Mock 服务已停止，文本 UI 闭环不计为通过。原有 Mock Agent 测试不替代该路径。
+完整托盘左右键/实际手动 HUD 点击、登录重新登录、DPI/多屏、干净 VM 和原生归档许可证最终复核仍未完成；继续保留草稿和发布阻断。未修改旧版源码或真实用户配置，也未发布或合并。

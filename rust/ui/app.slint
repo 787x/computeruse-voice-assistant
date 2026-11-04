@@ -2069,7 +2069,7 @@ export component AppWindow inherits Window {
 
 export component BackgroundTray inherits SystemTrayIcon {
     tooltip: "CUAVA 原生语音助手";
-    in property <image> tray-image;
+    in property <image> tray-image: @image-url("../assets/tray.png");
     icon: root.tray-image;
     in property <bool> microphone;
     in property <bool> login-start;

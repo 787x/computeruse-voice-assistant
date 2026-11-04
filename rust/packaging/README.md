@@ -58,3 +58,5 @@ enc: safeStorage 与 Rust DPAPI 不兼容，所有 Key 均不导入；按提供�
 执行 `./rust/packaging/build-cpu.ps1`；该脚本关闭 Whisper 主机专用指令集，并清除该依赖的 release 缓存，避免旧 CUDA/native 构建混入。
 然后执行 `./rust/packaging/package.ps1 -CpuExe C:/cuava-cpu-target/release/cuava.exe -MsvcRedist <VS许可Redist目录/x64/Microsoft.VC145.CRT> -MakeNsis <makensis.exe>`。
 输出到 dist-rust，打印 ZIP/安装器 SHA-256。工具链仅维护者构建需要，用户不需要。
+
+安装诊断记录在 `%TEMP%\cuava-install-diagnostic.ini`，含本次 PID、目标目录和阶段；应同时核对安装进程退出码、目标文件及 EXE 哈希，不能仅根据退出码或旧日志判定成功。目标 EXE 被占用时安装器返回非零并提示先正常退出，不强杀进程。Slint 托盘使用编译内嵌图标，确保后台首次创建时图标已经可用。

@@ -49,18 +49,6 @@ impl BackgroundUi {
         hud.window()
             .on_close_requested(|| slint::CloseRequestResponse::KeepWindowShown);
 
-        let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(32, 32);
-        let mut pixels = pixels;
-        for (i, pixel) in pixels.make_mut_slice().iter_mut().enumerate() {
-            let x = i % 32;
-            let y = i / 32;
-            *pixel = if (13..19).contains(&x) && (6..23).contains(&y) {
-                slint::Rgba8Pixel::new(255, 255, 255, 255)
-            } else {
-                slint::Rgba8Pixel::new(40, 90, 140, 255)
-            };
-        }
-        tray.set_tray_image(slint::Image::from_rgba8(pixels));
         tray.set_login_start(super::autostart::enabled());
         let weak = window.as_weak();
         let t = tray.as_weak();

@@ -1,0 +1,16 @@
+{
+  "Install": {
+    "Exit": 0,
+    "PID": 38608
+  },
+  "PayloadHashMatched": true,
+  "Busy": {
+    "Exit": 2,
+    "PID": 37476
+  },
+  "BusyDiagnostic": "[install]\r\nstage=blocked-in-use\r\ntarget=D:\\Projects\\computeruse-voice-assistant\\.tmp\\pr9-verified-install\r\npid=37476\r\n",
+  "UninstallExit": 0,
+  "ExeRemoved": true,
+  "SessionsRetained": true,
+  "ModelsRetained": true
+}
