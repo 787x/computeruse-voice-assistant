@@ -33,3 +33,6 @@ tools/__pycache__/
 
 # Rust 新版（PR5）构建产物
 rust/target/
+
+# Rust installer candidates
+dist-rust/

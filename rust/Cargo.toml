@@ -16,8 +16,10 @@ path = "src/main.rs"
 [dependencies]
 # UI：纯 Rust 原生渲染，不使用 Electron / Tauri / WebView。
 # 软件渲染器（renderer-winit-software）对虚拟机 / 无 GPU 环境更宽容。
-slint = { version = "1", default-features = false, features = [
+slint = { version = "=1.18.1", default-features = false, features = [
     "compat-1-2",
+    "system-tray",
+    "unstable-winit-030",
     "std",
     "backend-winit",
     "renderer-winit-software",
@@ -40,6 +42,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+raw-window-handle = "0.6"
 thiserror = "2"
 base64 = "0.22"
 
@@ -93,6 +96,8 @@ tts-cuda = ["sherpa-onnx/shared"]
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
     "Win32_System_SystemInformation",
     "Win32_System_Time",

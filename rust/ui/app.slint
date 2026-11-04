@@ -21,7 +21,7 @@
 // 现在统一改用内置的 `TextInput`（真实的文本编辑元素：支持输入法、复制粘贴、
 // 选区、Tab 焦点链、password 类型），外面套一层我们自己画边框和焦点态的
 // `AppLineEdit`。下拉框用 `PopupWindow` 展开完整列表并支持键盘上下选择。
-import { ScrollView } from "std-widgets.slint";
+import { Button, ScrollView } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------------
 // 数据模型
@@ -295,7 +295,8 @@ export global Theme {
 }
 
 export component AppWindow inherits Window {
-    title: "Computer Use 语音助手（PR5 文本版）";
+    title: "CUAVA 原生语音助手";
+    in-out property <int> wake-generation;
     preferred-width: 1020px;
     preferred-height: 760px;
     min-width: 720px;
@@ -2061,6 +2062,71 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+}
+
+
+export component BackgroundTray inherits SystemTrayIcon {
+    tooltip: "CUAVA 原生语音助手";
+    in property <image> tray-image;
+    icon: root.tray-image;
+    in property <bool> microphone;
+    in property <bool> login-start;
+    callback toggle-login();
+    callback toggle-hud();
+    callback open-main();
+    callback settings();
+    callback toggle-microphone();
+    callback stop-speech();
+    callback quit-app();
+    clicked => { open-main(); }
+    Menu {
+        MenuItem { title: "打开主窗口"; activated => { open-main(); } }
+        MenuItem { title: "打开/隐藏语音浮窗"; activated => { toggle-hud(); } }
+        MenuItem { title: root.login-start ? "关闭登录启动" : "开启登录启动（不开麦）"; activated => { toggle-login(); } }
+        MenuItem { title: "设置"; activated => { settings(); } }
+        MenuItem { title: root.microphone ? "关闭麦克风" : "开启麦克风"; activated => { toggle-microphone(); } }
+        MenuItem { title: "停止播报"; activated => { stop-speech(); } }
+        MenuItem { title: "退出"; activated => { quit-app(); } }
+    }
+}
+
+export component VoiceHud inherits Window {
+    title: "CUAVA Voice HUD";
+    width: 380px;
+    height: 290px;
+    no-frame: true;
+    always-on-top: true;
+    background: #f4f6f8;
+    in property <string> status;
+    in property <string> transcript;
+    in property <string> subtitle;
+    in property <bool> asking;
+    in property <int> request-id;
+    in property <string> prompt;
+    callback answer(int, bool);
+    callback open-main();
+    callback hide-hud();
+    callback stop-speech();
+    callback cancel-task();
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+        Text { text: root.status; color: #234560; wrap: word-wrap; }
+        Text { text: root.transcript; color: #333; wrap: word-wrap; overflow: elide; }
+        Text { text: root.asking ? root.prompt : root.subtitle; color: #222; wrap: word-wrap; overflow: elide; vertical-stretch: 1; }
+        if root.asking : HorizontalLayout {
+            Button { text: "允许"; clicked => { root.answer(root.request-id, true); } }
+            Button { text: "拒绝"; clicked => { root.answer(root.request-id, false); } }
+        }
+        HorizontalLayout {
+            Button { text: "停止播报"; clicked => { root.stop-speech(); } }
+            Button { text: "取消任务"; clicked => { root.cancel-task(); } }
+        }
+        HorizontalLayout {
+            Button { text: "主窗口"; clicked => { root.open-main(); } }
+            Button { text: "隐藏"; enabled: !root.asking; clicked => { root.hide-hud(); } }
         }
     }
 }

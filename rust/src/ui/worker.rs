@@ -161,7 +161,36 @@ pub(super) fn provider_id_for_index(index: i32) -> &'static str {
 
 /// 启动界面与工作线程（阻塞直到窗口关闭）。
 pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(instance) = super::instance::Instance::acquire()? else {
+        return Ok(());
+    };
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .with_winit_window_attributes_hook(|attributes| {
+            if attributes.title == "CUAVA Voice HUD" {
+                attributes.with_active(false)
+            } else {
+                attributes
+            }
+        })
+        .select()?;
     let window = AppWindow::new()?;
+    let instance_timer = slint::Timer::default();
+    let weak = window.as_weak();
+    instance_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(150),
+        move || {
+            for action in instance.requests() {
+                if let Some(w) = weak.upgrade() {
+                    let _ = w.show();
+                    if action == "settings" {
+                        w.invoke_open_settings();
+                    }
+                }
+            }
+        },
+    );
     let paths = AppPaths::resolve();
     let secret = SecretStore::new(paths.secret_file());
 
@@ -178,7 +207,14 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => {
             eprintln!("[config] {error}");
             seed_ui_with_load_error(&window, &paths, &error.to_string());
-            window.run()?;
+            let _background = super::background::BackgroundUi::new(&window)?;
+            window.on_quit_app(|| {
+                let _ = slint::quit_event_loop();
+            });
+            if !std::env::args().any(|a| a == "--background") {
+                window.show()?;
+            }
+            slint::run_event_loop_until_quit()?;
             return Ok(());
         }
     };
@@ -539,9 +575,12 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             }
             // 让挂起中的确认立刻结束（拒绝），不留一个还能点的框。
             confirmer.abort_pending();
-            let _ = tx.send(UiCommand::Quit);
+            if tx.send(UiCommand::Quit).is_err() {
+                let _ = slint::quit_event_loop();
+            }
         });
     }
+    let _background = super::background::BackgroundUi::new(&window)?;
     // ---- 工作线程 ----
     let weak = window.as_weak();
     std::thread::Builder::new()
@@ -587,7 +626,13 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             });
         })?;
 
-    window.run()?;
+    if !std::env::args().any(|arg| arg == "--background") {
+        window.show()?;
+    }
+    if std::env::args().any(|a| a == "--settings") {
+        window.invoke_open_settings();
+    }
+    slint::run_event_loop_until_quit()?;
     Ok(())
 }
 
@@ -2266,6 +2311,10 @@ impl VoiceRuntime {
             }
             VoiceEventKind::Woke { turn, keyword } => {
                 self.route.bind(event.instance, turn);
+                with_window(weak, |w| {
+                    w.set_voice_transcript("".into());
+                    w.set_wake_generation(w.get_wake_generation().wrapping_add(1));
+                });
                 set_voice_state(weak, &VoiceState::Capturing);
                 set_status(weak, &format!("已唤醒（{keyword}），请说指令"));
                 VoiceOutcome::None
