@@ -414,7 +414,7 @@ impl ProviderConfig {
         merged.extend(manual);
         for option in discovered {
             if let Some(existing) = merged.iter_mut().find(|item| item.id == option.id) {
-                existing.source = option.source;
+                // 手动保存的模型不能因在线目录覆盖而失去手动来源。
                 existing.context_window = option.context_window;
                 existing.max_output_tokens = option.max_output_tokens;
             } else {

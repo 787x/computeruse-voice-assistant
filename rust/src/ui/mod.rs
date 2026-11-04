@@ -14,6 +14,7 @@
 //!  - [`timeline`]：时间线 → 对话气泡 / 工具卡片（按真实调用实例）；
 //!  - [`settings`]：设置页一次保存的组装、校验、落盘与回填。
 
+pub mod model_probe;
 pub mod sessions;
 pub mod settings;
 pub mod timeline;

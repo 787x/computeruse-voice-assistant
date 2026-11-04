@@ -99,7 +99,10 @@ async fn discovered_models_materialize_missing_providers_and_survive_saved_confi
         .iter()
         .any(|m| m.id == "draft-model"));
     assert_eq!(
-        cache.models_for("deepseek", &draft).unwrap()[0].id,
+        cache
+            .models_for("deepseek", &draft, "fake-deepseek")
+            .unwrap()[0]
+            .id,
         "draft-model"
     );
     let (failed, server) = mock("unused", "fake-deepseek", false);

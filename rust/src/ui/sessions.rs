@@ -301,7 +301,7 @@ impl SessionRuntime {
         }
     }
 
-    /// 终态按回合/调用实例原位更新；缺少开始事件时补记未执行的终态。
+    /// 终态按回合/调用实例原位更新；缺少开始事件仍保留 Agent 给出的执行语义。
     pub fn update_tool_item(
         &mut self,
         turn_id: u64,
@@ -321,11 +321,7 @@ impl SessionRuntime {
             item.status = status;
             item.ms = ms;
             if !text.is_empty() {
-                item.text = if item.text.starts_with("未执行：") {
-                    format!("未执行：{text}")
-                } else {
-                    text.to_string()
-                };
+                item.text = text.to_string();
             }
         } else {
             session.push_timeline(TimelineItem {
@@ -335,7 +331,7 @@ impl SessionRuntime {
                 call_id,
                 tool: tool.to_string(),
                 status,
-                text: format!("未执行：{text}"),
+                text: text.to_string(),
                 ms,
                 at_ms: crate::clock::now().unix_ms,
                 ..TimelineItem::default()

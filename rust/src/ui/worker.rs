@@ -53,6 +53,7 @@ use crate::voice::{
 use crate::ChatEntry;
 use crate::ToolCard;
 
+use super::model_probe::ProbeDraft;
 use crate::AppWindow;
 
 /// 界面发给工作线程的命令。
@@ -92,12 +93,12 @@ pub enum UiCommand {
     /// 切换设置分类（只改界面，不回填）。
     SettingsTab(i32),
     /// 测试连接（真实发一次最小对话请求）。
-    TestConnection,
+    TestConnection(ProbeDraft),
     /// 获取在线模型列表（`/models`，带缓存与失败保留）。
-    FetchModels { provider: String, base_url: String },
+    FetchModels(ProbeDraft),
     ModelsFetched {
-        provider: String,
-        base_url: String,
+        draft: ProbeDraft,
+        credential: String,
         request: u64,
         fetch: crate::model_catalog::ModelFetch,
     },
@@ -149,7 +150,7 @@ const SETTINGS_TABS: [&str; 5] = [
     "语音输入 / 播报",
 ];
 
-fn provider_id_for_index(index: i32) -> &'static str {
+pub(super) fn provider_id_for_index(index: i32) -> &'static str {
     // 越界一律落到"自定义端点"，而不是悄悄用某个官方提供商：
     // 用错端点会把请求打到用户没配 Key 的官方地址上。
     usize::try_from(index)
@@ -198,6 +199,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     config::apply_env_overrides(&mut settings);
+    settings_ui::restore_model_catalogs(&mut settings, &paths, &secret, None);
     let has_key = secret.has(&settings.provider_id);
     /*
      * 启动自检：数据目录能不能写。
@@ -417,8 +419,11 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     {
         // ---- 模型发现与连通性 ----
         let tx = command_tx.clone();
+        let weak = window.as_weak();
         window.on_test_connection(move || {
-            let _ = tx.send(UiCommand::TestConnection);
+            if let Some(window) = weak.upgrade() {
+                let _ = tx.send(UiCommand::TestConnection(ProbeDraft::from_window(&window)));
+            }
         });
     }
     {
@@ -426,10 +431,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let weak = window.as_weak();
         window.on_fetch_models(move || {
             if let Some(window) = weak.upgrade() {
-                let _ = tx.send(UiCommand::FetchModels {
-                    provider: provider_id_for_index(window.get_provider_index()).into(),
-                    base_url: window.get_base_url().to_string(),
-                });
+                let _ = tx.send(UiCommand::FetchModels(ProbeDraft::from_window(&window)));
             }
         });
     }
@@ -1350,6 +1352,7 @@ async fn run_worker(
     let audit = AuditLog::new(paths.audit_file());
 
     let mut model_request = 0u64;
+    let connection_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
     // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
@@ -1522,6 +1525,11 @@ async fn run_worker(
                     }
                     window.set_base_url(provider.base_url_or_default().into());
                     window.set_model_name(provider.model.clone().into());
+                    window.set_provider_hint_index(settings_ui::provider_hint_index(
+                        provider.provider_hint,
+                    ));
+                    window.set_thinking_index(thinking_index(provider.thinking));
+                    window.set_effort_index(reasoning_effort_index(provider.reasoning_effort));
                     window.set_models_busy(false);
                     window.set_discovered_models(ModelRc::new(VecModel::from(Vec::<
                         slint::SharedString,
@@ -1532,6 +1540,12 @@ async fn run_worker(
             UiCommand::ClearApiKey(provider_id) => {
                 match secret.clear(&provider_id) {
                     Ok(()) => {
+                        settings_ui::restore_model_catalogs(&mut settings, &paths, &secret, None);
+                        let picker_settings = settings.clone();
+                        let picker_sessions = sessions.clone();
+                        with_window(&weak, move |window| {
+                            refresh_model_picker(window, &picker_settings, &picker_sessions)
+                        });
                         /*
                          * 设置页的 `has-key` 表示"**设置页当前选中**的提供商有没有 Key"。
                          *
@@ -1566,23 +1580,28 @@ async fn run_worker(
                 publish_audit(&weak, &audit.recent(crate::permissions::MAX_AUDIT_RECORDS));
             }
             // ---- 模型发现与连通性测试 ----
-            UiCommand::TestConnection => {
-                handle_test_connection(&weak, &settings, &secret);
+            UiCommand::TestConnection(draft) => {
+                handle_test_connection(&weak, &settings, &secret, draft, &connection_request);
             }
-            UiCommand::FetchModels { provider, base_url } => {
+            UiCommand::FetchModels(draft) => {
                 {
                     with_window(&weak, move |window| {
                         window.set_models_busy(true);
                         window.set_model_list_hint("正在获取在线模型列表…".into());
                     });
                 }
-                // 只查**当前生效提供商**的目录，并用那一家自己的 Key。
-                let mut provider = settings.provider(&provider);
-                provider.base_url = base_url;
-                let api_key = secret
-                    .load(&provider.id)
-                    .unwrap_or(None)
-                    .unwrap_or_default();
+                let (provider, api_key) = match draft.resolve(&settings, &secret) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        with_window(&weak, move |window| {
+                            if draft.matches_window(window) {
+                                window.set_models_busy(false);
+                                window.set_model_list_hint(error.into());
+                            }
+                        });
+                        continue;
+                    }
+                };
                 model_request += 1;
                 let request = model_request;
                 let mut cache = ModelCache::with_path(paths.model_cache_file());
@@ -1590,25 +1609,27 @@ async fn run_worker(
                 tokio::spawn(async move {
                     let fetch = fetch_models(&provider, &api_key, &mut cache, true).await;
                     let _ = tx.send(UiCommand::ModelsFetched {
-                        base_url: provider.base_url_or_default(),
-                        provider: provider.id,
+                        credential: crate::model_catalog::fingerprint(&api_key),
+                        draft,
                         request,
                         fetch,
                     });
                 });
             }
             UiCommand::ModelsFetched {
-                provider,
-                base_url,
+                draft,
+                credential,
                 request,
                 fetch,
             } => {
                 if request == model_request {
                     remember_fetched_models(
                         &mut settings,
-                        (&provider, &base_url, request),
+                        (&draft.provider_id, &draft.base_url, request),
                         model_request,
                         &fetch,
+                        &secret,
+                        &credential,
                     );
                     {
                         let settings = settings.clone();
@@ -1617,10 +1638,7 @@ async fn run_worker(
                         with_window(&weak, move |window| {
                             refresh_model_picker(window, &settings, &sessions);
                             window.set_models_busy(false);
-                            if provider_id_for_index(window.get_provider_index()) == provider
-                                && window.get_base_url().trim().trim_end_matches('/')
-                                    == base_url.trim().trim_end_matches('/')
-                            {
+                            if draft.matches_window(window) {
                                 window.set_model_list_hint(fetch.summary().into());
                                 if fetch.ok {
                                     window.set_discovered_models(ModelRc::new(VecModel::from(
@@ -2995,6 +3013,9 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
         .iter()
         .position(|mode| *mode == settings.permission_mode)
         .unwrap_or(0) as i32;
+    let hint_index = settings_ui::provider_hint_index(settings.provider_hint);
+    let thinking = thinking_index(settings.thinking);
+    let effort = reasoning_effort_index(settings.reasoning_effort);
     let base_url = settings.base_url.clone();
     let model = settings.model.clone();
     let plans = serde_json::to_string_pretty(&settings.model_plans).unwrap_or_default();
@@ -3021,7 +3042,16 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
             window.set_provider_index(provider_index);
             window.set_base_url(base_url.into());
             window.set_model_name(model.into());
+            window.set_provider_hint_index(hint_index);
+            window.set_thinking_index(thinking);
+            window.set_effort_index(effort);
             window.set_api_key_input("".into());
+            window.set_connection_hint("".into());
+            window.set_model_list_hint("".into());
+            window.set_discovered_models(ModelRc::new(VecModel::from(
+                Vec::<slint::SharedString>::new(),
+            )));
+            window.set_discovered_model_index(-1);
             window.set_has_key(has_key);
             window.set_permission_index(permission_index);
             window.set_override_indices(ModelRc::new(VecModel::from(overrides)));
@@ -3222,17 +3252,17 @@ async fn wait_turn(
                      * 权限立即生效：暂停/限时授权/档位/覆盖都作用于**下一个**
                      * 工具判断。这正是"不能复用过期授权"的落点。
                      */
-                    Some(UiCommand::TestConnection) => {
+                    Some(UiCommand::TestConnection(_)) => {
                         set_status(weak, "正在执行；先结束这一轮再测试连接");
                     }
-                    Some(UiCommand::ModelsFetched { provider, base_url, request, fetch }) => {
+                    Some(UiCommand::ModelsFetched { draft, credential, request, fetch }) => {
                         if request == *model_request {
-                            remember_fetched_models(settings, (&provider, &base_url, request), *model_request, &fetch);
+                            remember_fetched_models(settings, (&draft.provider_id, &draft.base_url, request), *model_request, &fetch, secret, &credential);
                             let settings = settings.clone(); let sessions = sessions.clone();
                             with_window(weak, move |window| { window.set_models_busy(false); refresh_model_picker(window, &settings, &sessions); });
                         }
                     }
-                    Some(UiCommand::FetchModels { .. }) => {
+                    Some(UiCommand::FetchModels(_)) => {
                         set_status(weak, "正在执行；先结束这一轮再获取模型列表");
                     }
                     Some(UiCommand::SettingsTab(index)) => {
@@ -3270,6 +3300,9 @@ async fn wait_turn(
                          */
                         match secret.clear(&provider_id) {
                             Ok(()) => {
+                                settings_ui::restore_model_catalogs(settings, paths, secret, None);
+                                let picker_settings = settings.clone(); let picker_sessions = sessions.clone();
+                                with_window(weak, move |window| refresh_model_picker(window, &picker_settings, &picker_sessions));
                                 let view = view_after_clear(secret, settings, &provider_id);
                                 let weak_ui = weak.clone();
                                 let provider_id_ui = provider_id.clone();
@@ -3431,11 +3464,18 @@ fn remember_fetched_models(
     identity: (&str, &str, u64),
     current_request: u64,
     fetch: &crate::model_catalog::ModelFetch,
+    secret: &SecretStore,
+    credential: &str,
 ) -> bool {
     let (provider, endpoint, request) = identity;
-    request == current_request
-        && fetch.ok
-        && settings.remember_discovered_models(provider, endpoint, &fetch.models)
+    let saved_key = secret.load(provider).ok().flatten().unwrap_or_default();
+    if request != current_request
+        || !fetch.ok
+        || crate::model_catalog::fingerprint(&saved_key) != credential
+    {
+        return false;
+    }
+    settings.remember_discovered_models(provider, endpoint, &fetch.models)
 }
 
 fn record_event(
@@ -3780,48 +3820,34 @@ fn handle_test_connection(
     weak: &slint::Weak<AppWindow>,
     settings: &Settings,
     secret: &SecretStore,
+    draft: ProbeDraft,
+    generation: &Arc<std::sync::atomic::AtomicU64>,
 ) {
-    let provider = settings.provider(&settings.provider_id);
-    let requires_key = config::get_provider(&provider.id)
-        .map(|info| info.api_key_required)
-        .unwrap_or(true);
-    // **只取这一家**的 Key，绝不借用别家的。
-    let api_key = secret
-        .load(&provider.id)
-        .unwrap_or(None)
-        .unwrap_or_default();
-    if requires_key && api_key.trim().is_empty() {
-        let weak_ui = weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = weak_ui.upgrade() {
-                window.set_connection_code("auth".into());
-                window.set_connection_hint(
-                    format!(
-                        "还没有 {} 的 API Key；请先保存 Key 再测试（不会借用其它提供商的 Key）",
-                        provider.id
-                    )
-                    .into(),
-                );
-            }
-        });
-        return;
-    }
-    let profile = settings.profile();
+    let request = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let (provider, api_key) = match draft.resolve(settings, secret) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            with_window(weak, move |window| {
+                if draft.matches_window(window) {
+                    window.set_connection_code("auth".into());
+                    window.set_connection_hint(error.into());
+                }
+            });
+            return;
+        }
+    };
+    let profile = ProbeDraft::profile(&provider);
     let timeout = settings.timeout_ms;
-    // 发请求要 await，不能阻塞工作线程的命令循环之外的状态——
-    // 这里由调用方在 run_worker 里直接 await（该函数本身是 async 的）。
-    let weak_ui = weak.clone();
-    let provider_id = provider.id.clone();
+    let weak = weak.clone();
+    let generation = generation.clone();
     tokio::spawn(async move {
         let outcome = probe_chat(&profile, &api_key, timeout).await;
-        let message = outcome.message();
-        let code = outcome.code();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = weak_ui.upgrade() {
-                window.set_connection_code(code.into());
-                window.set_connection_hint(message.into());
-                window.set_status(format!("连接测试（{provider_id}）：{code}").into());
+        with_window(&weak, move |window| {
+            if generation.load(Ordering::SeqCst) != request || !draft.matches_window(window) {
+                return;
             }
+            window.set_connection_code(outcome.code().into());
+            window.set_connection_hint(format!("{}：{}", draft.label(), outcome.message()).into());
         });
     });
 }
@@ -4119,6 +4145,8 @@ mod tests {
     #[test]
     fn stale_and_failed_discovery_cannot_change_model_catalog() {
         let mut settings = Settings::default();
+        let paths = AppPaths::with_root(unique_test_root("stale-fetch"));
+        let secret = SecretStore::new(paths.secret_file());
         let endpoint = settings.provider("deepseek").base_url_or_default();
         let mut fetch = crate::model_catalog::ModelFetch {
             ok: true,
@@ -4134,14 +4162,18 @@ mod tests {
             &mut settings,
             ("deepseek", &endpoint, 1),
             2,
-            &fetch
+            &fetch,
+            &secret,
+            ""
         ));
         assert!(settings.provider("deepseek").models.is_empty());
         assert!(remember_fetched_models(
             &mut settings,
             ("deepseek", &endpoint, 2),
             2,
-            &fetch
+            &fetch,
+            &secret,
+            ""
         ));
         fetch.ok = false;
         fetch.models = vec![config::ModelOption::manual("failed-model")];
@@ -4149,9 +4181,48 @@ mod tests {
             &mut settings,
             ("deepseek", &endpoint, 3),
             3,
-            &fetch
+            &fetch,
+            &secret,
+            ""
         ));
         assert_eq!(settings.provider("deepseek").models[0].id, "found-model");
+    }
+
+    #[test]
+    fn unknown_terminal_without_start_never_claims_not_executed() {
+        let paths = AppPaths::with_root(unique_test_root("unknown-terminal"));
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1000);
+        for text in [
+            "响应不完整，未执行",
+            "已中断（状态未知）",
+            "已中断（状态未知）",
+        ] {
+            record_event(
+                &slint::Weak::default(),
+                &mut sessions,
+                9,
+                AgentEvent::ToolEnd {
+                    turn: 9,
+                    step: 2,
+                    call: crate::agent::ToolCallId(1),
+                    name: "left_click".into(),
+                    status: ToolStatus::Cancelled,
+                    text: text.into(),
+                    ms: 23,
+                },
+            );
+        }
+        let restored = SessionRuntime::open(&paths);
+        let items = restored.timeline();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "已中断（状态未知）");
+        assert!(!items[0].text.contains("未执行"));
+        assert_eq!(items[0].ms, 23);
+        assert_eq!(
+            (items[0].turn_id, items[0].step, items[0].call_id),
+            (9, 2, 1)
+        );
     }
 
     #[test]

@@ -434,6 +434,35 @@ pub fn tts_runtime_config_changed(
         || key_changed_for_active_backend
 }
 
+/// 仅恢复当前端点和账户的发现目录；手动模型始终保留。不会保存设置或密钥。
+pub fn restore_model_catalogs(
+    settings: &mut Settings,
+    paths: &AppPaths,
+    secret: &SecretStore,
+    pending_key: Option<(&str, &str)>,
+) {
+    let cache = crate::model_catalog::ModelCache::with_path(paths.model_cache_file());
+    for id in settings.provider_ids() {
+        let mut provider = settings.provider(&id);
+        provider
+            .models
+            .retain(|model| model.source == config::ModelSource::Manual);
+        let saved_key = secret.load(&id).ok().flatten().unwrap_or_default();
+        let key = pending_key
+            .filter(|(target, _)| *target == id)
+            .map(|(_, key)| key)
+            .unwrap_or(&saved_key);
+        if let Some(models) = cache.models_for(&id, &provider.base_url_or_default(), key) {
+            provider.remember_models(models);
+        }
+        if let Some(existing) = settings.providers.iter_mut().find(|p| p.id == id) {
+            *existing = provider;
+        } else if !provider.models.is_empty() {
+            settings.providers.push(provider);
+        }
+    }
+}
+
 /// **一次保存的全部逻辑**。
 pub fn apply_save(
     paths: &AppPaths,
@@ -448,12 +477,17 @@ pub fn apply_save(
         Err(error) => return SaveOutcome::NotSaved(error),
     };
 
-    let cache = crate::model_catalog::ModelCache::with_path(paths.model_cache_file());
-    for provider in &mut next.providers {
-        if let Some(models) = cache.models_for(&provider.id, &provider.base_url_or_default()) {
-            provider.remember_models(models);
-        }
-    }
+    let pending_key = request.api_key.trim();
+    restore_model_catalogs(
+        &mut next,
+        paths,
+        secret,
+        if pending_key.is_empty() {
+            None
+        } else {
+            Some((&request.provider_id, pending_key))
+        },
+    );
 
     // 只写一次盘。失败时内存配置**不动**，界面保留草稿。
     if let Err(error) = config::save_settings(paths, &next) {
@@ -469,6 +503,8 @@ pub fn apply_save(
     } else {
         secret.save(&key_provider, &new_key).err()
     };
+
+    restore_model_catalogs(settings, paths, secret, None);
 
     // 只有"给当前启用的云端后端"写入了新 Key 才算凭据变化。
     let key_changed_for_active_backend = key_error.is_none()
@@ -573,7 +609,7 @@ mod tests {
         assert!(!provider.models.iter().any(|m| m.id == "old-model"));
         let cached = crate::model_catalog::ModelCache::with_path(paths.model_cache_file());
         assert_eq!(
-            cached.models_for("mimo", endpoint).unwrap()[0].id,
+            cached.models_for("mimo", endpoint, "").unwrap()[0].id,
             "new-model"
         );
     }

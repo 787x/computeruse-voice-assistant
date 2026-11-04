@@ -377,12 +377,12 @@ pub struct ModelCache {
     path: Option<std::path::PathBuf>,
 }
 
-fn cache_key(provider_id: &str, base_url: &str) -> String {
-    format!("{provider_id}|{base_url}")
+fn cache_key(provider_id: &str, base_url: &str, credential: &str) -> String {
+    format!("{provider_id}|{base_url}|{credential}")
 }
 
 /// Key 的短指纹：长度 + 简单散列，只用于"是不是同一个账号"的判断。
-fn fingerprint(api_key: &str) -> String {
+pub fn fingerprint(api_key: &str) -> String {
     if api_key.is_empty() {
         return String::new();
     }
@@ -432,7 +432,7 @@ impl ModelCache {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Option<&CacheEntry> {
-        let entry = self.entries.get(&cache_key(provider_id, base_url))?;
+        let entry = self.for_credentials(provider_id, base_url, api_key)?;
         if now_ms.saturating_sub(entry.at_ms) >= ttl_ms {
             return None;
         }
@@ -443,29 +443,58 @@ impl ModelCache {
     }
 
     /// 最近一次（无论是否过期）的缓存：请求失败时用来保留候选。
+    #[cfg(test)]
     fn last(&self, provider_id: &str, base_url: &str) -> Option<&CacheEntry> {
-        self.entries.get(&cache_key(provider_id, base_url))
+        self.entries
+            .values()
+            .filter(|entry| {
+                entry.provider_id == provider_id
+                    && entry.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+            })
+            .max_by_key(|entry| entry.at_ms)
     }
 
     fn put(&mut self, provider_id: &str, base_url: &str, entry: CacheEntry) {
-        self.entries.insert(cache_key(provider_id, base_url), entry);
+        self.entries.insert(
+            cache_key(provider_id, base_url, &entry.key_fingerprint),
+            entry,
+        );
     }
 
-    /// 已发现目录可随对应端点的设置保存；不把其他端点的目录合并进来。
-    pub fn models_for(&self, provider_id: &str, base_url: &str) -> Option<&[ModelOption]> {
+    fn for_credentials(
+        &self,
+        provider_id: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Option<&CacheEntry> {
+        let credential = fingerprint(api_key);
         self.entries
             .values()
-            .find(|entry| {
+            .filter(|entry| {
                 entry.provider_id == provider_id
                     && entry.base_url.trim().trim_end_matches('/')
                         == base_url.trim().trim_end_matches('/')
+                    && entry.key_fingerprint == credential
             })
+            .max_by_key(|entry| entry.at_ms)
+    }
+
+    /// 恢复目录时同时校验提供商、端点和账户；兼容旧缓存条目的字段布局。
+    pub fn models_for(
+        &self,
+        provider_id: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Option<&[ModelOption]> {
+        self.for_credentials(provider_id, base_url, api_key)
             .map(|entry| entry.models.as_slice())
     }
 
-    /// 清掉某个提供商的缓存（改了地址/Key 时用）。
     pub fn invalidate(&mut self, provider_id: &str, base_url: &str) {
-        self.entries.remove(&cache_key(provider_id, base_url));
+        self.entries.retain(|_, entry| {
+            entry.provider_id != provider_id
+                || entry.base_url.trim_end_matches('/') != base_url.trim_end_matches('/')
+        });
     }
 
     /// 缓存的条目数（测试用）。
@@ -512,7 +541,9 @@ pub async fn fetch_models(
         }
     }
 
-    let stale_snapshot = cache.last(&provider.id, &base_url).cloned();
+    let stale_snapshot = cache
+        .for_credentials(&provider.id, &base_url, api_key)
+        .cloned();
     let fallback = |error: String| ModelFetch {
         ok: false,
         cached: stale_snapshot.is_some(),
@@ -573,6 +604,14 @@ pub async fn fetch_models(
         return fallback(reason);
     }
 
+    // 网络并行，缓存提交串行：迟到的旧账户响应不能覆盖新账户的目录。
+    static CACHE_COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _commit = CACHE_COMMIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(path) = cache.path.clone() {
+        *cache = ModelCache::with_path(path);
+    }
     cache.put(
         &provider.id,
         &base_url,

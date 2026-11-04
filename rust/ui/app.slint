@@ -498,6 +498,13 @@ export component AppWindow inherits Window {
     callback grant-capability(capability: string, minutes: int);
     callback export-audit();
     // 模型发现与连通性（PR8）。
+    function clear-probe-results() {
+        root.connection-hint = "";
+        root.connection-code = "";
+        root.model-list-hint = "";
+        root.discovered-models = [];
+        root.discovered-model-index = -1;
+    }
     callback test-connection();
     callback fetch-models();
     callback confirm-decision(request-id: int, allow: bool);
@@ -1226,6 +1233,7 @@ export component AppWindow inherits Window {
                                     picked(index) => {
                                     root.settings-dirty = true;
                                     root.settings-error = "";
+                                    root.clear-probe-results();
                                     root.provider-changed(index);
                                 }
                             }
@@ -1238,7 +1246,7 @@ export component AppWindow inherits Window {
                                 enabled: !root.settings-saving;
                                 text <=> root.base-url;
                                 placeholder-text: "https://…";
-                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                edited => { root.settings-dirty = true; root.settings-error = "";  root.clear-probe-results();}
                             }
                         }
 
@@ -1249,7 +1257,7 @@ export component AppWindow inherits Window {
                                 enabled: !root.settings-saving;
                                 text <=> root.model-name;
                                 placeholder-text: "模型名";
-                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                edited => { root.settings-dirty = true; root.settings-error = "";  root.connection-hint = "";}
                             }
                         }
 
@@ -1261,7 +1269,7 @@ export component AppWindow inherits Window {
                                 text <=> root.api-key-input;
                                 placeholder-text: root.has-key ? "已保存（留空则不修改）" : "未保存";
                                 input-type-password: true;
-                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                edited => { root.settings-dirty = true; root.settings-error = "";  root.clear-probe-results();}
                             }
                         }
 
