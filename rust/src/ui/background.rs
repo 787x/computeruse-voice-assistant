@@ -23,7 +23,7 @@ impl BackgroundUi {
         let weak = window.as_weak();
         hud.on_open_main(move || {
             if let Some(w) = weak.upgrade() {
-                let _ = w.show();
+                activate_main(&w);
             }
         });
         let weak = window.as_weak();
@@ -78,13 +78,13 @@ impl BackgroundUi {
         let weak = window.as_weak();
         tray.on_open_main(move || {
             if let Some(w) = weak.upgrade() {
-                let _ = w.show();
+                activate_main(&w);
             }
         });
         let weak = window.as_weak();
         tray.on_settings(move || {
             if let Some(w) = weak.upgrade() {
-                let _ = w.show();
+                activate_main(&w);
                 w.invoke_open_settings();
             }
         });
@@ -203,5 +203,63 @@ mod visibility_tests {
     fn auto_expires() {
         assert!(should_hide(false, false, true, 4));
         assert!(!should_hide(false, false, true, 3));
+    }
+}
+
+/// Explicit user navigation only. Automatic HUD reveals must never call this.
+pub(super) fn activate_main(window: &AppWindow) {
+    use slint::winit_030::WinitWindowAccessor;
+    if let Err(error) = window.show() {
+        window.set_status(format!("无法打开主窗口：{error}").into());
+        return;
+    }
+    window.window().with_winit_window(|native| {
+        native.set_minimized(false);
+        native.focus_window();
+    });
+}
+#[cfg(all(test, windows))]
+mod navigation_tests {
+    use super::*;
+    use slint::winit_030::WinitWindowAccessor;
+    #[test]
+    #[ignore = "requires interactive Windows desktop; briefly focuses a test main window"]
+    fn explicit_navigation_restores_and_focuses_main() {
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .select()
+            .unwrap();
+        let window = AppWindow::new().unwrap();
+        window.show().unwrap();
+        let timer = slint::Timer::default();
+        let step = std::cell::Cell::new(0);
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(500),
+            move || {
+                match step.get() {
+                    0 => {
+                        window.window().with_winit_window(|w| w.set_minimized(true));
+                    }
+                    1 => activate_main(&window),
+                    2 => {
+                        window.window().with_winit_window(|w| {
+                            assert_ne!(w.is_minimized(), Some(true));
+                            assert!(
+                                w.has_focus(),
+                                "explicit main navigation must activate the window"
+                            );
+                        });
+                        activate_main(&window);
+                    }
+                    _ => {
+                        window.hide().unwrap();
+                        slint::quit_event_loop().unwrap();
+                    }
+                }
+                step.set(step.get() + 1);
+            },
+        );
+        slint::run_event_loop_until_quit().unwrap();
     }
 }

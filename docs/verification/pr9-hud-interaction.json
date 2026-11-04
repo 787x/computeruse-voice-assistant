@@ -1,0 +1,89 @@
+{
+  "Date": "2026-11-05",
+  "Scope": "Windows developer host, not clean VM",
+  "Dpi": [
+    {
+      "Dpi": 96,
+      "Scale": 100,
+      "WorkArea": [
+        0,
+        0,
+        2560,
+        1552
+      ],
+      "Bounds": [
+        2164,
+        1246,
+        380,
+        290
+      ]
+    },
+    {
+      "Dpi": 144,
+      "Scale": 150,
+      "WorkArea": [
+        0,
+        0,
+        2560,
+        1528
+      ],
+      "Bounds": [
+        1966,
+        1069,
+        570,
+        435
+      ]
+    },
+    {
+      "Dpi": 192,
+      "Scale": 200,
+      "WorkArea": [
+        0,
+        0,
+        2560,
+        1504
+      ],
+      "Bounds": [
+        1768,
+        892,
+        760,
+        580
+      ]
+    }
+  ],
+  "RestoredScale": 150,
+  "UserReported": [
+    "Tray menu complete",
+    "Manual HUD remained visible with microphone off for 15 seconds",
+    "Obscured/minimized main window restored to foreground",
+    "Visible ask Reject clicked after 15 seconds",
+    "New ask Allow clicked explicitly",
+    "HUD Cancel ended pending task"
+  ],
+  "MockToolResults": [
+    {
+      "ElapsedMs": 0,
+      "Status": "denied",
+      "Tool": 3000001,
+      "Turn": 3
+    },
+    {
+      "ElapsedMs": 655,
+      "Status": "ok",
+      "Tool": 4000001,
+      "Turn": 4
+    }
+  ],
+  "NativeFocusTest": {
+    "Foreground": "0x40854",
+    "RealKws": false,
+    "FirstAndTwoRetainedShows": "passed"
+  },
+  "Deferred": [
+    "real voice pipeline",
+    "clean Windows VM"
+  ],
+  "Unavailable": [
+    "multiple physical displays"
+  ]
+}

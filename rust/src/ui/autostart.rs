@@ -14,19 +14,25 @@ pub fn enabled() -> bool {
         let Ok(exe) = std::env::current_exe() else {
             return false;
         };
-        use std::os::windows::process::CommandExt;
-        // Registry strings are Unicode. reg.exe redirected output uses a legacy code page.
-        std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-ItemPropertyValue -LiteralPath 'Registry::HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'CUAVA-Rust' -ErrorAction Stop"])
-            .creation_flags(0x08000000).output().is_ok_and(|o| {
-                o.status.success() && owns_command(&String::from_utf8_lossy(&o.stdout), &exe.to_string_lossy())
-            })
+        registered_command().is_some_and(|value| owns_command(&value, &exe.to_string_lossy()))
     }
     #[cfg(not(windows))]
     {
         false
     }
 }
+#[cfg(windows)]
+fn registered_command() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-ItemPropertyValue -LiteralPath 'Registry::HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'CUAVA-Rust' -ErrorAction Stop"])
+        .creation_flags(0x08000000).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub fn set(enabled: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -81,5 +87,62 @@ mod tests {
             &q.replace("--background", "--settings"),
             r"C:\Portable\cuava.exe"
         ));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod registry_tests {
+    use super::*;
+    #[test]
+    #[ignore = "temporarily edits current-user CUAVA-Rust Run value and restores it"]
+    fn registry_roundtrip_and_foreign_owner_preservation() {
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 {
+                    let _ = reg(&[
+                        "add",
+                        KEY,
+                        "/v",
+                        "CUAVA-Rust",
+                        "/t",
+                        "REG_SZ",
+                        "/d",
+                        value,
+                        "/f",
+                    ]);
+                } else {
+                    let _ = reg(&["delete", KEY, "/v", "CUAVA-Rust", "/f"]);
+                }
+            }
+        }
+        let _restore = Restore(registered_command());
+        set(true).unwrap();
+        assert!(
+            enabled(),
+            "enable must persist a value owned by the current executable"
+        );
+        set(false).unwrap();
+        assert!(
+            registered_command().is_none(),
+            "disable must remove our value"
+        );
+        let foreign = r#""C:\portable-other\cuava.exe" --background"#;
+        assert!(reg(&[
+            "add",
+            KEY,
+            "/v",
+            "CUAVA-Rust",
+            "/t",
+            "REG_SZ",
+            "/d",
+            foreign,
+            "/f"
+        ])
+        .unwrap()
+        .status
+        .success());
+        set(false).unwrap();
+        assert_eq!(registered_command().as_deref(), Some(foreign));
     }
 }

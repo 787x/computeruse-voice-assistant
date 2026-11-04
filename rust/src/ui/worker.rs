@@ -183,7 +183,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         move || {
             for action in instance.requests() {
                 if let Some(w) = weak.upgrade() {
-                    let _ = w.show();
+                    super::background::activate_main(&w);
                     if action == "settings" {
                         w.invoke_open_settings();
                     }

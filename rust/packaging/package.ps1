@@ -28,10 +28,15 @@ $inventory = @()
 foreach ($package in $metadata.packages) {
     $inventory += "$($package.name) $($package.version) $($package.license) $($package.repository)"
     $dir = Split-Path $package.manifest_path
+    $nested = Join-Path $dir 'LICENSES'
+    if (Test-Path -LiteralPath $nested) {
+        Copy-Item -LiteralPath $nested -Destination (Join-Path $licenses "$($package.name)-$($package.version)-LICENSES") -Recurse
+    }
     foreach ($item in (Get-ChildItem -LiteralPath $dir -File | Where-Object Name -Match '^(LICENSE|COPYING|NOTICE)')) {
         Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $licenses "$($package.name)-$($package.version)-$($item.Name)")
     }
 }
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'native-notices') -Destination (Join-Path $licenses 'native') -Recurse
 $inventory | Set-Content -Encoding UTF8 (Join-Path $licenses 'cargo-inventory.txt')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'REDISTRIBUTION.md') -Destination $licenses
 $zip = Join-Path $Output 'cuava-0.1.0-windows-x64-cpu.zip'

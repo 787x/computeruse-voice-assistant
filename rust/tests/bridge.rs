@@ -464,3 +464,59 @@ async fn real_toolkit_captures_screenshot() {
 
     toolkit.bridge().dispose().await;
 }
+/// Read-only diagnostic for real DPI changes; only logs our HUD bounds and backend DPI data.
+#[tokio::test]
+#[ignore = "requires a manually visible HUD on an interactive Windows desktop"]
+async fn real_hud_geometry() {
+    let script = BridgeOptions::resolve_default_script().expect("cua.ps1");
+    let bridge = bridge_for(script, 30_000, 20_000);
+    let cancel = CancelToken::new();
+    let info = bridge.probe(&cancel).await.expect("ready");
+    println!("DPI probe: {info:?}");
+    let windows = bridge
+        .call("list_windows", serde_json::json!({}), None, &cancel)
+        .await
+        .expect("list windows");
+    let hud = windows["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["title"] == "CUAVA Voice HUD");
+    println!(
+        "HUD bounds: {}",
+        hud.map(|w| &w["bounds"])
+            .unwrap_or(&serde_json::Value::Null)
+    );
+    bridge.dispose().await;
+    let bounds = &hud.expect("manual HUD must be visible")["bounds"];
+    let x = bounds["x"].as_i64().unwrap();
+    let y = bounds["y"].as_i64().unwrap();
+    let width = bounds["width"].as_i64().unwrap();
+    let height = bounds["height"].as_i64().unwrap();
+    let monitors = info.raw["screen"]["monitors"].as_array().unwrap();
+    let monitor = monitors
+        .iter()
+        .find(|m| {
+            let b = &m["bounds"];
+            let left = b["x"].as_i64().unwrap();
+            let top = b["y"].as_i64().unwrap();
+            x + width / 2 >= left
+                && x + width / 2 < left + b["width"].as_i64().unwrap()
+                && y + height / 2 >= top
+                && y + height / 2 < top + b["height"].as_i64().unwrap()
+        })
+        .expect("HUD monitor");
+    let scale = monitor["dpi"].as_f64().unwrap() / 96.0;
+    assert!(
+        (width - (380.0 * scale).round() as i64).abs() <= 2,
+        "HUD width must preserve logical layout at DPI {scale}"
+    );
+    assert!(
+        (height - (290.0 * scale).round() as i64).abs() <= 2,
+        "HUD height must preserve logical layout at DPI {scale}"
+    );
+    let area = &monitor["working"];
+    assert!(x >= area["x"].as_i64().unwrap() && y >= area["y"].as_i64().unwrap());
+    assert!(x + width <= area["x"].as_i64().unwrap() + area["width"].as_i64().unwrap());
+    assert!(y + height <= area["y"].as_i64().unwrap() + area["height"].as_i64().unwrap());
+}

@@ -18,6 +18,10 @@ System::Call 'kernel32::GetCurrentProcessId() i.r1'
 WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "pid" "$1"
 WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "init"
 WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "target" "$INSTDIR"
+FunctionEnd
+Function CheckDestination
+# The directory page may change INSTDIR after .onInit.
+WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "target" "$INSTDIR"
 IfFileExists "$INSTDIR\cuava.exe" 0 executable_available
 System::Call 'kernel32::CreateFileW(w "$INSTDIR\cuava.exe", i 0xC0000000, i 0, p 0, i 3, i 0, p 0) p.r0'
 IntCmp $0 -1 executable_busy
@@ -34,13 +38,27 @@ Function .onInstSuccess
 WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "success"
 FunctionEnd
 Function .onInstFailed
+ReadINIStr $0 "$TEMP\cuava-install-diagnostic.ini" "install" "stage"
+StrCmp $0 "blocked-in-use" 0 generic_failure
+SetErrorLevel 2
+Return
+generic_failure:
 WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "failed"
 SetErrorLevel 1
 FunctionEnd
 Section "CUAVA Rust"
+Call CheckDestination
 WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "extract"
 SetShellVarContext current
+ClearErrors
 SetOutPath "$INSTDIR"
+IfErrors 0 directory_ready
+System::Call 'kernel32::GetLastError() i.r0'
+WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "directory-failed"
+WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "win32-error" "$0"
+SetErrorLevel 1
+Abort "无法创建安装目录（Windows 错误 $0）：$INSTDIR。请选择当前用户有写入权限的目录。"
+directory_ready:
 # In-use files raise the normal installer retry dialog; no process killing.
 ClearErrors
 File /r "${STAGE}\*"

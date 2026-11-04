@@ -1,0 +1,12 @@
+{
+  "CandidateSHA256": "11077A098E8D34414CA07624520E4A641D18C3023BB722CEF85F56CDBDD27FFB",
+  "InstallPID": 33040,
+  "InstallExit": 0,
+  "PayloadHashMatched": true,
+  "BusyPID": 6956,
+  "BusyExit": 2,
+  "BusyLog": "[install]\r\nstage=blocked-in-use\r\ntarget=D:\\Projects\\computeruse-voice-assistant\\.tmp\\pr9-last-install\r\npid=6956\r\n",
+  "UninstallExit": 0,
+  "ExeRemoved": true,
+  "ExistingRunPreserved": true
+}
