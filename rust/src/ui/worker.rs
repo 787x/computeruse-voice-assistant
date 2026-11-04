@@ -97,6 +97,7 @@ pub enum UiCommand {
     FetchModels { provider: String, base_url: String },
     ModelsFetched {
         provider: String,
+        base_url: String,
         request: u64,
         fetch: crate::model_catalog::ModelFetch,
     },
@@ -430,6 +431,20 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     base_url: window.get_base_url().to_string(),
                 });
             }
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_model_choice_picked(move |index| {
+            let _ = tx.send(UiCommand::ModelChoicePicked(index));
+        });
+        let tx = command_tx.clone();
+        window.on_reasoning_picked(move |index| {
+            let _ = tx.send(UiCommand::ReasoningPicked(index));
+        });
+        let tx = command_tx.clone();
+        window.on_apply_manual_model(move |model| {
+            let _ = tx.send(UiCommand::ApplyManualModel(model.to_string()));
         });
     }
     {
@@ -1333,7 +1348,7 @@ async fn run_worker(
         &settings.permission_overrides,
     )));
     let audit = AuditLog::new(paths.audit_file());
-    let model_cache = ModelCache::with_path(paths.model_cache_file());
+
     let mut model_request = 0u64;
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
@@ -1570,11 +1585,12 @@ async fn run_worker(
                     .unwrap_or_default();
                 model_request += 1;
                 let request = model_request;
-                let mut cache = model_cache.clone();
+                let mut cache = ModelCache::with_path(paths.model_cache_file());
                 let tx = command_tx.clone();
                 tokio::spawn(async move {
                     let fetch = fetch_models(&provider, &api_key, &mut cache, true).await;
                     let _ = tx.send(UiCommand::ModelsFetched {
+                        base_url: provider.base_url_or_default(),
                         provider: provider.id,
                         request,
                         fetch,
@@ -1583,17 +1599,17 @@ async fn run_worker(
             }
             UiCommand::ModelsFetched {
                 provider,
+                base_url,
                 request,
                 fetch,
             } => {
                 if request == model_request {
-                    if fetch.ok {
-                        if let Some(target) =
-                            settings.providers.iter_mut().find(|p| p.id == provider)
-                        {
-                            target.remember_models(&fetch.models);
-                        }
-                    }
+                    remember_fetched_models(
+                        &mut settings,
+                        (&provider, &base_url, request),
+                        model_request,
+                        &fetch,
+                    );
                     {
                         let settings = settings.clone();
                         let sessions = sessions.clone();
@@ -1601,7 +1617,10 @@ async fn run_worker(
                         with_window(&weak, move |window| {
                             refresh_model_picker(window, &settings, &sessions);
                             window.set_models_busy(false);
-                            if provider_id_for_index(window.get_provider_index()) == provider {
+                            if provider_id_for_index(window.get_provider_index()) == provider
+                                && window.get_base_url().trim().trim_end_matches('/')
+                                    == base_url.trim().trim_end_matches('/')
+                            {
                                 window.set_model_list_hint(fetch.summary().into());
                                 if fetch.ok {
                                     window.set_discovered_models(ModelRc::new(VecModel::from(
@@ -3206,9 +3225,9 @@ async fn wait_turn(
                     Some(UiCommand::TestConnection) => {
                         set_status(weak, "正在执行；先结束这一轮再测试连接");
                     }
-                    Some(UiCommand::ModelsFetched { provider, request, fetch }) => {
+                    Some(UiCommand::ModelsFetched { provider, base_url, request, fetch }) => {
                         if request == *model_request {
-                            if fetch.ok { if let Some(target) = settings.providers.iter_mut().find(|p| p.id == provider) { target.remember_models(&fetch.models); } }
+                            remember_fetched_models(settings, (&provider, &base_url, request), *model_request, &fetch);
                             let settings = settings.clone(); let sessions = sessions.clone();
                             with_window(weak, move |window| { window.set_models_busy(false); refresh_model_picker(window, &settings, &sessions); });
                         }
@@ -3407,6 +3426,18 @@ fn close_settings(weak: &slint::Weak<AppWindow>) {
 ///
 /// PR8 的事件带回合/步骤/调用实例：工具卡片按**真实调用实例**追加，
 /// 思考内容独立成块（不混进可见正文，因此不会被 TTS 朗读）。
+fn remember_fetched_models(
+    settings: &mut Settings,
+    identity: (&str, &str, u64),
+    current_request: u64,
+    fetch: &crate::model_catalog::ModelFetch,
+) -> bool {
+    let (provider, endpoint, request) = identity;
+    request == current_request
+        && fetch.ok
+        && settings.remember_discovered_models(provider, endpoint, &fetch.models)
+}
+
 fn record_event(
     weak: &slint::Weak<AppWindow>,
     sessions: &mut SessionRuntime,
@@ -3447,14 +3478,18 @@ fn record_event(
         ),
         AgentEvent::ToolEnd {
             turn,
+            step,
             call,
+            name,
             status,
             text,
             ms,
             ..
         } if *turn == turn_id => sessions.update_tool_item(
             *turn,
+            *step,
             call.0,
+            name,
             match status {
                 ToolStatus::Ok => TimelineToolStatus::Ok,
                 ToolStatus::Failed => TimelineToolStatus::Failed,
@@ -4079,6 +4114,83 @@ mod tests {
     fn speech_without_engine() -> SpeechRuntime {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         SpeechRuntime::new(tx)
+    }
+
+    #[test]
+    fn stale_and_failed_discovery_cannot_change_model_catalog() {
+        let mut settings = Settings::default();
+        let endpoint = settings.provider("deepseek").base_url_or_default();
+        let mut fetch = crate::model_catalog::ModelFetch {
+            ok: true,
+            cached: false,
+            stale: false,
+            models: vec![config::ModelOption::manual("found-model")],
+            dropped: Vec::new(),
+            raw: 1,
+            error: None,
+            at_ms: 1,
+        };
+        assert!(!remember_fetched_models(
+            &mut settings,
+            ("deepseek", &endpoint, 1),
+            2,
+            &fetch
+        ));
+        assert!(settings.provider("deepseek").models.is_empty());
+        assert!(remember_fetched_models(
+            &mut settings,
+            ("deepseek", &endpoint, 2),
+            2,
+            &fetch
+        ));
+        fetch.ok = false;
+        fetch.models = vec![config::ModelOption::manual("failed-model")];
+        assert!(!remember_fetched_models(
+            &mut settings,
+            ("deepseek", &endpoint, 3),
+            3,
+            &fetch
+        ));
+        assert_eq!(settings.provider("deepseek").models[0].id, "found-model");
+    }
+
+    #[test]
+    fn terminal_only_tool_events_are_saved_once_with_identity_and_not_executed_reason() {
+        let paths = AppPaths::with_root(unique_test_root("terminal-only"));
+        let mut sessions = SessionRuntime::open(&paths);
+        let first = sessions.create(1000, "first");
+        let weak = slint::Weak::default();
+        for call in [1, 1, 2] {
+            record_event(
+                &weak,
+                &mut sessions,
+                7,
+                AgentEvent::ToolEnd {
+                    turn: 7,
+                    step: 3,
+                    call: crate::agent::ToolCallId(call),
+                    name: "left_click".into(),
+                    status: ToolStatus::Failed,
+                    text: "响应不完整，未执行".into(),
+                    ms: 0,
+                },
+            );
+        }
+        sessions.create(2000, "second");
+        sessions.select(&first).unwrap();
+        let restored = SessionRuntime::open(&paths);
+        let items = restored.timeline();
+        assert_eq!(items.len(), 2);
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(
+                (item.turn_id, item.step, item.call_id),
+                (7, 3, i as u64 + 1)
+            );
+            assert_eq!(item.tool, "left_click");
+            assert_eq!(item.status, crate::session::TimelineToolStatus::Failed);
+            assert!(item.text.contains("未执行"));
+            assert!(item.text.contains("响应不完整"));
+        }
     }
 
     #[test]

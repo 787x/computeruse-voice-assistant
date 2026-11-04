@@ -301,11 +301,13 @@ impl SessionRuntime {
         }
     }
 
-    /// 更新一条已存在的时间线（按 `call_id` + `turn_id` 定位）。
+    /// 终态按回合/调用实例原位更新；缺少开始事件时补记未执行的终态。
     pub fn update_tool_item(
         &mut self,
         turn_id: u64,
+        step: usize,
         call_id: u64,
+        tool: &str,
         status: TimelineToolStatus,
         text: &str,
         ms: u64,
@@ -319,8 +321,25 @@ impl SessionRuntime {
             item.status = status;
             item.ms = ms;
             if !text.is_empty() {
-                item.text = text.to_string();
+                item.text = if item.text.starts_with("未执行：") {
+                    format!("未执行：{text}")
+                } else {
+                    text.to_string()
+                };
             }
+        } else {
+            session.push_timeline(TimelineItem {
+                kind: TimelineKind::Tool,
+                turn_id,
+                step,
+                call_id,
+                tool: tool.to_string(),
+                status,
+                text: format!("未执行：{text}"),
+                ms,
+                at_ms: crate::clock::now().unix_ms,
+                ..TimelineItem::default()
+            });
         }
         session.updated_at_ms = crate::clock::now().unix_ms;
     }
@@ -797,7 +816,15 @@ mod tests {
                 },
             );
         }
-        runtime.update_tool_item(5, 2, TimelineToolStatus::Ok, "窗口列表", 12);
+        runtime.update_tool_item(
+            5,
+            1,
+            2,
+            "list_windows",
+            TimelineToolStatus::Ok,
+            "窗口列表",
+            12,
+        );
         let items: Vec<TimelineItem> = runtime
             .timeline()
             .into_iter()

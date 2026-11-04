@@ -377,6 +377,11 @@ fn upsert_provider(
     let model_text = model.to_string();
     match providers.iter_mut().find(|provider| provider.id == id) {
         Some(existing) => {
+            if existing.base_url_or_default().trim_end_matches('/')
+                != base_url.trim().trim_end_matches('/')
+            {
+                existing.models.clear();
+            }
             existing.base_url = base_url.to_string();
             existing.model = model_text.clone();
             existing.provider_hint = hint;
@@ -438,10 +443,17 @@ pub fn apply_save(
     request: &SaveRequest,
 ) -> SaveOutcome {
     let previous = settings.clone();
-    let next = match build_candidate(&previous, request) {
+    let mut next = match build_candidate(&previous, request) {
         Ok(next) => next,
         Err(error) => return SaveOutcome::NotSaved(error),
     };
+
+    let cache = crate::model_catalog::ModelCache::with_path(paths.model_cache_file());
+    for provider in &mut next.providers {
+        if let Some(models) = cache.models_for(&provider.id, &provider.base_url_or_default()) {
+            provider.remember_models(models);
+        }
+    }
 
     // 只写一次盘。失败时内存配置**不动**，界面保留草稿。
     if let Err(error) = config::save_settings(paths, &next) {
@@ -523,6 +535,47 @@ mod tests {
             tts_local_speed: format!("{:.1}", settings.tts.local_speed),
             speak_mode: 0,
         }
+    }
+
+    #[test]
+    fn saving_changed_endpoint_uses_its_cached_models_and_preserves_other_providers() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp/save-discovered-endpoint");
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(&root);
+        let mut settings = Settings::default();
+        let old = settings.provider("mimo").base_url_or_default();
+        let old_models = vec![crate::config::ModelOption::manual("old-model")];
+        assert!(settings.remember_discovered_models("mimo", &old, &old_models));
+        let endpoint = "http://127.0.0.1:12345/v1";
+        assert!(!settings.remember_discovered_models(
+            "mimo",
+            endpoint,
+            &[crate::config::ModelOption::manual("new-model")]
+        ));
+        let cache = serde_json::json!({"entries": {format!("mimo|{endpoint}"): {"atMs": 1, "providerId": "mimo", "baseUrl": endpoint, "keyFingerprint": "", "models": [{"id": "new-model"}], "dropped": [], "raw": 1}}});
+        std::fs::write(
+            paths.model_cache_file(),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+        let mut request = base_request(&settings);
+        request.base_url = endpoint.into();
+        request.model = "new-model".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        let secret = SecretStore::new(paths.secret_file());
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        let restored = config::load_settings(&paths).unwrap();
+        let provider = restored.provider("mimo");
+        assert_eq!(provider.base_url, endpoint);
+        assert!(provider.models.iter().any(|m| m.id == "new-model"));
+        assert!(!provider.models.iter().any(|m| m.id == "old-model"));
+        let cached = crate::model_catalog::ModelCache::with_path(paths.model_cache_file());
+        assert_eq!(
+            cached.models_for("mimo", endpoint).unwrap()[0].id,
+            "new-model"
+        );
     }
 
     #[test]

@@ -451,6 +451,18 @@ impl ModelCache {
         self.entries.insert(cache_key(provider_id, base_url), entry);
     }
 
+    /// 已发现目录可随对应端点的设置保存；不把其他端点的目录合并进来。
+    pub fn models_for(&self, provider_id: &str, base_url: &str) -> Option<&[ModelOption]> {
+        self.entries
+            .values()
+            .find(|entry| {
+                entry.provider_id == provider_id
+                    && entry.base_url.trim().trim_end_matches('/')
+                        == base_url.trim().trim_end_matches('/')
+            })
+            .map(|entry| entry.models.as_slice())
+    }
+
     /// 清掉某个提供商的缓存（改了地址/Key 时用）。
     pub fn invalidate(&mut self, provider_id: &str, base_url: &str) {
         self.entries.remove(&cache_key(provider_id, base_url));

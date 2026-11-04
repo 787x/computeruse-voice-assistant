@@ -942,6 +942,28 @@ impl Settings {
         }
     }
 
+    /// 仅将与已配置端点匹配的目录写入提供商条目；草稿端点由模型缓存保留。
+    pub fn remember_discovered_models(
+        &mut self,
+        id: &str,
+        endpoint: &str,
+        models: &[ModelOption],
+    ) -> bool {
+        let mut provider = self.provider(id);
+        if provider.base_url_or_default().trim_end_matches('/')
+            != endpoint.trim().trim_end_matches('/')
+        {
+            return false;
+        }
+        provider.remember_models(models);
+        if let Some(existing) = self.providers.iter_mut().find(|p| p.id == id) {
+            *existing = provider;
+        } else {
+            self.providers.push(provider);
+        }
+        true
+    }
+
     /// 生成模型端点的档案（能力判定只在这里做一次）。
     ///
     /// 判定顺序（与旧版 `resolveCapability` 等价）：
