@@ -339,6 +339,29 @@ export component AppWindow inherits Window {
     in-out property <bool> settings-open: false;
     in-out property <int> provider-index: 0;
     in-out property <string> base-url: "";
+    in-out property <int> plan-edit-index: -1;
+    in-out property <string> plan-edit-id;
+    in-out property <string> plan-edit-name;
+    in-out property <string> plan-edit-provider: "mimo";
+    in-out property <string> plan-edit-model;
+    in-out property <[string]> plan-edit-labels;
+    callback edit-plan(index: int);
+    callback store-plan();
+    callback remove-plan();
+    in-out property <string> model-plans-json;
+    in-out property <string> model-schedule-json;
+    in-out property <bool> schedule-enabled;
+    in-out property <string> schedule-default;
+    callback update-schedule();
+    in-out property <[string]> rule-labels;
+    in-out property <int> rule-index: -1;
+    in-out property <string> rule-from: "09:00";
+    in-out property <string> rule-to: "18:00";
+    in-out property <string> rule-days;
+    in-out property <string> rule-plan;
+    callback edit-rule(index: int);
+    callback store-rule();
+    callback remove-rule();
     in-out property <string> model-name: "";
     in-out property <string> api-key-input: "";
     in-out property <bool> has-key: false;
@@ -471,6 +494,7 @@ export component AppWindow inherits Window {
     callback permission-mode-picked(index: int);
     callback override-picked(row: int, choice: int);
     callback toggle-pause();
+    in property <[string]> capability-ids;
     callback grant-capability(capability: string, minutes: int);
     callback export-audit();
     // 模型发现与连通性（PR8）。
@@ -731,7 +755,8 @@ export component AppWindow inherits Window {
                     transcript := VerticalLayout {
                         spacing: 8px;
 
-                        for entry in root.entries: Rectangle {
+                        for entry in root.entries: timeline-row := Rectangle {
+                            property <bool> expanded: false;
                             height: bubble.preferred-height + 16px;
                             border-radius: 8px;
                             background: entry.tint;
@@ -747,7 +772,12 @@ export component AppWindow inherits Window {
                                     font-size: 11px;
                                     color: #8a8a90;
                                 }
+                                if entry.role == "思考": AppButton {
+                                    label: timeline-row.expanded ? "收起思考" : "展开思考";
+                                    clicked => { timeline-row.expanded = !timeline-row.expanded; }
+                                }
                                 Text {
+                                    visible: entry.role != "思考" || timeline-row.expanded;
                                     text: entry.text;
                                     wrap: word-wrap;
                                     color: #1f1f22;
@@ -756,34 +786,6 @@ export component AppWindow inherits Window {
                                     text: entry.detail;
                                     font-size: 11px;
                                     color: #8a8a90;
-                                    wrap: word-wrap;
-                                }
-                            }
-                        }
-
-                        // 工具卡片与思考块都在时间线里（不再只靠右侧侧栏）。
-                        for tool in root.tools: Rectangle {
-                            height: timeline-tool.preferred-height + 12px;
-                            border-radius: 6px;
-                            background: tool.tint;
-                            border-width: 1px;
-                            border-color: #d8d8dd;
-
-                            timeline-tool := VerticalLayout {
-                                padding: 8px;
-                                spacing: 2px;
-
-                                Text {
-                                    color: Theme.text-color;
-                                    text: tool.name + "  ·  " + tool.state;
-                                    font-size: 12px;
-                                    font-weight: 600;
-                                    overflow: elide;
-                                }
-                                Text {
-                                    text: tool.detail;
-                                    font-size: 11px;
-                                    color: #55555c;
                                     wrap: word-wrap;
                                 }
                             }
@@ -1169,6 +1171,38 @@ export component AppWindow inherits Window {
 
                         // ===== 0. 模型 / 方案 =====
                         if root.settings-tab-index == 0 : VerticalLayout {
+                            Text { text: "模型方案"; color: Theme.text-color; }
+                            HorizontalLayout {
+                                AppComboBox { options: root.plan-edit-labels; index: root.plan-edit-index; picked(i) => { root.edit-plan(i); } }
+                                AppButton { label: "新建"; clicked => { root.edit-plan(-1); } }
+                                AppButton { label: "更新方案草稿"; clicked => { root.store-plan(); } }
+                                AppButton { label: "删除方案"; clicked => { root.remove-plan(); } }
+                            }
+                            HorizontalLayout {
+                                AppLineEdit { text <=> root.plan-edit-id; placeholder-text: "方案 ID"; }
+                                AppLineEdit { text <=> root.plan-edit-name; placeholder-text: "名称"; }
+                                AppLineEdit { text <=> root.plan-edit-provider; placeholder-text: "mimo / deepseek / openai-compatible"; }
+                                AppLineEdit { text <=> root.plan-edit-model; placeholder-text: "模型名称"; }
+                            }
+                            HorizontalLayout {
+                                AppButton { label: root.schedule-enabled ? "时段切换：已启用" : "时段切换：已禁用"; clicked => { root.schedule-enabled = !root.schedule-enabled; root.update-schedule(); } }
+                                AppLineEdit { text <=> root.schedule-default; placeholder-text: "默认方案 ID（留空跟随全局）"; edited => { root.update-schedule(); } }
+                            }
+                            Text { text: "时段规则（星期 1–7，逗号分隔；留空表示每天）"; color: Theme.text-color; }
+                            HorizontalLayout {
+                                AppComboBox { options: root.rule-labels; index: root.rule-index; picked(i) => { root.edit-rule(i); } }
+                                AppButton { label: "新规则"; clicked => { root.edit-rule(-1); } }
+                                AppButton { label: "更新规则草稿"; clicked => { root.store-rule(); } }
+                                AppButton { label: "删除规则"; clicked => { root.remove-rule(); } }
+                            }
+                            HorizontalLayout {
+                                AppLineEdit { text <=> root.rule-from; placeholder-text: "开始 HH:mm"; }
+                                AppLineEdit { text <=> root.rule-to; placeholder-text: "结束 HH:mm"; }
+                                AppLineEdit { text <=> root.rule-days; placeholder-text: "星期，例如 1,2,3,4,5"; }
+                                AppLineEdit { text <=> root.rule-plan; placeholder-text: "方案 ID"; }
+                            }
+
+
                             spacing: 10px;
 
                             Text {
@@ -1654,7 +1688,7 @@ export component AppWindow inherits Window {
                                     label: "限时允许";
                                     enabled: !root.settings-saving;
                                     width: 84px;
-                                    clicked => { root.grant-capability(row, 15); }
+                                    clicked => { root.grant-capability(root.capability-ids[index], 15); }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }

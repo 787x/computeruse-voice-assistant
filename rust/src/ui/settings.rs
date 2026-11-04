@@ -24,6 +24,8 @@ use crate::voice::tts::{TtsBackend, TtsSettings};
 /// 界面「保存」提交的全部内容。
 #[derive(Debug, Clone)]
 pub struct SaveRequest {
+    pub model_plans_json: String,
+    pub model_schedule_json: String,
     // ---- 当前生效的提供商（模型页顶部） ----
     pub provider_id: String,
     pub base_url: String,
@@ -272,6 +274,10 @@ fn parse_i32(field: &str, text: &str, default: i32) -> Result<i32, String> {
 /// 把界面提交组装成候选配置（**不碰磁盘**）。
 pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Settings, String> {
     let mut next = current.clone();
+    next.model_plans = serde_json::from_str(&request.model_plans_json)
+        .map_err(|e| format!("模型方案格式错误：{e}"))?;
+    next.model_schedule = serde_json::from_str(&request.model_schedule_json)
+        .map_err(|e| format!("时段规则格式错误：{e}"))?;
 
     // ---- 当前生效的提供商 ----
     next.provider_id = request.provider_id.trim().to_string();
@@ -490,6 +496,8 @@ mod tests {
 
     fn base_request(settings: &Settings) -> SaveRequest {
         SaveRequest {
+            model_plans_json: serde_json::to_string(&settings.model_plans).unwrap(),
+            model_schedule_json: serde_json::to_string(&settings.model_schedule).unwrap(),
             provider_id: settings.provider_id.clone(),
             base_url: settings.base_url.clone(),
             model: settings.model.clone(),

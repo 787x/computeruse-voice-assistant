@@ -1392,6 +1392,45 @@ mod tests {
     }
 
     #[test]
+    fn request_body_filters_foreign_reasoning_preserving_tool_pairs() {
+        let result = ChatResult {
+            text: "正文".into(),
+            reasoning: "私有思考".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "list_windows".into(),
+                arguments: "{}".into(),
+                valid: true,
+                invalid_reason: None,
+            }],
+            ..ChatResult::default()
+        };
+        let history = vec![
+            assistant_message_from(&result, true, "mimo"),
+            ChatMessage::tool_result("c1", "result"),
+        ];
+        for (provider, capability) in [
+            ("mimo", Capability::Mimo),
+            ("deepseek", Capability::DeepSeek),
+        ] {
+            let mut p = profile(capability, "model");
+            p.provider_id = provider.into();
+            let client = LlmClient::new(p, "", 0.3, 1000).unwrap();
+            let body = client.build_body(&history, &[], false);
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages[0]["content"], "正文");
+            assert_eq!(messages[0]["tool_calls"][0]["id"], "c1");
+            assert_eq!(messages[1]["tool_call_id"], "c1");
+            assert_eq!(messages[1]["content"], "result");
+            if provider == "deepseek" {
+                assert!(messages[0].get("reasoning_content").is_none());
+            } else {
+                assert_eq!(messages[0]["reasoning_content"], "私有思考");
+            }
+        }
+    }
+
+    #[test]
     fn request_body_omits_empty_tools() {
         let client = LlmClient::new(profile(Capability::Plain, "m"), "", 0.3, 1000).unwrap();
         let body = client.build_body(&[ChatMessage::user("hi")], &[], true);

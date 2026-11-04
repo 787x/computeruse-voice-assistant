@@ -21,6 +21,7 @@ use crate::ui::timeline::TimelineView;
 use crate::AppWindow;
 
 /// 会话运行时（工作线程持有）。
+#[derive(Clone)]
 pub struct SessionRuntime {
     store: SessionStore,
     /// 列表元数据（按最近更新时间倒序）。
@@ -159,6 +160,15 @@ impl SessionRuntime {
             .read_session(&session_id)
             .map_err(|error| error.to_string())?;
         session.repair_after_restore();
+        let index = SessionIndex {
+            current_id: session_id.clone(),
+            sessions: self.summaries.clone(),
+            rebuilt: false,
+            corrupt: Vec::new(),
+        };
+        self.store
+            .save_index(&index)
+            .map_err(|error| error.to_string())?;
         self.current_id = session_id;
         self.current = Some(session);
         Ok(())
@@ -196,8 +206,11 @@ impl SessionRuntime {
         session.title = title;
         session.updated_at_ms = now;
         self.store
-            .save_session(&session.for_storage())
+            .save_session(&session.clone().for_storage())
             .map_err(|error| error.to_string())?;
+        let summary = session.summary();
+        self.summaries.retain(|item| item.id != summary.id);
+        self.summaries.push(summary);
         self.sync_summaries();
         Ok(())
     }
@@ -310,6 +323,28 @@ impl SessionRuntime {
             }
         }
         session.updated_at_ms = crate::clock::now().unix_ms;
+    }
+
+    pub fn extend_fragment(&mut self, turn: u64, step: usize, kind: TimelineKind, text: &str) {
+        if let Some(session) = self.current.as_mut() {
+            if let Some(last) = session
+                .timeline
+                .last_mut()
+                .filter(|item| item.turn_id == turn && item.step == step && item.kind == kind)
+            {
+                last.text.push_str(text);
+                return;
+            }
+        }
+        self.push_timeline(
+            turn,
+            TimelineItem {
+                kind,
+                step,
+                text: text.to_string(),
+                ..TimelineItem::default()
+            },
+        );
     }
 
     /// 追加助手正文（同一回合的连续增量合并到同一条，跨回合分开）。
@@ -567,6 +602,29 @@ mod tests {
     }
 
     #[test]
+    fn selection_and_noncurrent_rename_survive_without_another_save() {
+        let paths = unique_paths("selection-rename");
+        let mut runtime = SessionRuntime::open(&paths);
+        let first = runtime.create(1000, "first");
+        runtime.create(2000, "second");
+        runtime.rename(&first, "renamed").unwrap();
+        assert_eq!(
+            runtime
+                .summaries()
+                .iter()
+                .find(|s| s.id == first)
+                .unwrap()
+                .title,
+            "renamed"
+        );
+        runtime.select(&first).unwrap();
+        assert!(runtime.select("missing").is_err());
+        let reopened = SessionRuntime::open(&paths);
+        assert_eq!(reopened.current_id(), first);
+        assert_eq!(reopened.current().unwrap().title, "renamed");
+    }
+
+    #[test]
     fn runtime_creates_and_switches_between_sessions() {
         let paths = unique_paths("runtime-sessions");
         let mut runtime = SessionRuntime::open(&paths);
@@ -622,7 +680,7 @@ mod tests {
             .iter()
             .find(|item| item.kind == TimelineKind::Tool)
             .unwrap();
-        assert_eq!(tool.status, TimelineToolStatus::Cancelled);
+        assert_eq!(tool.status, TimelineToolStatus::Interrupted);
         assert_eq!(
             reopened.current().unwrap().last_turn_status,
             TurnStatus::Interrupted

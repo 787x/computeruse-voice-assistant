@@ -87,7 +87,7 @@ impl TimelineView {
                         TimelineToolStatus::Failed => "#fdeeee",
                         TimelineToolStatus::Denied => "#fff4e5",
                         TimelineToolStatus::Cancelled => "#f1f1f3",
-                        TimelineToolStatus::Running => "#f1f1f3",
+                        TimelineToolStatus::Interrupted | TimelineToolStatus::Running => "#f1f1f3",
                     };
                     let mut detail_parts: Vec<String> = Vec::new();
                     if !item.args_summary.trim().is_empty() {
@@ -104,6 +104,12 @@ impl TimelineView {
                     } else {
                         item.tool.clone()
                     };
+                    view.entries.push(crate::ChatEntry {
+                        role: format!("#{} {} · {}", item.call_id, name, status.label()).into(),
+                        text: detail_parts.join(" · ").into(),
+                        detail: "".into(),
+                        tint: parse_hex_color(tint),
+                    });
                     view.tools.push(crate::ToolCard {
                         name: format!("#{} {}", item.call_id, name).into(),
                         state: format!("{}{}", status.label(), step_suffix(item.step)).into(),
@@ -295,7 +301,8 @@ mod tests {
         let json = serde_json::to_string(&items).unwrap();
         let restored: Vec<TimelineItem> = serde_json::from_str(&json).unwrap();
         let view = TimelineView::from_items(restored);
-        assert_eq!(view.entries().len(), 2);
+        assert_eq!(view.entries().len(), 3);
+        assert_eq!(view.entries()[1].role, "#1 list_windows · 成功");
         assert_eq!(view.tools().len(), 1);
         assert_eq!(view.tools()[0].state, "成功");
     }

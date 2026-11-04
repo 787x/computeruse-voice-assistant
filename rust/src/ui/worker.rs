@@ -29,10 +29,12 @@ use crate::session::{TimelineItem, TurnStatus};
 use crate::ui::sessions::{
     publish_audit, publish_session_list, publish_session_title, publish_timeline, SessionRuntime,
 };
+#[cfg(test)]
+use crate::ui::settings::permission_mode_for_index;
 use crate::ui::settings::{
-    self as settings_ui, apply_save, permission_mode_for_index, permission_mode_index,
-    reasoning_effort_index, thinking_index, tts_backend_index, SaveOutcome, SaveRequest,
-    EFFORT_LABELS, PERMISSION_LABELS, PERMISSION_MODES, THINKING_LABELS,
+    self as settings_ui, apply_save, permission_mode_index, reasoning_effort_index, thinking_index,
+    tts_backend_index, SaveOutcome, SaveRequest, EFFORT_LABELS, PERMISSION_LABELS,
+    PERMISSION_MODES, THINKING_LABELS,
 };
 use crate::voice::{
     asr::AsrBackend,
@@ -92,7 +94,12 @@ pub enum UiCommand {
     /// 测试连接（真实发一次最小对话请求）。
     TestConnection,
     /// 获取在线模型列表（`/models`，带缓存与失败保留）。
-    FetchModels,
+    FetchModels { provider: String, base_url: String },
+    ModelsFetched {
+        provider: String,
+        request: u64,
+        fetch: crate::model_catalog::ModelFetch,
+    },
     /// 新建会话。
     NewSession,
     /// 选择会话（空 id = 不做改动）。
@@ -372,7 +379,16 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let tx = command_tx.clone();
+        let weak = window.as_weak();
         window.on_override_picked(move |row, choice| {
+            if let Some(window) = weak.upgrade() {
+                let mut values: Vec<i32> = window.get_override_indices().iter().collect();
+                if let Some(value) = usize::try_from(row).ok().and_then(|i| values.get_mut(i)) {
+                    *value = choice;
+                }
+                window.set_override_indices(ModelRc::new(VecModel::from(values)));
+                window.set_settings_dirty(true);
+            }
             let _ = tx.send(UiCommand::OverridePicked { row, choice });
         });
     }
@@ -406,8 +422,14 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let tx = command_tx.clone();
+        let weak = window.as_weak();
         window.on_fetch_models(move || {
-            let _ = tx.send(UiCommand::FetchModels);
+            if let Some(window) = weak.upgrade() {
+                let _ = tx.send(UiCommand::FetchModels {
+                    provider: provider_id_for_index(window.get_provider_index()).into(),
+                    base_url: window.get_base_url().to_string(),
+                });
+            }
         });
     }
     {
@@ -575,6 +597,7 @@ fn seed_ui(window: &AppWindow, settings: &Settings, has_key: bool, sessions: &Se
             .collect::<Vec<_>>(),
     )));
     apply_permission_options(window);
+    wire_plan_editor(window);
     window.set_override_indices(ModelRc::new(VecModel::from(vec![
         0i32;
         crate::permissions::capabilities().len()
@@ -588,7 +611,226 @@ fn seed_ui(window: &AppWindow, settings: &Settings, has_key: bool, sessions: &Se
 }
 
 /// 权限档位与"逐能力覆盖"的选项标签（一次写入，不随每次保存重建）。
+fn refresh_plan_labels(window: &AppWindow) {
+    let schedule: config::ScheduleSettings =
+        serde_json::from_str(window.get_model_schedule_json().as_str()).unwrap_or_default();
+    window.set_rule_labels(ModelRc::new(VecModel::from(
+        schedule
+            .rules
+            .iter()
+            .map(|r| {
+                slint::SharedString::from(format!(
+                    "{}–{} · {} · {:?}",
+                    r.from, r.to, r.plan_id, r.days
+                ))
+            })
+            .collect::<Vec<_>>(),
+    )));
+
+    let plans: Vec<config::ModelPlan> =
+        serde_json::from_str(window.get_model_plans_json().as_str()).unwrap_or_default();
+    window.set_plan_edit_labels(ModelRc::new(VecModel::from(
+        plans
+            .iter()
+            .map(|p| slint::SharedString::from(p.name.as_str()))
+            .collect::<Vec<_>>(),
+    )));
+}
+
+fn wire_plan_editor(window: &AppWindow) {
+    let weak = window.as_weak();
+    window.on_edit_rule(move |index| {
+        if let Some(w) = weak.upgrade() {
+            let schedule: config::ScheduleSettings =
+                serde_json::from_str(w.get_model_schedule_json().as_str()).unwrap_or_default();
+            let rule = usize::try_from(index)
+                .ok()
+                .and_then(|i| schedule.rules.get(i));
+            w.set_rule_index(index);
+            w.set_rule_from(rule.map(|r| r.from.as_str()).unwrap_or("09:00").into());
+            w.set_rule_to(rule.map(|r| r.to.as_str()).unwrap_or("18:00").into());
+            w.set_rule_days(
+                rule.map(|r| {
+                    r.days
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+                .into(),
+            );
+            w.set_rule_plan(rule.map(|r| r.plan_id.as_str()).unwrap_or("").into());
+        }
+    });
+    let weak = window.as_weak();
+    window.on_store_rule(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut schedule) = serde_json::from_str::<config::ScheduleSettings>(
+                w.get_model_schedule_json().as_str(),
+            ) else {
+                return;
+            };
+            let days = w
+                .get_rule_days()
+                .split(',')
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| d.trim().parse::<u8>())
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(days) = days else {
+                w.set_settings_error("星期应为 1–7，使用逗号分隔".into());
+                return;
+            };
+            let rule = config::ScheduleRule {
+                from: w.get_rule_from().to_string(),
+                to: w.get_rule_to().to_string(),
+                days,
+                plan_id: w.get_rule_plan().to_string(),
+                enabled: true,
+            };
+            if let Some(existing) = usize::try_from(w.get_rule_index())
+                .ok()
+                .and_then(|i| schedule.rules.get_mut(i))
+            {
+                *existing = rule;
+            } else {
+                schedule.rules.push(rule);
+            }
+            if let Err(error) = schedule.validate() {
+                w.set_settings_error(error.into());
+                return;
+            }
+            w.set_model_schedule_json(
+                serde_json::to_string_pretty(&schedule)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_remove_rule(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut schedule) = serde_json::from_str::<config::ScheduleSettings>(
+                w.get_model_schedule_json().as_str(),
+            ) else {
+                return;
+            };
+            if let Ok(i) = usize::try_from(w.get_rule_index()) {
+                if i < schedule.rules.len() {
+                    schedule.rules.remove(i);
+                }
+            }
+            w.set_model_schedule_json(
+                serde_json::to_string_pretty(&schedule)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_rule_index(-1);
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+
+    let weak = window.as_weak();
+    window.on_update_schedule(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut schedule) = serde_json::from_str::<config::ScheduleSettings>(
+                w.get_model_schedule_json().as_str(),
+            ) else {
+                return;
+            };
+            schedule.enabled = w.get_schedule_enabled();
+            schedule.default_plan_id = w.get_schedule_default().to_string();
+            w.set_model_schedule_json(
+                serde_json::to_string_pretty(&schedule)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_settings_dirty(true);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_edit_plan(move |index| {
+        if let Some(w) = weak.upgrade() {
+            let plans: Vec<config::ModelPlan> =
+                serde_json::from_str(w.get_model_plans_json().as_str()).unwrap_or_default();
+            w.set_plan_edit_index(index);
+            let p = usize::try_from(index).ok().and_then(|i| plans.get(i));
+            w.set_plan_edit_id(p.map(|p| p.id.as_str()).unwrap_or("").into());
+            w.set_plan_edit_name(p.map(|p| p.name.as_str()).unwrap_or("").into());
+            w.set_plan_edit_provider(p.map(|p| p.provider_id.as_str()).unwrap_or("mimo").into());
+            w.set_plan_edit_model(p.map(|p| p.model.as_str()).unwrap_or("").into());
+        }
+    });
+    let weak = window.as_weak();
+    window.on_store_plan(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut plans) =
+                serde_json::from_str::<Vec<config::ModelPlan>>(w.get_model_plans_json().as_str())
+            else {
+                return;
+            };
+            let index = usize::try_from(w.get_plan_edit_index()).ok();
+            let previous = index.and_then(|i| plans.get(i)).cloned();
+            let plan = config::ModelPlan {
+                id: w.get_plan_edit_id().to_string(),
+                name: w.get_plan_edit_name().to_string(),
+                provider_id: w.get_plan_edit_provider().to_string(),
+                model: w.get_plan_edit_model().to_string(),
+                thinking: previous.as_ref().map(|p| p.thinking).unwrap_or_default(),
+                reasoning_effort: previous
+                    .as_ref()
+                    .map(|p| p.reasoning_effort)
+                    .unwrap_or_default(),
+            };
+            if let Some(existing) = index.and_then(|i| plans.get_mut(i)) {
+                *existing = plan;
+            } else {
+                plans.push(plan);
+            }
+            w.set_model_plans_json(
+                serde_json::to_string_pretty(&plans)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_remove_plan(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut plans) =
+                serde_json::from_str::<Vec<config::ModelPlan>>(w.get_model_plans_json().as_str())
+            else {
+                return;
+            };
+            if let Ok(i) = usize::try_from(w.get_plan_edit_index()) {
+                if i < plans.len() {
+                    plans.remove(i);
+                }
+            }
+            w.set_model_plans_json(
+                serde_json::to_string_pretty(&plans)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_plan_edit_index(-1);
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+}
+
 fn apply_permission_options(window: &AppWindow) {
+    window.set_capability_ids(ModelRc::new(VecModel::from(
+        crate::permissions::capabilities()
+            .iter()
+            .map(|c| slint::SharedString::from(c.id))
+            .collect::<Vec<_>>(),
+    )));
     window.set_permission_mode_labels(ModelRc::new(VecModel::from(
         PERMISSION_LABELS
             .iter()
@@ -1091,7 +1333,8 @@ async fn run_worker(
         &settings.permission_overrides,
     )));
     let audit = AuditLog::new(paths.audit_file());
-    let mut model_cache = ModelCache::with_path(paths.model_cache_file());
+    let model_cache = ModelCache::with_path(paths.model_cache_file());
+    let mut model_request = 0u64;
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
     // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
@@ -1146,12 +1389,16 @@ async fn run_worker(
             .collect();
         sessions.set_key_presence(presence);
     }
-    if let Some(window) = weak.upgrade() {
-        publish_session_list(&window.as_weak(), &sessions);
-        publish_timeline(&window.as_weak(), &sessions);
-        publish_session_title(&window.as_weak(), &sessions);
-        refresh_model_picker(&window, &settings, &sessions);
-        publish_model_badges(&window, &settings, &sessions);
+    {
+        let settings = settings.clone();
+        let sessions = sessions.clone();
+        with_window(&weak, move |window| {
+            publish_session_list(&window.as_weak(), &sessions);
+            publish_timeline(&window.as_weak(), &sessions);
+            publish_session_title(&window.as_weak(), &sessions);
+            refresh_model_picker(window, &settings, &sessions);
+            publish_model_badges(window, &settings, &sessions);
+        });
     }
     publish_audit(&weak, &audit.recent(crate::permissions::MAX_AUDIT_RECORDS));
 
@@ -1224,9 +1471,13 @@ async fn run_worker(
                         &save_generation,
                     );
                     // 保存成功后刷新输入区的模型下拉（选项/归属可能变了）。
-                    if let Some(window) = weak.upgrade() {
-                        refresh_model_picker(&window, &settings, &sessions);
-                        publish_model_badges(&window, &settings, &sessions);
+                    {
+                        let settings = settings.clone();
+                        let sessions = sessions.clone();
+                        with_window(&weak, move |window| {
+                            refresh_model_picker(window, &settings, &sessions);
+                            publish_model_badges(window, &settings, &sessions);
+                        });
                     }
                 }
             }
@@ -1247,8 +1498,21 @@ async fn run_worker(
                 let has_key = secret.has(&settings.provider_id);
                 apply_settings_to_ui(&weak, &settings, has_key);
             }
-            UiCommand::ProviderChanged(_index) => {
-                // 地址/模型由界面侧回填；这里不需要动作。
+            UiCommand::ProviderChanged(index) => {
+                model_request += 1;
+                let provider = settings.provider(provider_id_for_index(index));
+                with_window(&weak, move |window| {
+                    if window.get_provider_index() != index {
+                        return;
+                    }
+                    window.set_base_url(provider.base_url_or_default().into());
+                    window.set_model_name(provider.model.clone().into());
+                    window.set_models_busy(false);
+                    window.set_discovered_models(ModelRc::new(VecModel::from(Vec::<
+                        slint::SharedString,
+                    >::new(
+                    ))));
+                });
             }
             UiCommand::ClearApiKey(provider_id) => {
                 match secret.clear(&provider_id) {
@@ -1279,8 +1543,10 @@ async fn run_worker(
             }
             // ---- 设置分类导航 ----
             UiCommand::SettingsTab(index) => {
-                if let Some(window) = weak.upgrade() {
-                    window.set_settings_tab_index(index.max(0));
+                {
+                    with_window(&weak, move |window| {
+                        window.set_settings_tab_index(index.max(0));
+                    });
                 }
                 publish_audit(&weak, &audit.recent(crate::permissions::MAX_AUDIT_RECORDS));
             }
@@ -1288,47 +1554,89 @@ async fn run_worker(
             UiCommand::TestConnection => {
                 handle_test_connection(&weak, &settings, &secret);
             }
-            UiCommand::FetchModels => {
-                if let Some(window) = weak.upgrade() {
-                    window.set_models_busy(true);
-                    window.set_model_list_hint("正在获取在线模型列表…".into());
+            UiCommand::FetchModels { provider, base_url } => {
+                {
+                    with_window(&weak, move |window| {
+                        window.set_models_busy(true);
+                        window.set_model_list_hint("正在获取在线模型列表…".into());
+                    });
                 }
                 // 只查**当前生效提供商**的目录，并用那一家自己的 Key。
-                let provider = settings.provider(&settings.provider_id);
+                let mut provider = settings.provider(&provider);
+                provider.base_url = base_url;
                 let api_key = secret
                     .load(&provider.id)
                     .unwrap_or(None)
                     .unwrap_or_default();
-                let fetch = fetch_models(&provider, &api_key, &mut model_cache, true).await;
-                let summary = fetch.summary();
-                let models: Vec<slint::SharedString> = fetch
-                    .ids()
-                    .into_iter()
-                    .map(slint::SharedString::from)
-                    .collect();
-                let weak_ui = weak.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(window) = weak_ui.upgrade() {
-                        window.set_models_busy(false);
-                        window.set_model_list_hint(summary.into());
-                        window.set_discovered_models(ModelRc::new(VecModel::from(models)));
-                        window.set_discovered_model_index(-1);
-                    }
+                model_request += 1;
+                let request = model_request;
+                let mut cache = model_cache.clone();
+                let tx = command_tx.clone();
+                tokio::spawn(async move {
+                    let fetch = fetch_models(&provider, &api_key, &mut cache, true).await;
+                    let _ = tx.send(UiCommand::ModelsFetched {
+                        provider: provider.id,
+                        request,
+                        fetch,
+                    });
                 });
+            }
+            UiCommand::ModelsFetched {
+                provider,
+                request,
+                fetch,
+            } => {
+                if request == model_request {
+                    if fetch.ok {
+                        if let Some(target) =
+                            settings.providers.iter_mut().find(|p| p.id == provider)
+                        {
+                            target.remember_models(&fetch.models);
+                        }
+                    }
+                    {
+                        let settings = settings.clone();
+                        let sessions = sessions.clone();
+                        let fetch = fetch.clone();
+                        with_window(&weak, move |window| {
+                            refresh_model_picker(window, &settings, &sessions);
+                            window.set_models_busy(false);
+                            if provider_id_for_index(window.get_provider_index()) == provider {
+                                window.set_model_list_hint(fetch.summary().into());
+                                if fetch.ok {
+                                    window.set_discovered_models(ModelRc::new(VecModel::from(
+                                        fetch
+                                            .ids()
+                                            .into_iter()
+                                            .map(slint::SharedString::from)
+                                            .collect::<Vec<_>>(),
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                }
             }
             // ---- 会话 ----
             UiCommand::NewSession => {
                 speech.stop();
                 let now = crate::clock::now().unix_ms;
                 let id = sessions.create(now, "新会话");
+                if let Ok(mut state) = permissions.lock() {
+                    state.allowed_once.clear();
+                }
                 let _ = sessions.save_current();
                 let _ = id;
-                if let Some(window) = weak.upgrade() {
-                    publish_session_list(&window.as_weak(), &sessions);
-                    publish_timeline(&window.as_weak(), &sessions);
-                    publish_session_title(&window.as_weak(), &sessions);
-                    refresh_model_picker(&window, &settings, &sessions);
-                    publish_model_badges(&window, &settings, &sessions);
+                {
+                    let settings = settings.clone();
+                    let sessions = sessions.clone();
+                    with_window(&weak, move |window| {
+                        publish_session_list(&window.as_weak(), &sessions);
+                        publish_timeline(&window.as_weak(), &sessions);
+                        publish_session_title(&window.as_weak(), &sessions);
+                        refresh_model_picker(window, &settings, &sessions);
+                        publish_model_badges(window, &settings, &sessions);
+                    });
                 }
                 set_status(&weak, "已新建会话");
             }
@@ -1338,6 +1646,9 @@ async fn run_worker(
                 } else {
                     match sessions.select(&id) {
                         Ok(()) => {
+                            if let Ok(mut state) = permissions.lock() {
+                                state.allowed_once.clear();
+                            }
                             /*
                              * 已结束 Agent 回合但 TTS 仍可能还在播：切会话要停旧播报，
                              * 并让界面侧的播报身份失效——旧 `SpeechId` 的迟到事件
@@ -1352,12 +1663,16 @@ async fn run_worker(
                                     window.set_speech_active(false);
                                 }
                             });
-                            if let Some(window) = weak.upgrade() {
-                                publish_session_list(&window.as_weak(), &sessions);
-                                publish_timeline(&window.as_weak(), &sessions);
-                                publish_session_title(&window.as_weak(), &sessions);
-                                refresh_model_picker(&window, &settings, &sessions);
-                                publish_model_badges(&window, &settings, &sessions);
+                            {
+                                let settings = settings.clone();
+                                let sessions = sessions.clone();
+                                with_window(&weak, move |window| {
+                                    publish_session_list(&window.as_weak(), &sessions);
+                                    publish_timeline(&window.as_weak(), &sessions);
+                                    publish_session_title(&window.as_weak(), &sessions);
+                                    refresh_model_picker(window, &settings, &sessions);
+                                    publish_model_badges(window, &settings, &sessions);
+                                });
                             }
                             let warning = sessions
                                 .current()
@@ -1384,9 +1699,12 @@ async fn run_worker(
                 };
                 match sessions.rename(&target, &title) {
                     Ok(()) => {
-                        if let Some(window) = weak.upgrade() {
-                            publish_session_list(&window.as_weak(), &sessions);
-                            publish_session_title(&window.as_weak(), &sessions);
+                        {
+                            let sessions = sessions.clone();
+                            with_window(&weak, move |window| {
+                                publish_session_list(&window.as_weak(), &sessions);
+                                publish_session_title(&window.as_weak(), &sessions);
+                            });
                         }
                         set_status(&weak, "会话已改名");
                     }
@@ -1403,17 +1721,24 @@ async fn run_worker(
                 speech_view.current = None;
                 match sessions.delete(&target) {
                     Ok(()) => {
+                        if let Ok(mut state) = permissions.lock() {
+                            state.allowed_once.clear();
+                        }
                         // 删光了就补一个，保证界面始终有一个可对话的会话。
                         if sessions.current().is_none() {
                             sessions.ensure_one(crate::clock::now().unix_ms);
                             let _ = sessions.save_current();
                         }
-                        if let Some(window) = weak.upgrade() {
-                            publish_session_list(&window.as_weak(), &sessions);
-                            publish_timeline(&window.as_weak(), &sessions);
-                            publish_session_title(&window.as_weak(), &sessions);
-                            refresh_model_picker(&window, &settings, &sessions);
-                            publish_model_badges(&window, &settings, &sessions);
+                        {
+                            let settings = settings.clone();
+                            let sessions = sessions.clone();
+                            with_window(&weak, move |window| {
+                                publish_session_list(&window.as_weak(), &sessions);
+                                publish_timeline(&window.as_weak(), &sessions);
+                                publish_session_title(&window.as_weak(), &sessions);
+                                refresh_model_picker(window, &settings, &sessions);
+                                publish_model_badges(window, &settings, &sessions);
+                            });
                         }
                         set_status(&weak, "会话已删除");
                     }
@@ -1450,20 +1775,7 @@ async fn run_worker(
                 }
             }
             // ---- 权限（立即生效） ----
-            UiCommand::PermissionModePicked(index) => {
-                let mode = permission_mode_for_index(index);
-                if let Ok(mut state) = permissions.lock() {
-                    state.mode = mode;
-                    // 换档位时清掉旧的限时授权：不能让它跨档位继续生效。
-                    state.allowed_once.clear();
-                }
-                publish_permission_state(&weak, &permissions);
-                set_status(&weak, &format!("权限档位已切换为「{}」", mode.label()));
-            }
-            UiCommand::OverridePicked { row, choice } => {
-                apply_override_choice(&weak, &permissions, row, choice);
-                publish_permission_state(&weak, &permissions);
-            }
+            UiCommand::PermissionModePicked(_) | UiCommand::OverridePicked { .. } => {}
             UiCommand::TogglePause => toggle_pause(&weak, &permissions),
             UiCommand::GrantCapability {
                 capability,
@@ -1479,12 +1791,15 @@ async fn run_worker(
             UiCommand::Send(input) => {
                 // 新一轮开始：上一轮的声音立刻停下，绝不接在旧音频后面。
                 speech.stop();
-                next_turn_id += 1;
+                next_turn_id =
+                    next_turn_id.max(sessions.current().map(|s| s.last_turn_id).unwrap_or(0)) + 1;
                 // 首条消息决定会话标题（只在仍是默认标题时）。
                 sessions.adopt_title_from(&input);
                 let session_id = sessions.current_id().to_string();
                 let mut history = sessions.history();
                 sessions.push_timeline(next_turn_id, TimelineItem::user(input.clone()));
+                sessions.set_last_turn(next_turn_id, TurnStatus::Interrupted);
+                let _ = sessions.save_current();
                 publish_timeline(&weak, &sessions);
                 publish_session_list(&weak, &sessions);
                 set_busy(&weak, true);
@@ -1528,6 +1843,7 @@ async fn run_worker(
                             &mut speech_view,
                             &command_tx,
                             &save_generation,
+                            &mut model_request,
                             TurnSource::Text,
                         )
                         .await
@@ -1573,12 +1889,16 @@ async fn run_worker(
                 if let Some(prompt) = prompt {
                     // 语音指令也是一轮新的回合：先把上一轮的声音停掉。
                     speech.stop();
-                    next_turn_id += 1;
+                    next_turn_id = next_turn_id
+                        .max(sessions.current().map(|s| s.last_turn_id).unwrap_or(0))
+                        + 1;
                     // 语音最终文本只提交给**捕获时归属**的有效会话（当前会话）。
                     sessions.adopt_title_from(&prompt.text);
                     let session_id = sessions.current_id().to_string();
                     let mut history = sessions.history();
                     sessions.push_timeline(next_turn_id, TimelineItem::user(prompt.text.clone()));
+                    sessions.set_last_turn(next_turn_id, TurnStatus::Interrupted);
+                    let _ = sessions.save_current();
                     publish_timeline(&weak, &sessions);
                     publish_session_list(&weak, &sessions);
                     set_busy(&weak, true);
@@ -1623,6 +1943,7 @@ async fn run_worker(
                                 &mut speech_view,
                                 &command_tx,
                                 &save_generation,
+                                &mut model_request,
                                 TurnSource::Voice,
                             )
                             .await
@@ -2439,6 +2760,7 @@ fn seed_voice_ui(weak: &slint::Weak<AppWindow>, settings: &Settings) {
 struct RunningTurn {
     task: tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>,
     turn_id: TurnId,
+    events: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
 }
 
 /// 一次回合的启动结果。
@@ -2540,13 +2862,13 @@ fn start_turn(
      * 根本轮不到处理——用户点了"取消"却没有任何反应，直到模型自己跑完。
      * 放到 spawn 里之后，主循环随时能拿到命令，取消也就能立刻生效。
      */
-    let weak_events = weak.clone();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let settings_snapshot = settings.clone();
     let turn_confirmer = confirmer.clone();
     let turn_history = std::mem::take(history);
     let turn = tokio::spawn(async move {
         let emit = move |event: AgentEvent| {
-            apply_event(&weak_events, event);
+            let _ = event_tx.send(event);
         };
         let mut turn_history = turn_history;
         let outcome = agent
@@ -2557,6 +2879,7 @@ fn start_turn(
     TurnStart::Started(RunningTurn {
         task: turn,
         turn_id,
+        events: event_rx,
     })
 }
 
@@ -2608,6 +2931,8 @@ fn view_after_clear(
 /// 从当前配置里原样保留。
 pub fn build_save_request(window: &AppWindow) -> SaveRequest {
     SaveRequest {
+        model_plans_json: window.get_model_plans_json().to_string(),
+        model_schedule_json: window.get_model_schedule_json().to_string(),
         provider_id: PROVIDER_IDS
             .get(usize::try_from(window.get_provider_index()).unwrap_or(usize::MAX))
             .copied()
@@ -2653,15 +2978,34 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
         .unwrap_or(0) as i32;
     let base_url = settings.base_url.clone();
     let model = settings.model.clone();
+    let plans = serde_json::to_string_pretty(&settings.model_plans).unwrap_or_default();
+    let schedule_enabled = settings.model_schedule.enabled;
+    let schedule_default = settings.model_schedule.default_plan_id.clone();
+    let schedule = serde_json::to_string_pretty(&settings.model_schedule).unwrap_or_default();
+    let overrides: Vec<i32> = crate::permissions::capabilities()
+        .iter()
+        .map(|c| match settings.permission_overrides.get(c.id) {
+            Some(crate::config::PermissionOverride::Allow) => 1,
+            Some(crate::config::PermissionOverride::Ask) => 2,
+            Some(crate::config::PermissionOverride::Deny) => 3,
+            _ => 0,
+        })
+        .collect();
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            window.set_model_plans_json(plans.into());
+            window.set_model_schedule_json(schedule.into());
+            window.set_schedule_enabled(schedule_enabled);
+            window.set_schedule_default(schedule_default.into());
+            refresh_plan_labels(&window);
             window.set_provider_index(provider_index);
             window.set_base_url(base_url.into());
             window.set_model_name(model.into());
             window.set_api_key_input("".into());
             window.set_has_key(has_key);
             window.set_permission_index(permission_index);
+            window.set_override_indices(ModelRc::new(VecModel::from(overrides)));
             // 重新打开 = 以已保存配置为准：清掉上一次的错误与"未保存"标记。
             window.set_settings_error("".into());
             window.set_settings_dirty(false);
@@ -2683,7 +3027,7 @@ async fn wait_turn(
     paths: &AppPaths,
     secret: &SecretStore,
     settings: &mut Settings,
-    _sessions: &mut SessionRuntime,
+    sessions: &mut SessionRuntime,
     permissions: &Arc<std::sync::Mutex<PermissionState>>,
     audit: &AuditLog,
     confirmer: &Arc<UiConfirmer>,
@@ -2692,9 +3036,14 @@ async fn wait_turn(
     speech_view: &mut SpeechView,
     command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
     save_generation: &Arc<std::sync::atomic::AtomicU64>,
+    model_request: &mut u64,
     source: TurnSource,
 ) -> TurnWait {
-    let RunningTurn { mut task, turn_id } = turn;
+    let RunningTurn {
+        mut task,
+        turn_id,
+        mut events,
+    } = turn;
     /*
      * 确认请求出现/结束时也要**立刻**切换聆听模式：
      * 否则回合卡在"等点击"的这段时间里，语音确认永远进不去（没有人按按钮，
@@ -2705,7 +3054,9 @@ async fn wait_turn(
         // 每一轮重新决定聆听模式（播报中 = 听打断词，等待确认 = 听允许/拒绝）。
         sync_listen_mode(voice, speech, confirmer);
         tokio::select! {
+            Some(event) = events.recv() => { record_event(weak, sessions, turn_id, event); }
             joined = &mut task => {
+                while let Ok(event) = events.try_recv() { record_event(weak, sessions, turn_id, event); }
                 *turn_cancel = None;
                 match joined {
                     Ok((outcome, history, settings_snapshot)) => {
@@ -2783,16 +3134,7 @@ async fn wait_turn(
                             close_settings(weak);
                         }
                     }
-                    Some(UiCommand::PermissionModePicked(index)) => {
-                        let mode = permission_mode_for_index(index);
-                        if let Ok(mut state) = permissions.lock() {
-                            state.mode = mode;
-                        }
-                        set_status(weak, &format!("权限档位已切换为「{}」", mode.label()));
-                    }
-                    Some(UiCommand::OverridePicked { row, choice }) => {
-                        apply_override_choice(weak, permissions, row, choice);
-                    }
+                    Some(UiCommand::PermissionModePicked(_)) | Some(UiCommand::OverridePicked { .. }) => {}
                     Some(UiCommand::TogglePause) => toggle_pause(weak, permissions),
                     Some(UiCommand::GrantCapability {
                         capability,
@@ -2822,6 +3164,8 @@ async fn wait_turn(
                             &mut task,
                         )
                         .await;
+                        while let Ok(event) = events.try_recv() { record_event(weak, sessions, turn_id, event); }
+                        let _ = sessions.save_current();
                         *turn_cancel = None;
                         return TurnWait::Quit;
                     }
@@ -2859,42 +3203,21 @@ async fn wait_turn(
                      * 权限立即生效：暂停/限时授权/档位/覆盖都作用于**下一个**
                      * 工具判断。这正是"不能复用过期授权"的落点。
                      */
-                    Some(UiCommand::PermissionModePicked(index)) => {
-                        let mode = permission_mode_for_index(index);
-                        if let Ok(mut state) = permissions.lock() {
-                            state.mode = mode;
-                            // 立即生效语义要求：换档位时清掉旧的限时授权，
-                            // 否则"标准档下发的一次性允许"会跟着档位一起活下来。
-                            state.allowed_once.clear();
-                        }
-                        publish_permission_state(weak, permissions);
-                        set_status(
-                            weak,
-                            &format!("权限档位已切换为「{}」", mode.label()),
-                        );
-                    }
-                    Some(UiCommand::OverridePicked { row, choice }) => {
-                        apply_override_choice(weak, permissions, row, choice);
-                        publish_permission_state(weak, permissions);
-                    }
-                    Some(UiCommand::TogglePause) => toggle_pause(weak, permissions),
-                    Some(UiCommand::GrantCapability {
-                        capability,
-                        minutes,
-                    }) => {
-                        grant_capability(weak, permissions, &capability, minutes);
-                    }
-                    Some(UiCommand::ExportAudit) => export_audit(weak, audit, paths),
                     Some(UiCommand::TestConnection) => {
                         set_status(weak, "正在执行；先结束这一轮再测试连接");
                     }
-                    Some(UiCommand::FetchModels) => {
+                    Some(UiCommand::ModelsFetched { provider, request, fetch }) => {
+                        if request == *model_request {
+                            if fetch.ok { if let Some(target) = settings.providers.iter_mut().find(|p| p.id == provider) { target.remember_models(&fetch.models); } }
+                            let settings = settings.clone(); let sessions = sessions.clone();
+                            with_window(weak, move |window| { window.set_models_busy(false); refresh_model_picker(window, &settings, &sessions); });
+                        }
+                    }
+                    Some(UiCommand::FetchModels { .. }) => {
                         set_status(weak, "正在执行；先结束这一轮再获取模型列表");
                     }
                     Some(UiCommand::SettingsTab(index)) => {
-                        if let Some(window) = weak.upgrade() {
-                            window.set_settings_tab_index(index.max(0));
-                        }
+                        with_window(weak, move |window| window.set_settings_tab_index(index.max(0)));
                     }
                     /*
                      * 回合进行中的语音命令：
@@ -2916,7 +3239,7 @@ async fn wait_turn(
                         let has_key = secret.has(&settings.provider_id);
                         apply_settings_to_ui(weak, settings, has_key);
                     }
-                    Some(UiCommand::ProviderChanged(_)) => {}
+                    Some(UiCommand::ProviderChanged(_)) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
                     Some(UiCommand::ClearApiKey(provider_id)) => {
                         /*
                          * 任务执行期间清除 Key：**真实执行**，不是只提示。
@@ -2983,6 +3306,12 @@ fn handle_save_all_ui(
      * 只有代次仍是最新时才允许回填界面；否则这一次的结果属于"过期请求"，
      * 不能去覆盖用户当前的表单/状态。
      */
+    if outcome.config_written() {
+        if let Ok(mut state) = permissions.lock() {
+            state.mode = settings.permission_mode;
+            state.overrides = settings.permission_overrides.clone();
+        }
+    }
     if !generation_is_current(save_generation, generation) {
         return outcome;
     }
@@ -3078,6 +3407,77 @@ fn close_settings(weak: &slint::Weak<AppWindow>) {
 ///
 /// PR8 的事件带回合/步骤/调用实例：工具卡片按**真实调用实例**追加，
 /// 思考内容独立成块（不混进可见正文，因此不会被 TTS 朗读）。
+fn record_event(
+    weak: &slint::Weak<AppWindow>,
+    sessions: &mut SessionRuntime,
+    turn_id: u64,
+    event: AgentEvent,
+) {
+    use crate::session::{TimelineKind, TimelineToolStatus};
+    let mut checkpoint = true;
+    match &event {
+        AgentEvent::TextDelta { turn, step, text } if *turn == turn_id => {
+            sessions.extend_fragment(*turn, *step, crate::session::TimelineKind::Assistant, text);
+            checkpoint = false;
+        }
+        AgentEvent::ReasoningDone {
+            turn, step, text, ..
+        } if *turn == turn_id => sessions.settle_reasoning(*turn, *step, text),
+        AgentEvent::ReasoningDelta { turn, step, text } if *turn == turn_id => {
+            sessions.extend_fragment(*turn, *step, crate::session::TimelineKind::Reasoning, text);
+            checkpoint = false;
+        }
+        AgentEvent::ToolStart {
+            turn,
+            step,
+            call,
+            name,
+            args_summary,
+        } if *turn == turn_id => sessions.push_timeline(
+            *turn,
+            TimelineItem {
+                kind: TimelineKind::Tool,
+                step: *step,
+                call_id: call.0,
+                tool: name.clone(),
+                args_summary: args_summary.to_string(),
+                status: TimelineToolStatus::Running,
+                ..TimelineItem::default()
+            },
+        ),
+        AgentEvent::ToolEnd {
+            turn,
+            call,
+            status,
+            text,
+            ms,
+            ..
+        } if *turn == turn_id => sessions.update_tool_item(
+            *turn,
+            call.0,
+            match status {
+                ToolStatus::Ok => TimelineToolStatus::Ok,
+                ToolStatus::Failed => TimelineToolStatus::Failed,
+                ToolStatus::Denied => TimelineToolStatus::Denied,
+                ToolStatus::Cancelled => TimelineToolStatus::Cancelled,
+            },
+            text,
+            *ms,
+        ),
+        AgentEvent::ConfirmationRequired(_) => {
+            apply_event(weak, event);
+            return;
+        }
+        _ => return,
+    }
+    if checkpoint {
+        if let Err(error) = sessions.save_current() {
+            set_status(weak, &format!("会话保存失败：{error}"));
+        }
+    }
+    publish_timeline(weak, sessions);
+}
+
 fn apply_event(weak: &slint::Weak<AppWindow>, event: AgentEvent) {
     match event {
         AgentEvent::TextDelta { text, .. } => {
@@ -3471,11 +3871,13 @@ fn apply_session_choice(
 ) {
     match sessions.set_model_choice(choice) {
         Ok(()) => {
-            if let Some(window) = weak.upgrade() {
-                refresh_model_picker(&window, settings, sessions);
-                publish_model_badges(&window, settings, sessions);
-                publish_session_list(&window.as_weak(), sessions);
-            }
+            let settings = settings.clone();
+            let sessions = sessions.clone();
+            with_window(weak, move |window| {
+                refresh_model_picker(window, &settings, &sessions);
+                publish_model_badges(window, &settings, &sessions);
+                publish_session_list(&window.as_weak(), &sessions);
+            });
             set_status(weak, "已切换本会话的模型选择（下一轮生效）");
         }
         Err(error) => set_status(weak, &format!("保存模型选择失败：{error}")),
@@ -3515,39 +3917,6 @@ fn publish_model_badges_from_settings(
 }
 
 /// 权限：应用逐能力覆盖（立即生效，不必等保存）。
-fn apply_override_choice(
-    weak: &slint::Weak<AppWindow>,
-    permissions: &Arc<std::sync::Mutex<PermissionState>>,
-    row: i32,
-    choice: i32,
-) {
-    let capabilities = crate::permissions::capabilities();
-    let Some(capability) = usize::try_from(row)
-        .ok()
-        .and_then(|row| capabilities.get(row))
-    else {
-        return;
-    };
-    let parsed = match choice {
-        1 => crate::config::PermissionOverride::Allow,
-        2 => crate::config::PermissionOverride::Ask,
-        3 => crate::config::PermissionOverride::Deny,
-        _ => crate::config::PermissionOverride::Follow,
-    };
-    if let Ok(mut state) = permissions.lock() {
-        if parsed == crate::config::PermissionOverride::Follow {
-            state.overrides.remove(capability.id);
-        } else {
-            state.overrides.insert(capability.id.to_string(), parsed);
-        }
-    }
-    set_status(
-        weak,
-        &format!("「{}」已设为 {}", capability.label, parsed.as_str()),
-    );
-}
-
-/// 权限：暂停 / 恢复（10 分钟）。
 fn toggle_pause(
     weak: &slint::Weak<AppWindow>,
     permissions: &Arc<std::sync::Mutex<PermissionState>>,
@@ -3582,7 +3951,12 @@ fn grant_capability(
     minutes: i32,
 ) {
     if let Ok(mut state) = permissions.lock() {
-        state.grant_once(capability, minutes.max(1) as u64);
+        if let Some(capability) = crate::permissions::capabilities()
+            .iter()
+            .find(|c| c.id == capability || c.label == capability)
+        {
+            state.grant_once(capability.id, minutes.max(1) as u64);
+        }
     }
     publish_permission_state(weak, permissions);
 }
@@ -3617,8 +3991,10 @@ fn publish_permission_state(
         if let Some(window) = weak.upgrade() {
             window.set_paused(paused);
             window.set_pause_hint(pause_hint.into());
-            window.set_permission_index(mode_index);
-            window.set_override_indices(ModelRc::new(VecModel::from(overrides)));
+            if !window.get_settings_open() {
+                window.set_permission_index(mode_index);
+                window.set_override_indices(ModelRc::new(VecModel::from(overrides)));
+            }
         }
     });
 }
@@ -3631,6 +4007,15 @@ fn export_audit(weak: &slint::Weak<AppWindow>, audit: &AuditLog, paths: &AppPath
         }
         Err(error) => set_status(weak, &format!("导出审计失败：{error}")),
     }
+}
+
+fn with_window(weak: &slint::Weak<AppWindow>, update: impl FnOnce(&AppWindow) + Send + 'static) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            update(&window);
+        }
+    });
 }
 
 fn set_status(weak: &slint::Weak<AppWindow>, message: &str) {
@@ -3694,6 +4079,67 @@ mod tests {
     fn speech_without_engine() -> SpeechRuntime {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         SpeechRuntime::new(tx)
+    }
+
+    #[test]
+    fn event_checkpoints_restore_reasoning_and_two_tool_instances() {
+        let paths = AppPaths::with_root(unique_test_root("event-checkpoints"));
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1000);
+        sessions.set_last_turn(7, TurnStatus::Interrupted);
+        let weak = slint::Weak::default();
+        record_event(
+            &weak,
+            &mut sessions,
+            7,
+            AgentEvent::ReasoningDone {
+                turn: 7,
+                step: 1,
+                chars: 4,
+                text: "实际思考".into(),
+            },
+        );
+        for call in [1, 2] {
+            record_event(
+                &weak,
+                &mut sessions,
+                7,
+                AgentEvent::ToolStart {
+                    turn: 7,
+                    step: 1,
+                    call: crate::agent::ToolCallId(call),
+                    name: "read_clipboard".into(),
+                    args_summary: serde_json::json!({}),
+                },
+            );
+            if call == 1 {
+                record_event(
+                    &weak,
+                    &mut sessions,
+                    7,
+                    AgentEvent::ToolEnd {
+                        turn: 7,
+                        step: 1,
+                        call: crate::agent::ToolCallId(call),
+                        name: "read_clipboard".into(),
+                        status: ToolStatus::Ok,
+                        text: "ok".into(),
+                        ms: 20,
+                    },
+                );
+            }
+        }
+        let reopened = SessionRuntime::open(&paths);
+        let items = reopened.timeline();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text, "实际思考");
+        assert_eq!(items[1].status, crate::session::TimelineToolStatus::Ok);
+        assert_eq!(
+            items[2].status,
+            crate::session::TimelineToolStatus::Interrupted
+        );
+        assert_eq!(items[1].ms, 20);
+        assert_ne!(items[1].call_id, items[2].call_id);
     }
 
     #[test]

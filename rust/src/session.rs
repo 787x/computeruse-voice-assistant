@@ -107,6 +107,7 @@ pub enum TimelineToolStatus {
     /// 正在执行（进程中途退出时会留下这个状态，恢复时按 interrupted 处理）。
     #[default]
     Running,
+    Interrupted,
     Ok,
     Failed,
     Denied,
@@ -117,6 +118,7 @@ impl TimelineToolStatus {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Interrupted => "interrupted",
             Self::Ok => "ok",
             Self::Failed => "failed",
             Self::Denied => "denied",
@@ -127,6 +129,7 @@ impl TimelineToolStatus {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Running => "执行中",
+            Self::Interrupted => "中断，结果未知",
             Self::Ok => "成功",
             Self::Failed => "失败",
             Self::Denied => "已拒绝",
@@ -293,7 +296,7 @@ impl SessionFile {
         let mut touched = false;
         for item in &mut self.timeline {
             if item.kind == TimelineKind::Tool && item.status == TimelineToolStatus::Running {
-                item.status = TimelineToolStatus::Cancelled;
+                item.status = TimelineToolStatus::Interrupted;
                 if item.text.is_empty() {
                     item.text = "（程序在这一次调用中途退出，结果未知）".to_string();
                 }
@@ -348,6 +351,7 @@ pub struct SessionIndex {
 }
 
 /// 会话库：读写、创建、改名、删除、恢复。
+#[derive(Clone)]
 pub struct SessionStore {
     paths: AppPaths,
 }
@@ -817,7 +821,7 @@ mod tests {
             ..TimelineItem::default()
         });
         session.repair_after_restore();
-        assert_eq!(session.timeline[0].status, TimelineToolStatus::Cancelled);
+        assert_eq!(session.timeline[0].status, TimelineToolStatus::Interrupted);
         assert!(session.timeline[0].text.contains("未知"));
         assert_eq!(session.last_turn_status, TurnStatus::Interrupted);
     }
