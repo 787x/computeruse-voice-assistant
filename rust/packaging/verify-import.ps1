@@ -21,3 +21,10 @@ $hash=(Get-FileHash -LiteralPath $target).Hash
 if ((Get-FileHash -LiteralPath $target).Hash -ne $hash) { throw 'Repeated import changed target' }
 if ((Get-FileHash -LiteralPath $source).Hash -ne $sourceHash) { throw 'Source modified' }
 Write-Host 'PASS: preview, backup, customized values, secret exclusion, source immutability, repeat import'
+foreach ($case in @(@(9,$false),@(10,$true),@(99,$true),@(100,$false),@(1.5,$false))) {
+    $inputPath=Join-Path $root ('boundary-'+[guid]::NewGuid().ToString('N')+'.json')
+    [IO.File]::WriteAllText($inputPath, ('{"contextCompressPercent":'+$case[0]+'}'))
+    & powershell -NoProfile -File $script -Source $inputPath -DataDir (Join-Path $root 'empty') *> $null
+    if (($LASTEXITCODE -eq 0) -ne $case[1]) { throw "Boundary failed: $($case[0])" }
+}
+Write-Host 'PASS: compression 9/10/99/100/fraction boundaries'

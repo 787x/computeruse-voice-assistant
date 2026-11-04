@@ -30,11 +30,16 @@ WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust
 SectionEnd
 Section "Uninstall"
 SetShellVarContext current
+ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "CUAVA-Rust"
+StrCmp $0 '$\"$INSTDIR\cuava.exe$\" --background' 0 +2
 DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "CUAVA-Rust"
+ReadRegStr $1 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "InstallLocation"
+StrCmp $1 $INSTDIR 0 skip_metadata
 DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust"
 Delete "$DESKTOP\CUAVA Rust.lnk"
 Delete "$SMPROGRAMS\CUAVA Rust\CUAVA.lnk"
 RMDir "$SMPROGRAMS\CUAVA Rust"
+skip_metadata:
 # Only installation-owned files. Never recursively delete user data/models.
 Delete "$INSTDIR\cuava.exe"
 Delete "$INSTDIR\cua.ps1"

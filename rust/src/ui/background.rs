@@ -12,6 +12,8 @@ impl BackgroundUi {
     pub fn new(window: &AppWindow) -> Result<Self, slint::PlatformError> {
         let tray = BackgroundTray::new()?;
         let hud = VoiceHud::new()?;
+        let manual = std::rc::Rc::new(std::cell::Cell::new(false));
+        let placement = std::rc::Rc::new(super::hud_window::Placement::default());
         let weak = window.as_weak();
         hud.on_answer(move |id, allow| {
             if let Some(w) = weak.upgrade() {
@@ -37,7 +39,9 @@ impl BackgroundUi {
             }
         });
         let h = hud.as_weak();
+        let manual_hide = manual.clone();
         hud.on_hide_hud(move || {
+            manual_hide.set(false);
             if let Some(h) = h.upgrade() {
                 let _ = h.hide();
             }
@@ -70,12 +74,16 @@ impl BackgroundUi {
             }
         });
         let h = hud.as_weak();
+        let manual_toggle = manual.clone();
+        let place = placement.clone();
         tray.on_toggle_hud(move || {
             if let Some(h) = h.upgrade() {
                 if h.window().is_visible() && !h.get_asking() {
+                    manual_toggle.set(false);
                     let _ = h.hide();
                 } else {
-                    super::hud_window::show(&h);
+                    manual_toggle.set(true);
+                    place.show(&h);
                 }
             }
         });
@@ -139,16 +147,19 @@ impl BackgroundUi {
                         if h.window().is_visible()
                             || should_open(woke, w.get_voice_enabled(), w.get_confirm_open())
                         {
-                            super::hud_window::show(&h);
+                            placement.show(&h);
                         }
                         if w.get_confirm_open()
                             || (w.get_voice_enabled()
                                 && (woke || w.get_busy() || w.get_speech_active()))
                         {
                             idle_since.set(std::time::Instant::now());
-                        } else if !w.get_voice_enabled()
-                            || idle_since.get().elapsed().as_secs() >= 4
-                        {
+                        } else if should_hide(
+                            manual.get(),
+                            w.get_confirm_open(),
+                            w.get_voice_enabled(),
+                            idle_since.get().elapsed().as_secs(),
+                        ) {
                             let _ = h.hide();
                         }
                     }
@@ -183,5 +194,26 @@ mod tests {
     fn ordinary_status_or_subtitle_update_cannot_reopen_hidden_hud() {
         assert!(!should_open(false, true, false));
         assert!(should_open(true, true, false));
+    }
+}
+
+fn should_hide(manual: bool, asking: bool, microphone: bool, idle_seconds: u64) -> bool {
+    !manual && !asking && (!microphone || idle_seconds >= 4)
+}
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    #[test]
+    fn manual_survives_idle_and_microphone_off() {
+        assert!(!should_hide(true, false, false, 20));
+    }
+    #[test]
+    fn ask_survives_timeout() {
+        assert!(!should_hide(false, true, false, 20));
+    }
+    #[test]
+    fn auto_expires() {
+        assert!(should_hide(false, false, true, 4));
+        assert!(!should_hide(false, false, true, 3));
     }
 }

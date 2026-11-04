@@ -21,8 +21,9 @@ foreach ($name in $mapping.Keys) {
     if ($null -ne $current.PSObject.Properties[$dest]) { Write-Host "保留已有字段：$dest"; continue }
     $value = $old.$name
     if ($name -eq 'providerId' -and $value -notin @('mimo','deepseek','openai-compatible')) { Write-Host '不支持的提供商，跳过'; continue }
-    if ($name -eq 'contextWindow' -and ($value -lt 1024 -or $value -gt 10000000)) { throw '上下文长度超出可导入范围' }
-    if ($name -eq 'contextCompressPercent' -and ($value -lt 1 -or $value -gt 100)) { throw '压缩比例无效' }
+    if ($name -in @('contextWindow','contextCompressPercent') -and ([string]$value -notmatch '^\d+$')) { throw '数值必须为整数' }
+    if ($name -eq 'contextWindow' -and ($value -lt 1 -or $value -gt 10000000)) { throw '上下文长度超出可导入范围' }
+    if ($name -eq 'contextCompressPercent' -and ($value -lt 10 -or $value -gt 99)) { throw '压缩比例无效' }
     if ($name -eq 'baseURL') {
         $uri = $null
         if (-not [uri]::TryCreate([string]$value, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin @('http','https') -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) { Write-Host '跳过非标准端点（不复制嵌入式凭据）'; continue }

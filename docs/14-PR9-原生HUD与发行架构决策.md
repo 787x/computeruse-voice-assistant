@@ -21,7 +21,7 @@ with_active(false) 仅保护初次显示，不能独立满足持续无焦点唤�
 因此允许仅在 HUD 的当前 UI 线程、借用中的 HWND 上使用 windows crate 的必要 unsafe 调用：
 用前台窗口所属显示器的 rcWork
 定位，失败回退主显示器。不设置永久 NOACTIVATE 或穿透样式，按钮允许用户主动点击。
-Slint hide 释放底层 winit 窗口，不保留 Arc；再次 show 创建新窗口，使用 inactive 创建钩子。
+更正：Slint hide 不保证释放 winit 窗口，不能依赖重建实现无焦点。新窗口由 HUD 显示调用栈内的线程局部标记选择 inactive 属性；存活 HWND 在 show 期间临时设置 NOACTIVATE，之后恢复原样式。
 已显示时不重复 show，以免进入 winit 后续 SW_SHOW 路径。
 替代方案是直接用 Win32 绘制窗口或永久禁止激活；前者重复窗口系统，后者影响交互，均不采用。
 不缓存 HWND；每次通过 Slint/winit 借用取得，窗口重建后重新获取。
@@ -71,3 +71,28 @@ CPU 通用发行采用 --no-default-features，GPU 构建不能据此宣称缺�
 
 Slint/winit 的 HWND 生命周期或显示实现升级后必须重新验证焦点。winit 的安全显示器接口未提供 Windows 可用工作区，故保留仅 HUD 的窗口定位原生调用；不缓存句柄、不设置全窗口穿透，也不将 unsafe 扩散到业务层。
 打包脚本不会自动下载模型或修改旧数据。启动项只写 HKCU，卸载保留 AppData/cuava 和旧 Electron 全部数据。
+
+
+## f8901dd 审查后的修复与验证
+
+开始时本地与远端 PR #9 均为 f8901dd3ded5719784b0265e359374d58f5ac83b，继续原分支，不新建 PR。
+
+移除 attributes.title 判断，以 HUD 专用调用作用域标记识别新建窗口。已有窗口仅在 Slint show 期间临时增加 NOACTIVATE，借用结束重新取得 HWND 恢复样式；不保留句柄或永久禁止点击。新增 unsafe 仅限 HUD 原生适配和该模块的观察测试，其他运行时无扩展。
+位置检查缓存坐标/尺寸/缩放，只有几何变化才 SetWindowPos；已显示窗口使用 NOZORDER，不重复置顶。手动可见独立于麦克风/空闲，ask 强制可见，自动唤醒仍可超时收起。
+
+登录启动核对当前 EXE 完整命令，Unicode 注册表读取通过 PowerShell UTF-8 输出；显式开启可转移到当前版本，关闭不删除别的版本启动项。卸载仅删除与本路径匹配的 Run 值；卸载注册信息及快捷方式也核对 InstallLocation。安装升级不自动打开自启。
+main 入口及失败类别追加至 LOCALAPPDATA/cuava/startup.log（限长），不保存错误原文/凭据/语音；main 前依赖加载失败不能写日志，需结合进程退出码诊断。
+导入压缩比例仅接受整数 10–99，上下文接受整数 1–10000000；默认不覆盖已有值，未新增覆盖模式。已有默认值同样保留，用户应在新设置页手工调整，不能静默推断是否自定义。
+
+实际执行：CPU release、clippy all-targets、fmt、UI 单测（新增手动空闲/ask/自动超时与自启命令绑定）及导入预览/备份/幂等/秘密排除和 9/10/99/100/小数边界检查。另运行显式 ignored 原生窗口测试；在记事本为前台时，首次和两次隐藏重显后 HWND 均保持 0x40f4a，真实 Slint/Win32 窗口测试通过。该测试不经过 KWS/Agent，不验证用户点击确认或真实字幕；不能当作 Done Criteria 0 完成。
+
+本机安装检查：本轮候选使用 /S /D=D:\Projects\computeruse-voice-assistant\.tmp\pr9-repair-install，记录安装器 PID 33788、退出码 0，但目标 cuava.exe/cua.ps1 未观察到，未认定成功，也没有证据认定应用崩溃。尚未可靠定位此异常；未修改安全设置，不重复启动制造提示。
+
+仍未执行：真实 KWS/完整语音与按钮交互、100/150/200% DPI 及多屏变化组合、完整托盘/登录重新登录实测、干净 VM 安装/便携/只读 CUA/卸载数据保留。未完成原生预编译库内部全部许可证核验，继续作为发布阻断。保留草稿，不宣称全部验收达成。
+
+本轮最终复验：fmt/check diff 通过，CPU release 与 clippy all-targets 通过（历史警告保留）；UI 单测 48 通过、1 个原生图形测试默认 ignored，该图形测试另已显式运行通过。最终重新生成候选，未再次启动安装器：
+
+- ZIP SHA-256：CBD0C3677BAB6B1CB054B08D775915960880AB2F361939899829C4ABA6DDD047
+- 安装器 SHA-256：3274BC3FE90EDF07B444E10C94704AFE2DCF949F3DD4DF0CB36E83614D74ED9C
+
+此前 PID 33788 对应本轮中间候选，不能归为上述最终 SHA 的安装验收。最终候选安装/便携启动验收仍为未执行。

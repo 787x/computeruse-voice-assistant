@@ -167,7 +167,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     slint::BackendSelector::new()
         .backend_name("winit".into())
         .with_winit_window_attributes_hook(|attributes| {
-            if attributes.title == "CUAVA Voice HUD" {
+            if super::hud_window::creating_hud() {
                 attributes.with_active(false)
             } else {
                 attributes
