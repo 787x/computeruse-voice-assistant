@@ -35,6 +35,17 @@ export struct ChatEntry {
     tint: color,         // 气泡底色（由 Rust 侧按角色给定）
 }
 
+/// 会话列表的一行（PR8）。
+export struct SessionRow {
+    id: string,
+    title: string,
+    // 最近更新时间 + 回合状态（例如「11-03 20:41 · 已完成」）。
+    detail: string,
+    // 上一轮没有正常结束（取消 / 失败 / 进程中断）→ 用醒目色提示。
+    warning: bool,
+    selected: bool,
+}
+
 /// 工具调用卡片：界面上单独一块，便于看出它动屏幕到哪一步。
 export struct ToolCard {
     name: string,
@@ -303,10 +314,54 @@ export component AppWindow inherits Window {
     in-out property <string> context-text: "";
     in-out property <string> draft: "";
 
+    // ---- 会话（PR8） ----
+    in-out property <[SessionRow]> sessions: [];
+    in-out property <string> session-title: "（没有会话）";
+    // 当前会话的"生效模型/有效窗口"摘要（只读展示）。
+    in-out property <string> session-model-text: "";
+    in-out property <string> session-effective-window: "";
+    // 改名草稿与改名框开关（改名只作用于当前选中会话）。
+    in-out property <string> rename-draft: "";
+    in-out property <bool> rename-open: false;
+
+    // ---- 输入区的模型选择（PR8：跨提供商） ----
+    // `model-option-labels` 与 `model-choices` 一一对应；下拉只接受 [string]。
+    in-out property <[string]> model-option-labels: [];
+    in-out property <int> model-choice-index: -1;
+    in-out property <[string]> reasoning-options: [];
+    in-out property <int> reasoning-index: 0;
+    in-out property <bool> reasoning-applicable: false;
+    in-out property <string> model-hint: "";
+    in-out property <string> manual-model: "";
+    in-out property <bool> manual-model-open: false;
+
     // 设置区
     in-out property <bool> settings-open: false;
     in-out property <int> provider-index: 0;
     in-out property <string> base-url: "";
+    in-out property <int> plan-edit-index: -1;
+    in-out property <string> plan-edit-id;
+    in-out property <string> plan-edit-name;
+    in-out property <string> plan-edit-provider: "mimo";
+    in-out property <string> plan-edit-model;
+    in-out property <[string]> plan-edit-labels;
+    callback edit-plan(index: int);
+    callback store-plan();
+    callback remove-plan();
+    in-out property <string> model-plans-json;
+    in-out property <string> model-schedule-json;
+    in-out property <bool> schedule-enabled;
+    in-out property <string> schedule-default;
+    callback update-schedule();
+    in-out property <[string]> rule-labels;
+    in-out property <int> rule-index: -1;
+    in-out property <string> rule-from: "09:00";
+    in-out property <string> rule-to: "18:00";
+    in-out property <string> rule-days;
+    in-out property <string> rule-plan;
+    callback edit-rule(index: int);
+    callback store-rule();
+    callback remove-rule();
     in-out property <string> model-name: "";
     in-out property <string> api-key-input: "";
     in-out property <bool> has-key: false;
@@ -318,6 +373,49 @@ export component AppWindow inherits Window {
     in-out property <bool> settings-dirty: false;
     // 保存进行中：禁用保存按钮，避免重复提交；结果回来前界面照常可交互。
     in-out property <bool> settings-saving: false;
+
+    // ---- 设置分类导航（PR8） ----
+    in-out property <[string]> settings-tab-labels: [];
+    in-out property <int> settings-tab-index: 0;
+    // 最近审计（最新在前，每行一句可直接读的结论）。
+    in-out property <[string]> audit-lines: [];
+    // 权限：档位标签、逐能力覆盖（能力名 / 级别标签 / 当前选择索引）。
+    in-out property <[string]> permission-mode-labels: [];
+    in-out property <[string]> capability-labels: [];
+    in-out property <[string]> override-labels: [];
+    in-out property <[int]> override-indices: [];
+    in-out property <bool> paused: false;
+    in-out property <string> pause-hint: "";
+
+    // ---- Agent 与上下文（PR8） ----
+    in-out property <string> temperature: "0.3";
+    in-out property <string> max-steps: "16";
+    in-out property <string> timeout-ms: "60000";
+    in-out property <string> context-window: "1000000";
+    in-out property <string> compress-percent: "90";
+    in-out property <string> context-hint: "";
+    // 推理档位下拉的标签与当前索引 + 适用性（自定义端点不显示）。
+    in-out property <[string]> thinking-labels: [];
+    in-out property <[string]> effort-labels: [];
+    in-out property <int> thinking-index: 0;
+    in-out property <int> effort-index: 0;
+    in-out property <bool> thinking-control-visible: false;
+    in-out property <bool> effort-control-visible: false;
+    in-out property <int> provider-hint-index: 0;
+
+    // ---- 系统提示词（PR8） ----
+    in-out property <bool> prompt-custom: false;
+    in-out property <string> system-prompt: "";
+    in-out property <string> default-prompt: "";
+    in-out property <string> prompt-hint: "";
+
+    // ---- 模型发现与连通性（PR8） ----
+    in-out property <bool> models-busy: false;
+    in-out property <string> model-list-hint: "";
+    in-out property <[string]> discovered-models: [];
+    in-out property <int> discovered-model-index: -1;
+    in-out property <string> connection-hint: "";
+    in-out property <string> connection-code: "";
 
     // 权限确认（ask）
     in-out property <bool> confirm-open: false;
@@ -365,16 +463,50 @@ export component AppWindow inherits Window {
     // ---- 回调（Rust 侧实现） ----
     callback send(text: string);
     callback cancel-turn();
+
+    // 会话（PR8）：id 为空 = 由 Rust 侧解析"当前会话"。
+    callback new-session();
+    callback select-session(id: string);
+    callback rename-session(id: string, title: string);
+    callback delete-session(id: string);
+    callback open-rename();
+
+    // 输入区的模型 / 推理档位（PR8）。
+    callback model-choice-picked(index: int);
+    callback reasoning-picked(index: int);
+    callback apply-manual-model(model: string);
+
+    // 设置分类导航（PR8）。
+    callback settings-tab-picked(index: int);
+
     callback open-settings();
-    // **一次保存**：模型端点与语音播报一起提交，由 Rust 侧当作一个事务处理。
-    // 返回是否整体成功（Slint 的 callback 可以有返回值，用于就地显示错误）。
-    callback save-all(provider-index: int, base-url: string, model-name: string, api-key: string, permission-index: int, tts-enabled: bool, tts-backend-index: int, tts-mimo-voice: string, tts-mimo-style: string, tts-local-dir: string, tts-local-sid: string, tts-local-speed: string, tts-speak-mode: int);
+    // **一次保存**：模型端点、推理档位、提示词、权限与语音播报一起提交。
+    // 界面上读全部字段，由 Rust 侧当作一个事务处理；结果通过
+    // `settings-error` / `settings-saving` 回填，所以不需要参数与返回值。
+    callback save-all();
     // 关闭设置面板（取消）：丢弃界面上的未保存修改。
     callback cancel-settings();
     // 带上界面当前选中的提供商索引：清除的是**用户看到的**那一家，
     // 不是已保存配置里的那一家。
     callback clear-api-key(provider-index: int);
     callback provider-changed(provider-index: int);
+    // 权限：档位与单项覆盖**立即生效**（不等保存）；暂停/限时授权是运行态。
+    callback permission-mode-picked(index: int);
+    callback override-picked(row: int, choice: int);
+    callback toggle-pause();
+    in property <[string]> capability-ids;
+    callback grant-capability(capability: string, minutes: int);
+    callback export-audit();
+    // 模型发现与连通性（PR8）。
+    function clear-probe-results() {
+        root.connection-hint = "";
+        root.connection-code = "";
+        root.model-list-hint = "";
+        root.discovered-models = [];
+        root.discovered-model-index = -1;
+    }
+    callback test-connection();
+    callback fetch-models();
     callback confirm-decision(request-id: int, allow: bool);
     callback set-voice-enabled(enabled: bool);
     callback test-voice();
@@ -461,14 +593,167 @@ export component AppWindow inherits Window {
 
         Rectangle { height: 1px; background: #e3e3e6; }
 
-        // 主区域：对话 + 右侧工具状态
+        // 主区域：会话栏 + 对话 + 右侧工具状态
         HorizontalLayout {
             spacing: 0;
+
+            // ---- 会话栏（PR8） ----
+            //
+            // 宽度固定 210px：会话标题用 `elide` 截断，不让长标题把对话区挤窄。
+            VerticalLayout {
+                width: 210px;
+                padding-left: 12px;
+                padding-right: 10px;
+                padding-top: 12px;
+                padding-bottom: 10px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    Text {
+                        color: Theme.text-color;
+                        text: "会话";
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    AppButton {
+                        label: "新建";
+                        width: 58px;
+                        clicked => { root.new-session(); }
+                    }
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    content-width: self.width;
+                    content-height: session-list.preferred-height;
+
+                    session-list := VerticalLayout {
+                        spacing: 6px;
+
+                        if root.sessions.length == 0 : Text {
+                            text: "还没有会话。点「新建」开始。";
+                            font-size: 11px;
+                            color: #8a8a90;
+                            wrap: word-wrap;
+                        }
+
+                        for row in root.sessions: Rectangle {
+                            height: session-card.preferred-height + 12px;
+                            border-radius: 6px;
+                            background: row.selected ? #e6efff : (session-touch.has-hover ? #f2f2f4 : #ffffff);
+                            border-width: 1px;
+                            border-color: row.selected ? #b9d4ff : #e3e3e6;
+
+                            session-card := VerticalLayout {
+                                padding: 6px;
+                                spacing: 2px;
+
+                                Text {
+                                    color: Theme.text-color;
+                                    text: row.title;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: row.detail;
+                                    font-size: 10px;
+                                    color: row.warning ? #a05a00 : #8a8a90;
+                                    overflow: elide;
+                                }
+                            }
+
+                            session-touch := TouchArea {
+                                clicked => { root.select-session(row.id); }
+                            }
+                        }
+                    }
+                }
+
+                // 当前会话的操作（忙碌时禁用：避免在回合执行中切换/删除）。
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    AppButton {
+                        label: "改名";
+                        width: 58px;
+                        enabled: root.sessions.length > 0 && !root.busy;
+                        clicked => { root.open-rename(); }
+                    }
+
+                    AppButton {
+                        label: "删除";
+                        width: 58px;
+                        enabled: root.sessions.length > 0 && !root.busy;
+                        // 空 id = 由 Rust 侧解析为当前会话。
+                        clicked => { root.delete-session(""); }
+                    }
+                }
+
+                if root.rename-open : Rectangle {
+                    height: rename-box.preferred-height + 12px;
+                    border-radius: 6px;
+                    background: #ffffff;
+                    border-width: 1px;
+                    border-color: #c9c9d0;
+
+                    rename-box := VerticalLayout {
+                        padding: 6px;
+                        spacing: 6px;
+
+                        AppLineEdit {
+                            text <=> root.rename-draft;
+                            placeholder-text: "会话标题";
+                            accepted => {
+                                root.rename-session("", root.rename-draft);
+                                root.rename-open = false;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 6px;
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            AppButton {
+                                label: "取消";
+                                width: 52px;
+                                clicked => { root.rename-open = false; }
+                            }
+
+                            AppButton {
+                                label: "确定";
+                                primary: true;
+                                width: 52px;
+                                clicked => {
+                                    root.rename-session("", root.rename-draft);
+                                    root.rename-open = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle { width: 1px; background: #e3e3e6; }
 
             // 对话
             VerticalLayout {
                 padding: 16px;
                 spacing: 10px;
+
+                // 当前会话标题：一眼看出在跟哪个会话说话。
+                Text {
+                    color: Theme.text-color;
+                    text: root.session-title;
+                    font-size: 14px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
 
                 ScrollView {
                     content-width: self.width;
@@ -477,7 +762,8 @@ export component AppWindow inherits Window {
                     transcript := VerticalLayout {
                         spacing: 8px;
 
-                        for entry in root.entries: Rectangle {
+                        for entry in root.entries: timeline-row := Rectangle {
+                            property <bool> expanded: false;
                             height: bubble.preferred-height + 16px;
                             border-radius: 8px;
                             background: entry.tint;
@@ -493,7 +779,12 @@ export component AppWindow inherits Window {
                                     font-size: 11px;
                                     color: #8a8a90;
                                 }
+                                if entry.role == "思考": AppButton {
+                                    label: timeline-row.expanded ? "收起思考" : "展开思考";
+                                    clicked => { timeline-row.expanded = !timeline-row.expanded; }
+                                }
                                 Text {
+                                    visible: entry.role != "思考" || timeline-row.expanded;
                                     text: entry.text;
                                     wrap: word-wrap;
                                     color: #1f1f22;
@@ -505,6 +796,13 @@ export component AppWindow inherits Window {
                                     wrap: word-wrap;
                                 }
                             }
+                        }
+
+                        if root.entries.length == 0 && root.tools.length == 0 : Text {
+                            text: "还没有对话。在下面输入指令，或点「打开麦克风」用语音。";
+                            font-size: 12px;
+                            color: #8a8a90;
+                            wrap: word-wrap;
                         }
                     }
                 }
@@ -577,6 +875,71 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                         }
                     }
+                }
+
+                // ---- 输入区的模型 / 推理档位（PR8） ----
+                //
+                // 这一行显示"这一轮会用哪家哪模型"：跨提供商，选中后只改当前
+                // 会话的选择并持久化。执行中禁用（不热切换正在跑的回合）。
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    AppComboBox {
+                        width: 280px;
+                        enabled: !root.busy && root.model-option-labels.length > 0;
+                        options: root.model-option-labels;
+                        index: root.model-choice-index;
+                        picked(index) => { root.model-choice-picked(index); }
+                    }
+
+                    // 推理档位只对声明了协议的提供商显示（自定义端点不注入专属字段）。
+                    if root.reasoning-applicable : AppComboBox {
+                        width: 160px;
+                        enabled: !root.busy && root.reasoning-options.length > 0;
+                        options: root.reasoning-options;
+                        index: root.reasoning-index;
+                        picked(index) => { root.reasoning-picked(index); }
+                    }
+
+                    AppButton {
+                        label: "手填模型";
+                        width: 82px;
+                        enabled: !root.busy;
+                        clicked => { root.manual-model-open = !root.manual-model-open; }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                if root.manual-model-open : HorizontalLayout {
+                    spacing: 8px;
+
+                    AppLineEdit {
+                        text <=> root.manual-model;
+                        placeholder-text: "输入模型名（在线目录里没有也能用）";
+                        accepted => {
+                            root.apply-manual-model(root.manual-model);
+                            root.manual-model-open = false;
+                        }
+                    }
+
+                    AppButton {
+                        label: "使用";
+                        primary: true;
+                        width: 64px;
+                        clicked => {
+                            root.apply-manual-model(root.manual-model);
+                            root.manual-model-open = false;
+                        }
+                    }
+                }
+
+                // 当前生效来源（会话手选 / 时段方案 / 全局默认）或"缺 Key"的提示。
+                if root.model-hint != "" : Text {
+                    text: root.model-hint;
+                    font-size: 11px;
+                    color: #a05a00;
+                    wrap: word-wrap;
                 }
 
                 // 输入区
@@ -754,6 +1117,54 @@ export component AppWindow inherits Window {
 
                 Rectangle { height: 1px; background: #e3e3e6; }
 
+                // ---- 分类导航（PR8） ----
+                //
+                // 标签宽度按文字自适应（用 `tab-text.preferred-width`），
+                // 不使用固定宽度：中文标签"Agent 与上下文"比"权限"宽得多。
+                Rectangle {
+                    background: #fafafb;
+                    height: 42px;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 4px;
+
+                        for label[index] in root.settings-tab-labels: Rectangle {
+                            width: tab-label.preferred-width + 22px;
+                            height: 30px;
+                            border-radius: 5px;
+                            background: index == root.settings-tab-index ? #e6efff : (tab-touch.has-hover ? #f0f0f4 : transparent);
+                            border-width: 1px;
+                            border-color: index == root.settings-tab-index ? #b9d4ff : transparent;
+
+                            tab-label := Text {
+                                text: label;
+                                font-size: 12px;
+                                color: Theme.text-color;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            tab-touch := TouchArea {
+                                clicked => {
+                                    // **先在本侧立即切换**：分类导航是纯界面状态，
+                                    // 不该等工作线程往返——它可能正忙，那时"点了没反应"
+                                    // 会让人以为界面卡住。
+                                    root.settings-tab-index = index;
+                                    root.settings-tab-picked(index);
+                                }
+                            }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #e3e3e6; }
+
                 // 可滚动主体
                 settings-scroll := ScrollView {
                     vertical-stretch: 1;
@@ -765,27 +1176,64 @@ export component AppWindow inherits Window {
                         padding-bottom: 14px;
                         spacing: 10px;
 
-                        Text {
-                            color: Theme.text-color;
-                            text: "模型端点";
-                            font-size: 14px;
-                            font-weight: 600;
-                        }
+                        // ===== 0. 模型 / 方案 =====
+                        if root.settings-tab-index == 0 : VerticalLayout {
+                            Text { text: "模型方案"; color: Theme.text-color; }
+                            HorizontalLayout {
+                                AppComboBox { options: root.plan-edit-labels; index: root.plan-edit-index; picked(i) => { root.edit-plan(i); } }
+                                AppButton { label: "新建"; clicked => { root.edit-plan(-1); } }
+                                AppButton { label: "更新方案草稿"; clicked => { root.store-plan(); } }
+                                AppButton { label: "删除方案"; clicked => { root.remove-plan(); } }
+                            }
+                            HorizontalLayout {
+                                AppLineEdit { text <=> root.plan-edit-id; placeholder-text: "方案 ID"; }
+                                AppLineEdit { text <=> root.plan-edit-name; placeholder-text: "名称"; }
+                                AppLineEdit { text <=> root.plan-edit-provider; placeholder-text: "mimo / deepseek / openai-compatible"; }
+                                AppLineEdit { text <=> root.plan-edit-model; placeholder-text: "模型名称"; }
+                            }
+                            HorizontalLayout {
+                                AppButton { label: root.schedule-enabled ? "时段切换：已启用" : "时段切换：已禁用"; clicked => { root.schedule-enabled = !root.schedule-enabled; root.update-schedule(); } }
+                                AppLineEdit { text <=> root.schedule-default; placeholder-text: "默认方案 ID（留空跟随全局）"; edited => { root.update-schedule(); } }
+                            }
+                            Text { text: "时段规则（星期 1–7，逗号分隔；留空表示每天）"; color: Theme.text-color; }
+                            HorizontalLayout {
+                                AppComboBox { options: root.rule-labels; index: root.rule-index; picked(i) => { root.edit-rule(i); } }
+                                AppButton { label: "新规则"; clicked => { root.edit-rule(-1); } }
+                                AppButton { label: "更新规则草稿"; clicked => { root.store-rule(); } }
+                                AppButton { label: "删除规则"; clicked => { root.remove-rule(); } }
+                            }
+                            HorizontalLayout {
+                                AppLineEdit { text <=> root.rule-from; placeholder-text: "开始 HH:mm"; }
+                                AppLineEdit { text <=> root.rule-to; placeholder-text: "结束 HH:mm"; }
+                                AppLineEdit { text <=> root.rule-days; placeholder-text: "星期，例如 1,2,3,4,5"; }
+                                AppLineEdit { text <=> root.rule-plan; placeholder-text: "方案 ID"; }
+                            }
 
-                        HorizontalLayout {
+
                             spacing: 10px;
-                            Text { text: "提供商"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
-                            AppComboBox {
-                                enabled: !root.settings-saving;
-                                options: ["mimo", "deepseek", "openai-compatible"];
-                                // 注意 `index:` 是**单向**绑定：下拉自己会先改内部的
-                                // `index`，这里必须同时把值写回 `root.provider-index`，
-                                // 否则界面显示的提供商与保存出去的 provider_id 会不一致
-                                // （选 DeepSeek 却存成 MiMo，Key 也会写到错误的那家名下）。
-                                index <=> root.provider-index;
-                                picked(index) => {
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "模型端点";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "提供商"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                                AppComboBox {
+                                    enabled: !root.settings-saving;
+                                    options: ["mimo", "deepseek", "openai-compatible"];
+                                    // 注意 `index:` 是**单向**绑定：下拉自己会先改内部的
+                                    // `index`，这里必须同时把值写回 `root.provider-index`，
+                                    // 否则界面显示的提供商与保存出去的 provider_id 会不一致
+                                    // （选 DeepSeek 却存成 MiMo，Key 也会写到错误的那家名下）。
+                                    index <=> root.provider-index;
+                                    picked(index) => {
                                     root.settings-dirty = true;
                                     root.settings-error = "";
+                                    root.clear-probe-results();
                                     root.provider-changed(index);
                                 }
                             }
@@ -798,7 +1246,7 @@ export component AppWindow inherits Window {
                                 enabled: !root.settings-saving;
                                 text <=> root.base-url;
                                 placeholder-text: "https://…";
-                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                edited => { root.settings-dirty = true; root.settings-error = "";  root.clear-probe-results();}
                             }
                         }
 
@@ -809,7 +1257,7 @@ export component AppWindow inherits Window {
                                 enabled: !root.settings-saving;
                                 text <=> root.model-name;
                                 placeholder-text: "模型名";
-                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                edited => { root.settings-dirty = true; root.settings-error = "";  root.connection-hint = "";}
                             }
                         }
 
@@ -821,30 +1269,10 @@ export component AppWindow inherits Window {
                                 text <=> root.api-key-input;
                                 placeholder-text: root.has-key ? "已保存（留空则不修改）" : "未保存";
                                 input-type-password: true;
-                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                edited => { root.settings-dirty = true; root.settings-error = "";  root.clear-probe-results();}
                             }
                         }
 
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Text { text: "权限档位"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
-                            AppComboBox {
-                                enabled: !root.settings-saving;
-                                options: ["standard", "conservative", "permissive"];
-                                index <=> root.permission-index;
-                                picked(index) => {
-                                    root.settings-dirty = true;
-                                    root.settings-error = "";
-                                }
-                            }
-                        }
-
-                        Text {
-                            text: "Key 用 Windows DPAPI 以当前用户身份加密后保存在本程序自己的数据目录；配置文件里不含密钥，日志里也不出现明文。";
-                            font-size: 11px;
-                            color: #8a8a90;
-                            wrap: word-wrap;
-                        }
 
                         Rectangle { height: 1px; background: #e3e3e6; }
 
@@ -957,6 +1385,525 @@ export component AppWindow inherits Window {
                             color: #8a8a90;
                             wrap: word-wrap;
                         }
+
+                        Rectangle { height: 1px; background: #e3e3e6; }
+
+                        // ---- 模型发现与连通性 ----
+                        Text {
+                            color: Theme.text-color;
+                            text: "连通性与模型发现";
+                            font-size: 13px;
+                            font-weight: 600;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            AppButton {
+                                label: "测试连接";
+                                enabled: !root.settings-saving && !root.models-busy;
+                                clicked => { root.test-connection(); }
+                            }
+                            AppButton {
+                                label: root.models-busy ? "获取中…" : "获取模型";
+                                enabled: !root.settings-saving && !root.models-busy;
+                                clicked => { root.fetch-models(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        if root.connection-hint != "" : Text {
+                            text: root.connection-hint;
+                            font-size: 11px;
+                            color: root.connection-code == "ok" ? #1f7a3a : (root.connection-code == "auth" ? #a02020 : #a05a00);
+                            wrap: word-wrap;
+                        }
+
+                        if root.model-list-hint != "" : Text {
+                            text: root.model-list-hint;
+                            font-size: 11px;
+                            color: #55555c;
+                            wrap: word-wrap;
+                        }
+
+                        if root.discovered-models.length > 0 : HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "在线模型"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
+                            AppComboBox {
+                                enabled: !root.settings-saving;
+                                options: root.discovered-models;
+                                index <=> root.discovered-model-index;
+                                picked(index) => {
+                                    // 选中就填进模型输入框（用户随后保存；
+                                    // 不会偷偷改掉已生效配置）。
+                                    if index >= 0 && index < root.discovered-models.length {
+                                        root.model-name = root.discovered-models[index];
+                                        root.settings-dirty = true;
+                                        root.settings-error = "";
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "「获取模型」只查询 /models 目录：成功不等于模型能聊天，失败也不妨碍手填模型名。「测试连接」会真的发一次最小对话请求，据此区分授权 / 模型 / 网络问题。";
+                            font-size: 11px;
+                            color: #8a8a90;
+                            wrap: word-wrap;
+                        }
+                        }
+
+                        // ===== 1. Agent 与上下文 =====
+                        if root.settings-tab-index == 1 : VerticalLayout {
+                            spacing: 10px;
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "采样与步数";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "温度"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    text <=> root.temperature;
+                                    placeholder-text: "0~2";
+                                    width: 120px;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                                Text {
+                                    text: "思考模式下部分型号会忽略温度（服务端强制覆盖）";
+                                    font-size: 11px;
+                                    color: #8a8a90;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "最大步数"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    text <=> root.max-steps;
+                                    placeholder-text: "1~40";
+                                    width: 120px;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                                Text {
+                                    text: "一步 = 一次模型往返（可含多个工具调用）";
+                                    font-size: 11px;
+                                    color: #8a8a90;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "超时(ms)"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    text <=> root.timeout-ms;
+                                    placeholder-text: "5000~600000";
+                                    width: 120px;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                            }
+
+                            Rectangle { height: 1px; background: #e3e3e6; }
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "上下文预算";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "窗口(tokens)"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    text <=> root.context-window;
+                                    placeholder-text: "默认 1000000";
+                                    width: 140px;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                                AppLineEdit {
+                                    text <=> root.compress-percent;
+                                    placeholder-text: "压缩触发 %";
+                                    width: 120px;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                            }
+
+                            Text {
+                                text: root.context-hint;
+                                font-size: 11px;
+                                color: #55555c;
+                                wrap: word-wrap;
+                            }
+
+                            Text {
+                                text: "默认 1,000,000 tokens、到 90% 才压缩。模型有可信且更小的窗口元数据时按更小的算（只收紧、不放宽）。低于触发点绝不提前丢历史。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ===== 2. 系统提示词 =====
+                        if root.settings-tab-index == 2 : VerticalLayout {
+                            spacing: 10px;
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "系统提示词";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "模式"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppComboBox {
+                                    options: ["使用内置默认", "使用自定义"];
+                                    index: root.prompt-custom ? 1 : 0;
+                                    picked(index) => {
+                                        root.prompt-custom = index == 1;
+                                        root.settings-dirty = true;
+                                        root.prompt-hint = "";
+                                    }
+                                }
+                            }
+
+                            if root.prompt-custom : AppLineEdit {
+                                text <=> root.system-prompt;
+                                placeholder-text: "整段替换：这里的内容就是模型收到的人设（不会偷偷拼回默认设定）";
+                                edited => { root.settings-dirty = true; root.settings-error = ""; }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                AppButton {
+                                    label: "复制默认提示词";
+                                    clicked => {
+                                        // 复制走 Rust 侧的剪贴板命令；失败会如实提示。
+                                        root.prompt-hint = "复制中…";
+                                    }
+                                }
+                                AppButton {
+                                    label: "恢复默认";
+                                    clicked => {
+                                        root.system-prompt = root.default-prompt;
+                                        root.settings-dirty = true;
+                                        root.prompt-hint = "已填入默认提示词（保存后生效）";
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            if root.prompt-hint != "" : Text {
+                                text: root.prompt-hint;
+                                font-size: 11px;
+                                color: #a05a00;
+                                wrap: word-wrap;
+                            }
+
+                            Text {
+                                text: "提示词不决定工具能不能执行——那是权限的事。改完保存，下一轮请求立刻生效。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ===== 3. 权限 =====
+                        if root.settings-tab-index == 3 : VerticalLayout {
+                            spacing: 10px;
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "权限档位";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "档位"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppComboBox {
+                                    enabled: !root.settings-saving;
+                                    options: root.permission-mode-labels;
+                                    index <=> root.permission-index;
+                                    picked(index) => {
+                                        root.settings-dirty = true;
+                                        root.settings-error = "";
+                                        root.permission-mode-picked(index);
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "「免确认」= 已知且可授权的工具都不再询问（含删除、执行命令）。未知工具仍拒绝；全局暂停仍优先；下面的单项覆盖仍可把它掰回询问/拒绝。";
+                                font-size: 11px;
+                                color: #a02020;
+                                wrap: word-wrap;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                AppButton {
+                                    label: root.paused ? "恢复操作" : "暂停 10 分钟";
+                                    primary: root.paused;
+                                    clicked => { root.toggle-pause(); }
+                                }
+                                Text {
+                                    text: root.pause-hint;
+                                    font-size: 11px;
+                                    color: #a05a00;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            Rectangle { height: 1px; background: #e3e3e6; }
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "逐能力覆盖（跟随档位 = 不覆盖）";
+                                font-size: 13px;
+                                font-weight: 600;
+                            }
+
+                            for row[index] in root.capability-labels: HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: row;
+                                    width: 120px;
+                                    vertical-alignment: center;
+                                    color: Theme.text-color;
+                                    font-size: 12px;
+                                }
+                                AppComboBox {
+                                    enabled: !root.settings-saving;
+                                    width: 120px;
+                                    options: root.override-labels;
+                                    index: index < root.override-indices.length ? root.override-indices[index] : 0;
+                                    picked(choice) => { root.override-picked(index, choice); }
+                                }
+                                AppButton {
+                                    label: "限时允许";
+                                    enabled: !root.settings-saving;
+                                    width: 84px;
+                                    clicked => { root.grant-capability(root.capability-ids[index], 15); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            Text {
+                                text: "「限时允许」只作用于本会话：不写盘、重启失效、不跨会话泄漏；它只能把「询问」提升为「允许」，不会解开「拒绝」或未知工具。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle { height: 1px; background: #e3e3e6; }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    color: Theme.text-color;
+                                    text: "最近审计";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                AppButton {
+                                    label: "导出全部";
+                                    clicked => { root.export-audit(); }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 150px;
+                                border-radius: 6px;
+                                background: #fafafb;
+                                border-width: 1px;
+                                border-color: #e3e3e6;
+
+                                ScrollView {
+                                    content-width: self.width;
+                                    content-height: audit-list.preferred-height;
+
+                                    audit-list := VerticalLayout {
+                                        padding: 6px;
+                                        spacing: 2px;
+                                        for line in root.audit-lines: Text {
+                                            text: line;
+                                            font-size: 11px;
+                                            color: #55555c;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ===== 4. 语音输入 / 播报 =====
+                        if root.settings-tab-index == 4 : VerticalLayout {
+                            spacing: 10px;
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "语音输入";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            Text {
+                                text: "语音输入走本机 Whisper 与唤醒词模型，完全离线；设备与模型状态显示在主界面状态条。这里不提供尚未实现的开关。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                AppButton {
+                                    label: root.voice-enabled ? "关闭麦克风" : "打开麦克风";
+                                    primary: root.voice-enabled;
+                                    clicked => { root.set-voice-enabled(!root.voice-enabled); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            Text {
+                                text: root.voice-device;
+                                font-size: 11px;
+                                color: #55555c;
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle { height: 1px; background: #e3e3e6; }
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "语音播报";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "播报后端"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppComboBox {
+                                    enabled: !root.settings-saving;
+                                    options: ["关闭", "MiMo 云端", "本地 ONNX"];
+                                    index <=> root.tts-backend-index;
+                                    picked(index) => {
+                                        root.tts-enabled = index != 0;
+                                        root.settings-dirty = true;
+                                        root.settings-error = "";
+                                    }
+                                }
+                                Text {
+                                    text: root.tts-backend-ready ? "可用" : "不可用";
+                                    font-size: 11px;
+                                    color: root.tts-backend-ready ? #1f7a3a : #a02020;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            // 明确区分「当前生效」与「尚未保存的选择」。
+                            if root.settings-dirty : Text {
+                                text: "当前生效：" + root.tts-active-label;
+                                font-size: 11px;
+                                color: #a05a00;
+                                wrap: word-wrap;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "云端音色"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    enabled: !root.settings-saving;
+                                    text <=> root.tts-mimo-voice;
+                                    placeholder-text: "留空 = 服务端默认预置音色";
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "风格指令"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    enabled: !root.settings-saving;
+                                    text <=> root.tts-mimo-style;
+                                    placeholder-text: "可选，例如：语速稍快（<120 字）";
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "本地模型"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    enabled: !root.settings-saving;
+                                    text <=> root.tts-local-dir;
+                                    placeholder-text: "留空 = 数据目录 models/kokoro-multi-lang-v1_0";
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "音色/语速"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    enabled: !root.settings-saving;
+                                    text <=> root.tts-local-sid;
+                                    placeholder-text: "音色编号";
+                                    width: 110px;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                                AppLineEdit {
+                                    enabled: !root.settings-saving;
+                                    text <=> root.tts-local-speed;
+                                    placeholder-text: "语速 0.5~2.0";
+                                    width: 130px;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "自动播报"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppComboBox {
+                                    enabled: !root.settings-saving;
+                                    options: ["语音与文本", "只播语音", "只播文本", "都不自动"];
+                                    index <=> root.tts-speak-mode;
+                                    picked(index) => {
+                                        root.settings-dirty = true;
+                                        root.settings-error = "";
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "云端模式会把助手回复的**正文**发给 MiMo 合成语音（只用 MiMo 账户的 Key，不会借用其它提供商）；本地 ONNX 不联网，但需要自己准备模型。思考内容与工具 JSON 永远不朗读。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+
+                            Text {
+                                text: "当前版本没有音乐控制与联网搜索，相关设置在迁移对照里明确标注为后续实现。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+                        }
                     }
                 }
 
@@ -1036,24 +1983,10 @@ export component AppWindow inherits Window {
                             primary: true;
                             enabled: !root.settings-saving;
                             clicked => {
-                                // **一次**提交：模型端点 + 播报设置一起交给 Rust，
-                                // 由它按"要么都生效、要么如实报错"处理。
+                                // **一次**提交：界面上读全部字段，由 Rust 侧按
+                                // "要么都生效、要么如实报错"处理（不需要参数）。
                                 root.settings-saving = true;
-                                root.save-all(
-                                    root.provider-index,
-                                    root.base-url,
-                                    root.model-name,
-                                    root.api-key-input,
-                                    root.permission-index,
-                                    root.tts-backend-index != 0,
-                                    root.tts-backend-index,
-                                    root.tts-mimo-voice,
-                                    root.tts-mimo-style,
-                                    root.tts-local-dir,
-                                    root.tts-local-sid,
-                                    root.tts-local-speed,
-                                    root.tts-speak-mode
-                                );
+                                root.save-all();
                             }
                         }
                     }

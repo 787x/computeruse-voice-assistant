@@ -1,20 +1,35 @@
-//! 权限引擎（对应 `packages/agent/permissions.mjs`）。
+//! 权限引擎（对应 `packages/agent/permissions.mjs`，PR8 补齐四档与逐能力覆盖）。
 //!
 //! 唯一能说"能不能做"的地方。所有工具调用都必须先过这里，包括 PR5 的 12 个 CUA 工具。
 //!
 //! 三个概念分开：
 //!  - 能力（capability）：按"能造成什么后果"划分（看屏幕 / 点鼠标 / 敲键盘…）
 //!  - 级别（level）：allow / ask / deny，回答"这个能力现在允许到什么程度"
-//!  - 作用域：PR5 只做时间维度（暂停），应用/目录作用域留待后续
+//!  - 作用域：本版只做时间维度（暂停 + 限时授权），应用/目录作用域留待后续
 //!
-//! 默认取向与旧版一致：低风险放行保证流畅，不可逆动作询问，破坏性系统操作拒绝。
-//! **未知工具一律 deny**——不在白名单里的工具不该因为任何档位被放行。
+//! 判定顺序（与旧版 `resolveLevel` 一致，PR8 显式写出来）：
+//!  1. **全局暂停**最高优先：暂停期间任何工具都不执行（含已知、可授权工具）；
+//!  2. **未知工具**一律拒绝——不在白名单里的工具不因任何档位被放行；
+//!  3. 档位预设（保守 / 标准 / 宽松 / 免确认）调整**已知能力**的默认级别；
+//!  4. 逐能力覆盖（allow / ask / deny / 跟随档位）覆盖档位结果；
+//!  5. 会话内限时授权只把 `ask` 变成 `allow`，不会把 `deny` 或未知工具解开。
+//!
+//! 免确认（`pass-through`）的语义（旧版 `unattended`）：
+//!  - 已知且可授权的工具**不再询问**，包括删除/执行命令这类默认 ask 与默认 deny 的破坏性操作；
+//!  - 未知工具仍然拒绝；
+//!  - 全局暂停仍然优先；
+//!  - 单项覆盖仍可把它掰回 ask / deny（留一个刹车）；
+//!  - 风险升级（Win+R、rm -rf 之类）在免确认下不再强制询问。
+//!
+//! 取消语义：等待确认期间回合被取消 → 迟到的"允许"不生效，工具绝不执行。
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::PermissionMode;
+use crate::config::{PermissionMode, PermissionOverride};
 
 /// 决策级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,25 +48,38 @@ impl Level {
             Self::Deny => "deny",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Allow => "允许",
+            Self::Ask => "询问",
+            Self::Deny => "拒绝",
+        }
+    }
 }
 
 /// 一次分类结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub capability: &'static str,
+    /// 该能力的**默认**级别（档位与覆盖会在此基础上调整）。
     pub level: Level,
     /// 定性说明（升级原因 / 拒绝原因），会显示给用户。
     pub reason: String,
     /// 是否因具体参数（Win+R、rm -rf 之类）被风险升级。
     pub escalated: bool,
+    /// 是否是不在白名单里的未知工具（未知工具无条件拒绝）。
+    pub unknown: bool,
 }
 
-/// 能力默认级别。
-struct CapabilityInfo {
-    id: &'static str,
-    label: &'static str,
-    level: Level,
-    audit: bool,
+/// 能力定义（界面上的"逐能力覆盖"表格直接来自这里）。
+#[derive(Debug, Clone, Copy)]
+pub struct CapabilityInfo {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub level: Level,
+    /// 是否需要留痕（审计）。
+    pub audit: bool,
 }
 
 const CAPABILITIES: &[CapabilityInfo] = &[
@@ -171,6 +199,11 @@ const CAPABILITIES: &[CapabilityInfo] = &[
     },
 ];
 
+/// 全部能力定义（界面/审计用；顺序稳定）。
+pub fn capabilities() -> &'static [CapabilityInfo] {
+    CAPABILITIES
+}
+
 fn capability_info(id: &str) -> Option<&'static CapabilityInfo> {
     CAPABILITIES.iter().find(|item| item.id == id)
 }
@@ -247,6 +280,7 @@ pub fn classify(tool: &str, args: &serde_json::Value) -> Classification {
             level: Level::Deny,
             reason: format!("未知工具：{tool}"),
             escalated: false,
+            unknown: true,
         };
     };
 
@@ -265,6 +299,7 @@ pub fn classify(tool: &str, args: &serde_json::Value) -> Classification {
                     level: Level::Ask,
                     reason: format!("{keys}：{why}"),
                     escalated: true,
+                    unknown: false,
                 };
             }
         }
@@ -284,6 +319,7 @@ pub fn classify(tool: &str, args: &serde_json::Value) -> Classification {
                     level: Level::Ask,
                     reason: (*why).to_string(),
                     escalated: true,
+                    unknown: false,
                 };
             }
         }
@@ -297,23 +333,27 @@ pub fn classify(tool: &str, args: &serde_json::Value) -> Classification {
         level: base,
         reason: String::new(),
         escalated: false,
+        unknown: false,
     }
 }
 
-/// 权限状态（运行期可改，`paused_until` / `allowed_once` 属于会话状态）。
+/// 权限状态（运行期可改，`paused_until` / `allowed_once` 属于会话状态，**不落盘**）。
 #[derive(Debug, Clone)]
 pub struct PermissionState {
     pub mode: PermissionMode,
+    /// 逐能力覆盖（来自设置；`Follow` = 跟随档位）。
+    pub overrides: std::collections::BTreeMap<String, PermissionOverride>,
     /// 全局暂停：任何工具都不执行。
     pub paused_until: Option<SystemTime>,
-    /// 本次会话内"一次性允许"的能力 → 到期时间。
-    pub allowed_once: Vec<(&'static str, SystemTime)>,
+    /// 本次会话内"限时允许"的能力 → 到期时间（不持久化、不跨 Session 泄漏）。
+    pub allowed_once: Vec<(String, SystemTime)>,
 }
 
 impl Default for PermissionState {
     fn default() -> Self {
         Self {
             mode: PermissionMode::Standard,
+            overrides: Default::default(),
             paused_until: None,
             allowed_once: Vec::new(),
         }
@@ -328,7 +368,22 @@ impl PermissionState {
         }
     }
 
-    /// 合并"档位默认 + 过期临时授权"得出最终级别。
+    /// 从设置构造（档位 + 逐能力覆盖）。
+    pub fn from_settings(
+        mode: PermissionMode,
+        overrides: &std::collections::BTreeMap<String, PermissionOverride>,
+    ) -> Self {
+        Self {
+            mode,
+            overrides: overrides.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// 合并"档位预设 + 逐能力覆盖 + 过期临时授权"得出最终级别。
+    ///
+    /// 注意顺序：**覆盖在档位之后**（用户显式覆盖必须能压过免确认档位，
+    /// 这是"免确认也有刹车"的实现），临时授权最后只提升 `ask`。
     pub fn resolve_level(&self, capability: &str, now: SystemTime) -> Level {
         let base = capability_info(capability)
             .map(|info| info.level)
@@ -353,16 +408,28 @@ impl PermissionState {
                 }
                 _ => base,
             },
-            // 免确认：连 deny 也放开（否则"完全权限"名不副实）。
-            // 未知工具在被调用前就已按未知拒绝，不会走到这里。
+            // 免确认：已知能力（含默认 deny 的破坏性操作）全部放行。
+            // 未知工具在 `PermissionGate::check` 里就被拒绝，走不到这里。
             PermissionMode::PassThrough => Level::Allow,
             PermissionMode::Standard => base,
         };
+
+        // 逐能力覆盖：显式 allow / ask / deny 压过档位；`Follow` 不改变任何东西。
+        if let Some(choice) = self.overrides.get(capability) {
+            match choice {
+                PermissionOverride::Allow => level = Level::Allow,
+                PermissionOverride::Ask => level = Level::Ask,
+                PermissionOverride::Deny => level = Level::Deny,
+                PermissionOverride::Follow => {}
+            }
+        }
+
+        // 限时授权只把 ask 提升为 allow：deny 与未知工具不可能被一次授权解开。
         if level == Level::Ask {
             let granted = self
                 .allowed_once
                 .iter()
-                .any(|(id, until)| *id == capability && *until > now);
+                .any(|(id, until)| id == capability && *until > now);
             if granted {
                 level = Level::Allow;
             }
@@ -370,18 +437,48 @@ impl PermissionState {
         level
     }
 
-    pub fn grant_once(&mut self, capability: &'static str, minutes: u64) {
-        let until = SystemTime::now() + Duration::from_secs(minutes * 60);
-        self.allowed_once.retain(|(id, _)| *id != capability);
-        self.allowed_once.push((capability, until));
+    /// 会话内限时允许某能力（`minutes` 分钟后自动失效，不落盘）。
+    pub fn grant_once(&mut self, capability: &str, minutes: u64) {
+        let until = SystemTime::now() + Duration::from_secs(minutes.saturating_mul(60));
+        self.allowed_once.retain(|(id, _)| id != capability);
+        self.allowed_once.push((capability.to_string(), until));
+    }
+
+    /// 当前仍然有效的临时授权（界面显示用）。
+    pub fn active_grants(&self, now: SystemTime) -> Vec<(String, u64)> {
+        self.allowed_once
+            .iter()
+            .filter(|(_, until)| *until > now)
+            .filter_map(|(id, until)| {
+                until
+                    .duration_since(now)
+                    .ok()
+                    .map(|left| (id.clone(), left.as_secs().div_ceil(60)))
+            })
+            .collect()
     }
 
     pub fn pause(&mut self, minutes: u64) {
-        self.paused_until = Some(SystemTime::now() + Duration::from_secs(minutes * 60));
+        self.paused_until =
+            Some(SystemTime::now() + Duration::from_secs(minutes.saturating_mul(60)));
+    }
+
+    pub fn resume(&mut self) {
+        self.paused_until = None;
     }
 
     pub fn is_paused(&self, now: SystemTime) -> bool {
         matches!(self.paused_until, Some(until) if until > now)
+    }
+
+    /// 暂停还剩多少分钟（`None` = 没有暂停）。
+    pub fn paused_minutes(&self, now: SystemTime) -> Option<u64> {
+        self.paused_until.and_then(|until| {
+            until
+                .duration_since(now)
+                .ok()
+                .map(|left| left.as_secs().div_ceil(60))
+        })
     }
 }
 
@@ -391,7 +488,7 @@ pub struct Decision {
     pub allow: bool,
     pub level: Level,
     pub capability: &'static str,
-    /// 决策通道：`policy` / `pause` / `no-channel` / `click` / `deny`。
+    /// 决策通道：`policy` / `unattended` / `pause` / `no-channel` / `click` / `voice` / `deny` / `cancelled`。
     pub channel: &'static str,
     pub reason: String,
 }
@@ -404,11 +501,7 @@ impl Decision {
 
 /// "问用户"的异步回调。
 ///
-/// PR5 只有**点击确认**（界面上的允许/拒绝按钮）。语音确认由语音阶段实现；
-/// 这里的签名不假设音频存在，也不影响旧版语音确认。
-///
-/// 为什么是异步：确认要绕到 Slint 主线程再等用户点按钮，
-/// 权限引擎自己不能阻塞，也不能碰 UI 细节。
+/// 点击确认与语音确认都通过这一个接口；权限引擎自己不能阻塞，也不碰 UI 细节。
 pub type ConfirmFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = ConfirmAnswer> + Send + 'a>>;
 
@@ -490,10 +583,154 @@ impl ConfirmAnswer {
     }
 }
 
+/// 一次权限决策的审计记录（只含必要信息，不含密钥/截图）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditRecord {
+    /// Unix 毫秒时间戳（界面直接显示本地时间）。
+    pub ts_ms: u64,
+    pub tool: String,
+    pub capability: String,
+    pub level: String,
+    /// `allow` / `deny`
+    pub decision: String,
+    pub channel: String,
+    /// 脱敏后的参数摘要（JSON 文本，截断到 120 字）。
+    pub args: String,
+    pub reason: String,
+    /// 该记录归属的会话 id（`None` = 设置页/非回合操作）。
+    pub session_id: Option<String>,
+    pub turn_id: Option<u64>,
+}
+
+impl AuditRecord {
+    pub fn label(&self) -> String {
+        let when = format_local_short(self.ts_ms);
+        let verdict = if self.decision == "allow" {
+            "允许"
+        } else {
+            "拒绝"
+        };
+        let reason = if self.reason.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", self.reason)
+        };
+        format!(
+            "{when} {verdict} {} · {} 通过 {}{reason}",
+            self.capability_label(),
+            self.tool,
+            self.channel
+        )
+    }
+    pub fn capability_label(&self) -> String {
+        capability_label(&self.capability).to_string()
+    }
+}
+
+/// `ts_ms` → 本地 `HH:mm:ss`。
+///
+/// 审计记录里的时间戳是毫秒；显示时用 `clock` 的本地时间换算
+/// （Windows 上走系统时区，其它平台退化 UTC）。只用于展示，不影响判定。
+fn format_local_short(ts_ms: u64) -> String {
+    let local = crate::clock::from_unix_ms(ts_ms);
+    format!("{:02}:{:02}:{:02}", local.hour, local.minute, local.second)
+}
+
+/// 审计日志：按 JSONL 追加写，最多保留 `MAX_AUDIT_RECORDS` 条（读取时从尾部取）。
+#[derive(Debug, Clone)]
+pub struct AuditLog {
+    path: PathBuf,
+}
+
+/// 审计文件最多读取的条数（界面只显示最近若干条）。
+pub const MAX_AUDIT_RECORDS: usize = 50;
+
+impl AuditLog {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 追加一条记录。失败只记 stderr——审计写入不能反过来阻断工具执行。
+    pub fn append(&self, record: &AuditRecord) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(line) = serde_json::to_string(record) else {
+            return;
+        };
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{line}");
+            }
+            Err(error) => eprintln!("[audit] 写入失败：{error}"),
+        }
+    }
+
+    /// 读取最近 `limit` 条（从旧到新）。
+    pub fn recent(&self, limit: usize) -> Vec<AuditRecord> {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Vec::new();
+        };
+        let mut records: Vec<AuditRecord> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if records.len() > limit {
+            records.drain(0..records.len() - limit);
+        }
+        records
+    }
+
+    /// 导出全部记录到 `exports/` 目录，返回写出的条数与路径。
+    pub fn export(&self, exports_dir: &Path) -> Result<(usize, PathBuf), String> {
+        let records = self.all();
+        std::fs::create_dir_all(exports_dir)
+            .map_err(|error| format!("无法创建导出目录：{error}"))?;
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let path = exports_dir.join(format!("audit-export-{stamp}.jsonl"));
+        let mut text = String::new();
+        for record in &records {
+            if let Ok(line) = serde_json::to_string(record) {
+                text.push_str(&line);
+                text.push('\n');
+            }
+        }
+        std::fs::write(&path, text).map_err(|error| format!("写出审计导出失败：{error}"))?;
+        Ok((records.len(), path))
+    }
+
+    fn all(&self) -> Vec<AuditRecord> {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+}
+
 /// 权限门：所有工具调用的唯一入口。
 pub struct PermissionGate<'a> {
     state: &'a PermissionState,
     now: Box<dyn Fn() -> SystemTime + Send + Sync>,
+    /// 审计记录（可选）：有就按 `should_audit` 留痕。
+    audit: Option<AuditLog>,
+    session_id: Option<String>,
+    turn_id: Option<u64>,
 }
 
 impl<'a> PermissionGate<'a> {
@@ -501,7 +738,18 @@ impl<'a> PermissionGate<'a> {
         Self {
             state,
             now: Box::new(SystemTime::now),
+            audit: None,
+            session_id: None,
+            turn_id: None,
         }
+    }
+
+    /// 带审计的门：回合内的工具判断会写一条脱敏记录。
+    pub fn with_audit(mut self, audit: AuditLog, session_id: Option<String>, turn_id: u64) -> Self {
+        self.audit = Some(audit);
+        self.session_id = session_id;
+        self.turn_id = Some(turn_id);
+        self
     }
 
     /// 判定一次调用。`confirm` 为 `None` 时，`ask` 一律拒绝（没有确认通道就不该放行）。
@@ -517,69 +765,89 @@ impl<'a> PermissionGate<'a> {
     ) -> Decision {
         let now = (self.now)();
 
-        // 全局暂停优先于一切。
+        // 全局暂停优先于一切（含免确认档与临时授权）。
         if self.state.is_paused(now) {
-            let minutes = self
-                .state
-                .paused_until
-                .and_then(|until| until.duration_since(now).ok())
-                .map(|left| left.as_secs().div_ceil(60))
-                .unwrap_or(0);
-            return Decision {
-                allow: false,
-                level: Level::Deny,
-                capability: "all",
-                channel: "pause",
-                reason: format!("已暂停 {minutes} 分钟，期间不执行任何操作"),
-            };
+            let minutes = self.state.paused_minutes(now).unwrap_or(0);
+            return self.finish(
+                Decision {
+                    allow: false,
+                    level: Level::Deny,
+                    capability: "all",
+                    channel: "pause",
+                    reason: format!("已暂停 {minutes} 分钟，期间不执行任何操作"),
+                },
+                tool,
+                args,
+            );
         }
 
         let verdict = classify(tool, args);
-        if verdict.level == Level::Deny {
-            return Decision {
-                allow: false,
-                level: Level::Deny,
-                capability: verdict.capability,
-                channel: "policy",
-                reason: verdict.reason,
-            };
+        // 未知工具：不因任何档位放行。
+        if verdict.unknown {
+            return self.finish(
+                Decision {
+                    allow: false,
+                    level: Level::Deny,
+                    capability: verdict.capability,
+                    channel: "policy",
+                    reason: verdict.reason,
+                },
+                tool,
+                args,
+            );
         }
 
         let mut level = self.state.resolve_level(verdict.capability, now);
-        // 风险升级（Win+R、rm -rf 之类）默认强制 ask。
-        if verdict.escalated {
+        // 风险升级（Win+R、rm -rf 之类）默认强制 ask；免确认档下不强制。
+        if verdict.escalated && self.state.mode != PermissionMode::PassThrough {
             level = Level::Ask;
         }
 
         match level {
-            Level::Allow => Decision {
-                allow: true,
-                level,
-                capability: verdict.capability,
-                channel: "policy",
-                reason: verdict.reason,
-            },
+            Level::Allow => self.finish(
+                Decision {
+                    allow: true,
+                    level,
+                    capability: verdict.capability,
+                    channel: if self.state.mode == PermissionMode::PassThrough {
+                        "unattended"
+                    } else {
+                        "policy"
+                    },
+                    reason: verdict.reason,
+                },
+                tool,
+                args,
+            ),
             Level::Deny => {
                 let label = capability_info(verdict.capability)
                     .map(|info| info.label)
                     .unwrap_or(verdict.capability);
-                Decision {
-                    allow: false,
-                    level,
-                    capability: verdict.capability,
-                    channel: "policy",
-                    reason: format!("「{label}」已被设为拒绝"),
-                }
+                self.finish(
+                    Decision {
+                        allow: false,
+                        level,
+                        capability: verdict.capability,
+                        channel: "policy",
+                        reason: format!("「{label}」已被设为拒绝"),
+                    },
+                    tool,
+                    args,
+                )
             }
             Level::Ask => {
                 let Some(confirm) = confirm else {
-                    return Decision {
-                        allow: false,
-                        level: Level::Deny,
-                        capability: verdict.capability,
-                        channel: "no-channel",
-                        reason: "需要确认，但当前没有可用的确认通道".to_string(),
-                    };
+                    return self.finish(
+                        Decision {
+                            allow: false,
+                            level: Level::Deny,
+                            capability: verdict.capability,
+                            channel: "no-channel",
+                            reason: "需要确认，但当前没有可用的确认通道".to_string(),
+                        },
+                        tool,
+                        args,
+                    );
                 };
                 let request = ConfirmRequest {
                     tool: tool.to_string(),
@@ -592,28 +860,35 @@ impl<'a> PermissionGate<'a> {
                 };
                 let answer = confirm.confirm(request, cancel).await;
                 // 用户点了允许、但回合在此期间已被取消/退出：这条答复**不生效**。
-                // 取消是终态，迟到的"允许"不能把一个已经结束的回合重新变成可执行。
                 if cancel.is_cancelled() {
-                    return Decision {
-                        allow: false,
-                        level: Level::Ask,
-                        capability: verdict.capability,
-                        channel: "cancelled",
-                        reason: "已中断，未执行".to_string(),
-                    };
+                    return self.finish(
+                        Decision {
+                            allow: false,
+                            level: Level::Ask,
+                            capability: verdict.capability,
+                            channel: "cancelled",
+                            reason: "已中断，未执行".to_string(),
+                        },
+                        tool,
+                        args,
+                    );
                 }
                 let allowed = answer.allow && matches!(answer.channel, "click" | "voice");
-                Decision {
-                    allow: allowed,
-                    level: Level::Ask,
-                    capability: verdict.capability,
-                    channel: if allowed { answer.channel } else { "deny" },
-                    reason: if allowed {
-                        String::new()
-                    } else {
-                        answer.reason
+                self.finish(
+                    Decision {
+                        allow: allowed,
+                        level: Level::Ask,
+                        capability: verdict.capability,
+                        channel: if allowed { answer.channel } else { "deny" },
+                        reason: if allowed {
+                            String::new()
+                        } else {
+                            answer.reason
+                        },
                     },
-                }
+                    tool,
+                    args,
+                )
             }
         }
     }
@@ -623,6 +898,34 @@ impl<'a> PermissionGate<'a> {
         capability_info(capability)
             .map(|info| info.audit)
             .unwrap_or(true)
+    }
+
+    /// 收口：按规则写审计并返回决策。
+    fn finish(&self, decision: Decision, tool: &str, args: &serde_json::Value) -> Decision {
+        let worth = decision.level != Level::Allow
+            || self.should_audit(decision.capability)
+            || decision.capability == "unknown"
+            || decision.capability == "all";
+        if worth {
+            if let Some(audit) = &self.audit {
+                audit.append(&AuditRecord {
+                    ts_ms: (self.now)()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis() as u64)
+                        .unwrap_or(0),
+                    tool: tool.to_string(),
+                    capability: decision.capability.to_string(),
+                    level: decision.level.as_str().to_string(),
+                    decision: if decision.allow { "allow" } else { "deny" }.to_string(),
+                    channel: decision.channel.to_string(),
+                    args: audit_args_text(args),
+                    reason: truncate(&decision.reason, 120),
+                    session_id: self.session_id.clone(),
+                    turn_id: self.turn_id,
+                });
+            }
+        }
+        decision
     }
 }
 
@@ -634,6 +937,10 @@ pub fn summarize_args(args: &serde_json::Value) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for (key, value) in object {
         let summarized = match value {
+            // data URL / base64 图片：整段丢掉，只留类型标记。
+            serde_json::Value::String(text) if text.starts_with("data:") => {
+                serde_json::Value::String("[图片数据已省略]".to_string())
+            }
             serde_json::Value::String(text) if text.chars().count() > 80 => {
                 let head: String = text.chars().take(80).collect();
                 serde_json::Value::String(format!("{head}…"))
@@ -647,6 +954,50 @@ pub fn summarize_args(args: &serde_json::Value) -> serde_json::Value {
         out.insert(key.clone(), summarized);
     }
     serde_json::Value::Object(out)
+}
+
+/// 审计里的参数文本：摘要 + 截断，**绝不**包含 base64。
+pub fn audit_args_text(args: &serde_json::Value) -> String {
+    let summary = summarize_args(args);
+    // 再兜一层：任何长串 base64（哪怕藏在普通字段里）都在这层被削掉。
+    let text = redact_base64(&summary.to_string());
+    truncate(&text, 120)
+}
+
+/// 把长得像 base64 的连续片段替换成占位符。
+///
+/// 只对**足够长**的串生效（≥ 80 个 base64 字符），避免误伤普通英文/数字字段。
+fn redact_base64(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=' {
+            run.push(ch);
+            continue;
+        }
+        flush_base64_run(&mut out, &mut run);
+        out.push(ch);
+    }
+    flush_base64_run(&mut out, &mut run);
+    out
+}
+
+fn flush_base64_run(out: &mut String, run: &mut String) {
+    const MIN_BASE64_RUN: usize = 80;
+    if run.len() >= MIN_BASE64_RUN {
+        out.push_str("[省略]");
+    } else {
+        out.push_str(run);
+    }
+    run.clear();
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(max).collect();
+    format!("{head}…")
 }
 
 /// 能力的中文标签（界面/拒绝原因用）。
@@ -665,7 +1016,7 @@ mod tests {
         PermissionState::new(mode)
     }
 
-    /// 固定答复的确认器：PR5 只有点击确认。
+    /// 固定答复的确认器。
     struct Fixed(bool);
     impl Confirmer for Fixed {
         fn confirm<'a>(
@@ -768,17 +1119,23 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_is_always_denied() {
-        let state = gate(PermissionMode::Permissive);
-        let decision = PermissionGate::new(&state)
-            .check(
-                "os_shutdown",
-                &args(serde_json::json!({})),
-                Some(&YES),
-                &CancelToken::new(),
-            )
-            .await;
-        assert!(!decision.allow);
-        assert_eq!(decision.capability, "unknown");
+        for mode in [
+            PermissionMode::Standard,
+            PermissionMode::Permissive,
+            PermissionMode::PassThrough,
+        ] {
+            let state = gate(mode);
+            let decision = PermissionGate::new(&state)
+                .check(
+                    "os_shutdown",
+                    &args(serde_json::json!({})),
+                    Some(&YES),
+                    &CancelToken::new(),
+                )
+                .await;
+            assert!(!decision.allow, "{mode:?} 下未知工具也必须拒绝");
+            assert_eq!(decision.capability, "unknown");
+        }
     }
 
     #[tokio::test]
@@ -873,6 +1230,105 @@ mod tests {
         assert!(decision.allow);
     }
 
+    /// 免确认档：已知且可授权的 ask 工具不再询问；破坏性默认 deny 能力也放行。
+    #[tokio::test]
+    async fn pass_through_allows_known_tools_without_prompting() {
+        let state = gate(PermissionMode::PassThrough);
+        for (tool, capability) in [
+            ("read_clipboard", "clipboard.read"),
+            ("key", "input.keyboard"),
+        ] {
+            let decision = PermissionGate::new(&state)
+                .check(
+                    tool,
+                    &args(serde_json::json!({"key":"win+r"})),
+                    None,
+                    &CancelToken::new(),
+                )
+                .await;
+            assert!(decision.allow, "免确认下 {tool} 必须放行：{decision:?}");
+            assert_eq!(decision.channel, "unattended");
+            let _ = capability;
+        }
+    }
+
+    /// 免确认档仍保留两条硬边界：未知工具与全局暂停。
+    #[tokio::test]
+    async fn pass_through_keeps_unknown_and_pause_boundaries() {
+        let state = gate(PermissionMode::PassThrough);
+        let unknown = PermissionGate::new(&state)
+            .check(
+                "not_a_tool",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!unknown.allow);
+
+        let mut paused = gate(PermissionMode::PassThrough);
+        paused.pause(10);
+        let decision = PermissionGate::new(&paused)
+            .check(
+                "left_click",
+                &args(serde_json::json!({"x":1,"y":2})),
+                Some(&YES),
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!decision.allow);
+        assert_eq!(decision.channel, "pause");
+    }
+
+    /// 单项覆盖能压过免确认档（刹车），并且对普通档同样生效。
+    #[tokio::test]
+    async fn explicit_override_beats_mode_and_survives_pass_through() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("file.delete".to_string(), PermissionOverride::Deny);
+        let state = PermissionState::from_settings(PermissionMode::PassThrough, &overrides);
+        let decision = PermissionGate::new(&state)
+            .check(
+                "type",
+                &args(serde_json::json!({"text":"rm -rf /tmp/x"})),
+                Some(&YES),
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(
+            !decision.allow,
+            "覆盖为拒绝时免确认也不能执行：{decision:?}"
+        );
+
+        // 覆盖为允许时，标准档的 ask 不再询问。
+        let mut allow_overrides = std::collections::BTreeMap::new();
+        allow_overrides.insert("clipboard.read".to_string(), PermissionOverride::Allow);
+        let state = PermissionState::from_settings(PermissionMode::Standard, &allow_overrides);
+        let decision = PermissionGate::new(&state)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(decision.allow);
+        assert_eq!(decision.channel, "policy");
+
+        // 「跟随档位」不改变任何判定。
+        let mut follow = std::collections::BTreeMap::new();
+        follow.insert("clipboard.read".to_string(), PermissionOverride::Follow);
+        let state = PermissionState::from_settings(PermissionMode::Standard, &follow);
+        let decision = PermissionGate::new(&state)
+            .check(
+                "read_clipboard",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!decision.allow, "跟随档位应保持 ask（无通道→拒绝）");
+    }
+
     #[tokio::test]
     async fn pause_blocks_everything() {
         let mut state = gate(PermissionMode::Standard);
@@ -887,6 +1343,18 @@ mod tests {
             .await;
         assert!(!decision.allow);
         assert_eq!(decision.channel, "pause");
+
+        // 恢复后立即生效（下一个工具判断按有效策略处理）。
+        state.resume();
+        let decision = PermissionGate::new(&state)
+            .check(
+                "screenshot",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(decision.allow);
     }
 
     #[tokio::test]
@@ -902,6 +1370,36 @@ mod tests {
             )
             .await;
         assert!(decision.allow);
+        assert!(!state.active_grants(SystemTime::now()).is_empty());
+    }
+
+    /// 限时授权不会解开 deny 或未知工具。
+    #[tokio::test]
+    async fn grant_once_cannot_unlock_deny_or_unknown() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("file.delete".to_string(), PermissionOverride::Deny);
+        let mut state = PermissionState::from_settings(PermissionMode::Standard, &overrides);
+        state.grant_once("file.delete", 5);
+        let decision = PermissionGate::new(&state)
+            .check(
+                "type",
+                &args(serde_json::json!({"text":"rm -rf /tmp/x"})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!decision.allow, "deny 不能被限时授权解开");
+
+        state.grant_once("unknown", 5);
+        let decision = PermissionGate::new(&state)
+            .check(
+                "mystery",
+                &args(serde_json::json!({})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!decision.allow, "未知工具不能被限时授权解开");
     }
 
     /// 语音答复走**同一个**权限门：明确肯定才放行，否定与"不明确"都拒绝。
@@ -979,5 +1477,47 @@ mod tests {
             summary["obj"],
             serde_json::Value::String("[object]".to_string())
         );
+    }
+
+    /// 审计只记必要信息：不含密钥、不含大块 base64。
+    #[test]
+    fn audit_records_are_redacted_and_ordered() {
+        let dir = unique_root("perm-audit");
+        let log = AuditLog::new(dir.join("audit.jsonl"));
+        log.append(&AuditRecord {
+            ts_ms: 1,
+            tool: "read_clipboard".to_string(),
+            capability: "clipboard.read".to_string(),
+            level: "ask".to_string(),
+            decision: "allow".to_string(),
+            channel: "click".to_string(),
+            args: audit_args_text(&serde_json::json!({
+                "text": "x".repeat(300),
+                "image": "data:image/png;base64,".to_string() + &"A".repeat(500)
+            })),
+            reason: String::new(),
+            session_id: Some("s1".to_string()),
+            turn_id: Some(3),
+        });
+        let records = log.recent(10);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].args.chars().count() <= 121);
+        assert!(!records[0].args.contains("sk-"));
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(!text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_root(prefix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!("{prefix}-{seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

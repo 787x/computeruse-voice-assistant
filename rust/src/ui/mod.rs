@@ -8,7 +8,16 @@
 //!
 //! 取消语义：界面点"取消"只置 `CancelToken`，工作线程在下一次检查点干净退出；
 //! 迟到的 LLM / PowerShell 响应因此不可能触发新工具或覆盖新回合。
+//!
+//! PR8 拆出的三个有明确职责的模块（`worker` 仍是唯一的回合执行路径）：
+//!  - [`sessions`]：会话库、切换/新建/改名/删除、时间线与模型选择的持久化；
+//!  - [`timeline`]：时间线 → 对话气泡 / 工具卡片（按真实调用实例）；
+//!  - [`settings`]：设置页一次保存的组装、校验、落盘与回填。
 
+pub mod model_probe;
+pub mod sessions;
+pub mod settings;
+pub mod timeline;
 pub mod worker;
 
 pub use worker::{run_app, UiCommand};

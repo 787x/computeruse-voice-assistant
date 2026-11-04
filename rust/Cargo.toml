@@ -94,6 +94,8 @@ tts-cuda = ["sherpa-onnx/shared"]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
 ] }
 
 [build-dependencies]

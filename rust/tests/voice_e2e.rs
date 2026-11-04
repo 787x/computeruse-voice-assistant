@@ -163,10 +163,8 @@ fn real_vad_ends_on_silence_for_a_real_recording() {
         for event in detector.push(chunk) {
             match event {
                 VadEvent::SpeechStarted => started = true,
-                VadEvent::UtteranceEnded { reason } => {
-                    if ended.is_none() {
-                        ended = Some(reason);
-                    }
+                VadEvent::UtteranceEnded { reason } if ended.is_none() => {
+                    ended = Some(reason);
                 }
                 _ => {}
             }

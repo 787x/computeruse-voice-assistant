@@ -251,6 +251,8 @@ fn agent_config() -> AgentConfig {
         context_policy: resolve_context_policy(Some(1_000_000), Some(90), None),
         system_prompt: "test".to_string(),
         echo_reasoning: false,
+        turn_id: 1,
+        use_tools: true,
     }
 }
 
@@ -267,7 +269,7 @@ async fn run(
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = events.clone();
     let emit = move |event: AgentEvent| {
-        if let AgentEvent::Failed { reason } = &event {
+        if let AgentEvent::Failed { reason, .. } = &event {
             sink.lock().unwrap().push(format!("failed:{reason}"));
         }
     };

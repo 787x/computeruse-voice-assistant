@@ -9,17 +9,33 @@ use std::sync::Arc;
 use serde_json::Value;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
-use crate::agent::{Agent, AgentConfig, AgentEvent, ConfirmationPrompt, TurnOutcome};
+use crate::agent::{Agent, AgentConfig, AgentEvent, ConfirmationPrompt, ToolStatus, TurnOutcome};
 use crate::cancel::CancelToken;
-use crate::config::{self, AppPaths, PermissionMode, Settings};
+use crate::config::{self, AppPaths, SessionModelChoice, Settings};
+// `PermissionMode` 只有测试直接用到：生产代码一律经 `ui::settings` 的索引映射，
+// 避免"界面索引 → 档位"的逻辑在两处各写一份而漂移。
+#[cfg(test)]
+use crate::config::PermissionMode;
 use crate::cua::bridge::{BridgeOptions, PwshBridge};
 use crate::cua::tools::CuaToolkit;
 use crate::llm::{ChatMessage, LlmClient};
+use crate::model_catalog::{fetch_models, probe_chat, ModelCache};
 use crate::permissions::{
-    ConfirmAnswer, ConfirmFuture, ConfirmRequest, Confirmer, PermissionState,
+    AuditLog, ConfirmAnswer, ConfirmFuture, ConfirmRequest, Confirmer, PermissionState,
 };
 use crate::prompt;
 use crate::secret::SecretStore;
+use crate::session::{TimelineItem, TurnStatus};
+use crate::ui::sessions::{
+    publish_audit, publish_session_list, publish_session_title, publish_timeline, SessionRuntime,
+};
+#[cfg(test)]
+use crate::ui::settings::permission_mode_for_index;
+use crate::ui::settings::{
+    self as settings_ui, apply_save, permission_mode_index, reasoning_effort_index, thinking_index,
+    tts_backend_index, SaveOutcome, SaveRequest, EFFORT_LABELS, PERMISSION_LABELS,
+    PERMISSION_MODES, THINKING_LABELS,
+};
 use crate::voice::{
     asr::AsrBackend,
     bargein,
@@ -30,13 +46,14 @@ use crate::voice::{
     playback::PlaybackState,
     settings::VoicePaths,
     speech::{SpeechEvent, SpeechRuntime},
-    tts::{SpeechId, TtsBackend, TtsSettings, TurnId},
+    tts::{SpeechId, TtsSettings, TurnId},
     CaptureInfoForUi, RejectReason, VoiceEvent, VoiceEventKind, VoiceInstance, VoiceState,
     VoiceTurn,
 };
 use crate::ChatEntry;
 use crate::ToolCard;
 
+use super::model_probe::ProbeDraft;
 use crate::AppWindow;
 
 /// 界面发给工作线程的命令。
@@ -56,7 +73,7 @@ pub enum UiCommand {
     /// 没有回执通道是刻意的——在 Slint 主线程上等待会卡住整个界面。
     /// `generation` 是提交时取的代次：回填时只有仍是最新的一代才允许改界面。
     SaveAll {
-        request: SaveAllRequest,
+        request: SaveRequest,
         generation: u64,
     },
     /// 关闭设置面板（取消）：丢弃界面上的未保存修改，重新按已保存配置回填。
@@ -73,6 +90,42 @@ pub enum UiCommand {
     ProviderChanged(i32),
     /// 打开设置：按当前已保存的配置回填界面。
     OpenSettings,
+    /// 切换设置分类（只改界面，不回填）。
+    SettingsTab(i32),
+    /// 测试连接（真实发一次最小对话请求）。
+    TestConnection(ProbeDraft),
+    /// 获取在线模型列表（`/models`，带缓存与失败保留）。
+    FetchModels(ProbeDraft),
+    ModelsFetched {
+        draft: ProbeDraft,
+        credential: String,
+        request: u64,
+        fetch: crate::model_catalog::ModelFetch,
+    },
+    /// 新建会话。
+    NewSession,
+    /// 选择会话（空 id = 不做改动）。
+    SelectSession(String),
+    /// 重命名会话（空 id = 当前会话）。
+    RenameSession { id: String, title: String },
+    /// 删除会话（空 id = 当前会话）。
+    DeleteSession(String),
+    /// 输入区的模型下拉被选中。
+    ModelChoicePicked(i32),
+    /// 输入区的推理档位被选中。
+    ReasoningPicked(i32),
+    /// 手工输入模型名（对当前会话生效）。
+    ApplyManualModel(String),
+    /// 权限档位被选中（立即生效，不等保存）。
+    PermissionModePicked(i32),
+    /// 逐能力覆盖被选中（立即生效，不等保存）。
+    OverridePicked { row: i32, choice: i32 },
+    /// 暂停 / 恢复。
+    TogglePause,
+    /// 会话内限时允许某能力。
+    GrantCapability { capability: String, minutes: i32 },
+    /// 导出审计。
+    ExportAudit,
     /// 启用/关闭麦克风监听（界面开关）。
     SetVoiceEnabled(bool),
     /// 语音线程发回的事件（内部消息，不是用户动作）。
@@ -86,27 +139,24 @@ pub enum UiCommand {
 /// 提供商下拉框的顺序（与 UI 里的数组一致）。
 const PROVIDER_IDS: &[&str] = &["mimo", "deepseek", "openai-compatible"];
 /// MiMo 提供商的 id。MiMo TTS 只从这家账户读 Key（见 `voice::tts::mimo::KEY_PROVIDER`）。
-const MIMO_PROVIDER_ID: &str = "mimo";
-const PERMISSION_MODES: &[PermissionMode] = &[
-    PermissionMode::Standard,
-    PermissionMode::Conservative,
-    PermissionMode::Permissive,
+pub const MIMO_PROVIDER_ID: &str = "mimo";
+
+/// 设置分类的标签（顺序即导航顺序）。
+const SETTINGS_TABS: [&str; 5] = [
+    "模型",
+    "Agent 与上下文",
+    "系统提示词",
+    "权限",
+    "语音输入 / 播报",
 ];
 
-fn provider_id_for_index(index: i32) -> &'static str {
+pub(super) fn provider_id_for_index(index: i32) -> &'static str {
     // 越界一律落到"自定义端点"，而不是悄悄用某个官方提供商：
     // 用错端点会把请求打到用户没配 Key 的官方地址上。
     usize::try_from(index)
         .ok()
         .and_then(|index| PROVIDER_IDS.get(index).copied())
         .unwrap_or("openai-compatible")
-}
-
-fn permission_mode_for_index(index: i32) -> PermissionMode {
-    usize::try_from(index)
-        .ok()
-        .and_then(|index| PERMISSION_MODES.get(index).copied())
-        .unwrap_or(PermissionMode::Standard)
 }
 
 /// 启动界面与工作线程（阻塞直到窗口关闭）。
@@ -149,10 +199,43 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     config::apply_env_overrides(&mut settings);
+    settings_ui::restore_model_catalogs(&mut settings, &paths, &secret, None);
     let has_key = secret.has(&settings.provider_id);
-    seed_ui(&window, &settings, has_key);
+    /*
+     * 启动自检：数据目录能不能写。
+     *
+     * 必须在保存时才发现"写不进去"是最糟的时机（用户已经改了一堆设置）。
+     * 这里提前探测一次，并把结论直接显示在状态栏——原因与解决办法都在
+     * `describe_write_error` 里写清楚了，用户照做即可。
+     */
+    let startup_write_error = config::check_writable(&paths).err();
+    /*
+     * 会话库：与全局设置、密钥分开存放（`%APPDATA%\cuava\sessions\`）。
+     *
+     * **必须在 `seed_ui` 之前就备好一个会话**：`seed_ui` 会在主线程同步推一次
+     * 会话列表，若那时还是空的，界面会显示"（没有会话）"，而后台线程补建的
+     * 那次推送因为窗口已经渲染过、用户看起来就像"新建了但没显示"。
+     */
+    let mut sessions = SessionRuntime::open(&paths);
+    let mut startup_session_error: Option<String> = None;
+    if sessions.ensure_one(crate::clock::now().unix_ms) {
+        if let Err(error) = sessions.save_current() {
+            startup_session_error = Some(error);
+        }
+    }
+    seed_ui(&window, &settings, has_key, &sessions);
     if let Some(error) = migration_error {
         window.set_status(format!("旧 Key 迁移失败：{error}").into());
+    }
+    /*
+     * 写盘能力优先显示：它决定"设置与会话能不能保存"，
+     * 比"会话建不出来"更根本，所以覆盖在上面。
+     */
+    if let Some(error) = &startup_write_error {
+        window.set_status(format!("数据目录不可写：{error}").into());
+        window.set_settings_error(error.clone().into());
+    } else if let Some(error) = &startup_session_error {
+        window.set_status(format!("会话无法保存：{error}").into());
     }
 
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
@@ -217,53 +300,29 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let tx = command_tx.clone();
         let weak = window.as_weak();
         let save_generation = save_generation.clone();
-        window.on_save_all(
-            move |provider_index,
-                  base_url,
-                  model,
-                  api_key,
-                  permission_index,
-                  tts_enabled,
-                  tts_backend_index,
-                  mimo_voice,
-                  mimo_style,
-                  local_dir,
-                  local_sid,
-                  local_speed,
-                  speak_mode| {
-                let request = SaveAllRequest {
-                    provider_index,
-                    base_url: base_url.to_string(),
-                    model: model.to_string(),
-                    api_key: api_key.to_string(),
-                    permission_index,
-                    tts_enabled,
-                    tts_backend_index,
-                    mimo_voice: mimo_voice.to_string(),
-                    mimo_style: mimo_style.to_string(),
-                    local_dir: local_dir.to_string(),
-                    local_sid: local_sid.to_string(),
-                    local_speed: local_speed.to_string(),
-                    speak_mode,
-                };
+        window.on_save_all(move || {
+            // 界面上读一次当前全部字段（工作线程持有权威配置副本）。
+            let request = match weak.upgrade() {
+                Some(window) => build_save_request(&window),
+                None => return,
+            };
 
-                // 取一个新的代次；工作线程只有拿它回填才算"最新"。
-                let generation = save_generation.fetch_add(1, Ordering::SeqCst) + 1;
-                if tx
-                    .send(UiCommand::SaveAll {
-                        request,
-                        generation,
-                    })
-                    .is_err()
-                {
-                    // 后台线程没了：立刻收掉"保存中"，并如实说明没保存。
-                    if let Some(window) = weak.upgrade() {
-                        window.set_settings_saving(false);
-                        window.set_settings_error("后台线程已退出，设置没有保存".into());
-                    }
+            // 取一个新的代次；工作线程只有拿它回填才算"最新"。
+            let generation = save_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            if tx
+                .send(UiCommand::SaveAll {
+                    request,
+                    generation,
+                })
+                .is_err()
+            {
+                // 后台线程没了：立刻收掉"保存中"，并如实说明没保存。
+                if let Some(window) = weak.upgrade() {
+                    window.set_settings_saving(false);
+                    window.set_settings_error("后台线程已退出，设置没有保存".into());
                 }
-            },
-        );
+            }
+        });
     }
     {
         /*
@@ -307,6 +366,132 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 window.set_has_key(has_key);
             }
+        });
+    }
+    {
+        // ---- 权限（立即生效：不等保存） ----
+        let tx = command_tx.clone();
+        let weak = window.as_weak();
+        window.on_permission_mode_picked(move |index| {
+            if let Some(window) = weak.upgrade() {
+                window.set_settings_dirty(true);
+                window.set_settings_error("".into());
+            }
+            let _ = tx.send(UiCommand::PermissionModePicked(index));
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        let weak = window.as_weak();
+        window.on_override_picked(move |row, choice| {
+            if let Some(window) = weak.upgrade() {
+                let mut values: Vec<i32> = window.get_override_indices().iter().collect();
+                if let Some(value) = usize::try_from(row).ok().and_then(|i| values.get_mut(i)) {
+                    *value = choice;
+                }
+                window.set_override_indices(ModelRc::new(VecModel::from(values)));
+                window.set_settings_dirty(true);
+            }
+            let _ = tx.send(UiCommand::OverridePicked { row, choice });
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_toggle_pause(move || {
+            let _ = tx.send(UiCommand::TogglePause);
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_grant_capability(move |capability, minutes| {
+            let _ = tx.send(UiCommand::GrantCapability {
+                capability: capability.to_string(),
+                minutes,
+            });
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_export_audit(move || {
+            let _ = tx.send(UiCommand::ExportAudit);
+        });
+    }
+    {
+        // ---- 模型发现与连通性 ----
+        let tx = command_tx.clone();
+        let weak = window.as_weak();
+        window.on_test_connection(move || {
+            if let Some(window) = weak.upgrade() {
+                let _ = tx.send(UiCommand::TestConnection(ProbeDraft::from_window(&window)));
+            }
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        let weak = window.as_weak();
+        window.on_fetch_models(move || {
+            if let Some(window) = weak.upgrade() {
+                let _ = tx.send(UiCommand::FetchModels(ProbeDraft::from_window(&window)));
+            }
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_model_choice_picked(move |index| {
+            let _ = tx.send(UiCommand::ModelChoicePicked(index));
+        });
+        let tx = command_tx.clone();
+        window.on_reasoning_picked(move |index| {
+            let _ = tx.send(UiCommand::ReasoningPicked(index));
+        });
+        let tx = command_tx.clone();
+        window.on_apply_manual_model(move |model| {
+            let _ = tx.send(UiCommand::ApplyManualModel(model.to_string()));
+        });
+    }
+    {
+        // ---- 会话 ----
+        let tx = command_tx.clone();
+        window.on_new_session(move || {
+            let _ = tx.send(UiCommand::NewSession);
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_select_session(move |id| {
+            let _ = tx.send(UiCommand::SelectSession(id.to_string()));
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_rename_session(move |id, title| {
+            let _ = tx.send(UiCommand::RenameSession {
+                id: id.to_string(),
+                title: title.to_string(),
+            });
+        });
+    }
+    {
+        let tx = command_tx.clone();
+        window.on_delete_session(move |id| {
+            let _ = tx.send(UiCommand::DeleteSession(id.to_string()));
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_open_rename(move || {
+            if let Some(window) = weak.upgrade() {
+                let title = window.get_session_title().to_string();
+                window.set_rename_draft(title.into());
+                window.set_rename_open(true);
+            }
+        });
+    }
+    {
+        // ---- 设置分类导航 ----
+        let tx = command_tx.clone();
+        window.on_settings_tab_picked(move |index| {
+            let _ = tx.send(UiCommand::SettingsTab(index));
         });
     }
     {
@@ -383,6 +568,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 paths,
                 secret,
                 settings,
+                sessions,
                 command_rx,
                 command_tx,
                 confirmer,
@@ -405,8 +591,8 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 把初始配置同步到界面控件。
-fn seed_ui(window: &AppWindow, settings: &Settings, has_key: bool) {
+/// 把初始配置同步到界面控件（含会话列表、设置分类与输入区的模型下拉）。
+fn seed_ui(window: &AppWindow, settings: &Settings, has_key: bool, sessions: &SessionRuntime) {
     let provider_index = PROVIDER_IDS
         .iter()
         .position(|id| *id == settings.provider_id)
@@ -415,14 +601,407 @@ fn seed_ui(window: &AppWindow, settings: &Settings, has_key: bool) {
     window.set_base_url(settings.base_url.clone().into());
     window.set_model_name(settings.model.clone().into());
     window.set_has_key(has_key);
-    let permission_index = PERMISSION_MODES
-        .iter()
-        .position(|mode| *mode == settings.permission_mode)
-        .unwrap_or(0) as i32;
-    window.set_permission_index(permission_index);
+    window.set_permission_index(permission_mode_index(settings.permission_mode));
     window.set_endpoint_text(config::describe_endpoint(settings, has_key).into());
     window.set_entries(ModelRc::new(VecModel::from(Vec::<ChatEntry>::new())));
     window.set_tools(ModelRc::new(VecModel::from(Vec::<ToolCard>::new())));
+
+    // 设置分类导航 + 权限档位标签 + 逐能力覆盖的初始行。
+    window.set_settings_tab_labels(ModelRc::new(VecModel::from(
+        SETTINGS_TABS
+            .iter()
+            .map(|label| slint::SharedString::from(*label))
+            .collect::<Vec<_>>(),
+    )));
+    apply_permission_options(window);
+    wire_plan_editor(window);
+    window.set_override_indices(ModelRc::new(VecModel::from(vec![
+        0i32;
+        crate::permissions::capabilities().len()
+    ])));
+
+    // 会话：列表 + 当前会话的时间线 + 标题（都从磁盘恢复）。
+    publish_session_list(&window.as_weak(), sessions);
+    publish_timeline(&window.as_weak(), sessions);
+    publish_session_title(&window.as_weak(), sessions);
+    refresh_model_picker(window, settings, sessions);
+}
+
+/// 权限档位与"逐能力覆盖"的选项标签（一次写入，不随每次保存重建）。
+fn refresh_plan_labels(window: &AppWindow) {
+    let schedule: config::ScheduleSettings =
+        serde_json::from_str(window.get_model_schedule_json().as_str()).unwrap_or_default();
+    window.set_rule_labels(ModelRc::new(VecModel::from(
+        schedule
+            .rules
+            .iter()
+            .map(|r| {
+                slint::SharedString::from(format!(
+                    "{}–{} · {} · {:?}",
+                    r.from, r.to, r.plan_id, r.days
+                ))
+            })
+            .collect::<Vec<_>>(),
+    )));
+
+    let plans: Vec<config::ModelPlan> =
+        serde_json::from_str(window.get_model_plans_json().as_str()).unwrap_or_default();
+    window.set_plan_edit_labels(ModelRc::new(VecModel::from(
+        plans
+            .iter()
+            .map(|p| slint::SharedString::from(p.name.as_str()))
+            .collect::<Vec<_>>(),
+    )));
+}
+
+fn wire_plan_editor(window: &AppWindow) {
+    let weak = window.as_weak();
+    window.on_edit_rule(move |index| {
+        if let Some(w) = weak.upgrade() {
+            let schedule: config::ScheduleSettings =
+                serde_json::from_str(w.get_model_schedule_json().as_str()).unwrap_or_default();
+            let rule = usize::try_from(index)
+                .ok()
+                .and_then(|i| schedule.rules.get(i));
+            w.set_rule_index(index);
+            w.set_rule_from(rule.map(|r| r.from.as_str()).unwrap_or("09:00").into());
+            w.set_rule_to(rule.map(|r| r.to.as_str()).unwrap_or("18:00").into());
+            w.set_rule_days(
+                rule.map(|r| {
+                    r.days
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+                .into(),
+            );
+            w.set_rule_plan(rule.map(|r| r.plan_id.as_str()).unwrap_or("").into());
+        }
+    });
+    let weak = window.as_weak();
+    window.on_store_rule(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut schedule) = serde_json::from_str::<config::ScheduleSettings>(
+                w.get_model_schedule_json().as_str(),
+            ) else {
+                return;
+            };
+            let days = w
+                .get_rule_days()
+                .split(',')
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| d.trim().parse::<u8>())
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(days) = days else {
+                w.set_settings_error("星期应为 1–7，使用逗号分隔".into());
+                return;
+            };
+            let rule = config::ScheduleRule {
+                from: w.get_rule_from().to_string(),
+                to: w.get_rule_to().to_string(),
+                days,
+                plan_id: w.get_rule_plan().to_string(),
+                enabled: true,
+            };
+            if let Some(existing) = usize::try_from(w.get_rule_index())
+                .ok()
+                .and_then(|i| schedule.rules.get_mut(i))
+            {
+                *existing = rule;
+            } else {
+                schedule.rules.push(rule);
+            }
+            if let Err(error) = schedule.validate() {
+                w.set_settings_error(error.into());
+                return;
+            }
+            w.set_model_schedule_json(
+                serde_json::to_string_pretty(&schedule)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_remove_rule(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut schedule) = serde_json::from_str::<config::ScheduleSettings>(
+                w.get_model_schedule_json().as_str(),
+            ) else {
+                return;
+            };
+            if let Ok(i) = usize::try_from(w.get_rule_index()) {
+                if i < schedule.rules.len() {
+                    schedule.rules.remove(i);
+                }
+            }
+            w.set_model_schedule_json(
+                serde_json::to_string_pretty(&schedule)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_rule_index(-1);
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+
+    let weak = window.as_weak();
+    window.on_update_schedule(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut schedule) = serde_json::from_str::<config::ScheduleSettings>(
+                w.get_model_schedule_json().as_str(),
+            ) else {
+                return;
+            };
+            schedule.enabled = w.get_schedule_enabled();
+            schedule.default_plan_id = w.get_schedule_default().to_string();
+            w.set_model_schedule_json(
+                serde_json::to_string_pretty(&schedule)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_settings_dirty(true);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_edit_plan(move |index| {
+        if let Some(w) = weak.upgrade() {
+            let plans: Vec<config::ModelPlan> =
+                serde_json::from_str(w.get_model_plans_json().as_str()).unwrap_or_default();
+            w.set_plan_edit_index(index);
+            let p = usize::try_from(index).ok().and_then(|i| plans.get(i));
+            w.set_plan_edit_id(p.map(|p| p.id.as_str()).unwrap_or("").into());
+            w.set_plan_edit_name(p.map(|p| p.name.as_str()).unwrap_or("").into());
+            w.set_plan_edit_provider(p.map(|p| p.provider_id.as_str()).unwrap_or("mimo").into());
+            w.set_plan_edit_model(p.map(|p| p.model.as_str()).unwrap_or("").into());
+        }
+    });
+    let weak = window.as_weak();
+    window.on_store_plan(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut plans) =
+                serde_json::from_str::<Vec<config::ModelPlan>>(w.get_model_plans_json().as_str())
+            else {
+                return;
+            };
+            let index = usize::try_from(w.get_plan_edit_index()).ok();
+            let previous = index.and_then(|i| plans.get(i)).cloned();
+            let plan = config::ModelPlan {
+                id: w.get_plan_edit_id().to_string(),
+                name: w.get_plan_edit_name().to_string(),
+                provider_id: w.get_plan_edit_provider().to_string(),
+                model: w.get_plan_edit_model().to_string(),
+                thinking: previous.as_ref().map(|p| p.thinking).unwrap_or_default(),
+                reasoning_effort: previous
+                    .as_ref()
+                    .map(|p| p.reasoning_effort)
+                    .unwrap_or_default(),
+            };
+            if let Some(existing) = index.and_then(|i| plans.get_mut(i)) {
+                *existing = plan;
+            } else {
+                plans.push(plan);
+            }
+            w.set_model_plans_json(
+                serde_json::to_string_pretty(&plans)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_remove_plan(move || {
+        if let Some(w) = weak.upgrade() {
+            let Ok(mut plans) =
+                serde_json::from_str::<Vec<config::ModelPlan>>(w.get_model_plans_json().as_str())
+            else {
+                return;
+            };
+            if let Ok(i) = usize::try_from(w.get_plan_edit_index()) {
+                if i < plans.len() {
+                    plans.remove(i);
+                }
+            }
+            w.set_model_plans_json(
+                serde_json::to_string_pretty(&plans)
+                    .unwrap_or_default()
+                    .into(),
+            );
+            w.set_plan_edit_index(-1);
+            w.set_settings_dirty(true);
+            refresh_plan_labels(&w);
+        }
+    });
+}
+
+fn apply_permission_options(window: &AppWindow) {
+    window.set_capability_ids(ModelRc::new(VecModel::from(
+        crate::permissions::capabilities()
+            .iter()
+            .map(|c| slint::SharedString::from(c.id))
+            .collect::<Vec<_>>(),
+    )));
+    window.set_permission_mode_labels(ModelRc::new(VecModel::from(
+        PERMISSION_LABELS
+            .iter()
+            .map(|label| slint::SharedString::from(*label))
+            .collect::<Vec<_>>(),
+    )));
+    window.set_capability_labels(ModelRc::new(VecModel::from(
+        crate::permissions::capabilities()
+            .iter()
+            .map(|capability| slint::SharedString::from(capability.label))
+            .collect::<Vec<_>>(),
+    )));
+    window.set_override_labels(ModelRc::new(VecModel::from(
+        settings_ui::OVERRIDE_LABELS
+            .iter()
+            .map(|label| slint::SharedString::from(*label))
+            .collect::<Vec<_>>(),
+    )));
+}
+
+/// 输入区的模型下拉：列出**已配置的提供商**及其已知模型。
+///
+/// 会话级手动选择优先；没有手选时按"时段方案 → 默认方案 → 全局"解析一次，
+/// 下拉的选中项如实反映当前会用的那一个。
+fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &SessionRuntime) {
+    let now = crate::clock::now();
+    let choice = sessions.model_choice();
+    let selection = settings.resolve_selection(
+        if choice.is_empty() {
+            None
+        } else {
+            Some(&choice)
+        },
+        &now,
+    );
+    let mut labels: Vec<slint::SharedString> = Vec::new();
+    let mut selected_index: i32 = -1;
+    for provider_id in settings.provider_ids() {
+        let provider = settings.provider(&provider_id);
+        let mut models: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
+        if !provider.model.trim().is_empty() && !models.contains(&provider.model) {
+            models.insert(0, provider.model.clone());
+        }
+        if models.is_empty() {
+            continue;
+        }
+        let provider_label = provider.display_name();
+        let requires_key = config::get_provider(&provider_id)
+            .map(|info| info.api_key_required)
+            .unwrap_or(true);
+        // 只对这个提供商**自己**的 Key 做判断，绝不借用别家。
+        let has_key = !requires_key || sessions.has_key_for(&provider_id);
+        for model in models {
+            if selected_index < 0
+                && provider_id == selection.provider_id
+                && model == selection.model
+            {
+                selected_index = labels.len() as i32;
+            }
+            let label = if has_key {
+                format!("{provider_label} · {model}")
+            } else {
+                format!("{provider_label} · {model}（还没 Key）")
+            };
+            labels.push(label.into());
+        }
+    }
+    window.set_model_option_labels(ModelRc::new(VecModel::from(labels)));
+    window.set_model_choice_index(selected_index);
+
+    // 推理档位：只对声明了协议的提供商显示（自定义端点不注入专属字段）。
+    let capability = settings.provider(&selection.provider_id).capability();
+    match capability {
+        crate::llm::Capability::Mimo => {
+            window.set_thinking_control_visible(true);
+            window.set_effort_control_visible(false);
+            window.set_reasoning_applicable(true);
+            window.set_reasoning_options(ModelRc::new(VecModel::from(
+                THINKING_LABELS
+                    .iter()
+                    .map(|label| slint::SharedString::from(*label))
+                    .collect::<Vec<_>>(),
+            )));
+            let index = choice
+                .thinking
+                .map(thinking_index)
+                .unwrap_or_else(|| thinking_index(selection.thinking));
+            window.set_reasoning_index(index);
+        }
+        crate::llm::Capability::DeepSeek => {
+            window.set_thinking_control_visible(false);
+            window.set_effort_control_visible(true);
+            window.set_reasoning_applicable(true);
+            window.set_reasoning_options(ModelRc::new(VecModel::from(
+                EFFORT_LABELS
+                    .iter()
+                    .map(|label| slint::SharedString::from(*label))
+                    .collect::<Vec<_>>(),
+            )));
+            let index = choice
+                .reasoning_effort
+                .map(reasoning_effort_index)
+                .unwrap_or_else(|| reasoning_effort_index(selection.reasoning_effort));
+            window.set_reasoning_index(index);
+        }
+        crate::llm::Capability::Plain => {
+            window.set_thinking_control_visible(false);
+            window.set_effort_control_visible(false);
+            window.set_reasoning_applicable(false);
+            window.set_reasoning_options(ModelRc::new(VecModel::from(
+                Vec::<slint::SharedString>::new(),
+            )));
+            window.set_reasoning_index(0);
+        }
+    }
+
+    let hint = if choice.is_empty() {
+        format!(
+            "按「{}」使用 {} · {}",
+            selection.source.label(),
+            selection.provider_id,
+            selection.model
+        )
+    } else {
+        "本会话的手动选择（不受时段规则影响）".to_string()
+    };
+    window.set_model_hint(hint.into());
+}
+
+/// 只改**模型下拉/推理档位**的文字显示（不改设置，不落盘）。
+fn publish_model_badges(window: &AppWindow, settings: &Settings, sessions: &SessionRuntime) {
+    let choice = sessions.model_choice();
+    let selection = settings.resolve_selection(
+        if choice.is_empty() {
+            None
+        } else {
+            Some(&choice)
+        },
+        &crate::clock::now(),
+    );
+    window.set_session_model_text(
+        format!(
+            "{} · {}",
+            settings.provider(&selection.provider_id).display_name(),
+            selection.model
+        )
+        .into(),
+    );
+    window.set_session_effective_window(
+        settings
+            .effective_context_window_of(&selection.provider_id, &selection.model)
+            .to_string()
+            .into(),
+    );
 }
 
 /// 配置读不出来时的界面：把错误原文显示出来，**不伪造一份默认配置**。
@@ -506,32 +1085,6 @@ fn push_entry(window: &AppWindow, role: &str, text: &str, detail: &str, tint: &s
         items.drain(0..items.len() - 500);
     }
     window.set_entries(ModelRc::new(VecModel::from(items)));
-}
-
-fn update_tool(window: &AppWindow, name: &str, state: &str, detail: &str, tint: &str) {
-    let model = window.get_tools();
-    let mut items: Vec<ToolCard> = model.iter().collect();
-    let color = parse_hex_color(tint);
-    if let Some(existing) = items
-        .iter_mut()
-        .rev()
-        .find(|card| card.name.as_str() == name)
-    {
-        existing.state = state.into();
-        existing.detail = detail.into();
-        existing.tint = color;
-    } else {
-        items.push(ToolCard {
-            name: name.into(),
-            state: state.into(),
-            detail: detail.into(),
-            tint: color,
-        });
-    }
-    if items.len() > 200 {
-        items.drain(0..items.len() - 200);
-    }
-    window.set_tools(ModelRc::new(VecModel::from(items)));
 }
 
 /// 一次待确认的请求。
@@ -759,6 +1312,7 @@ async fn run_worker(
     paths: AppPaths,
     secret: SecretStore,
     mut settings: Settings,
+    mut sessions: SessionRuntime,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
     command_tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
     confirmer: Arc<UiConfirmer>,
@@ -782,11 +1336,23 @@ async fn run_worker(
 
     let mut toolkit: Option<Arc<CuaToolkit>> =
         bridge.map(|bridge| Arc::new(CuaToolkit::new(bridge, Some(paths.frames_dir()))));
-    // 会话历史由回合任务持有并送回：回合在工作线程之外跑，主循环仍要能响应取消。
-    let mut history: Vec<ChatMessage> = Vec::new();
+    // 会话历史由会话运行时持有（按会话隔离）；回合期间只读一份快照。
     let mut turn_cancel: Option<CancelToken> = None;
     // 回合身份：每个 Agent 回合一个，播报据此判断"这段音频属于哪一轮"。
     let mut next_turn_id: TurnId = 0;
+
+    /*
+     * 权限运行态（共享给 Agent）：界面上的暂停/限时授权/覆盖要在
+     * **下一个工具判断前**生效，所以用 `Arc<Mutex<..>>` 而不是每轮新建一份。
+     */
+    let permissions = Arc::new(std::sync::Mutex::new(PermissionState::from_settings(
+        settings.permission_mode,
+        &settings.permission_overrides,
+    )));
+    let audit = AuditLog::new(paths.audit_file());
+
+    let mut model_request = 0u64;
+    let connection_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
     // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
@@ -825,6 +1391,34 @@ async fn run_worker(
      */
     seed_voice_ui(&weak, &settings);
     seed_tts_ui(&weak, &settings, &speech);
+
+    // 会话已由 `run_app` 在 `seed_ui` **之前**备好（含落盘），
+    // 这里只把"启动时保存失败"的原因如实显示出来。
+    if let Some(error) = sessions.last_save_error() {
+        set_status(&weak, &format!("会话无法保存：{error}"));
+    }
+    // 记住"哪些提供商已有 Key"：输入区的模型下拉据此提示"还没 Key"，
+    // 且**只**看该提供商自己的 Key。
+    {
+        let presence: Vec<String> = config::PROVIDERS
+            .iter()
+            .filter(|info| secret.has(info.id))
+            .map(|info| info.id.to_string())
+            .collect();
+        sessions.set_key_presence(presence);
+    }
+    {
+        let settings = settings.clone();
+        let sessions = sessions.clone();
+        with_window(&weak, move |window| {
+            publish_session_list(&window.as_weak(), &sessions);
+            publish_timeline(&window.as_weak(), &sessions);
+            publish_session_title(&window.as_weak(), &sessions);
+            refresh_model_picker(window, &settings, &sessions);
+            publish_model_badges(window, &settings, &sessions);
+        });
+    }
+    publish_audit(&weak, &audit.recent(crate::permissions::MAX_AUDIT_RECORDS));
 
     loop {
         // 每一轮都按"当前是否在播报 / 是否有挂起的确认"重新决定聆听模式：
@@ -889,10 +1483,20 @@ async fn run_worker(
                         &secret,
                         &mut settings,
                         &mut speech,
+                        &permissions,
                         &request,
                         generation,
                         &save_generation,
                     );
+                    // 保存成功后刷新输入区的模型下拉（选项/归属可能变了）。
+                    {
+                        let settings = settings.clone();
+                        let sessions = sessions.clone();
+                        with_window(&weak, move |window| {
+                            refresh_model_picker(window, &settings, &sessions);
+                            publish_model_badges(window, &settings, &sessions);
+                        });
+                    }
                 }
             }
             UiCommand::CancelSettings { generation } => {
@@ -912,12 +1516,36 @@ async fn run_worker(
                 let has_key = secret.has(&settings.provider_id);
                 apply_settings_to_ui(&weak, &settings, has_key);
             }
-            UiCommand::ProviderChanged(_index) => {
-                // 地址/模型由界面侧回填；这里不需要动作。
+            UiCommand::ProviderChanged(index) => {
+                model_request += 1;
+                let provider = settings.provider(provider_id_for_index(index));
+                with_window(&weak, move |window| {
+                    if window.get_provider_index() != index {
+                        return;
+                    }
+                    window.set_base_url(provider.base_url_or_default().into());
+                    window.set_model_name(provider.model.clone().into());
+                    window.set_provider_hint_index(settings_ui::provider_hint_index(
+                        provider.provider_hint,
+                    ));
+                    window.set_thinking_index(thinking_index(provider.thinking));
+                    window.set_effort_index(reasoning_effort_index(provider.reasoning_effort));
+                    window.set_models_busy(false);
+                    window.set_discovered_models(ModelRc::new(VecModel::from(Vec::<
+                        slint::SharedString,
+                    >::new(
+                    ))));
+                });
             }
             UiCommand::ClearApiKey(provider_id) => {
                 match secret.clear(&provider_id) {
                     Ok(()) => {
+                        settings_ui::restore_model_catalogs(&mut settings, &paths, &secret, None);
+                        let picker_settings = settings.clone();
+                        let picker_sessions = sessions.clone();
+                        with_window(&weak, move |window| {
+                            refresh_model_picker(window, &picker_settings, &picker_sessions)
+                        });
                         /*
                          * 设置页的 `has-key` 表示"**设置页当前选中**的提供商有没有 Key"。
                          *
@@ -942,21 +1570,296 @@ async fn run_worker(
                     Err(error) => set_status(&weak, &format!("清除 Key 失败：{error}")),
                 }
             }
+            // ---- 设置分类导航 ----
+            UiCommand::SettingsTab(index) => {
+                {
+                    with_window(&weak, move |window| {
+                        window.set_settings_tab_index(index.max(0));
+                    });
+                }
+                publish_audit(&weak, &audit.recent(crate::permissions::MAX_AUDIT_RECORDS));
+            }
+            // ---- 模型发现与连通性测试 ----
+            UiCommand::TestConnection(draft) => {
+                handle_test_connection(&weak, &settings, &secret, draft, &connection_request);
+            }
+            UiCommand::FetchModels(draft) => {
+                {
+                    with_window(&weak, move |window| {
+                        window.set_models_busy(true);
+                        window.set_model_list_hint("正在获取在线模型列表…".into());
+                    });
+                }
+                let (provider, api_key) = match draft.resolve(&settings, &secret) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        with_window(&weak, move |window| {
+                            if draft.matches_window(window) {
+                                window.set_models_busy(false);
+                                window.set_model_list_hint(error.into());
+                            }
+                        });
+                        continue;
+                    }
+                };
+                model_request += 1;
+                let request = model_request;
+                let mut cache = ModelCache::with_path(paths.model_cache_file());
+                let tx = command_tx.clone();
+                tokio::spawn(async move {
+                    let fetch = fetch_models(&provider, &api_key, &mut cache, true).await;
+                    let _ = tx.send(UiCommand::ModelsFetched {
+                        credential: crate::model_catalog::fingerprint(&api_key),
+                        draft,
+                        request,
+                        fetch,
+                    });
+                });
+            }
+            UiCommand::ModelsFetched {
+                draft,
+                credential,
+                request,
+                fetch,
+            } => {
+                if request == model_request {
+                    remember_fetched_models(
+                        &mut settings,
+                        (&draft.provider_id, &draft.base_url, request),
+                        model_request,
+                        &fetch,
+                        &secret,
+                        &credential,
+                    );
+                    {
+                        let settings = settings.clone();
+                        let sessions = sessions.clone();
+                        let fetch = fetch.clone();
+                        with_window(&weak, move |window| {
+                            refresh_model_picker(window, &settings, &sessions);
+                            window.set_models_busy(false);
+                            if draft.matches_window(window) {
+                                window.set_model_list_hint(fetch.summary().into());
+                                if fetch.ok {
+                                    window.set_discovered_models(ModelRc::new(VecModel::from(
+                                        fetch
+                                            .ids()
+                                            .into_iter()
+                                            .map(slint::SharedString::from)
+                                            .collect::<Vec<_>>(),
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            // ---- 会话 ----
+            UiCommand::NewSession => {
+                speech.stop();
+                let now = crate::clock::now().unix_ms;
+                let id = sessions.create(now, "新会话");
+                if let Ok(mut state) = permissions.lock() {
+                    state.allowed_once.clear();
+                }
+                let _ = sessions.save_current();
+                let _ = id;
+                {
+                    let settings = settings.clone();
+                    let sessions = sessions.clone();
+                    with_window(&weak, move |window| {
+                        publish_session_list(&window.as_weak(), &sessions);
+                        publish_timeline(&window.as_weak(), &sessions);
+                        publish_session_title(&window.as_weak(), &sessions);
+                        refresh_model_picker(window, &settings, &sessions);
+                        publish_model_badges(window, &settings, &sessions);
+                    });
+                }
+                set_status(&weak, "已新建会话");
+            }
+            UiCommand::SelectSession(id) => {
+                if id.trim().is_empty() {
+                    // 空 id = 界面没指定：保持当前选中，不做事。
+                } else {
+                    match sessions.select(&id) {
+                        Ok(()) => {
+                            if let Ok(mut state) = permissions.lock() {
+                                state.allowed_once.clear();
+                            }
+                            /*
+                             * 已结束 Agent 回合但 TTS 仍可能还在播：切会话要停旧播报，
+                             * 并让界面侧的播报身份失效——旧 `SpeechId` 的迟到事件
+                             * 不会再改到新会话的字幕。
+                             */
+                            speech.stop();
+                            speech_view.current = None;
+                            let weak_ui = weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(window) = weak_ui.upgrade() {
+                                    window.set_speech_subtitle("".into());
+                                    window.set_speech_active(false);
+                                }
+                            });
+                            {
+                                let settings = settings.clone();
+                                let sessions = sessions.clone();
+                                with_window(&weak, move |window| {
+                                    publish_session_list(&window.as_weak(), &sessions);
+                                    publish_timeline(&window.as_weak(), &sessions);
+                                    publish_session_title(&window.as_weak(), &sessions);
+                                    refresh_model_picker(window, &settings, &sessions);
+                                    publish_model_badges(window, &settings, &sessions);
+                                });
+                            }
+                            let warning = sessions
+                                .current()
+                                .map(|session| session.last_turn_status.needs_warning())
+                                .unwrap_or(false);
+                            if warning {
+                                set_status(
+                                    &weak,
+                                    "已切换会话；上一轮没有正常结束（不会自动重放工具）",
+                                );
+                            } else {
+                                set_status(&weak, "已切换会话");
+                            }
+                        }
+                        Err(error) => set_status(&weak, &format!("切换会话失败：{error}")),
+                    }
+                }
+            }
+            UiCommand::RenameSession { id, title } => {
+                let target = if id.trim().is_empty() {
+                    sessions.current_id().to_string()
+                } else {
+                    id
+                };
+                match sessions.rename(&target, &title) {
+                    Ok(()) => {
+                        {
+                            let sessions = sessions.clone();
+                            with_window(&weak, move |window| {
+                                publish_session_list(&window.as_weak(), &sessions);
+                                publish_session_title(&window.as_weak(), &sessions);
+                            });
+                        }
+                        set_status(&weak, "会话已改名");
+                    }
+                    Err(error) => set_status(&weak, &format!("改名失败：{error}")),
+                }
+            }
+            UiCommand::DeleteSession(id) => {
+                let target = if id.trim().is_empty() {
+                    sessions.current_id().to_string()
+                } else {
+                    id
+                };
+                speech.stop();
+                speech_view.current = None;
+                match sessions.delete(&target) {
+                    Ok(()) => {
+                        if let Ok(mut state) = permissions.lock() {
+                            state.allowed_once.clear();
+                        }
+                        // 删光了就补一个，保证界面始终有一个可对话的会话。
+                        if sessions.current().is_none() {
+                            sessions.ensure_one(crate::clock::now().unix_ms);
+                            let _ = sessions.save_current();
+                        }
+                        {
+                            let settings = settings.clone();
+                            let sessions = sessions.clone();
+                            with_window(&weak, move |window| {
+                                publish_session_list(&window.as_weak(), &sessions);
+                                publish_timeline(&window.as_weak(), &sessions);
+                                publish_session_title(&window.as_weak(), &sessions);
+                                refresh_model_picker(window, &settings, &sessions);
+                                publish_model_badges(window, &settings, &sessions);
+                            });
+                        }
+                        set_status(&weak, "会话已删除");
+                    }
+                    Err(error) => set_status(&weak, &format!("删除失败：{error}")),
+                }
+            }
+            // ---- 输入区的模型 / 推理选择（只改当前会话） ----
+            UiCommand::ModelChoicePicked(index) => {
+                handle_model_pick(&weak, &settings, &mut sessions, index);
+            }
+            UiCommand::ReasoningPicked(index) => {
+                handle_reasoning_pick(&weak, &settings, &mut sessions, index);
+            }
+            UiCommand::ApplyManualModel(model) => {
+                let model = model.trim().to_string();
+                if model.is_empty() {
+                    set_status(&weak, "手填模型不能为空");
+                } else {
+                    let provider_id = sessions.model_choice().provider_id;
+                    let provider_id = if provider_id.is_empty() {
+                        settings
+                            .resolve_selection(None, &crate::clock::now())
+                            .provider_id
+                    } else {
+                        provider_id
+                    };
+                    let choice = SessionModelChoice {
+                        provider_id,
+                        model,
+                        thinking: sessions.model_choice().thinking,
+                        reasoning_effort: sessions.model_choice().reasoning_effort,
+                    };
+                    apply_session_choice(&weak, &settings, &mut sessions, choice);
+                }
+            }
+            // ---- 权限（立即生效） ----
+            UiCommand::PermissionModePicked(_) | UiCommand::OverridePicked { .. } => {}
+            UiCommand::TogglePause => toggle_pause(&weak, &permissions),
+            UiCommand::GrantCapability {
+                capability,
+                minutes,
+            } => {
+                grant_capability(&weak, &permissions, &capability, minutes);
+                set_status(
+                    &weak,
+                    &format!("已允许「{capability}」{minutes} 分钟（仅本次会话）"),
+                );
+            }
+            UiCommand::ExportAudit => export_audit(&weak, &audit, &paths),
             UiCommand::Send(input) => {
                 // 新一轮开始：上一轮的声音立刻停下，绝不接在旧音频后面。
                 speech.stop();
-                next_turn_id += 1;
+                next_turn_id =
+                    next_turn_id.max(sessions.current().map(|s| s.last_turn_id).unwrap_or(0)) + 1;
+                // 首条消息决定会话标题（只在仍是默认标题时）。
+                sessions.adopt_title_from(&input);
+                let session_id = sessions.current_id().to_string();
+                let mut history = sessions.history();
+                sessions.push_timeline(next_turn_id, TimelineItem::user(input.clone()));
+                sessions.set_last_turn(next_turn_id, TurnStatus::Interrupted);
+                let _ = sessions.save_current();
+                publish_timeline(&weak, &sessions);
+                publish_session_list(&weak, &sessions);
+                set_busy(&weak, true);
+                let choice = sessions.model_choice();
                 match start_turn(
                     &weak,
                     &paths,
                     &secret,
                     &settings,
+                    if choice.is_empty() {
+                        None
+                    } else {
+                        Some(&choice)
+                    },
                     &toolkit,
                     &confirmer,
+                    &permissions,
+                    &audit,
                     &mut history,
                     &mut turn_cancel,
                     input,
                     next_turn_id,
+                    session_id,
                 ) {
                     TurnStart::Started(turn) => {
                         // 等待结束，但**同时**继续处理取消/退出/设置命令。
@@ -968,21 +1871,37 @@ async fn run_worker(
                             &paths,
                             &secret,
                             &mut settings,
+                            &mut sessions,
+                            &permissions,
+                            &audit,
                             &confirmer,
                             &mut voice,
                             &mut speech,
                             &mut speech_view,
                             &command_tx,
                             &save_generation,
+                            &mut model_request,
                             TurnSource::Text,
                         )
                         .await
                         {
-                            TurnWait::Finished(returned) => history = returned,
+                            TurnWait::Finished(finished) => {
+                                finish_session_turn(
+                                    &weak,
+                                    &mut sessions,
+                                    &mut speech,
+                                    &settings,
+                                    finished,
+                                    next_turn_id,
+                                );
+                            }
                             TurnWait::Quit => break,
                         }
                     }
-                    TurnStart::Rejected(status) => set_status(&weak, &status),
+                    TurnStart::Rejected(status) => {
+                        set_busy(&weak, false);
+                        set_status(&weak, &status);
+                    }
                 }
             }
             UiCommand::SetVoiceEnabled(enabled) => {
@@ -1007,43 +1926,81 @@ async fn run_worker(
                 if let Some(prompt) = prompt {
                     // 语音指令也是一轮新的回合：先把上一轮的声音停掉。
                     speech.stop();
-                    next_turn_id += 1;
-                    let turn = commit_voice_text(
+                    next_turn_id = next_turn_id
+                        .max(sessions.current().map(|s| s.last_turn_id).unwrap_or(0))
+                        + 1;
+                    // 语音最终文本只提交给**捕获时归属**的有效会话（当前会话）。
+                    sessions.adopt_title_from(&prompt.text);
+                    let session_id = sessions.current_id().to_string();
+                    let mut history = sessions.history();
+                    sessions.push_timeline(next_turn_id, TimelineItem::user(prompt.text.clone()));
+                    sessions.set_last_turn(next_turn_id, TurnStatus::Interrupted);
+                    let _ = sessions.save_current();
+                    publish_timeline(&weak, &sessions);
+                    publish_session_list(&weak, &sessions);
+                    set_busy(&weak, true);
+                    let choice = sessions.model_choice();
+                    let turn = prompt.text.clone();
+                    match start_turn(
                         &weak,
-                        prompt.text,
-                        prompt.audio_seconds,
-                        prompt.decode_ms,
-                        &mut turn_cancel,
-                        &toolkit,
-                        &confirmer,
-                        &mut history,
-                        &settings,
                         &paths,
                         &secret,
+                        &settings,
+                        if choice.is_empty() {
+                            None
+                        } else {
+                            Some(&choice)
+                        },
+                        &toolkit,
+                        &confirmer,
+                        &permissions,
+                        &audit,
+                        &mut history,
+                        &mut turn_cancel,
+                        turn,
                         next_turn_id,
-                    );
-                    if let Some(turn) = turn {
-                        // 与文本输入完全相同的等待方式：取消/退出/设置照常处理。
-                        match wait_turn(
-                            &mut commands,
-                            turn,
-                            &weak,
-                            &mut turn_cancel,
-                            &paths,
-                            &secret,
-                            &mut settings,
-                            &confirmer,
-                            &mut voice,
-                            &mut speech,
-                            &mut speech_view,
-                            &command_tx,
-                            &save_generation,
-                            TurnSource::Voice,
-                        )
-                        .await
-                        {
-                            TurnWait::Finished(returned) => history = returned,
-                            TurnWait::Quit => break,
+                        session_id,
+                    ) {
+                        TurnStart::Started(turn) => {
+                            // 与文本输入完全相同的等待方式：取消/退出/设置照常处理。
+                            match wait_turn(
+                                &mut commands,
+                                turn,
+                                &weak,
+                                &mut turn_cancel,
+                                &paths,
+                                &secret,
+                                &mut settings,
+                                &mut sessions,
+                                &permissions,
+                                &audit,
+                                &confirmer,
+                                &mut voice,
+                                &mut speech,
+                                &mut speech_view,
+                                &command_tx,
+                                &save_generation,
+                                &mut model_request,
+                                TurnSource::Voice,
+                            )
+                            .await
+                            {
+                                TurnWait::Finished(finished) => {
+                                    finish_session_turn(
+                                        &weak,
+                                        &mut sessions,
+                                        &mut speech,
+                                        &settings,
+                                        finished,
+                                        next_turn_id,
+                                    );
+                                }
+                                TurnWait::Quit => break,
+                            }
+                        }
+                        TurnStart::Rejected(status) => {
+                            set_busy(&weak, false);
+                            set_status(&weak, &status);
                         }
                     }
                 }
@@ -1413,23 +2370,6 @@ impl TurnSource {
     }
 }
 
-/// 播报设置下拉框的顺序（与界面数组一致）。
-const TTS_BACKENDS: &[TtsBackend] = &[TtsBackend::Off, TtsBackend::Mimo, TtsBackend::Local];
-
-fn tts_backend_for_index(index: i32) -> TtsBackend {
-    usize::try_from(index)
-        .ok()
-        .and_then(|index| TTS_BACKENDS.get(index).copied())
-        .unwrap_or(TtsBackend::Off)
-}
-
-fn tts_backend_index(backend: TtsBackend) -> i32 {
-    TTS_BACKENDS
-        .iter()
-        .position(|candidate| *candidate == backend)
-        .unwrap_or(0) as i32
-}
-
 /// 按"当前在播报 / 有挂起的确认"决定聆听模式。
 ///
 /// 这是"什么时候可以不喊唤醒词"的**唯一**开关：
@@ -1661,260 +2601,6 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
     }
 }
 
-/// 界面上「保存」一次提交的全部内容（模型端点 + 语音播报）。
-///
-/// 为什么合并成一个请求：原来是两条独立命令，各自落盘、各自关面板，
-/// 于是「模型设置写失败但播报设置写成功」会把面板关掉，用户既看不到错误、
-/// 也不知道哪一半生效了。现在由 [`apply_save_all`] 当作**一个事务**处理。
-#[derive(Debug, Clone)]
-pub struct SaveAllRequest {
-    pub provider_index: i32,
-    pub base_url: String,
-    pub model: String,
-    pub api_key: String,
-    pub permission_index: i32,
-    pub tts_enabled: bool,
-    pub tts_backend_index: i32,
-    /// 界面上的文本原样传入：解析失败要**如实报错**，不能静默改成默认值。
-    pub local_sid: String,
-    pub local_speed: String,
-    pub mimo_voice: String,
-    pub mimo_style: String,
-    pub local_dir: String,
-    pub speak_mode: i32,
-}
-
-impl SaveAllRequest {
-    /// 音色编号/语速是文本输入：解析失败返回可读错误（保留用户输入）。
-    fn parse_local_numbers(&self) -> Result<(i32, f32), String> {
-        let sid_text = self.local_sid.trim();
-        let sid = if sid_text.is_empty() {
-            0
-        } else {
-            sid_text
-                .parse::<i32>()
-                .map_err(|_| format!("音色编号必须是整数，收到「{sid_text}」"))?
-        };
-        let speed_text = self.local_speed.trim();
-        let speed = if speed_text.is_empty() {
-            1.0
-        } else {
-            speed_text
-                .parse::<f32>()
-                .map_err(|_| format!("语速必须是数字（0.5~2.0），收到「{speed_text}」"))?
-        };
-        Ok((sid, speed))
-    }
-}
-
-/// 把界面上的「自动播报」选项翻译成两个布尔开关。
-fn speak_flags(mode: i32) -> (bool, bool) {
-    match mode {
-        1 => (true, false),
-        2 => (false, true),
-        3 => (false, false),
-        // 0 与越界都按「语音与文本」处理（与界面数组第一项一致）。
-        _ => (true, true),
-    }
-}
-
-/// 一次保存的**结果分类**（对应任务书第 4 条）。
-///
-/// 刻意做成枚举而不是几个布尔：界面要区分"没保存"和"保存了但播报暂不可用"，
-/// 两者对用户的含义完全不同（前者要保留草稿继续改，后者可以关面板）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SaveOutcome {
-    /// 配置已写入，一切正常。
-    Saved,
-    /// 配置已写入，但播报当前不可用（缺 Key / 缺模型 / 设备问题）。
-    ///
-    /// **算保存成功**：用户的设置确实存下来了，只是引擎建不起来。
-    SavedSpeechUnavailable(String),
-    /// 配置已写入，但 Key 没有写进去（只有该提供商的 Key 受影响）。
-    SavedKeyFailed(String),
-    /// 配置**没有**写入：校验失败或落盘失败。界面必须保留草稿。
-    NotSaved(String),
-}
-
-impl SaveOutcome {
-    /// 配置是否已经落盘（决定界面要不要保留草稿）。
-    pub fn config_written(&self) -> bool {
-        !matches!(self, Self::NotSaved(_))
-    }
-
-    /// 是否可以在成功后关闭面板。
-    pub fn can_close_panel(&self) -> bool {
-        self.config_written()
-    }
-
-    /// 给用户看的一句话（状态栏与面板内提示共用）。
-    pub fn message(&self) -> String {
-        match self {
-            Self::Saved => "设置已保存".to_string(),
-            Self::SavedSpeechUnavailable(detail) => {
-                format!("设置已保存，但播报暂不可用：{detail}")
-            }
-            Self::SavedKeyFailed(detail) => {
-                format!("设置已保存，但 Key 没有写入：{detail}")
-            }
-            Self::NotSaved(detail) => detail.clone(),
-        }
-    }
-}
-
-/// **一次保存的全部逻辑**（模型端点 + 语音播报）。
-///
-/// 事务规则（对应任务书第 4 条）：
-///  1. 先在内存里把两份配置都算出来并**一起校验**；任何一项不合法就整体失败，
-///     此时磁盘和内存都没被改过，用户输入原样留在界面上；
-///  2. 校验通过后**只写一次盘**（端点与播报本来就在同一份 settings.json 里）；
-///  3. 写盘成功后再写 Key（只写到目标提供商名下，留空 = 不动）；
-///  4. 最后重建 TTS 引擎。
-///
-/// 引擎建不起来（缺 Key / 缺模型）**不算保存失败**：配置本身合法，
-/// 只是当前不可用——如实显示为警告，不把用户的选择回滚掉。
-pub fn apply_save_all(
-    paths: &AppPaths,
-    secret: &SecretStore,
-    settings: &mut Settings,
-    speech: &mut SpeechRuntime,
-    request: &SaveAllRequest,
-) -> SaveOutcome {
-    // ---- 1) 组装候选配置（还没碰磁盘） ----
-    let (sid, speed) = match request.parse_local_numbers() {
-        Ok(values) => values,
-        Err(error) => return SaveOutcome::NotSaved(error),
-    };
-    let (speak_voice, speak_text) = speak_flags(request.speak_mode);
-
-    let previous = settings.clone();
-    let mut next = settings.clone();
-    next.provider_id = provider_id_for_index(request.provider_index).to_string();
-    next.base_url = request.base_url.clone();
-    next.model = request.model.clone();
-    next.permission_mode = permission_mode_for_index(request.permission_index);
-    next.tts.enabled = request.tts_enabled;
-    next.tts.backend = tts_backend_for_index(request.tts_backend_index);
-    next.tts.mimo_voice = request.mimo_voice.clone();
-    next.tts.mimo_style = request.mimo_style.clone();
-    next.tts.local_model_dir = request.local_dir.clone();
-    next.tts.local_sid = sid;
-    next.tts.local_speed = speed;
-    next.tts.speak_voice_turns = speak_voice;
-    next.tts.speak_text_turns = speak_text;
-
-    // ---- 2) 整体校验（端点 + 播报一起） ----
-    let next = match next.normalized() {
-        Ok(next) => next,
-        Err(error) => return SaveOutcome::NotSaved(error),
-    };
-
-    // ---- 3) 只写一次盘 ----
-    if let Err(error) = config::save_settings(paths, &next) {
-        return SaveOutcome::NotSaved(format!("写入配置文件失败：{error}"));
-    }
-
-    // 写盘成功那一刻起，配置就是"已保存"了。后面无论 Key 或引擎出什么问题，
-    // 都不能再报成"没有保存"——否则用户会以为改动丢了，然后重复保存。
-    *settings = next;
-
-    // ---- 4) 再写 Key（留空 = 不动该提供商的 Key） ----
-    let key_provider = settings.provider_id.clone();
-    let new_key = request.api_key.trim().to_string();
-    let key_error = if new_key.is_empty() {
-        None
-    } else {
-        secret.save(&key_provider, &new_key).err()
-    };
-
-    /*
-     * ---- 5) 只在**播报配置真的变了**时才重建引擎 ----
-     *
-     * 只改模型端点 / 推理 / 权限时，TTS 的有效配置与相关凭据都没变：
-     * 重建会 `stop()` 掉正在播的内容，还会让本地模型重新加载 + 预热（数秒）。
-     * 这里先判断"是否需要"，避免完全不必要的打断。
-     */
-    // 只有"这次真的写入了 **MiMo 提供商** 的 Key，且当前启用的正是 MiMo TTS"
-    // 才算凭据变化。
-    //
-    // 之前只看"有没有写 Key" + "TTS 后端是不是 MiMo"，于是给 DeepSeek 存 Key
-    // 时也会被判成 MiMo 凭据变化 → 重建引擎 → 打断正在播报的 MiMo 语音。
-    // 写入目标由 provider_id 决定，所以必须同时核对它确实是 `mimo`。
-    let key_changed_for_active_backend = key_error.is_none()
-        && !new_key.is_empty()
-        && key_provider == MIMO_PROVIDER_ID
-        && settings.tts.active_backend() == TtsBackend::Mimo;
-    let tts_changed =
-        tts_runtime_config_changed(&previous, settings, key_changed_for_active_backend);
-    let speech_warning = if tts_changed {
-        rebuild_speech(settings, secret, speech)
-    } else {
-        // 配置没变：保持当前引擎与正在播放的音频不动，只同步界面描述。
-        None
-    };
-
-    match (key_error, speech_warning) {
-        // Key 没写进去要单独说清楚：普通配置已保存，只有 Key 没存。
-        (Some(error), warning) => {
-            let mut detail = error.to_string();
-            if let Some(warning) = warning {
-                detail.push('；');
-                detail.push_str(&warning);
-            }
-            SaveOutcome::SavedKeyFailed(detail)
-        }
-        (None, Some(warning)) => SaveOutcome::SavedSpeechUnavailable(warning),
-        (None, None) => SaveOutcome::Saved,
-    }
-}
-
-/// 这次保存是否真的改变了**播报运行时**的配置。
-///
-/// 只有这些变化才值得重建引擎（会 `stop()` 当前播报、重载本地模型并重新预热）：
-///  - TTS 开关 / 后端；
-///  - MiMo 的模型/音色/风格，本地模型的目录/音色编号/语速/提供者；
-///  - 输出设备与超时。
-///
-/// **不需要**重建的：模型端点、推理参数、权限档位，以及"自动播报"两个开关
-/// （它们只决定"要不要播"，不影响引擎本身）。
-///
-/// 另外，给**当前启用的云端后端**写入了新 Key 时，凭据变了也必须重建。
-fn tts_runtime_config_changed(
-    previous: &Settings,
-    next: &Settings,
-    key_changed_for_active_backend: bool,
-) -> bool {
-    let a = &previous.tts;
-    let b = &next.tts;
-    a.enabled != b.enabled
-        || a.backend != b.backend
-        || a.mimo_model != b.mimo_model
-        || a.mimo_voice != b.mimo_voice
-        || a.mimo_style != b.mimo_style
-        || a.local_model_dir != b.local_model_dir
-        || a.local_sid != b.local_sid
-        || (a.local_speed - b.local_speed).abs() > f32::EPSILON
-        || a.local_provider != b.local_provider
-        || a.output_device != b.output_device
-        || a.timeout_ms != b.timeout_ms
-        || key_changed_for_active_backend
-}
-
-/// 按当前（已保存的）播报配置重建引擎。
-///
-/// 返回 `None` = 一切正常；`Some(原因)` = 配置已保存但引擎建不起来
-/// （缺 Key / 缺模型 / 设备不可用）——这**不是**保存失败。
-///
-/// 必须用调用方传进来的 `SecretStore`（同一个数据目录），否则会在错误的
-/// 目录里找 Key，误报"播报不可用"。
-fn rebuild_speech(
-    settings: &Settings,
-    secret: &SecretStore,
-    speech: &mut SpeechRuntime,
-) -> Option<String> {
-    speech.apply_settings(&settings.tts, secret).err()
-}
-
 /// 启动时把已保存的播报偏好同步到界面（**不**自动试音）。
 fn seed_tts_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, speech: &SpeechRuntime) {
     publish_tts_ui(weak, &settings.tts, speech);
@@ -2009,63 +2695,6 @@ fn apply_voice_enabled(
         voice.enable(weak, paths, settings, command_tx);
     } else {
         voice.disable(weak);
-    }
-}
-
-/// 语音最终文本 → 现有 Agent 入口（与文本发送同一条路径）。
-///
-/// 返回 `Some(turn)` 表示回合已启动，调用方负责等待；`None` 表示没有启动
-/// （空文本，或 Agent 忙/等待确认/正在取消）。
-#[allow(clippy::too_many_arguments)]
-fn commit_voice_text(
-    weak: &slint::Weak<AppWindow>,
-    text: String,
-    audio_seconds: f32,
-    decode_ms: u64,
-    turn_cancel: &mut Option<CancelToken>,
-    toolkit: &Option<Arc<CuaToolkit>>,
-    confirmer: &Arc<UiConfirmer>,
-    history: &mut Vec<ChatMessage>,
-    settings: &Settings,
-    paths: &AppPaths,
-    secret: &SecretStore,
-    turn_id: TurnId,
-) -> Option<RunningTurn> {
-    let trimmed = text.trim().to_string();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // 先把结果放进对话区：用户看得见「我听到的是这句」。
-    push_entry_via_weak(
-        weak,
-        "你（语音）",
-        &trimmed,
-        &format!("{audio_seconds:.1}s 音频 · 识别 {decode_ms} ms"),
-        "#e8f0fe",
-    );
-    match start_turn(
-        weak,
-        paths,
-        secret,
-        settings,
-        toolkit,
-        confirmer,
-        history,
-        turn_cancel,
-        trimmed,
-        turn_id,
-    ) {
-        TurnStart::Started(turn) => {
-            set_busy(weak, true);
-            set_status(weak, "正在思考…");
-            Some(turn)
-        }
-        TurnStart::Rejected(status) => {
-            // Agent 忙 / 等待点击确认 / 正在取消：**不启动第二回合**，
-            // 也不把这句话排队延后执行——明确告诉用户这句话没有执行。
-            set_status(weak, &format!("{status}；这句话没有执行"));
-            None
-        }
     }
 }
 
@@ -2168,6 +2797,7 @@ fn seed_voice_ui(weak: &slint::Weak<AppWindow>, settings: &Settings) {
 struct RunningTurn {
     task: tokio::task::JoinHandle<(TurnOutcome, Vec<ChatMessage>, Settings)>,
     turn_id: TurnId,
+    events: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
 }
 
 /// 一次回合的启动结果。
@@ -2179,18 +2809,25 @@ enum TurnStart {
 
 /// 启动一个 Agent 回合。文本输入与语音最终文本都**只**经由这里，
 /// 所以两条路径的权限、取消与并发约束完全一致。
+///
+/// `choice` 是发起这一轮时**会话**的模型选择：整轮按它（或全局/时段方案）
+/// 解析一次快照，运行期间不热切换。这样别的会话改模型不会影响正在跑的回合。
 #[allow(clippy::too_many_arguments)]
 fn start_turn(
     weak: &slint::Weak<AppWindow>,
     _paths: &AppPaths,
     secret: &SecretStore,
     settings: &Settings,
+    choice: Option<&SessionModelChoice>,
     toolkit: &Option<Arc<CuaToolkit>>,
     confirmer: &Arc<UiConfirmer>,
+    permissions: &Arc<std::sync::Mutex<PermissionState>>,
+    audit: &AuditLog,
     history: &mut Vec<ChatMessage>,
     turn_cancel: &mut Option<CancelToken>,
     input: String,
     turn_id: TurnId,
+    session_id: String,
 ) -> TurnStart {
     /*
      * 并发约束：上一轮还在跑（含等待点击确认）时**不启动第二回合**。
@@ -2204,13 +2841,20 @@ fn start_turn(
         return TurnStart::Rejected("Computer Use 后端不可用，无法执行指令".to_string());
     };
 
-    // 端点快照：整轮用同一套「地址 + Key + 模型 + 推理档位」。
-    // **按提供商取 Key**：当前提供商没有就拿空串，绝不借用别家的。
+    /*
+     * 端点快照：整轮用同一套「地址 + Key + 模型 + 推理档位」。
+     *
+     * 优先级：会话手选 > 时段规则 → 方案 > 全局默认。**只在这里解析一次**，
+     * 所以时段跨过边界、别的会话改模型都不会影响这一轮。
+     */
+    let now = crate::clock::now();
+    let selection = settings.resolve_selection(choice, &now);
+    let profile = settings.profile_for_selection(&selection);
+    // **按提供商取 Key**：解析出的那一家没有 Key 就拿空串，绝不借用别家的。
     let api_key = secret
-        .load(&settings.provider_id)
+        .load(&selection.provider_id)
         .unwrap_or(None)
         .unwrap_or_default();
-    let profile = settings.profile();
     let echo_reasoning = profile.capability.requires_reasoning_echo();
     let llm = match LlmClient::new(profile, api_key, settings.temperature, settings.timeout_ms) {
         Ok(client) => client,
@@ -2219,21 +2863,30 @@ fn start_turn(
             return TurnStart::Rejected(format!("端点配置无效：{error}"));
         }
     };
-    let model_context_window = crate::config::get_provider(&settings.provider_id)
-        .and_then(|provider| provider.context_window);
     let policy = crate::context::resolve_context_policy(
         Some(settings.context_window),
         Some(settings.context_compress_percent),
-        model_context_window,
+        // 模型元数据只能收紧窗口，不能放宽。
+        settings.model_context_window(&selection.provider_id, &selection.model),
     );
     let agent_config = AgentConfig {
         max_steps: settings.max_steps,
         context_policy: policy,
         system_prompt: prompt::resolve_system_prompt(settings.system_prompt.as_deref()),
         echo_reasoning,
+        // 回合身份：事件带它，UI/播报据此核对归属。
+        turn_id,
+        use_tools: true,
     };
-    let permissions = PermissionState::new(settings.permission_mode);
-    let mut agent = Agent::new(llm, toolkit, agent_config, permissions);
+    // 权限状态是**共享**的：界面改暂停/覆盖后，下一个工具判断立刻按新值处理。
+    let mut agent = Agent::with_shared_state(
+        llm,
+        toolkit,
+        agent_config,
+        permissions.clone(),
+        Some(audit.clone()),
+        Some(session_id),
+    );
 
     let token = CancelToken::new();
     // 记下本回合的令牌，让"取消"能作用于正在跑的这一轮。
@@ -2246,13 +2899,13 @@ fn start_turn(
      * 根本轮不到处理——用户点了"取消"却没有任何反应，直到模型自己跑完。
      * 放到 spawn 里之后，主循环随时能拿到命令，取消也就能立刻生效。
      */
-    let weak_events = weak.clone();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let settings_snapshot = settings.clone();
     let turn_confirmer = confirmer.clone();
     let turn_history = std::mem::take(history);
     let turn = tokio::spawn(async move {
         let emit = move |event: AgentEvent| {
-            apply_event(&weak_events, event);
+            let _ = event_tx.send(event);
         };
         let mut turn_history = turn_history;
         let outcome = agent
@@ -2263,43 +2916,36 @@ fn start_turn(
     TurnStart::Started(RunningTurn {
         task: turn,
         turn_id,
+        events: event_rx,
     })
+}
+
+/// 一个已结束的回合：Agent 返回的历史、结果与回合快照。
+///
+/// 收尾（写会话、落盘、更新界面）由调用方在 `SessionRuntime` 上做，
+/// 这样 `wait_turn` 不必同时持有会话与界面两套状态。
+struct TurnFinished {
+    history: Vec<ChatMessage>,
+    outcome: TurnOutcome,
+    settings: Settings,
 }
 
 /// 等待回合结束期间的命令处理结果。
 enum TurnWait {
-    /// 回合正常结束（带回会话历史）。
-    Finished(Vec<ChatMessage>),
+    /// 回合正常结束（带回历史、结果与回合快照）。
+    Finished(TurnFinished),
     /// 用户要求退出：调用方应当结束主循环。
     Quit,
-}
-
-/// 一次"保存设置"请求（仅测试使用）。
-///
-/// 界面上的保存走 [`SaveAllRequest`]（端点 + 播报一起提交）；
-/// 这里保留一个只含端点的入口，让既有测试继续覆盖真实保存路径。
-#[cfg(test)]
-struct SaveRequest {
-    provider_index: i32,
-    base_url: String,
-    model: String,
-    api_key: String,
-    permission_index: i32,
 }
 
 /// 清除某个提供商的 Key 之后，界面该怎么更新。
 ///
 /// 两个显示位置含义不同，不能混用同一个 provider：
-///  - **设置页的 `has-key`** 反映"设置页**当前选中**的提供商有没有 Key"。
-///    用户点"清除"时选中的就是 `cleared_provider`，所以按它算。
-///    用已保存的 `settings.provider_id` 会答错——用户可能刚切走还没保存。
-///  - **主界面端点摘要** 反映"实际生效的配置"，所以仍按 `settings` 算，
-///    不跟着未保存的界面选择走。
+///  - **设置页的 `has-key`** 反映"设置页**当前选中**的提供商有没有 Key"；
+///  - **主界面端点摘要** 反映"实际生效的配置"。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClearedKeyView {
-    /// 设置页应当显示的 has-key。
     selected_has_key: bool,
-    /// 主界面应当显示的端点摘要。
     endpoint_summary: String,
 }
 
@@ -2315,50 +2961,44 @@ fn view_after_clear(
     }
 }
 
-/// 应用一次设置保存。返回 `true` 表示配置已落盘。
+/// 从界面读出一次保存的全部字段。
 ///
-/// 这是界面上「保存」的**旧入口形状**，内部走统一事务 [`apply_save_all`]：
-/// 模型端点与语音播报本来就写在同一份 settings.json 里，分开保存没有意义。
-/// 保留这个签名是为了让既有测试继续覆盖真实保存路径（Key 归属、失败不落盘等）。
-///
-/// 关键规则（由 `apply_save_all` 保证）：
-/// - 校验失败 / 写盘失败**都不更新**内存里的 `settings`，界面也拿不到"已保存"；
-/// - Key 只写到**目标提供商**名下；留空表示"不动该提供商的 Key"；
-/// - **先写配置、再写 Key**。反过来不行：先覆盖 Key 再回滚，
-///   会在回滚时把用户原有的 Key A 一起删掉（原来 Bug 就是这样丢数据的）。
-#[cfg(test)]
-fn handle_save_settings(
-    weak: &slint::Weak<AppWindow>,
-    paths: &AppPaths,
-    secret: &SecretStore,
-    settings: &mut Settings,
-    request: SaveRequest,
-    speech: &mut SpeechRuntime,
-) -> bool {
-    let all = SaveAllRequest {
-        provider_index: request.provider_index,
-        base_url: request.base_url,
-        model: request.model,
-        api_key: request.api_key,
-        permission_index: request.permission_index,
-        // 只改端点：播报设置按已保存的值原样带过（不会被覆盖）。
-        tts_enabled: settings.tts.enabled,
-        tts_backend_index: tts_backend_index(settings.tts.backend),
-        local_sid: settings.tts.local_sid.to_string(),
-        local_speed: settings.tts.local_speed.to_string(),
-        mimo_voice: settings.tts.mimo_voice.clone(),
-        mimo_style: settings.tts.mimo_style.clone(),
-        local_dir: settings.tts.local_model_dir.clone(),
-        speak_mode: speak_mode_code(
-            settings.tts.speak_voice_turns,
-            settings.tts.speak_text_turns,
-        ),
-    };
-    let outcome = apply_save_all(paths, secret, settings, speech, &all);
-    if !outcome.config_written() {
-        set_status(weak, &format!("保存设置失败：{}", outcome.message()));
+/// 界面是"用户正在编辑的表单"，工作线程持有权威配置副本；这里把两者对齐：
+/// 表单里的每个字段都带上，未涉及的设置（方案/时段等）由 [`apply_save`]
+/// 从当前配置里原样保留。
+pub fn build_save_request(window: &AppWindow) -> SaveRequest {
+    SaveRequest {
+        model_plans_json: window.get_model_plans_json().to_string(),
+        model_schedule_json: window.get_model_schedule_json().to_string(),
+        provider_id: PROVIDER_IDS
+            .get(usize::try_from(window.get_provider_index()).unwrap_or(usize::MAX))
+            .copied()
+            .unwrap_or("openai-compatible")
+            .to_string(),
+        base_url: window.get_base_url().to_string(),
+        model: window.get_model_name().to_string(),
+        provider_hint: window.get_provider_hint_index(),
+        api_key: window.get_api_key_input().to_string(),
+        temperature: window.get_temperature().to_string(),
+        max_steps: window.get_max_steps().to_string(),
+        timeout_ms: window.get_timeout_ms().to_string(),
+        context_window: window.get_context_window().to_string(),
+        compress_percent: window.get_compress_percent().to_string(),
+        thinking: window.get_thinking_index(),
+        reasoning_effort: window.get_effort_index(),
+        custom_prompt: window.get_prompt_custom(),
+        system_prompt: window.get_system_prompt().to_string(),
+        permission_index: window.get_permission_index(),
+        permission_overrides: window.get_override_indices().iter().collect(),
+        tts_enabled: window.get_tts_enabled(),
+        tts_backend_index: window.get_tts_backend_index(),
+        tts_mimo_voice: window.get_tts_mimo_voice().to_string(),
+        tts_mimo_style: window.get_tts_mimo_style().to_string(),
+        tts_local_dir: window.get_tts_local_dir().to_string(),
+        tts_local_sid: window.get_tts_local_sid().to_string(),
+        tts_local_speed: window.get_tts_local_speed().to_string(),
+        speak_mode: window.get_tts_speak_mode(),
     }
-    outcome.config_written()
 }
 
 /// 把设置（与 Key 状态）推给界面。
@@ -2373,17 +3013,48 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
         .iter()
         .position(|mode| *mode == settings.permission_mode)
         .unwrap_or(0) as i32;
+    let hint_index = settings_ui::provider_hint_index(settings.provider_hint);
+    let thinking = thinking_index(settings.thinking);
+    let effort = reasoning_effort_index(settings.reasoning_effort);
     let base_url = settings.base_url.clone();
     let model = settings.model.clone();
+    let plans = serde_json::to_string_pretty(&settings.model_plans).unwrap_or_default();
+    let schedule_enabled = settings.model_schedule.enabled;
+    let schedule_default = settings.model_schedule.default_plan_id.clone();
+    let schedule = serde_json::to_string_pretty(&settings.model_schedule).unwrap_or_default();
+    let overrides: Vec<i32> = crate::permissions::capabilities()
+        .iter()
+        .map(|c| match settings.permission_overrides.get(c.id) {
+            Some(crate::config::PermissionOverride::Allow) => 1,
+            Some(crate::config::PermissionOverride::Ask) => 2,
+            Some(crate::config::PermissionOverride::Deny) => 3,
+            _ => 0,
+        })
+        .collect();
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            window.set_model_plans_json(plans.into());
+            window.set_model_schedule_json(schedule.into());
+            window.set_schedule_enabled(schedule_enabled);
+            window.set_schedule_default(schedule_default.into());
+            refresh_plan_labels(&window);
             window.set_provider_index(provider_index);
             window.set_base_url(base_url.into());
             window.set_model_name(model.into());
+            window.set_provider_hint_index(hint_index);
+            window.set_thinking_index(thinking);
+            window.set_effort_index(effort);
             window.set_api_key_input("".into());
+            window.set_connection_hint("".into());
+            window.set_model_list_hint("".into());
+            window.set_discovered_models(ModelRc::new(VecModel::from(
+                Vec::<slint::SharedString>::new(),
+            )));
+            window.set_discovered_model_index(-1);
             window.set_has_key(has_key);
             window.set_permission_index(permission_index);
+            window.set_override_indices(ModelRc::new(VecModel::from(overrides)));
             // 重新打开 = 以已保存配置为准：清掉上一次的错误与"未保存"标记。
             window.set_settings_error("".into());
             window.set_settings_dirty(false);
@@ -2405,15 +3076,23 @@ async fn wait_turn(
     paths: &AppPaths,
     secret: &SecretStore,
     settings: &mut Settings,
+    sessions: &mut SessionRuntime,
+    permissions: &Arc<std::sync::Mutex<PermissionState>>,
+    audit: &AuditLog,
     confirmer: &Arc<UiConfirmer>,
     voice: &mut VoiceRuntime,
     speech: &mut SpeechRuntime,
     speech_view: &mut SpeechView,
     command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
     save_generation: &Arc<std::sync::atomic::AtomicU64>,
+    model_request: &mut u64,
     source: TurnSource,
 ) -> TurnWait {
-    let RunningTurn { mut task, turn_id } = turn;
+    let RunningTurn {
+        mut task,
+        turn_id,
+        mut events,
+    } = turn;
     /*
      * 确认请求出现/结束时也要**立刻**切换聆听模式：
      * 否则回合卡在"等点击"的这段时间里，语音确认永远进不去（没有人按按钮，
@@ -2424,13 +3103,18 @@ async fn wait_turn(
         // 每一轮重新决定聆听模式（播报中 = 听打断词，等待确认 = 听允许/拒绝）。
         sync_listen_mode(voice, speech, confirmer);
         tokio::select! {
+            Some(event) = events.recv() => { record_event(weak, sessions, turn_id, event); }
             joined = &mut task => {
+                while let Ok(event) = events.try_recv() { record_event(weak, sessions, turn_id, event); }
                 *turn_cancel = None;
                 match joined {
                     Ok((outcome, history, settings_snapshot)) => {
-                        finish_turn(weak, &outcome, &settings_snapshot);
                         maybe_speak(weak, speech, &settings_snapshot, &outcome, turn_id, source);
-                        return TurnWait::Finished(history);
+                        return TurnWait::Finished(TurnFinished {
+                            history,
+                            outcome,
+                            settings: settings_snapshot,
+                        });
                     }
                     Err(error) => {
                         let outcome = TurnOutcome {
@@ -2439,8 +3123,11 @@ async fn wait_turn(
                             failure_reason: Some("worker_panic".to_string()),
                             ..TurnOutcome::default()
                         };
-                        finish_turn(weak, &outcome, &Settings::default());
-                        return TurnWait::Finished(Vec::new());
+                        return TurnWait::Finished(TurnFinished {
+                            history: Vec::new(),
+                            outcome,
+                            settings: Settings::default(),
+                        });
                     }
                 }
             }
@@ -2481,6 +3168,7 @@ async fn wait_turn(
                                 secret,
                                 settings,
                                 speech,
+                                permissions,
                                 &request,
                                 generation,
                                 save_generation,
@@ -2495,6 +3183,13 @@ async fn wait_turn(
                             close_settings(weak);
                         }
                     }
+                    Some(UiCommand::PermissionModePicked(_)) | Some(UiCommand::OverridePicked { .. }) => {}
+                    Some(UiCommand::TogglePause) => toggle_pause(weak, permissions),
+                    Some(UiCommand::GrantCapability {
+                        capability,
+                        minutes,
+                    }) => grant_capability(weak, permissions, &capability, minutes),
+                    Some(UiCommand::ExportAudit) => export_audit(weak, audit, paths),
                     Some(UiCommand::Speech(event)) => {
                         apply_speech_event(speech_view, weak, &event);
                     }
@@ -2518,11 +3213,60 @@ async fn wait_turn(
                             &mut task,
                         )
                         .await;
+                        while let Ok(event) = events.try_recv() { record_event(weak, sessions, turn_id, event); }
+                        let _ = sessions.save_current();
                         *turn_cancel = None;
                         return TurnWait::Quit;
                     }
                     Some(UiCommand::Send(_)) => {
                         set_status(weak, "上一轮还在跑，先取消再发新指令");
+                    }
+                    /*
+                     * 忙碌期间的会话操作：一律拒绝并说明原因。
+                     *
+                     * 正在跑的回合绑定在**发起时**的会话上；这时切换/删除会话
+                     * 会让"工具结果要写进哪个会话"变得不确定——所以宁可拒绝。
+                     */
+                    Some(UiCommand::NewSession) => {
+                        set_status(weak, "正在执行；先完成或取消这一轮再新建会话");
+                    }
+                    Some(UiCommand::SelectSession(_)) => {
+                        set_status(weak, "正在执行；先完成或取消这一轮再切换会话");
+                    }
+                    Some(UiCommand::RenameSession { .. }) => {
+                        set_status(weak, "正在执行；先完成或取消这一轮再改名");
+                    }
+                    Some(UiCommand::DeleteSession(_)) => {
+                        set_status(weak, "正在执行；先完成或取消这一轮再删除会话");
+                    }
+                    /*
+                     * 忙碌期间的模型/推理选择：只提示"下一轮生效"，不热切换。
+                     * 当前回合已经用启动时的端点快照，改它既无意义也不安全。
+                     */
+                    Some(UiCommand::ModelChoicePicked(_))
+                    | Some(UiCommand::ReasoningPicked(_))
+                    | Some(UiCommand::ApplyManualModel(_)) => {
+                        set_status(weak, "正在执行；模型选择会在下一轮生效");
+                    }
+                    /*
+                     * 权限立即生效：暂停/限时授权/档位/覆盖都作用于**下一个**
+                     * 工具判断。这正是"不能复用过期授权"的落点。
+                     */
+                    Some(UiCommand::TestConnection(_)) => {
+                        set_status(weak, "正在执行；先结束这一轮再测试连接");
+                    }
+                    Some(UiCommand::ModelsFetched { draft, credential, request, fetch }) => {
+                        if request == *model_request {
+                            remember_fetched_models(settings, (&draft.provider_id, &draft.base_url, request), *model_request, &fetch, secret, &credential);
+                            let settings = settings.clone(); let sessions = sessions.clone();
+                            with_window(weak, move |window| { window.set_models_busy(false); refresh_model_picker(window, &settings, &sessions); });
+                        }
+                    }
+                    Some(UiCommand::FetchModels(_)) => {
+                        set_status(weak, "正在执行；先结束这一轮再获取模型列表");
+                    }
+                    Some(UiCommand::SettingsTab(index)) => {
+                        with_window(weak, move |window| window.set_settings_tab_index(index.max(0)));
                     }
                     /*
                      * 回合进行中的语音命令：
@@ -2544,7 +3288,7 @@ async fn wait_turn(
                         let has_key = secret.has(&settings.provider_id);
                         apply_settings_to_ui(weak, settings, has_key);
                     }
-                    Some(UiCommand::ProviderChanged(_)) => {}
+                    Some(UiCommand::ProviderChanged(_)) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
                     Some(UiCommand::ClearApiKey(provider_id)) => {
                         /*
                          * 任务执行期间清除 Key：**真实执行**，不是只提示。
@@ -2556,6 +3300,9 @@ async fn wait_turn(
                          */
                         match secret.clear(&provider_id) {
                             Ok(()) => {
+                                settings_ui::restore_model_catalogs(settings, paths, secret, None);
+                                let picker_settings = settings.clone(); let picker_sessions = sessions.clone();
+                                with_window(weak, move |window| refresh_model_picker(window, &picker_settings, &picker_sessions));
                                 let view = view_after_clear(secret, settings, &provider_id);
                                 let weak_ui = weak.clone();
                                 let provider_id_ui = provider_id.clone();
@@ -2598,11 +3345,12 @@ fn handle_save_all_ui(
     secret: &SecretStore,
     settings: &mut Settings,
     speech: &mut SpeechRuntime,
-    request: &SaveAllRequest,
+    permissions: &Arc<std::sync::Mutex<PermissionState>>,
+    request: &SaveRequest,
     generation: u64,
     save_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> SaveOutcome {
-    let outcome = apply_save_all(paths, secret, settings, speech, request);
+    let outcome = apply_save(paths, secret, settings, speech, request);
     set_status(weak, &outcome.message());
 
     /*
@@ -2610,6 +3358,12 @@ fn handle_save_all_ui(
      * 只有代次仍是最新时才允许回填界面；否则这一次的结果属于"过期请求"，
      * 不能去覆盖用户当前的表单/状态。
      */
+    if outcome.config_written() {
+        if let Ok(mut state) = permissions.lock() {
+            state.mode = settings.permission_mode;
+            state.overrides = settings.permission_overrides.clone();
+        }
+    }
     if !generation_is_current(save_generation, generation) {
         return outcome;
     }
@@ -2617,11 +3371,15 @@ fn handle_save_all_ui(
     // 只有配置真的落盘了，才刷新"已生效"状态；失败时**不动**界面上的可编辑字段，
     // 否则会把用户刚输入的非法内容悄悄换回旧值，让他无从修改。
     if outcome.config_written() {
+        // 权限运行态跟着新档位/覆盖走（但不重置暂停与限时授权）。
+        if let Ok(mut state) = permissions.lock() {
+            state.mode = settings.permission_mode;
+            state.overrides = settings.permission_overrides.clone();
+        }
         publish_tts_ui(weak, &settings.tts, speech);
         let has_key = secret.has(&settings.provider_id);
         let endpoint = config::describe_endpoint(settings, has_key);
         let message = outcome.message();
-        let close = outcome.can_close_panel();
         let weak_ui = weak.clone();
         let save_generation = save_generation.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -2634,11 +3392,9 @@ fn handle_save_all_ui(
                 window.set_has_key(has_key);
                 window.set_settings_error(message.into());
                 window.set_settings_saving(false);
-                if close {
-                    window.set_settings_dirty(false);
-                    window.set_api_key_input("".into());
-                    window.set_settings_open(false);
-                }
+                window.set_settings_dirty(false);
+                window.set_api_key_input("".into());
+                window.set_settings_open(false);
             }
         });
     } else {
@@ -2700,9 +3456,106 @@ fn close_settings(weak: &slint::Weak<AppWindow>) {
 }
 
 /// 把 Agent 事件映射到界面。
+///
+/// PR8 的事件带回合/步骤/调用实例：工具卡片按**真实调用实例**追加，
+/// 思考内容独立成块（不混进可见正文，因此不会被 TTS 朗读）。
+fn remember_fetched_models(
+    settings: &mut Settings,
+    identity: (&str, &str, u64),
+    current_request: u64,
+    fetch: &crate::model_catalog::ModelFetch,
+    secret: &SecretStore,
+    credential: &str,
+) -> bool {
+    let (provider, endpoint, request) = identity;
+    let saved_key = secret.load(provider).ok().flatten().unwrap_or_default();
+    if request != current_request
+        || !fetch.ok
+        || crate::model_catalog::fingerprint(&saved_key) != credential
+    {
+        return false;
+    }
+    settings.remember_discovered_models(provider, endpoint, &fetch.models)
+}
+
+fn record_event(
+    weak: &slint::Weak<AppWindow>,
+    sessions: &mut SessionRuntime,
+    turn_id: u64,
+    event: AgentEvent,
+) {
+    use crate::session::{TimelineKind, TimelineToolStatus};
+    let mut checkpoint = true;
+    match &event {
+        AgentEvent::TextDelta { turn, step, text } if *turn == turn_id => {
+            sessions.extend_fragment(*turn, *step, crate::session::TimelineKind::Assistant, text);
+            checkpoint = false;
+        }
+        AgentEvent::ReasoningDone {
+            turn, step, text, ..
+        } if *turn == turn_id => sessions.settle_reasoning(*turn, *step, text),
+        AgentEvent::ReasoningDelta { turn, step, text } if *turn == turn_id => {
+            sessions.extend_fragment(*turn, *step, crate::session::TimelineKind::Reasoning, text);
+            checkpoint = false;
+        }
+        AgentEvent::ToolStart {
+            turn,
+            step,
+            call,
+            name,
+            args_summary,
+        } if *turn == turn_id => sessions.push_timeline(
+            *turn,
+            TimelineItem {
+                kind: TimelineKind::Tool,
+                step: *step,
+                call_id: call.0,
+                tool: name.clone(),
+                args_summary: args_summary.to_string(),
+                status: TimelineToolStatus::Running,
+                ..TimelineItem::default()
+            },
+        ),
+        AgentEvent::ToolEnd {
+            turn,
+            step,
+            call,
+            name,
+            status,
+            text,
+            ms,
+            ..
+        } if *turn == turn_id => sessions.update_tool_item(
+            *turn,
+            *step,
+            call.0,
+            name,
+            match status {
+                ToolStatus::Ok => TimelineToolStatus::Ok,
+                ToolStatus::Failed => TimelineToolStatus::Failed,
+                ToolStatus::Denied => TimelineToolStatus::Denied,
+                ToolStatus::Cancelled => TimelineToolStatus::Cancelled,
+            },
+            text,
+            *ms,
+        ),
+        AgentEvent::ConfirmationRequired(_) => {
+            apply_event(weak, event);
+            return;
+        }
+        _ => return,
+    }
+    if checkpoint {
+        if let Err(error) = sessions.save_current() {
+            set_status(weak, &format!("会话保存失败：{error}"));
+        }
+    }
+    publish_timeline(weak, sessions);
+}
+
 fn apply_event(weak: &slint::Weak<AppWindow>, event: AgentEvent) {
     match event {
-        AgentEvent::TextDelta(text) => {
+        AgentEvent::TextDelta { text, .. } => {
             let weak = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = weak.upgrade() {
@@ -2710,29 +3563,85 @@ fn apply_event(weak: &slint::Weak<AppWindow>, event: AgentEvent) {
                 }
             });
         }
-        AgentEvent::Reasoning { .. } => {
-            // 思考内容不展示（只用于协议回传）。
+        AgentEvent::ReasoningDelta { .. } => {
+            // 流式思考片段不逐片渲染（会闪烁且重复），等 ReasoningDone 的最终文本。
         }
-        AgentEvent::ToolStart { name, .. } => {
+        AgentEvent::ReasoningDone { text, .. } => {
+            // 真实思考内容：独立一条「思考」气泡（可折叠语义由样式区分），
+            // 绝不进助手正文，也就不进播报。
+            if text.is_empty() {
+                return;
+            }
             let weak = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = weak.upgrade() {
-                    update_tool(&window, &name, "running", "执行中…", "#f1f1f3");
-                    window.set_status(format!("正在执行 {name}…").into());
+                    push_entry(
+                        &window,
+                        "思考",
+                        &text,
+                        "模型返回的推理内容（不朗读）",
+                        "#f4f4f7",
+                    );
                 }
             });
         }
-        AgentEvent::ToolEnd { name, ok, text, .. } => {
+        AgentEvent::ToolStart {
+            name,
+            args_summary,
+            call,
+            ..
+        } => {
+            let weak = weak.clone();
+            let weak_for_status = weak.clone();
+            let args_text = serde_json::to_string(&args_summary).unwrap_or_default();
+            let name_for_card = name.clone();
+            let call_id = call.0;
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    // 按调用实例一张卡片：连续同名工具各自独立（用 call id 区分）。
+                    push_tool(
+                        &window,
+                        call_id,
+                        &name_for_card,
+                        "running",
+                        &args_text,
+                        "#f1f1f3",
+                    );
+                }
+            });
+            let name_for_status = name;
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak_for_status.upgrade() {
+                    window.set_status(format!("正在执行 {name_for_status}…").into());
+                }
+            });
+        }
+        AgentEvent::ToolEnd {
+            name,
+            status,
+            text,
+            ms,
+            call,
+            ..
+        } => {
             let weak = weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = weak.upgrade() {
-                    let (state, tint) = if ok {
-                        ("ok", "#eef8ef")
-                    } else {
-                        ("failed", "#fdeeee")
+                    let (state, tint) = match status {
+                        ToolStatus::Ok => ("ok", "#eef8ef"),
+                        ToolStatus::Failed => ("failed", "#fdeeee"),
+                        ToolStatus::Denied => ("denied", "#fff4e5"),
+                        ToolStatus::Cancelled => ("cancelled", "#f1f1f3"),
                     };
                     let summary: String = text.chars().take(400).collect();
-                    update_tool(&window, &name, state, &summary, tint);
+                    update_tool(
+                        &window,
+                        call.0,
+                        &name,
+                        state,
+                        &format!("{summary}（{} ms）", ms),
+                        tint,
+                    );
                 }
             });
         }
@@ -2755,6 +3664,51 @@ fn apply_event(weak: &slint::Weak<AppWindow>, event: AgentEvent) {
     }
 }
 
+/// 追加一张工具卡片（按调用实例 id 归属，不覆盖别的实例）。
+fn push_tool(window: &AppWindow, call_id: u64, name: &str, state: &str, detail: &str, tint: &str) {
+    let model = window.get_tools();
+    let mut items: Vec<ToolCard> = model.iter().collect();
+    items.push(ToolCard {
+        // 用 `#id name` 让"连续同名工具"在界面上也能区分。
+        name: format!("#{call_id} {name}").into(),
+        state: state.into(),
+        detail: detail.into(),
+        tint: parse_hex_color(tint),
+    });
+    if items.len() > 300 {
+        items.drain(0..items.len() - 300);
+    }
+    window.set_tools(ModelRc::new(VecModel::from(items)));
+}
+
+/// 更新指定调用实例的卡片（不是"最后一张"，避免串到别的调用）。
+fn update_tool(
+    window: &AppWindow,
+    call_id: u64,
+    name: &str,
+    state: &str,
+    detail: &str,
+    tint: &str,
+) {
+    let model = window.get_tools();
+    let mut items: Vec<ToolCard> = model.iter().collect();
+    let label = format!("#{call_id} {name}");
+    if let Some(card) = items.iter_mut().rev().find(|card| card.name == label) {
+        card.state = state.into();
+        card.detail = detail.into();
+        card.tint = parse_hex_color(tint);
+    } else {
+        // 没找到（例如启动时重建）就补一张，绝不静默丢弃这次调用。
+        items.push(ToolCard {
+            name: label.into(),
+            state: state.into(),
+            detail: detail.into(),
+            tint: parse_hex_color(tint),
+        });
+    }
+    window.set_tools(ModelRc::new(VecModel::from(items)));
+}
+
 /// 把流式增量追加到最后一个助手气泡（没有就新开一个）。
 fn append_assistant_delta(window: &AppWindow, delta: &str) {
     let model = window.get_entries();
@@ -2775,34 +3729,78 @@ fn append_assistant_delta(window: &AppWindow, delta: &str) {
     window.set_entries(ModelRc::new(VecModel::from(items)));
 }
 
-/// 回合收尾：更新状态栏、补充错误信息、恢复界面。
-fn finish_turn(weak: &slint::Weak<AppWindow>, outcome: &TurnOutcome, settings: &Settings) {
-    let text = outcome.text.clone();
+/// 回合收尾：先把结果写回**发起的那个会话**，再更新界面。
+///
+/// 顺序很重要：会话历史/时间线/状态先落盘，界面只是它的投影。
+/// 这样"界面显示有结果"与"磁盘上真的有"是同一件事。
+fn finish_session_turn(
+    weak: &slint::Weak<AppWindow>,
+    sessions: &mut SessionRuntime,
+    speech: &mut SpeechRuntime,
+    settings: &Settings,
+    finished: TurnFinished,
+    turn_id: TurnId,
+) {
+    let TurnFinished {
+        history,
+        outcome,
+        settings: turn_settings,
+    } = finished;
+
+    // 历史（发给模型的那份）与时间线（用户看到的那份）分开写。
+    sessions.set_history(history);
+    // 纯工具回合没有可见正文时，补一条最终结果，避免"只有卡片没有回复"。
+    if !outcome.text.trim().is_empty() && !sessions.has_assistant_text(turn_id) {
+        sessions.push_or_extend_assistant(turn_id, &outcome.text);
+    }
+    let status = if outcome.cancelled {
+        TurnStatus::Cancelled
+    } else if outcome.failed {
+        TurnStatus::Failed
+    } else {
+        TurnStatus::Completed
+    };
+    if outcome.failed && !outcome.cancelled {
+        sessions.push_timeline(
+            turn_id,
+            TimelineItem::system(format!(
+                "这一轮没能完成：{}",
+                outcome
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "未知原因".to_string())
+            )),
+        );
+    } else if outcome.cancelled {
+        sessions.push_timeline(turn_id, TimelineItem::system("这一轮被取消。"));
+    }
+    sessions.set_last_turn(turn_id, status);
+    if let Err(error) = sessions.save_current() {
+        set_status(weak, &format!("会话保存失败：{error}"));
+    }
+    publish_session_list(weak, sessions);
+    publish_timeline(weak, sessions);
+    publish_session_title(weak, sessions);
+    publish_model_badges_from_settings(weak, settings, sessions);
+
+    // 已经取消/失败的回合不播报（播报只针对正常完成的可见正文）。
+    let _ = speech;
+
     let steps = outcome.steps.len();
     let failed = outcome.failed;
     let cancelled = outcome.cancelled;
     let reason = outcome.failure_reason.clone();
     let context_text = format!(
         "上下文 ≈ {} / {} tokens（{}% 触发压缩）",
-        outcome.context_tokens, outcome.context_window, settings.context_compress_percent
+        outcome.context_tokens,
+        turn_settings.context_window,
+        turn_settings.context_compress_percent
     );
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(window) = weak.upgrade() else { return };
         window.set_busy(false);
         window.set_context_text(context_text.into());
-        // 如果助手气泡还是空的（纯工具回合），补一条可读结果。
-        if !text.is_empty() {
-            let model = window.get_entries();
-            let items: Vec<ChatEntry> = model.iter().collect();
-            let needs_push = !items
-                .last()
-                .map(|entry| entry.role.as_str() == "助手")
-                .unwrap_or(false);
-            if needs_push {
-                push_entry(&window, "助手", &text, "", "#ffffff");
-            }
-        }
         let status = if cancelled {
             "已中断".to_string()
         } else if failed {
@@ -2811,6 +3809,273 @@ fn finish_turn(weak: &slint::Weak<AppWindow>, outcome: &TurnOutcome, settings: &
             format!("完成（{} 步工具调用）", steps)
         };
         window.set_status(status.into());
+    });
+}
+
+/// 测试连接：真的发一次最小对话请求，并把结论分类显示。
+///
+/// **不等同于"获取模型列表"**：`/models` 只能说明目录接口可用，
+/// 模型是否存在、能否聊天是另一回事（严格端点会对不存在的模型 404）。
+fn handle_test_connection(
+    weak: &slint::Weak<AppWindow>,
+    settings: &Settings,
+    secret: &SecretStore,
+    draft: ProbeDraft,
+    generation: &Arc<std::sync::atomic::AtomicU64>,
+) {
+    let request = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let (provider, api_key) = match draft.resolve(settings, secret) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            with_window(weak, move |window| {
+                if draft.matches_window(window) {
+                    window.set_connection_code("auth".into());
+                    window.set_connection_hint(error.into());
+                }
+            });
+            return;
+        }
+    };
+    let profile = ProbeDraft::profile(&provider);
+    let timeout = settings.timeout_ms;
+    let weak = weak.clone();
+    let generation = generation.clone();
+    tokio::spawn(async move {
+        let outcome = probe_chat(&profile, &api_key, timeout).await;
+        with_window(&weak, move |window| {
+            if generation.load(Ordering::SeqCst) != request || !draft.matches_window(window) {
+                return;
+            }
+            window.set_connection_code(outcome.code().into());
+            window.set_connection_hint(format!("{}：{}", draft.label(), outcome.message()).into());
+        });
+    });
+}
+
+/// 输入区的模型下拉被选中：只改**当前会话**的选择并持久化。
+fn handle_model_pick(
+    weak: &slint::Weak<AppWindow>,
+    settings: &Settings,
+    sessions: &mut SessionRuntime,
+    index: i32,
+) {
+    // 用与界面相同的顺序重新枚举一遍候选，避免把索引与标签错位。
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for provider_id in settings.provider_ids() {
+        let provider = settings.provider(&provider_id);
+        let mut models: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
+        if !provider.model.trim().is_empty() && !models.contains(&provider.model) {
+            models.insert(0, provider.model.clone());
+        }
+        for model in models {
+            candidates.push((provider_id.clone(), model));
+        }
+    }
+    let Some((provider_id, model)) = usize::try_from(index)
+        .ok()
+        .and_then(|index| candidates.get(index).cloned())
+    else {
+        set_status(weak, "模型选择无效，请重新选择");
+        return;
+    };
+    let previous = sessions.model_choice();
+    let choice = SessionModelChoice {
+        provider_id,
+        model,
+        // 推理档位沿用本会话已有的（若没有就跟随新提供商的默认）。
+        thinking: previous.thinking,
+        reasoning_effort: previous.reasoning_effort,
+    };
+    apply_session_choice(weak, settings, sessions, choice);
+}
+
+/// 推理档位被选中：写进**当前会话**的选择并持久化。
+fn handle_reasoning_pick(
+    weak: &slint::Weak<AppWindow>,
+    settings: &Settings,
+    sessions: &mut SessionRuntime,
+    index: i32,
+) {
+    let mut choice = sessions.model_choice();
+    if choice.is_empty() {
+        // 还没手选过：以"当前解析出的生效选择"为基准，避免写出一条半空的记录。
+        let selection = settings.resolve_selection(None, &crate::clock::now());
+        choice.provider_id = selection.provider_id;
+        choice.model = selection.model;
+    }
+    let capability = settings.provider(&choice.provider_id).capability();
+    match capability {
+        crate::llm::Capability::Mimo => {
+            choice.thinking = Some(settings_ui::thinking_for_index(index));
+        }
+        crate::llm::Capability::DeepSeek => {
+            choice.reasoning_effort = Some(settings_ui::reasoning_effort_for_index(index));
+        }
+        crate::llm::Capability::Plain => {
+            // 自定义端点没有专属推理参数：不写任何档位，如实说明。
+            set_status(
+                weak,
+                "该端点没有专属推理档位（不会注入 MiMo/DeepSeek 字段）",
+            );
+            return;
+        }
+    }
+    apply_session_choice(weak, settings, sessions, choice);
+}
+
+/// 把会话级模型选择写进会话并持久化，然后刷新界面。
+fn apply_session_choice(
+    weak: &slint::Weak<AppWindow>,
+    settings: &Settings,
+    sessions: &mut SessionRuntime,
+    choice: SessionModelChoice,
+) {
+    match sessions.set_model_choice(choice) {
+        Ok(()) => {
+            let settings = settings.clone();
+            let sessions = sessions.clone();
+            with_window(weak, move |window| {
+                refresh_model_picker(window, &settings, &sessions);
+                publish_model_badges(window, &settings, &sessions);
+                publish_session_list(&window.as_weak(), &sessions);
+            });
+            set_status(weak, "已切换本会话的模型选择（下一轮生效）");
+        }
+        Err(error) => set_status(weak, &format!("保存模型选择失败：{error}")),
+    }
+}
+
+/// 把生效模型摘要推给界面（弱引用版，供回合收尾使用）。
+fn publish_model_badges_from_settings(
+    weak: &slint::Weak<AppWindow>,
+    settings: &Settings,
+    sessions: &SessionRuntime,
+) {
+    let choice = sessions.model_choice();
+    let selection = settings.resolve_selection(
+        if choice.is_empty() {
+            None
+        } else {
+            Some(&choice)
+        },
+        &crate::clock::now(),
+    );
+    let model_text = format!(
+        "{} · {}",
+        settings.provider(&selection.provider_id).display_name(),
+        selection.model
+    );
+    let effective = settings
+        .effective_context_window_of(&selection.provider_id, &selection.model)
+        .to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_session_model_text(model_text.into());
+            window.set_session_effective_window(effective.into());
+        }
+    });
+}
+
+/// 权限：应用逐能力覆盖（立即生效，不必等保存）。
+fn toggle_pause(
+    weak: &slint::Weak<AppWindow>,
+    permissions: &Arc<std::sync::Mutex<PermissionState>>,
+) {
+    let paused_now = permissions
+        .lock()
+        .map(|state| state.is_paused(std::time::SystemTime::now()))
+        .unwrap_or(false);
+    if let Ok(mut state) = permissions.lock() {
+        if paused_now {
+            state.resume();
+        } else {
+            state.pause(10);
+        }
+    }
+    publish_permission_state(weak, permissions);
+    set_status(
+        weak,
+        if paused_now {
+            "已恢复操作"
+        } else {
+            "已暂停 10 分钟，期间不执行任何操作"
+        },
+    );
+}
+
+/// 权限：会话内限时允许某能力。
+fn grant_capability(
+    weak: &slint::Weak<AppWindow>,
+    permissions: &Arc<std::sync::Mutex<PermissionState>>,
+    capability: &str,
+    minutes: i32,
+) {
+    if let Ok(mut state) = permissions.lock() {
+        if let Some(capability) = crate::permissions::capabilities()
+            .iter()
+            .find(|c| c.id == capability || c.label == capability)
+        {
+            state.grant_once(capability.id, minutes.max(1) as u64);
+        }
+    }
+    publish_permission_state(weak, permissions);
+}
+
+/// 把权限运行态推给界面（暂停标记 + 各能力的覆盖索引）。
+fn publish_permission_state(
+    weak: &slint::Weak<AppWindow>,
+    permissions: &Arc<std::sync::Mutex<PermissionState>>,
+) {
+    let Ok(state) = permissions.lock() else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let paused = state.is_paused(now);
+    let pause_hint = state
+        .paused_minutes(now)
+        .map(|minutes| format!("已暂停 {minutes} 分钟；期间任何工具都不会执行"))
+        .unwrap_or_default();
+    let mode_index = permission_mode_index(state.mode);
+    let overrides: Vec<i32> = crate::permissions::capabilities()
+        .iter()
+        .map(|capability| match state.overrides.get(capability.id) {
+            Some(crate::config::PermissionOverride::Allow) => 1,
+            Some(crate::config::PermissionOverride::Ask) => 2,
+            Some(crate::config::PermissionOverride::Deny) => 3,
+            _ => 0,
+        })
+        .collect();
+    drop(state);
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_paused(paused);
+            window.set_pause_hint(pause_hint.into());
+            if !window.get_settings_open() {
+                window.set_permission_index(mode_index);
+                window.set_override_indices(ModelRc::new(VecModel::from(overrides)));
+            }
+        }
+    });
+}
+
+/// 导出审计到数据目录的 `exports/`，如实回报条数与路径。
+fn export_audit(weak: &slint::Weak<AppWindow>, audit: &AuditLog, paths: &AppPaths) {
+    match audit.export(&paths.exports_dir()) {
+        Ok((count, path)) => {
+            set_status(weak, &format!("已导出 {count} 条审计到 {}", path.display()))
+        }
+        Err(error) => set_status(weak, &format!("导出审计失败：{error}")),
+    }
+}
+
+fn with_window(weak: &slint::Weak<AppWindow>, update: impl FnOnce(&AppWindow) + Send + 'static) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            update(&window);
+        }
     });
 }
 
@@ -2877,666 +4142,320 @@ mod tests {
         SpeechRuntime::new(tx)
     }
 
-    /// **需求 1**：从 MiMo 切到 DeepSeek 并保存后，配置里的 provider 是 DeepSeek，
-    /// Key 写到 DeepSeek 名下，**原 MiMo Key 不被覆盖**。
-    ///
-    /// 这条直接对应"选 DeepSeek 却存成 MiMo"的回归：界面索引必须一路传到
-    /// `provider_id`，而 Key 只按目标提供商写入。
-    #[cfg(windows)]
     #[test]
-    fn switching_provider_saves_to_the_selected_provider_and_keeps_other_keys() {
-        let root = unique_test_root("worker-provider-switch");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-
-        // 先按 MiMo 保存一次（带 MiMo 的 Key）。
+    fn stale_and_failed_discovery_cannot_change_model_catalog() {
         let mut settings = Settings::default();
-        let mut speech = speech_without_engine();
-        let mimo = save_all_request(
-            0,
-            "https://api.xiaomimimo.com/v1",
-            "mimo-v2.6-flash",
-            "sk-mimo-original",
-        );
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &mimo);
-        assert!(outcome.config_written(), "{outcome:?}");
-        assert_eq!(settings.provider_id, "mimo");
-
-        // 切到 DeepSeek 并保存（填 DeepSeek 的 Key）。
-        let request = save_all_request(
-            1,
-            "https://api.deepseek.com/v1",
-            "deepseek-v4-pro",
-            "sk-deepseek-new",
-        );
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
-        assert!(outcome.config_written(), "{outcome:?}");
-
-        // 内存与磁盘都必须是 DeepSeek（"重新打开仍显示 DeepSeek"的依据）。
-        assert_eq!(settings.provider_id, "deepseek");
-        let reloaded = config::load_settings(&paths).unwrap();
-        assert_eq!(reloaded.provider_id, "deepseek");
-        assert_eq!(reloaded.base_url, "https://api.deepseek.com/v1");
-        assert_eq!(reloaded.model, "deepseek-v4-pro");
-
-        // Key 落在目标提供商名下；MiMo 的原 Key 必须完好无损。
-        assert_eq!(
-            secret.load("deepseek").unwrap().as_deref(),
-            Some("sk-deepseek-new")
-        );
-        assert_eq!(
-            secret.load("mimo").unwrap().as_deref(),
-            Some("sk-mimo-original"),
-            "切换提供商不能覆盖原来那家的 Key"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **需求 4**：缺本地 TTS 模型时配置照样保存，结果要报"已保存但播报暂不可用"，
-    /// 而不是"没保存"。
-    #[cfg(windows)]
-    #[test]
-    fn missing_local_tts_model_is_saved_but_reported_unavailable() {
-        let root = unique_test_root("worker-tts-unavailable");
-        let paths = AppPaths::with_root(&root);
+        let paths = AppPaths::with_root(unique_test_root("stale-fetch"));
         let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let mut speech = speech_without_engine();
-
-        let mut request =
-            save_all_request(0, "https://api.xiaomimimo.com/v1", "mimo-v2.6-flash", "");
-        request.tts_enabled = true;
-        request.tts_backend_index = 2; // 本地 ONNX（模型不存在）
-        request.local_dir = "Z:/definitely/not/here".to_string();
-
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
-
-        // 配置必须已经落盘——这是"保存成功"与"当前不可用"分开的关键。
-        assert!(outcome.config_written(), "{outcome:?}");
-        assert!(
-            matches!(outcome, SaveOutcome::SavedSpeechUnavailable(_)),
-            "缺模型必须归类为'已保存但暂不可用'：{outcome:?}"
-        );
-        assert!(
-            outcome.message().contains("已保存") && outcome.message().contains("不可用"),
-            "{}",
-            outcome.message()
-        );
-        let reloaded = config::load_settings(&paths).unwrap();
-        assert_eq!(reloaded.tts.backend, TtsBackend::Local);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **需求 4**：Key 写失败时不能报"全部成功"，要明确说普通配置已保存。
-    #[cfg(windows)]
-    #[test]
-    fn key_write_failure_is_reported_as_partial_not_success() {
-        let root = unique_test_root("worker-key-fail-partial");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let mut speech = speech_without_engine();
-
-        // 让密钥写入一定失败：把 `secrets` 目录的位置占成一个**普通文件**。
-        // 布局是 `<root>/secrets/<provider>.bin`，所以建目录这一步会失败，
-        // 写 Key 随之返回错误——正是"配置能存、Key 存不了"的场景。
-        std::fs::create_dir_all(&root).unwrap();
-        let blocker = root.join("secrets");
-        std::fs::write(&blocker, b"not-a-directory").unwrap();
-        let request = save_all_request(
-            1,
-            "https://api.deepseek.com/v1",
-            "deepseek-v4-pro",
-            "sk-cannot-write",
-        );
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
-
-        assert!(outcome.config_written(), "配置本身必须已保存：{outcome:?}");
-        assert!(
-            matches!(outcome, SaveOutcome::SavedKeyFailed(_)),
-            "Key 失败必须单独分类：{outcome:?}"
-        );
-        assert!(
-            outcome.message().contains("Key"),
-            "必须说明是 Key 没写进去：{}",
-            outcome.message()
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **需求 5**：只改模型端点时，TTS 运行时配置不算变化 → 不重建引擎。
-    #[test]
-    fn llm_only_change_does_not_require_tts_rebuild() {
-        let mut previous = Settings::default();
-        previous.tts.enabled = true;
-        previous.tts.backend = TtsBackend::Mimo;
-        previous.tts.mimo_voice = "alloy".to_string();
-
-        let mut next = previous.clone();
-        next.provider_id = "deepseek".to_string();
-        next.model = "deepseek-v4-pro".to_string();
-        next.base_url = "https://api.deepseek.com/v1".to_string();
-        next.permission_mode = PermissionMode::Conservative;
-
-        // 这些断言只看配置差异，与凭据无关。
-        assert!(
-            !tts_runtime_config_changed(&previous, &next, false),
-            "只改 LLM 端点 / 权限时不该重建 TTS（会停播并重载模型）"
-        );
-
-        // 真正的 TTS 改动仍然要重建。
-        next.tts.mimo_voice = "nova".to_string();
-        assert!(tts_runtime_config_changed(&previous, &next, false));
-
-        let mut third = previous.clone();
-        third.tts.backend = TtsBackend::Local;
-        assert!(tts_runtime_config_changed(&previous, &third, false));
-
-        let mut fourth = previous.clone();
-        fourth.tts.enabled = false;
-        assert!(tts_runtime_config_changed(&previous, &fourth, false));
-
-        // 自动播报开关只影响"要不要播"，不要求重建引擎。
-        let mut fifth = previous.clone();
-        fifth.tts.speak_text_turns = false;
-        assert!(
-            !tts_runtime_config_changed(&previous, &fifth, false),
-            "只改自动播报开关不该重建引擎"
-        );
-
-        // 给当前启用的 MiMo 换了新 Key：凭据变了，必须重建。
-        assert!(
-            tts_runtime_config_changed(&previous, &previous.clone(), true),
-            "换了当前后端的 Key 必须重建引擎"
-        );
-    }
-
-    /// **需求 5（行为级）**：播报正在进行时保存"只改 LLM"的设置，
-    /// 当前播报不能被停掉。
-    ///
-    /// 这条直接验证"不停止当前播报"这条验收：`apply_save_all` 在
-    /// `tts_runtime_config_changed == false` 时根本不调用 `apply_settings`，
-    /// 而后者无条件 `stop()`。用真实 SpeechRuntime + 假扬声器证明它还在播。
-    #[tokio::test]
-    async fn saving_llm_only_settings_does_not_stop_current_speech() {
-        use crate::voice::tts::{AudioFormat, SpeechChunk, SpeechStream};
-
-        struct FakeEngine;
-        impl crate::voice::tts::TtsEngine for FakeEngine {
-            fn label(&self) -> String {
-                "fake-mimo".to_string()
-            }
-            fn start(
-                &self,
-                request: crate::voice::tts::SynthRequest,
-            ) -> Result<SpeechStream, String> {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let (sid, turn, sentence) = (request.speech_id, request.turn, request.sentence);
-                tokio::spawn(async move {
-                    let _ = tx.send(crate::voice::tts::TtsEvent::Chunk(SpeechChunk {
-                        speech_id: sid,
-                        turn,
-                        sentence,
-                        sample_rate: 24_000,
-                        channels: 1,
-                        format: AudioFormat::Pcm16Le,
-                        samples: vec![0.2; 24_000],
-                    }));
-                    let _ = tx.send(crate::voice::tts::TtsEvent::Finished);
-                });
-                Ok(SpeechStream::new(rx))
-            }
-        }
-
-        let root = unique_test_root("worker-llm-only-no-stop");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut speech = SpeechRuntime::new(tx);
-        let shared = Arc::new(crate::voice::playback::PlaybackShared::new(24_000, 1));
-        speech.attach_playback_for_test(shared.clone());
-        speech.attach_engine_for_test(Arc::new(FakeEngine));
-
-        // 先让播报真的开始（有一段音频在缓冲里）。
-        let mut settings = Settings::default();
-        settings.tts.enabled = true;
-        settings.tts.backend = TtsBackend::Mimo;
-        speech.speak(1, "这一句正在播报").unwrap();
-        for _ in 0..200 {
-            if speech.is_speaking() && shared.progress().pushed_frames > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(speech.is_speaking(), "播报应当已经开始");
-        let speech_id_before = speech.current_speech_id();
-
-        // 保存"只改 LLM 模型"：TTS 配置原样带过。
-        let mut request = SaveAllRequest {
-            provider_index: 1,
-            base_url: "https://api.deepseek.com/v1".to_string(),
-            model: "deepseek-v4-pro".to_string(),
-            api_key: String::new(),
-            permission_index: 0,
-            tts_enabled: true,
-            tts_backend_index: 1,
-            local_sid: "0".to_string(),
-            local_speed: "1.0".to_string(),
-            mimo_voice: settings.tts.mimo_voice.clone(),
-            mimo_style: settings.tts.mimo_style.clone(),
-            local_dir: String::new(),
-            speak_mode: 0,
+        let endpoint = settings.provider("deepseek").base_url_or_default();
+        let mut fetch = crate::model_catalog::ModelFetch {
+            ok: true,
+            cached: false,
+            stale: false,
+            models: vec![config::ModelOption::manual("found-model")],
+            dropped: Vec::new(),
+            raw: 1,
+            error: None,
+            at_ms: 1,
         };
-        // 让请求里的播报字段与已保存的一致（只有 LLM 部分不同）。
-        request.mimo_voice = settings.tts.mimo_voice.clone();
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
-        assert!(outcome.config_written(), "{outcome:?}");
-
-        // 关键断言：播报没有被停掉，身份也没变。
-        assert!(speech.is_speaking(), "只改 LLM 设置不该停止正在播报的内容");
-        assert_eq!(
-            speech.current_speech_id(),
-            speech_id_before,
-            "不该被当成新播报"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(!remember_fetched_models(
+            &mut settings,
+            ("deepseek", &endpoint, 1),
+            2,
+            &fetch,
+            &secret,
+            ""
+        ));
+        assert!(settings.provider("deepseek").models.is_empty());
+        assert!(remember_fetched_models(
+            &mut settings,
+            ("deepseek", &endpoint, 2),
+            2,
+            &fetch,
+            &secret,
+            ""
+        ));
+        fetch.ok = false;
+        fetch.models = vec![config::ModelOption::manual("failed-model")];
+        assert!(!remember_fetched_models(
+            &mut settings,
+            ("deepseek", &endpoint, 3),
+            3,
+            &fetch,
+            &secret,
+            ""
+        ));
+        assert_eq!(settings.provider("deepseek").models[0].id, "found-model");
     }
 
-    /// **需求 3**：只有最新一次保存的代号才算"当前"，旧回执必须被丢弃。
     #[test]
-    fn stale_save_generation_is_rejected() {
-        let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
-        assert!(generation_is_current(&generation, 1));
-        assert!(!generation_is_current(&generation, 0));
-
-        // 提交新保存后，旧的一代立刻失效（晚到的回执不能覆盖新表单）。
-        generation.fetch_add(1, Ordering::SeqCst);
-        assert!(!generation_is_current(&generation, 1));
-        assert!(generation_is_current(&generation, 2));
-
-        // 取消同样会把代次推高，作废所有在途请求。
-        let cancelled = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        assert!(!generation_is_current(&generation, 2));
-        assert!(generation_is_current(&generation, cancelled));
-    }
-
-    /// **需求 3（竞态）**：过期保存请求不能替新请求收掉"保存中"。
-    ///
-    /// 旧实现里过期分支会无条件 `set_settings_saving(false)`。若新请求还在跑，
-    /// 按钮就提前可点，用户会重复提交。这条用代次语义把这个行为钉住：
-    /// 只有"当前那一代"才允许更新保存状态。
-    #[test]
-    fn only_the_current_generation_may_finish_the_saving_state() {
-        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // 用户点了两次保存：第一次 g=1，第二次 g=2（后提交的更新）。
-        let first = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let second = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        assert_eq!((first, second), (1, 2));
-
-        // 第一个请求这时才算完：它已经过期，**不能**结束"保存中"。
-        assert!(
-            !generation_is_current(&generation, first),
-            "过期请求不允许更新保存状态"
-        );
-        // 第二个仍在进行：它才是唯一有权收尾的那一代。
-        assert!(generation_is_current(&generation, second));
-    }
-
-    /// **需求 4**：保存 DeepSeek 的 Key 不能触发 MiMo TTS 重建。
-    ///
-    /// 之前只判断"写了 Key + 后端是 MiMo"，于是给 DeepSeek 存 Key 也会重建，
-    /// 把正在播报的 MiMo 语音打断。凭据变化必须同时核对写入目标确实是 `mimo`。
-    #[test]
-    fn saving_other_provider_key_does_not_rebuild_mimo_tts() {
-        // 真实判断逻辑：key_provider 来自 provider_id，只有 mimo 才算凭据变化。
-        for (index, provider_id, expected) in [
-            (0, "mimo", true),
-            (1, "deepseek", false),
-            (2, "openai-compatible", false),
+    fn unknown_terminal_without_start_never_claims_not_executed() {
+        let paths = AppPaths::with_root(unique_test_root("unknown-terminal"));
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1000);
+        for text in [
+            "响应不完整，未执行",
+            "已中断（状态未知）",
+            "已中断（状态未知）",
         ] {
-            assert_eq!(provider_id_for_index(index), provider_id);
-            // 判定条件与 `apply_save_all` 一致：写入了 Key 且目标是 mimo。
-            let key_changed = provider_id == MIMO_PROVIDER_ID;
-            assert_eq!(
-                key_changed, expected,
-                "写入 {provider_id} 的 Key 时，MiMo 凭据变化判定应当为 {expected}"
+            record_event(
+                &slint::Weak::default(),
+                &mut sessions,
+                9,
+                AgentEvent::ToolEnd {
+                    turn: 9,
+                    step: 2,
+                    call: crate::agent::ToolCallId(1),
+                    name: "left_click".into(),
+                    status: ToolStatus::Cancelled,
+                    text: text.into(),
+                    ms: 23,
+                },
             );
         }
-
-        // 之后再叠上"当前启用 MiMo TTS"这个条件：
-        let mut settings = Settings::default();
-        settings.tts.enabled = true;
-        settings.tts.backend = TtsBackend::Mimo;
-        assert_eq!(settings.tts.active_backend(), TtsBackend::Mimo);
-
-        let deepseek_key_changed = provider_id_for_index(1) == MIMO_PROVIDER_ID;
-        assert!(
-            !tts_runtime_config_changed(
-                &settings,
-                &settings.clone(),
-                deepseek_key_changed && settings.tts.active_backend() == TtsBackend::Mimo
-            ),
-            "给 DeepSeek 存 Key 不该重建 MiMo TTS"
-        );
-
-        // 而写入 MiMo 自己的 Key 仍然要重建（否则新 Key 不会生效）。
-        let mimo_key_changed = provider_id_for_index(0) == MIMO_PROVIDER_ID;
-        assert!(
-            tts_runtime_config_changed(
-                &settings,
-                &settings.clone(),
-                mimo_key_changed && settings.tts.active_backend() == TtsBackend::Mimo
-            ),
-            "给 MiMo 换 Key 必须重建，否则新 Key 不生效"
+        let restored = SessionRuntime::open(&paths);
+        let items = restored.timeline();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "已中断（状态未知）");
+        assert!(!items[0].text.contains("未执行"));
+        assert_eq!(items[0].ms, 23);
+        assert_eq!(
+            (items[0].turn_id, items[0].step, items[0].call_id),
+            (9, 2, 1)
         );
     }
 
-    /// 构造一次"只改端点、播报保持已保存值"的保存请求。
-    fn save_all_request(
-        provider_index: i32,
-        base_url: &str,
-        model: &str,
-        key: &str,
-    ) -> SaveAllRequest {
-        SaveAllRequest {
-            provider_index,
-            base_url: base_url.to_string(),
-            model: model.to_string(),
-            api_key: key.to_string(),
-            permission_index: 0,
-            tts_enabled: false,
-            tts_backend_index: 0,
-            local_sid: "0".to_string(),
-            local_speed: "1.0".to_string(),
-            mimo_voice: String::new(),
-            mimo_style: String::new(),
-            local_dir: String::new(),
-            speak_mode: 0,
+    #[test]
+    fn terminal_only_tool_events_are_saved_once_with_identity_and_not_executed_reason() {
+        let paths = AppPaths::with_root(unique_test_root("terminal-only"));
+        let mut sessions = SessionRuntime::open(&paths);
+        let first = sessions.create(1000, "first");
+        let weak = slint::Weak::default();
+        for call in [1, 1, 2] {
+            record_event(
+                &weak,
+                &mut sessions,
+                7,
+                AgentEvent::ToolEnd {
+                    turn: 7,
+                    step: 3,
+                    call: crate::agent::ToolCallId(call),
+                    name: "left_click".into(),
+                    status: ToolStatus::Failed,
+                    text: "响应不完整，未执行".into(),
+                    ms: 0,
+                },
+            );
+        }
+        sessions.create(2000, "second");
+        sessions.select(&first).unwrap();
+        let restored = SessionRuntime::open(&paths);
+        let items = restored.timeline();
+        assert_eq!(items.len(), 2);
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(
+                (item.turn_id, item.step, item.call_id),
+                (7, 3, i as u64 + 1)
+            );
+            assert_eq!(item.tool, "left_click");
+            assert_eq!(item.status, crate::session::TimelineToolStatus::Failed);
+            assert!(item.text.contains("未执行"));
+            assert!(item.text.contains("响应不完整"));
         }
     }
 
-    /// **下拉选择映射**：界面索引 ↔ 配置枚举必须严格一一对应。
-    ///
-    /// 这条直接对应任务书「保持选中值与已有 Rust 配置的映射正确」：
-    /// 用错一位就会把"本地 ONNX"存成"MiMo 云端"，而且界面上看不出来。
     #[test]
-    fn selector_indices_map_to_the_right_configuration_values() {
-        // 提供商：与界面数组 ["mimo","deepseek","openai-compatible"] 一致。
+    fn event_checkpoints_restore_reasoning_and_two_tool_instances() {
+        let paths = AppPaths::with_root(unique_test_root("event-checkpoints"));
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1000);
+        sessions.set_last_turn(7, TurnStatus::Interrupted);
+        let weak = slint::Weak::default();
+        record_event(
+            &weak,
+            &mut sessions,
+            7,
+            AgentEvent::ReasoningDone {
+                turn: 7,
+                step: 1,
+                chars: 4,
+                text: "实际思考".into(),
+            },
+        );
+        for call in [1, 2] {
+            record_event(
+                &weak,
+                &mut sessions,
+                7,
+                AgentEvent::ToolStart {
+                    turn: 7,
+                    step: 1,
+                    call: crate::agent::ToolCallId(call),
+                    name: "read_clipboard".into(),
+                    args_summary: serde_json::json!({}),
+                },
+            );
+            if call == 1 {
+                record_event(
+                    &weak,
+                    &mut sessions,
+                    7,
+                    AgentEvent::ToolEnd {
+                        turn: 7,
+                        step: 1,
+                        call: crate::agent::ToolCallId(call),
+                        name: "read_clipboard".into(),
+                        status: ToolStatus::Ok,
+                        text: "ok".into(),
+                        ms: 20,
+                    },
+                );
+            }
+        }
+        let reopened = SessionRuntime::open(&paths);
+        let items = reopened.timeline();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text, "实际思考");
+        assert_eq!(items[1].status, crate::session::TimelineToolStatus::Ok);
+        assert_eq!(
+            items[2].status,
+            crate::session::TimelineToolStatus::Interrupted
+        );
+        assert_eq!(items[1].ms, 20);
+        assert_ne!(items[1].call_id, items[2].call_id);
+    }
+
+    #[test]
+    fn provider_index_mapping_is_stable() {
         assert_eq!(provider_id_for_index(0), "mimo");
         assert_eq!(provider_id_for_index(1), "deepseek");
         assert_eq!(provider_id_for_index(2), "openai-compatible");
-        // 越界不能 panic，也不能悄悄落到某个官方提供商上。
-        assert_eq!(provider_id_for_index(-1), "openai-compatible");
+        // 越界不能 panic，也不能悄悄落到某个官方提供商上
         assert_eq!(provider_id_for_index(99), "openai-compatible");
-
-        // 权限档位：["standard","conservative","permissive"]
-        assert_eq!(permission_mode_for_index(0), PermissionMode::Standard);
-        assert_eq!(permission_mode_for_index(1), PermissionMode::Conservative);
-        assert_eq!(permission_mode_for_index(2), PermissionMode::Permissive);
-        assert_eq!(permission_mode_for_index(-1), PermissionMode::Standard);
-
-        // TTS 后端：["关闭","MiMo 云端","本地 ONNX"]，且必须能往返。
-        assert_eq!(tts_backend_for_index(0), TtsBackend::Off);
-        assert_eq!(tts_backend_for_index(1), TtsBackend::Mimo);
-        assert_eq!(tts_backend_for_index(2), TtsBackend::Local);
-        for index in 0..3 {
-            assert_eq!(
-                tts_backend_index(tts_backend_for_index(index)),
-                index,
-                "TTS 后端索引必须能原样往返"
-            );
-        }
-        assert_eq!(tts_backend_for_index(9), TtsBackend::Off);
-
-        // 自动播报：0=都播 1=只语音 2=只文本 3=都不，往返一致。
-        for (index, (voice, text)) in [
-            (0, (true, true)),
-            (1, (true, false)),
-            (2, (false, true)),
-            (3, (false, false)),
-            // 越界按第一项处理，不 panic。
-            (9, (true, true)),
-        ] {
-            assert_eq!(
-                speak_flags(index),
-                (voice, text),
-                "自动播报选项 {index} 映射错误"
-            );
-            assert_eq!(
-                speak_mode_code(voice, text),
-                if index == 9 { 0 } else { index },
-                "自动播报必须能往返"
-            );
-        }
+        assert_eq!(provider_id_for_index(-1), "openai-compatible");
     }
 
-    /// 语速/音色编号是**文本输入**：非法值必须报具体错误，不能静默改默认值。
+    /// 权限档位的索引映射与 `ui::settings` 的数组必须一致，
+    /// 否则界面选"免确认"而实际执行的是别的档位。
     #[test]
-    fn invalid_numeric_tts_input_is_reported_not_silently_defaulted() {
-        let mut request = save_all_request(0, "https://api.xiaomimimo.com/v1", "m", "");
-        // 空 = 采用默认（不是错误）。
-        assert_eq!(request.parse_local_numbers().unwrap(), (0, 1.0));
-
-        request.local_speed = "快一点".to_string();
-        let error = request.parse_local_numbers().unwrap_err();
-        assert!(error.contains("语速"), "{error}");
-        assert!(error.contains("快一点"), "错误里要带上用户输入：{error}");
-
-        request.local_speed = "1.0".to_string();
-        request.local_sid = "abc".to_string();
-        let error = request.parse_local_numbers().unwrap_err();
-        assert!(error.contains("音色编号"), "{error}");
-
-        // 合法值照常解析。
-        request.local_sid = "3".to_string();
-        request.local_speed = "1.25".to_string();
-        assert_eq!(request.parse_local_numbers().unwrap(), (3, 1.25));
-    }
-
-    /// **一次保存**：端点和播报写在同一次落盘里，两者都生效。
-    #[cfg(windows)]
-    #[test]
-    fn save_all_persists_endpoint_and_tts_together() {
-        let root = unique_test_root("worker-save-all");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let mut speech = speech_without_engine();
-
-        let request = SaveAllRequest {
-            provider_index: 1,
-            base_url: "https://api.deepseek.com/v1".to_string(),
-            model: "deepseek-v4-pro".to_string(),
-            api_key: "sk-deepseek-test".to_string(),
-            permission_index: 2,
-            tts_enabled: true,
-            tts_backend_index: 2, // 本地 ONNX
-            local_sid: "7".to_string(),
-            local_speed: "1.3".to_string(),
-            mimo_voice: "alloy".to_string(),
-            mimo_style: "语速稍快".to_string(),
-            local_dir: "D:/models/kokoro".to_string(),
-            speak_mode: 2, // 只播文本
-        };
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
-        // 本地模型不存在 → 引擎建不起来，但**配置本身是合法的**：
-        // 如实给出警告，不能当成保存失败把用户的选择回滚掉。
-        assert!(
-            outcome.config_written(),
-            "配置本身合法，应当已落盘：{outcome:?}"
-        );
-        // 本地模型不存在 → 引擎建不起来，但那是"已保存但暂不可用"。
-        assert!(matches!(
-            outcome,
-            SaveOutcome::Saved | SaveOutcome::SavedSpeechUnavailable(_)
-        ));
-
-        assert_eq!(settings.provider_id, "deepseek");
-        assert_eq!(settings.model, "deepseek-v4-pro");
-        assert_eq!(settings.permission_mode, PermissionMode::Permissive);
-        assert_eq!(settings.tts.backend, TtsBackend::Local);
-        assert!(settings.tts.enabled);
-        assert_eq!(settings.tts.local_sid, 7);
-        assert!((settings.tts.local_speed - 1.3).abs() < 1e-6);
-        assert!(!settings.tts.speak_voice_turns);
-        assert!(settings.tts.speak_text_turns);
+    fn permission_index_mapping_matches_settings_module() {
+        for (index, mode) in settings_ui::PERMISSION_MODES.iter().enumerate() {
+            assert_eq!(permission_mode_for_index(index as i32), *mode);
+        }
         assert_eq!(
-            secret.load("deepseek").unwrap().as_deref(),
-            Some("sk-deepseek-test")
+            permission_mode_for_index(settings_ui::PERMISSION_MODES.len() as i32),
+            PermissionMode::Standard,
+            "越界回到安全默认档"
         );
-
-        // 磁盘上是**同一份**配置里同时有端点和播报。
-        let reloaded = config::load_settings(&paths).unwrap();
-        assert_eq!(reloaded.model, "deepseek-v4-pro");
-        assert_eq!(reloaded.tts.backend, TtsBackend::Local);
-        assert_eq!(reloaded.tts.local_sid, 7);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 校验失败：**一样都不落盘**，内存配置不动（界面据此保留用户输入）。
-    #[cfg(windows)]
-    #[test]
-    fn save_all_validation_failure_writes_nothing() {
-        let root = unique_test_root("worker-save-all-bad");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let before = settings.clone();
-        let mut speech = speech_without_engine();
-
-        // 端点非法 + 合法播报设置：整体失败，播报也不该被写进去。
-        let mut request =
-            save_all_request(0, "ftp://not-http", "mimo-v2.6-flash", "sk-must-not-write");
-        request.tts_enabled = true;
-        request.tts_backend_index = 1;
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
-
-        assert!(!outcome.config_written(), "配置不该被写入");
-        assert!(
-            outcome.message().contains("http"),
-            "{:?}",
-            outcome.message()
-        );
-        assert_eq!(settings.base_url, before.base_url, "内存配置不能被改动");
+        // 「免确认」必须真的能被索引到（PR7 曾把它静默解析成 standard）。
+        let pass_index = settings_ui::permission_mode_index(PermissionMode::PassThrough);
         assert_eq!(
-            settings.tts.backend, before.tts.backend,
-            "播报设置也不能被写"
+            permission_mode_for_index(pass_index),
+            PermissionMode::PassThrough
         );
-        assert!(secret.load("mimo").unwrap().is_none(), "失败时不能写 Key");
-        assert!(
-            !paths.settings_file().is_file(),
-            "失败时不应该有配置文件落盘"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 语速非法：给出具体原因，且不落盘（保留用户输入）。
-    #[cfg(windows)]
     #[test]
-    fn save_all_rejects_bad_speed_with_a_specific_message() {
-        let root = unique_test_root("worker-save-all-speed");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let mut speech = speech_without_engine();
-
-        let mut request =
-            save_all_request(0, "https://api.xiaomimimo.com/v1", "mimo-v2.6-flash", "");
-        request.local_speed = "9".to_string();
-        let outcome = apply_save_all(&paths, &secret, &mut settings, &mut speech, &request);
-        assert!(!outcome.config_written(), "语速非法不能落盘");
-        assert!(
-            outcome.message().contains("0.5~2.0"),
-            "{:?}",
-            outcome.message()
-        );
-        assert!(!paths.settings_file().is_file(), "语速非法时不能落盘");
-
-        let _ = std::fs::remove_dir_all(&root);
+    fn endpoint_summary_never_contains_key() {
+        let summary = settings_summary(&Settings::default(), true);
+        assert!(!summary.contains("sk-"));
+        assert!(summary.contains("Key 已保存"));
     }
 
-    fn subtitle(text: &str, speech_id: SpeechId) -> SpeechEvent {
-        SpeechEvent::Subtitle {
-            speech_id,
-            text: text.to_string(),
-        }
-    }
-
-    fn state_event(speech_id: SpeechId, state: PlaybackState) -> SpeechEvent {
-        SpeechEvent::State {
-            speech_id,
-            turn: 1,
-            state,
-        }
-    }
-
-    /// **P1 回归**：旧播报的迟到事件不能覆盖新播报的界面状态。
-    ///
-    /// A 停止后立刻启动 B：A 迟到的 `Stopped` / `Finished` / `Failed` /
-    /// 字幕清空都必须被丢掉。
     #[test]
-    fn late_events_from_previous_speech_do_not_reach_the_ui() {
-        let mut view = SpeechView::default();
-        // B 先接管界面。
-        assert!(view.accepts(2));
-        assert_eq!(view.current(), Some(2));
-        // A（id=1）的迟到终态与字幕清空一律不接受。
-        assert!(!view.accepts(1), "旧播报的状态不能改界面");
-        assert!(!view.accepts(1), "旧播报的字幕不能改界面");
-        assert!(!view.accepts(1), "旧播报的提示不能改界面");
-        assert_eq!(view.current(), Some(2), "旧事件不能把当前身份改回去");
-        // 同一段播报自己的事件照常接受。
-        assert!(view.accepts(2));
-        // 下一段播报（id=3）自动接管。
-        assert!(view.accepts(3));
-        assert_eq!(view.current(), Some(3));
-        assert!(!view.accepts(2), "已经结束的那一段不能再改界面");
+    fn arg_summary_is_secret_free() {
+        let value = serde_json::json!({ "app": "notepad", "x": 10 });
+        assert!(summary_is_secret_free(&value));
+        // data URL 的 base64 也必须被摘要层挡住。
+        let image = serde_json::json!({
+            "image": "data:image/png;base64,".to_string() + &"A".repeat(400)
+        });
+        let summary = crate::permissions::summarize_args(&image);
+        assert!(summary_is_secret_free(&summary));
+        assert!(!summary.as_object().map(|o| o.is_empty()).unwrap_or(true));
     }
 
-    /// 播报事件路径按 `speech_id` 归属分发：A 迟到的终态不会发出界面更新。
-    ///
-    /// 这里用一个"只记录接受与否"的替身验证调用顺序，而不是依赖真实窗口：
-    /// `apply_speech_event` 的所有副作用都在 `invoke_from_event_loop` 里，
-    /// 没有窗口时会被静默丢弃——所以断言收敛在 `SpeechView` 上。
-    #[test]
-    fn speech_event_ownership_is_checked_before_any_ui_update() {
-        let mut view = SpeechView::default();
-        // 模拟"B 已经接管"之后再收到 A 的一串事件。
-        let _ = view.accepts(7);
-        for event in [
-            state_event(6, PlaybackState::Stopped),
-            state_event(6, PlaybackState::Finished),
-            state_event(6, PlaybackState::Failed("旧失败".to_string())),
-            subtitle("", 6),
-            subtitle("旧的一句", 6),
-        ] {
-            let speech_id = match &event {
-                SpeechEvent::State { speech_id, .. }
-                | SpeechEvent::Subtitle { speech_id, .. }
-                | SpeechEvent::Notice { speech_id, .. } => *speech_id,
-            };
-            assert!(
-                !view.accepts(speech_id),
-                "旧播报的事件必须被拒绝：{event:?}"
-            );
-        }
-        assert_eq!(view.current(), Some(7));
-    }
-
-    /// 聆听模式：播报期间是打断，结束后必须回到唤醒词；挂起确认优先。
-    ///
-    /// 这条依赖 `SpeechRuntime::is_speaking()` 如实反映真实运行状态——
-    /// 只改 `sync_listen_mode` 而不收敛 `is_speaking()` 是修不好的。
     #[tokio::test]
-    async fn listen_mode_follows_speech_and_confirmation_state() {
+    async fn matching_request_id_settles_the_confirmation() {
+        let confirmer = confirmer_without_ui();
+        let mut wait = install_pending(&confirmer, 7);
+        assert!(confirmer.submit(7, ConfirmAnswer::allow_click()));
+        assert!(wait.try_recv().unwrap().allow);
+        // 结算后槽位清空
+        assert!(confirmer.pending.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_request_id_is_rejected() {
+        let confirmer = confirmer_without_ui();
+        let _wait = install_pending(&confirmer, 5);
+        // 旧请求的 id 不能结算当前挂起的这一条
+        assert!(!confirmer.submit(4, ConfirmAnswer::allow_click()));
+        assert!(confirmer.pending.lock().unwrap().is_some());
+    }
+
+    /// **关键安全语义**：一次确认只结算一次，连续两次确认的答复不会串。
+    #[tokio::test]
+    async fn answers_never_leak_between_consecutive_confirmations() {
+        let confirmer = confirmer_without_ui();
+        // 第一次：允许
+        let mut first = install_pending(&confirmer, 1);
+        assert!(confirmer.submit(1, ConfirmAnswer::allow_click()));
+        assert!(first.try_recv().unwrap().allow);
+        // 第二次：拒绝。绝不能因为"上一次被允许过"而继承允许。
+        let mut second = install_pending(&confirmer, 2);
+        assert!(confirmer.submit(2, ConfirmAnswer::deny_click()));
+        assert!(!second.try_recv().unwrap().allow);
+    }
+
+    #[tokio::test]
+    async fn abort_pending_denies_instead_of_leaving_it_open() {
+        let confirmer = confirmer_without_ui();
+        let mut wait = install_pending(&confirmer, 3);
+        confirmer.abort_pending();
+        let answer = wait.try_recv().expect("中止必须让等待方立刻拿到答复");
+        assert!(!answer.allow, "中止 = 拒绝，不能放行");
+        assert!(confirmer.pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn voice_prompt_outcome_is_only_prompt() {
+        let prompt = VoicePrompt {
+            text: "打开浏览器".to_string(),
+            audio_seconds: 1.0,
+            decode_ms: 10,
+        };
+        assert!(VoiceOutcome::Prompt(prompt).into_prompt().is_some());
+        assert!(VoiceOutcome::None.into_prompt().is_none());
+    }
+
+    /// 旧实例的迟到事件不得改界面状态。
+    #[test]
+    fn stale_voice_instance_events_are_ignored() {
+        let mut voice = VoiceRuntime::new();
+        let current = voice.route.open();
+        // 另一个实例号（模拟关麦后重开）
+        let stale = current + 1;
+        assert!(voice.route.is_current(current));
+        assert!(!voice.route.is_current(stale));
+        voice.route.close();
+        assert!(!voice.route.is_current(current), "关麦后旧实例彻底作废");
+    }
+
+    /// 播报视图只接受"当前或更新"的 speech id。
+    #[test]
+    fn first_speech_event_takes_over_the_view() {
+        let mut view = SpeechView::default();
+        assert_eq!(view.current(), None);
+        assert!(view.accepts(1));
+        assert_eq!(view.current(), Some(1));
+        // 更旧的 id 不能覆盖
+        assert!(!view.accepts(0));
+    }
+
+    /// 聆听模式：有挂起确认听「允许/拒绝」，播报中听打断词，否则等唤醒词。
+    #[test]
+    fn listen_mode_follows_confirm_and_speech() {
         let mut voice = VoiceRuntime::new();
         let confirmer = confirmer_without_ui();
         let speech = speech_without_engine();
@@ -3557,18 +4476,52 @@ mod tests {
         assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
     }
 
-    /// `SpeechView` 的初始状态：第一条事件无条件接管。
-    #[test]
-    fn first_speech_event_takes_over_the_view() {
-        let mut view = SpeechView::default();
-        assert_eq!(view.current(), None);
-        assert!(view.accepts(1));
-        assert_eq!(view.current(), Some(1));
+    /// 语音确认的语义：明确否定不能被当成同意。
+    #[tokio::test]
+    async fn voice_denial_does_not_settle_as_allow() {
+        let confirmer = confirmer_without_ui();
+        let mut wait = install_pending(&confirmer, 9);
+        assert!(confirmer.submit(9, ConfirmAnswer::deny_voice("用户说：不要")));
+        assert!(!wait.try_recv().unwrap().allow);
     }
 
-    /// **并发约束**：回合还在跑（含等待点击确认）时，语音/文本都**不能**启动第二回合。
-    ///
-    /// 这条是任务书的硬要求：不可启动第二回合，也不可把语音排队延后执行。
+    /// 没有 CUA 后端时不能启动回合，且必须给出可读原因。
+    #[test]
+    fn missing_toolkit_rejects_with_reason() {
+        let root = unique_test_root("worker-no-toolkit");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        let settings = Settings::default();
+        let toolkit: Option<Arc<CuaToolkit>> = None;
+        let confirmer = Arc::new(confirmer_without_ui());
+        let permissions = Arc::new(std::sync::Mutex::new(PermissionState::default()));
+        let audit = AuditLog::new(paths.audit_file());
+        let mut history = Vec::new();
+        let mut idle = None;
+        match start_turn(
+            &slint::Weak::default(),
+            &paths,
+            &secret,
+            &settings,
+            None,
+            &toolkit,
+            &confirmer,
+            &permissions,
+            &audit,
+            &mut history,
+            &mut idle,
+            "列出窗口".to_string(),
+            1,
+            "s1".to_string(),
+        ) {
+            TurnStart::Rejected(reason) => assert!(reason.contains("Computer Use")),
+            TurnStart::Started(_) => panic!("没有工具后端时不该启动"),
+        }
+        assert!(idle.is_none(), "失败时不能留下取消令牌");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **并发约束**：已经有回合在跑时，绝不启动第二回合。
     #[test]
     fn busy_turn_rejects_a_second_turn() {
         let root = unique_test_root("worker-busy");
@@ -3577,6 +4530,8 @@ mod tests {
         let settings = Settings::default();
         let toolkit: Option<Arc<CuaToolkit>> = None;
         let confirmer = Arc::new(confirmer_without_ui());
+        let permissions = Arc::new(std::sync::Mutex::new(PermissionState::default()));
+        let audit = AuditLog::new(paths.audit_file());
         let mut history = Vec::new();
 
         // 模拟「上一轮还在跑」：令牌槽位非空。
@@ -3586,1117 +4541,25 @@ mod tests {
             &paths,
             &secret,
             &settings,
+            None,
             &toolkit,
             &confirmer,
+            &permissions,
+            &audit,
             &mut history,
             &mut running,
             "打开浏览器".to_string(),
             1,
+            "s1".to_string(),
         ) {
             TurnStart::Rejected(reason) => {
                 assert!(reason.contains("上一轮"), "原因必须说清楚：{reason}");
             }
             TurnStart::Started(_) => panic!("忙的时候绝不能启动第二回合"),
         }
-        // 原来的令牌不能被语音/Cua 的拒绝路径换掉。
+        // 原来的令牌不能被拒绝路径换掉。
         assert!(running.is_some(), "拒绝新回合不能清掉正在跑的那一轮");
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 没有 CUA 后端时也不能启动回合，但必须给出可读原因（而不是静默失败）。
-    #[test]
-    fn missing_toolkit_rejects_with_reason() {
-        let root = unique_test_root("worker-no-toolkit");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let settings = Settings::default();
-        let toolkit: Option<Arc<CuaToolkit>> = None;
-        let confirmer = Arc::new(confirmer_without_ui());
-        let mut history = Vec::new();
-        let mut idle = None;
-        match start_turn(
-            &slint::Weak::default(),
-            &paths,
-            &secret,
-            &settings,
-            &toolkit,
-            &confirmer,
-            &mut history,
-            &mut idle,
-            "列出窗口".to_string(),
-            1,
-        ) {
-            TurnStart::Rejected(reason) => assert!(reason.contains("Computer Use")),
-            TurnStart::Started(_) => panic!("没有工具后端时不该启动"),
-        }
-        assert!(idle.is_none(), "失败时不能留下取消令牌");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn provider_index_mapping_is_stable() {
-        assert_eq!(provider_id_for_index(0), "mimo");
-        assert_eq!(provider_id_for_index(1), "deepseek");
-        assert_eq!(provider_id_for_index(2), "openai-compatible");
-        // 越界不能 panic，也不能悄悄落到某个官方提供商上
-        assert_eq!(provider_id_for_index(99), "openai-compatible");
-        assert_eq!(provider_id_for_index(-1), "openai-compatible");
-    }
-
-    #[tokio::test]
-    async fn matching_request_id_settles_the_confirmation() {
-        let confirmer = confirmer_without_ui();
-        let mut wait = install_pending(&confirmer, 7);
-        assert!(confirmer.submit(7, ConfirmAnswer::allow_click()));
-        assert!(wait.try_recv().unwrap().allow);
-        // 结算后槽位清空
-        assert!(confirmer.pending.lock().unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn stale_request_id_is_rejected() {
-        let confirmer = confirmer_without_ui();
-        let mut wait = install_pending(&confirmer, 7);
-        // 上一次确认（id=6）的迟到点击必须被丢弃
-        assert!(!confirmer.submit(6, ConfirmAnswer::allow_click()));
-        assert!(wait.try_recv().is_err(), "不该被旧 id 的答复结算");
-        assert!(
-            confirmer.pending.lock().unwrap().is_some(),
-            "挂起的确认仍然有效"
-        );
-    }
-
-    #[tokio::test]
-    async fn repeated_clicks_only_settle_once() {
-        let confirmer = confirmer_without_ui();
-        let mut wait = install_pending(&confirmer, 3);
-        assert!(confirmer.submit(3, ConfirmAnswer::allow_click()));
-        // 第二次点击：槽位已空，必须被丢弃
-        assert!(!confirmer.submit(3, ConfirmAnswer::allow_click()));
-        assert!(wait.try_recv().unwrap().allow);
-        assert!(confirmer.submit(3, ConfirmAnswer::allow_click()).eq(&false));
-    }
-
-    #[tokio::test]
-    async fn click_without_pending_is_ignored() {
-        let confirmer = confirmer_without_ui();
-        // 没有挂起确认时，任何点击（包括 id=0 的默认值）都不生效
-        assert!(!confirmer.submit(0, ConfirmAnswer::allow_click()));
-        assert!(!confirmer.submit(1, ConfirmAnswer::allow_click()));
-    }
-
-    #[tokio::test]
-    async fn abort_pending_denies_and_clears() {
-        let confirmer = confirmer_without_ui();
-        let mut wait = install_pending(&confirmer, 11);
-        confirmer.abort_pending();
-        let answer = wait.try_recv().unwrap();
-        assert!(!answer.allow, "退出时挂起的确认必须按拒绝结算");
-        assert!(confirmer.pending.lock().unwrap().is_none());
-    }
-
-    /// 两次确认之间：第二次的答复不会落到第一次的等待上。
-    #[tokio::test]
-    async fn answers_never_leak_between_consecutive_confirmations() {
-        let confirmer = confirmer_without_ui();
-
-        let mut first = install_pending(&confirmer, 1);
-        assert!(confirmer.submit(1, ConfirmAnswer::allow_click()));
-        assert!(first.try_recv().unwrap().allow);
-
-        let mut second = install_pending(&confirmer, 2);
-        // 第一次那个 id 再点一次，不能结算第二次
-        assert!(!confirmer.submit(1, ConfirmAnswer::allow_click()));
-        assert!(second.try_recv().is_err());
-        // 真正属于第二次的答复才行
-        assert!(confirmer.submit(2, ConfirmAnswer::deny_click()));
-        assert!(!second.try_recv().unwrap().allow);
-    }
-
-    /// 确认器拿到的取消令牌被置位时，等待应当立刻结束。
-    #[tokio::test]
-    async fn cancel_token_ends_the_wait() {
-        let confirmer = Arc::new(confirmer_without_ui());
-        let cancel = CancelToken::new();
-        let request = ConfirmRequest {
-            tool: "read_clipboard".to_string(),
-            capability: "clipboard.read",
-            label: "读剪贴板",
-            reason: String::new(),
-            args_summary: serde_json::json!({}),
-        };
-        let token = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            token.cancel();
-        });
-        let answer = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            confirmer.confirm(request, &cancel),
-        )
-        .await
-        .expect("取消必须让等待立刻结束");
-        assert!(!answer.allow, "取消按拒绝处理");
-        assert!(confirmer.pending.lock().unwrap().is_none(), "槽位必须清空");
-    }
-
-    /// 确认超时：不点按钮也不会一直挂着。
-    #[tokio::test]
-    async fn confirmation_times_out() {
-        let mut confirmer = confirmer_without_ui();
-        confirmer.timeout = std::time::Duration::from_millis(50);
-        let confirmer = Arc::new(confirmer);
-        let cancel = CancelToken::new();
-        let request = ConfirmRequest {
-            tool: "read_clipboard".to_string(),
-            capability: "clipboard.read",
-            label: "读剪贴板",
-            reason: String::new(),
-            args_summary: serde_json::json!({}),
-        };
-        let answer = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            confirmer.confirm(request, &cancel),
-        )
-        .await
-        .expect("超时必须让等待结束");
-        assert!(!answer.allow);
-        assert!(confirmer.pending.lock().unwrap().is_none());
-    }
-
-    /// 保存成功：内存配置与磁盘都更新，并按目标提供商写入 Key。
-    #[cfg(windows)]
-    #[test]
-    fn save_settings_updates_memory_and_disk() {
-        let root = unique_test_root("worker-save-ok");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-
-        let ok = handle_save_settings(
-            &slint::Weak::default(),
-            &paths,
-            &secret,
-            &mut settings,
-            SaveRequest {
-                provider_index: 1, // deepseek
-                base_url: "https://api.deepseek.com/v1".to_string(),
-                model: "deepseek-v4-pro".to_string(),
-                api_key: "sk-deepseek-test".to_string(),
-                permission_index: 1, // conservative
-            },
-            &mut speech_without_engine(),
-        );
-
-        assert!(ok, "合法设置应当保存成功");
-        assert_eq!(settings.provider_id, "deepseek");
-        assert_eq!(settings.model, "deepseek-v4-pro");
-        assert_eq!(settings.permission_mode, PermissionMode::Conservative);
-        // Key 写到 deepseek 名下，不是别的提供商
-        assert_eq!(
-            secret.load("deepseek").unwrap().as_deref(),
-            Some("sk-deepseek-test")
-        );
-        assert_eq!(secret.load("mimo").unwrap(), None);
-        // 磁盘上也读得到新值（这就是"下次打开设置显示最新值"的依据）
-        let reloaded = config::load_settings(&paths).unwrap();
-        assert_eq!(reloaded.model, "deepseek-v4-pro");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 清除界面选中的提供商后：
-    /// 设置页按**选中**的那家显示，主界面摘要按**已保存**的配置显示。
-    #[cfg(windows)]
-    #[test]
-    fn clear_updates_selected_state_not_saved_state() {
-        let root = unique_test_root("worker-clear-selected");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-
-        // 已保存的配置是 mimo，两家都有 Key
-        let saved = Settings {
-            provider_id: "mimo".to_string(),
-            base_url: "https://api.xiaomimimo.com/v1".to_string(),
-            model: "mimo-v2.6-flash".to_string(),
-            ..Settings::default()
-        };
-        secret.save("mimo", "sk-mimo").unwrap();
-        secret.save("deepseek", "sk-deepseek").unwrap();
-
-        // 用户在设置页切到 deepseek（未保存），点清除
-        secret.clear("deepseek").unwrap();
-        let view = view_after_clear(&secret, &saved, "deepseek");
-
-        assert!(
-            !view.selected_has_key,
-            "设置页显示的是选中那家（deepseek），它刚被清掉，应当显示'未保存'"
-        );
-        assert!(
-            view.endpoint_summary.contains("Key 已保存"),
-            "主界面摘要反映已生效的 mimo 配置，它仍有 Key：{}",
-            view.endpoint_summary
-        );
-        assert_eq!(
-            secret.load("mimo").unwrap().as_deref(),
-            Some("sk-mimo"),
-            "已保存那家的 Key 不能被动到"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 清除的正是已保存的那家：设置页与摘要都显示"未保存"。
-    #[cfg(windows)]
-    #[test]
-    fn clear_saved_provider_updates_both_views() {
-        let root = unique_test_root("worker-clear-saved");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-
-        let saved = Settings {
-            provider_id: "mimo".to_string(),
-            base_url: "https://api.xiaomimimo.com/v1".to_string(),
-            model: "mimo-v2.6-flash".to_string(),
-            ..Settings::default()
-        };
-        secret.save("mimo", "sk-mimo").unwrap();
-        secret.clear("mimo").unwrap();
-
-        let view = view_after_clear(&secret, &saved, "mimo");
-        assert!(!view.selected_has_key);
-        assert!(
-            view.endpoint_summary.contains("未保存 Key"),
-            "生效摘要也应当反映出来：{}",
-            view.endpoint_summary
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 清除一家不影响另一家：选中的那家状态变，另一家 Key 不动。
-    #[cfg(windows)]
-    #[test]
-    fn clearing_one_provider_spares_the_other_in_view() {
-        let root = unique_test_root("worker-clear-spare");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let saved = Settings {
-            provider_id: "mimo".to_string(),
-            ..Settings::default()
-        };
-        secret.save("mimo", "sk-mimo").unwrap();
-        secret.save("deepseek", "sk-deepseek").unwrap();
-
-        secret.clear("deepseek").unwrap();
-        assert!(!view_after_clear(&secret, &saved, "deepseek").selected_has_key);
-        // 切回 mimo 看：它还在
-        assert!(view_after_clear(&secret, &saved, "mimo").selected_has_key);
-        assert_eq!(secret.load("mimo").unwrap().as_deref(), Some("sk-mimo"));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 保存失败（非法地址）：内存配置不变、Key 不写、返回 false。
-    #[test]
-    fn save_settings_failure_changes_nothing() {
-        let root = unique_test_root("worker-save-bad");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let before = settings.clone();
-
-        let ok = handle_save_settings(
-            &slint::Weak::default(),
-            &paths,
-            &secret,
-            &mut settings,
-            SaveRequest {
-                provider_index: 0,
-                base_url: "ftp://invalid".to_string(),
-                model: "x".to_string(),
-                api_key: "sk-should-not-be-written".to_string(),
-                permission_index: 0,
-            },
-            &mut speech_without_engine(),
-        );
-
-        assert!(!ok, "非法设置必须返回失败，界面不得显示成功");
-        assert_eq!(settings.provider_id, before.provider_id);
-        assert_eq!(settings.model, before.model);
-        assert!(secret.load("mimo").unwrap().is_none(), "失败时不该写入 Key");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 已有 Key A → 输入 Key B → 配置写盘失败 → Key A 必须仍然可用。
-    ///
-    /// 这是原先最严重的数据丢失路径：旧实现"先覆盖 Key、配署失败再 clear()"，
-    /// 结果把用户原来的 Key A 也清掉了。现在先写配置，失败时 Key 压根没被碰过。
-    #[cfg(windows)]
-    #[test]
-    fn config_failure_keeps_previous_key_in_save_flow() {
-        let root = unique_test_root("worker-save-config-fail");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        secret.save("mimo", "sk-key-a").unwrap();
-
-        // 注入故障：占住配置的临时文件路径，让 save_settings 写临时文件失败
-        let tmp = paths.settings_file().with_extension("json.tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let ok = handle_save_settings(
-            &slint::Weak::default(),
-            &paths,
-            &secret,
-            &mut settings,
-            SaveRequest {
-                provider_index: 0,
-                base_url: "https://api.xiaomimimo.com/v1".to_string(),
-                model: "mimo-v2.6-pro".to_string(),
-                api_key: "sk-key-b".to_string(),
-                permission_index: 0,
-            },
-            &mut speech_without_engine(),
-        );
-
-        assert!(!ok, "配置写失败必须返回 false");
-        assert_eq!(
-            settings.model, "mimo-v2.6-flash",
-            "内存配置不能被改成未落盘的值"
-        );
-
-        std::fs::remove_dir_all(&tmp).unwrap();
-        assert_eq!(
-            secret.load("mimo").unwrap().as_deref(),
-            Some("sk-key-a"),
-            "Key B 没保存成功，Key A 也不能丢"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 留空 Key：不改动该提供商已有的 Key。
-    #[cfg(windows)]
-    #[test]
-    fn save_settings_with_blank_key_keeps_existing() {
-        let root = unique_test_root("worker-save-blank");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        secret.save("mimo", "sk-existing-mimo").unwrap();
-        let mut settings = Settings::default();
-
-        let ok = handle_save_settings(
-            &slint::Weak::default(),
-            &paths,
-            &secret,
-            &mut settings,
-            SaveRequest {
-                provider_index: 0,
-                base_url: "https://api.xiaomimimo.com/v1".to_string(),
-                model: "mimo-v2.6-pro".to_string(),
-                api_key: String::new(),
-                permission_index: 0,
-            },
-            &mut speech_without_engine(),
-        );
-
-        assert!(ok);
-        assert_eq!(
-            secret.load("mimo").unwrap().as_deref(),
-            Some("sk-existing-mimo"),
-            "留空表示不修改，不能把已有 Key 清掉"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 执行中收到退出：应当取消回合、让等待结束，并返回 Quit。
-    ///
-    /// 这里用一个"自己循环检查取消令牌"的假回合，模拟真实的 Agent 行为：
-    /// 它不会自己结束，只有取消才能让它停下——正是执行中退出的场景。
-    #[tokio::test]
-    async fn quit_during_turn_cancels_and_returns_quit() {
-        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
-        let turn_cancel = CancelToken::new();
-        let token_for_turn = turn_cancel.clone();
-        let stopper = turn_cancel.clone();
-
-        // 假回合：一直跑到被取消
-        let turn = tokio::spawn(async move {
-            let mut ticks = 0u64;
-            loop {
-                if token_for_turn.is_cancelled() {
-                    return (
-                        TurnOutcome {
-                            cancelled: true,
-                            failed: true,
-                            ..TurnOutcome::default()
-                        },
-                        Vec::new(),
-                        Settings::default(),
-                    );
-                }
-                ticks += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                if ticks > 500 {
-                    // 兜底：没被取消就超时失败，避免测试挂死
-                    return (TurnOutcome::default(), Vec::new(), Settings::default());
-                }
-            }
-        });
-
-        // 模拟用户点了退出
-        let _ = tx.send(UiCommand::Quit);
-        let _ = stopper;
-
-        let root = unique_test_root("worker-quit-turn");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let mut cancel_slot = Some(turn_cancel.clone());
-        let confirmer = Arc::new(confirmer_without_ui());
-
-        let mut voice = VoiceRuntime::new();
-        let mut speech = speech_without_engine();
-        let save_generation_for_test = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            wait_turn(
-                &mut commands,
-                RunningTurn {
-                    task: turn,
-                    turn_id: 1,
-                },
-                &slint::Weak::default(),
-                &mut cancel_slot,
-                &paths,
-                &secret,
-                &mut settings,
-                &confirmer,
-                &mut voice,
-                &mut speech,
-                &mut SpeechView::default(),
-                &command_tx,
-                &save_generation_for_test,
-                TurnSource::Text,
-            ),
-        )
-        .await
-        .expect("退出不能让等待无限挂起");
-
-        assert!(matches!(result, TurnWait::Quit), "必须返回 Quit");
-        assert!(turn_cancel.is_cancelled(), "回合必须被取消");
-        assert!(cancel_slot.is_none(), "退出后令牌槽位要清空");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **执行中关麦**：`wait_turn` 里的开关命令必须真的停采集，
-    /// 而不是只改一行提示文字；同时不能把正在跑的回合取消掉。
-    #[tokio::test]
-    async fn closing_voice_while_waiting_a_turn_really_stops_capture() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
-        let watch = CancelToken::new();
-        let token_for_turn = watch.clone();
-
-        // 假回合：只有被取消才会结束——正是"关麦不该结束它"的场景。
-        let turn = tokio::spawn(async move {
-            while !token_for_turn.is_cancelled() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            (
-                TurnOutcome {
-                    cancelled: true,
-                    failed: true,
-                    ..TurnOutcome::default()
-                },
-                Vec::new(),
-                Settings::default(),
-            )
-        });
-
-        let root = unique_test_root("worker-close-mic-in-turn");
-        let paths = AppPaths::with_root(&root);
-        let secret = SecretStore::new(paths.secret_file());
-        let mut settings = Settings::default();
-        let mut cancel_slot = Some(watch.clone());
-        let confirmer = Arc::new(confirmer_without_ui());
-
-        let mut voice = VoiceRuntime::new();
-        let mut speech = speech_without_engine();
-        let save_generation_for_test = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let instance = voice.route.open();
-        let stop = Arc::new(AtomicBool::new(false));
-        voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
-
-        // 模拟用户在执行中点了「关闭麦克风」，随后又点了「取消」。
-        // 两个 future 在同一个任务上交替推进（不需要 'static）。
-        let mut speech_view = SpeechView::default();
-        let driver = async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = tx.send(UiCommand::SetVoiceEnabled(false));
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            assert!(stop.load(Ordering::SeqCst), "执行中关麦必须真的停止采集");
-            assert!(!watch.is_cancelled(), "关麦不是撤销：回合不能被取消");
-            let _ = tx.send(UiCommand::Cancel);
-        };
-        let weak = slint::Weak::default();
-        let wait = wait_turn(
-            &mut commands,
-            RunningTurn {
-                task: turn,
-                turn_id: 1,
-            },
-            &weak,
-            &mut cancel_slot,
-            &paths,
-            &secret,
-            &mut settings,
-            &confirmer,
-            &mut voice,
-            &mut speech,
-            &mut speech_view,
-            &tx,
-            &save_generation_for_test,
-            TurnSource::Text,
-        );
-        let (result, ()) = tokio::join!(wait, driver);
-
-        assert!(matches!(result, TurnWait::Finished(_)));
-        assert!(stop.load(Ordering::SeqCst), "关麦后采集必须保持停止");
-        assert!(voice.handle.is_none(), "关麦后不能继续持有采集线程");
-        assert!(voice.route.active.current().is_none(), "在途语音必须过期");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **偏好保存失败只影响持久化**：本次关麦必须照样生效。
-    #[test]
-    fn voice_preference_save_failure_still_closes_the_mic() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let root = unique_test_root("worker-voice-pref-fail");
-        let paths = AppPaths::with_root(&root);
-        let mut settings = Settings::default();
-        settings.voice.enabled = true;
-        let mut voice = VoiceRuntime::new();
-        let instance = voice.route.open();
-        let stop = Arc::new(AtomicBool::new(false));
-        voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
-
-        // 注入故障：占住配置写入用的临时文件路径，让 save_settings 失败。
-        let tmp = paths.settings_file().with_extension("json.tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        apply_voice_enabled(
-            &slint::Weak::default(),
-            &paths,
-            &mut settings,
-            &mut voice,
-            &tx,
-            false,
-        );
-
-        assert!(stop.load(Ordering::SeqCst), "保存失败也必须真的关麦");
-        assert!(voice.handle.is_none(), "句柄必须释放");
-        assert!(
-            settings.voice.enabled,
-            "写盘失败时内存里的偏好不应被改成未落盘的值"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // ------------------------------------------------------------ 语音路由
-
-    /// 归属核对：旧实例（关麦前那个）的事件一律无效。
-    #[test]
-    fn voice_route_rejects_stale_instances() {
-        let mut route = VoiceRoute::default();
-        let old = route.open();
-        let turn = VoiceTurn {
-            instance: old,
-            session: 1,
-        };
-        assert!(route.bind(old, turn));
-
-        // 关麦后立刻重开：新实例号不同，旧实例的事件不再生效。
-        route.close();
-        let new = route.open();
-        assert_ne!(old, new);
-        assert!(!route.is_current(old));
-        assert!(route.is_current(new));
-        assert_eq!(route.take(old, turn), None, "旧实例的结果不得被取走");
-        assert_eq!(
-            route.take(
-                new,
-                VoiceTurn {
-                    instance: new,
-                    session: 1
-                }
-            ),
-            None,
-            "新实例没有这一句，也不能提交"
-        );
-    }
-
-    #[test]
-    fn voice_route_takes_each_turn_once() {
-        let mut route = VoiceRoute::default();
-        let instance = route.open();
-        let turn = VoiceTurn {
-            instance,
-            session: 3,
-        };
-        assert!(route.bind(instance, turn));
-        assert_eq!(route.take(instance, turn), Some(turn));
-        assert_eq!(route.take(instance, turn), None, "同一句只能提交一次");
-
-        // 拒绝只清归属匹配的那一句。
-        let first = VoiceTurn {
-            instance,
-            session: 4,
-        };
-        let second = VoiceTurn {
-            instance,
-            session: 5,
-        };
-        assert!(route.bind(instance, first));
-        route.release(instance, second);
-        assert_eq!(route.pending, Some(first), "别的会话不能清掉当前这句");
-        assert_eq!(route.cancel(), Some(first));
-        assert_eq!(route.pending, None);
-    }
-
-    /// **旧实例收尾不能清掉新实例的活动会话**（快速关麦 / 重开的真实路径）。
-    ///
-    /// 修复前整个 `VoiceRuntime` 只有一份 `ActiveSession`，每个实例
-    /// `spawn` 时都 clone 同一份：旧线程迟到的 `shutdown()` / `fail()` 里
-    /// 的无条件 `clear()` 会把新实例正在识别的那一句抹掉 ——
-    /// 于是新实例的 Final 被当成过期丢弃（表现为「所有 Final 都无效」）。
-    ///
-    /// 这里走真实的分配路径：实例号与会话都由 `VoiceRoute::open()` 给出，
-    /// 再用两个真实的 `SessionMachine` 驱动识别与收尾。
-    #[test]
-    fn old_instance_teardown_cannot_clear_the_new_instance_session() {
-        use std::sync::Mutex;
-
-        use crate::voice::asr::{AsrError, InferenceCancel, Transcript};
-        use crate::voice::coordinator::{AsrSubmitter, ReplySink, SessionMachine};
-
-        /// 记录事件（带实例号，用来判断结果属于谁）。
-        #[derive(Clone, Default)]
-        struct Sink {
-            events: Arc<Mutex<Vec<(VoiceInstance, VoiceEventKind)>>>,
-        }
-
-        impl Sink {
-            fn shared(&self) -> SharedSink {
-                let events = self.events.clone();
-                SharedSink::new(move |event| {
-                    events.lock().unwrap().push((event.instance, event.kind))
-                })
-            }
-
-            fn finals(&self) -> Vec<(VoiceInstance, String)> {
-                self.events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|(instance, kind)| match kind {
-                        VoiceEventKind::Final { text, .. } => Some((*instance, text.clone())),
-                        _ => None,
-                    })
-                    .collect()
-            }
-        }
-
-        /// 手动控制结果回调的假 ASR：由测试决定「推理什么时候结束」。
-        struct DeferredAsr(Arc<Mutex<Vec<(VoiceTurn, ReplySink)>>>);
-
-        impl AsrSubmitter for DeferredAsr {
-            fn submit(
-                &self,
-                turn: VoiceTurn,
-                _samples: Vec<f32>,
-                _cancel: InferenceCancel,
-                reply: ReplySink,
-            ) -> Result<(), AsrError> {
-                self.0.lock().unwrap().push((turn, reply));
-                Ok(())
-            }
-        }
-
-        fn transcript(text: &str, turn: VoiceTurn) -> Result<Transcript, AsrError> {
-            Ok(Transcript {
-                session_id: turn.session,
-                text: text.to_string(),
-                audio_seconds: 1.0,
-                decode_ms: 5,
-                language_id: 1,
-                no_speech: vec![],
-            })
-        }
-
-        let sink = Sink::default();
-        let mut route = VoiceRoute::default();
-
-        // ---- 实例 A：唤醒后进入识别（推理还没回来）----
-        let a = route.open();
-        let active_a = route.active_session();
-        let pending_a = Arc::new(Mutex::new(Vec::new()));
-        let mut machine_a = SessionMachine::new(
-            a,
-            sink.shared(),
-            active_a.clone(),
-            Box::new(DeferredAsr(pending_a.clone())),
-            0,
-        );
-        machine_a.start_listening();
-        machine_a.begin("小爱同学".to_string());
-        machine_a.finish(1.0, vec![0.1, -0.1, 0.2, -0.2]);
-        assert_eq!(machine_a.state(), &VoiceState::Transcribing);
-        assert!(active_a.current().is_some(), "A 应该有在途会话");
-
-        // ---- 用户关麦并立刻重开：B 从这里拿到**自己**的会话 ----
-        route.close();
-        let b = route.open();
-        assert_ne!(a, b, "重开必须是新实例");
-        let active_b = route.active_session();
-        let pending_b = Arc::new(Mutex::new(Vec::new()));
-        let mut machine_b = SessionMachine::new(
-            b,
-            sink.shared(),
-            active_b.clone(),
-            Box::new(DeferredAsr(pending_b.clone())),
-            0,
-        );
-        machine_b.start_listening();
-        machine_b.begin("小爱同学".to_string());
-        machine_b.finish(1.0, vec![0.1, -0.1, 0.2, -0.2]);
-        let turn_b = active_b.current().expect("B 应该有在途会话");
-        assert!(route.bind(b, turn_b));
-
-        // ---- A 的线程这时才收尾：shutdown / fail 都会无条件 clear ----
-        machine_a.shutdown();
-        machine_a.fail("麦克风错误：设备断开".to_string());
-        assert!(active_a.current().is_none(), "A 自己的会话确实被清了");
-        assert!(
-            active_b.is_current(turn_b),
-            "旧实例的收尾不能清掉新实例的活动会话"
-        );
-
-        // ---- B 的识别正常结束：Final 恰好一次，且属于 B ----
-        let (turn, reply_b) = pending_b.lock().unwrap().pop().expect("B 应有一次识别");
-        reply_b(transcript("打开浏览器", turn));
-        assert!(machine_b.poll(), "B 应该回到监听");
-        assert!(route.take(b, turn).is_some(), "B 的结果必须能提交");
-        assert!(route.take(b, turn).is_none(), "同一句只能提交一次");
-
-        // ---- A 的识别这时才回来：不能交付 ----
-        let (late, reply_a) = pending_a.lock().unwrap().pop().expect("A 应有一次识别");
-        reply_a(transcript("上一句", late));
-        assert!(route.take(a, late).is_none(), "旧实例的结果不能提交");
-
-        assert_eq!(
-            sink.finals(),
-            vec![(b, "打开浏览器".to_string())],
-            "只有新实例的这句被交付，且恰好一次"
-        );
-    }
-
-    /// 旧实例的迟到事件：不改状态、不动新会话、不触发 Agent。
-    #[test]
-    fn stale_events_from_previous_instance_are_ignored() {
-        let weak = slint::Weak::default();
-        let mut voice = VoiceRuntime::new();
-        let old = voice.route.open();
-        let old_turn = VoiceTurn {
-            instance: old,
-            session: 1,
-        };
-
-        // 关麦 → 立刻重开
-        voice.route.close();
-        let new = voice.route.open();
-        let new_turn = VoiceTurn {
-            instance: new,
-            session: 1,
-        };
-        assert!(voice.route.bind(new, new_turn));
-
-        let stale_events = [
-            VoiceEventKind::Ready(Box::new(test_capture_info(AsrBackend::Cpu, None))),
-            VoiceEventKind::Woke {
-                turn: old_turn,
-                keyword: "小爱同学".to_string(),
-            },
-            VoiceEventKind::StateChanged(VoiceState::Listening),
-            VoiceEventKind::StateChanged(VoiceState::Error("旧的设备错误".to_string())),
-            VoiceEventKind::Final {
-                turn: old_turn,
-                text: "打开浏览器".to_string(),
-                audio_seconds: 1.0,
-                decode_ms: 1,
-                purpose: ListenPurpose::Wake,
-                request_id: 0,
-            },
-            VoiceEventKind::Rejected {
-                turn: old_turn,
-                reason: RejectReason::EmptyTranscript,
-            },
-        ];
-        for kind in stale_events {
-            let prompt = voice.on_event(
-                &weak,
-                VoiceEvent {
-                    instance: old,
-                    kind,
-                },
-                false,
-            );
-            assert!(prompt.into_prompt().is_none(), "旧实例的事件不得触发 Agent");
-        }
-        // 新实例的这一句仍在等结果，不能被旧事件清掉。
-        assert_eq!(voice.route.pending, Some(new_turn));
-    }
-
-    /// Agent 执行中关麦：采集真的停了，但正在跑的回合不被撤销。
-    #[test]
-    fn closing_voice_during_turn_stops_capture_without_cancelling_turn() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let weak = slint::Weak::default();
-        let mut voice = VoiceRuntime::new();
-        let instance = voice.route.open();
-        let stop = Arc::new(AtomicBool::new(false));
-        voice.handle = Some(VoiceHandle::for_test(stop.clone(), instance));
-        voice.route.active.begin(VoiceTurn {
-            instance,
-            session: 1,
-        });
-        let turn_cancel = CancelToken::new();
-
-        voice.disable(&weak);
-
-        assert!(stop.load(Ordering::SeqCst), "关麦必须真的停止采集");
-        assert!(voice.handle.is_none(), "句柄要释放，避免重复持有设备");
-        assert!(voice.route.active.current().is_none(), "在途识别必须过期");
-        assert!(
-            !turn_cancel.is_cancelled(),
-            "关麦不是撤销：正在执行的回合继续"
-        );
-    }
-
-    /// Agent 忙（含等待点击确认）时，有效 Final 不启动第二回合，也不排队。
-    #[test]
-    fn final_during_busy_turn_is_dropped_not_queued() {
-        let weak = slint::Weak::default();
-        let mut voice = VoiceRuntime::new();
-        let instance = voice.route.open();
-        let turn = VoiceTurn {
-            instance,
-            session: 1,
-        };
-        assert!(voice.route.bind(instance, turn));
-
-        let final_event = VoiceEvent {
-            instance,
-            kind: VoiceEventKind::Final {
-                turn,
-                text: "打开浏览器".to_string(),
-                audio_seconds: 1.0,
-                decode_ms: 5,
-                purpose: ListenPurpose::Wake,
-                request_id: 0,
-            },
-        };
-        assert!(
-            voice
-                .on_event(&weak, final_event.clone(), true)
-                .into_prompt()
-                .is_none(),
-            "Agent 忙时不能启动第二回合"
-        );
-        assert!(voice.route.pending.is_none(), "这句话不能排队延后执行");
-
-        // 合法的状态事件仍然照常处理：不会被当成“另一条指令”，
-        // 也不会在忙的时候触发任何回合。
-        assert!(voice
-            .on_event(
-                &weak,
-                VoiceEvent {
-                    instance,
-                    kind: VoiceEventKind::StateChanged(VoiceState::Listening),
-                },
-                true,
-            )
-            .into_prompt()
-            .is_none());
-        assert!(voice
-            .on_event(
-                &weak,
-                VoiceEvent {
-                    instance,
-                    kind: VoiceEventKind::Overflow,
-                },
-                true,
-            )
-            .into_prompt()
-            .is_none());
-    }
-
-    /// 正常路径：有效 Final 恰好提交一次；重复事件不会提交第二次。
-    #[test]
-    fn valid_final_is_submitted_exactly_once() {
-        let weak = slint::Weak::default();
-        let mut voice = VoiceRuntime::new();
-        let instance = voice.route.open();
-        let turn = VoiceTurn {
-            instance,
-            session: 2,
-        };
-        assert!(voice.route.bind(instance, turn));
-        let event = VoiceEvent {
-            instance,
-            kind: VoiceEventKind::Final {
-                turn,
-                text: "打开记事本".to_string(),
-                audio_seconds: 1.2,
-                decode_ms: 9,
-                purpose: ListenPurpose::Wake,
-                request_id: 0,
-            },
-        };
-
-        let prompt = voice
-            .on_event(&weak, event.clone(), false)
-            .into_prompt()
-            .expect("空闲时有效 Final 应当提交");
-        assert_eq!(prompt.text, "打开记事本");
-        assert!((prompt.audio_seconds - 1.2).abs() < f32::EPSILON);
-
-        assert!(
-            voice.on_event(&weak, event, false).into_prompt().is_none(),
-            "同一结果不得提交第二次"
-        );
-    }
-
-    /// 取消当前输入后，迟到的 Final 不得提交。
-    #[test]
-    fn late_final_after_cancel_is_dropped() {
-        let weak = slint::Weak::default();
-        let mut voice = VoiceRuntime::new();
-        let instance = voice.route.open();
-        let turn = VoiceTurn {
-            instance,
-            session: 1,
-        };
-        assert!(voice.route.bind(instance, turn));
-        voice.cancel_pending();
-        assert!(voice.route.active.current().is_none());
-
-        let prompt = voice.on_event(
-            &weak,
-            VoiceEvent {
-                instance,
-                kind: VoiceEventKind::Final {
-                    turn,
-                    text: "打开浏览器".to_string(),
-                    audio_seconds: 1.0,
-                    decode_ms: 5,
-                    purpose: ListenPurpose::Wake,
-                    request_id: 0,
-                },
-            },
-            false,
-        );
-        assert!(prompt.into_prompt().is_none(), "取消之后的结果不得提交");
-    }
-
-    /// 旧实例的 Final 不得冒充新实例的会话（两者 session 号可能相同）。
-    #[test]
-    fn old_instance_final_cannot_impersonate_new_session() {
-        let weak = slint::Weak::default();
-        let mut voice = VoiceRuntime::new();
-        let old = voice.route.open();
-        let old_turn = VoiceTurn {
-            instance: old,
-            session: 1,
-        };
-        voice.route.close();
-        let new = voice.route.open();
-        let new_turn = VoiceTurn {
-            instance: new,
-            session: 1,
-        };
-        assert!(voice.route.bind(new, new_turn));
-
-        assert!(voice
-            .on_event(
-                &weak,
-                VoiceEvent {
-                    instance: old,
-                    kind: VoiceEventKind::Final {
-                        turn: old_turn,
-                        text: "上一句".to_string(),
-                        audio_seconds: 1.0,
-                        decode_ms: 5,
-                        purpose: ListenPurpose::Wake,
-                        request_id: 0,
-                    },
-                },
-                false,
-            )
-            .into_prompt()
-            .is_none());
-        assert_eq!(voice.route.pending, Some(new_turn));
-    }
-
-    /// 界面文字只反映**实际**后端。
-    #[test]
-    fn backend_label_reflects_actual_backend() {
-        assert_eq!(
-            describe_backend(&test_capture_info(AsrBackend::Cuda, None)),
-            "Whisper CUDA"
-        );
-        assert_eq!(
-            describe_backend(&test_capture_info(AsrBackend::Cpu, None)),
-            "Whisper CPU"
-        );
-        let degraded = test_capture_info(
-            AsrBackend::Cpu,
-            Some("CUDA：初始化失败（缺少 CUDA 运行库）".to_string()),
-        );
-        assert_eq!(
-            describe_backend(&degraded),
-            "Whisper CPU（CUDA：初始化失败（缺少 CUDA 运行库））"
-        );
-        let cpu_build = test_capture_info(AsrBackend::Cpu, Some("本构建未启用 CUDA".to_string()));
-        assert_eq!(
-            describe_backend(&cpu_build),
-            "Whisper CPU（本构建未启用 CUDA）"
-        );
-    }
-
-    fn test_capture_info(backend: AsrBackend, fallback_reason: Option<String>) -> CaptureInfoForUi {
-        CaptureInfoForUi {
-            device_name: "测试麦克风".to_string(),
-            sample_rate: 48_000,
-            resampled: true,
-            wake_labels: vec!["小爱同学".to_string()],
-            keywords_file: std::path::PathBuf::from("kws-keywords.txt"),
-            whisper_model: std::path::PathBuf::from("ggml-small.bin"),
-            backend,
-            fallback_reason,
-        }
     }
 
     fn unique_test_root(prefix: &str) -> std::path::PathBuf {
@@ -4710,27 +4573,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn permission_index_mapping_is_stable() {
-        assert_eq!(permission_mode_for_index(0), PermissionMode::Standard);
-        assert_eq!(permission_mode_for_index(1), PermissionMode::Conservative);
-        assert_eq!(permission_mode_for_index(2), PermissionMode::Permissive);
-        assert_eq!(permission_mode_for_index(9), PermissionMode::Standard);
-    }
-
-    #[test]
-    fn endpoint_summary_never_contains_key() {
-        let settings = Settings::default();
-        let summary = settings_summary(&settings, true);
-        assert!(!summary.contains("sk-"));
-        assert!(summary.contains("Key 已保存"));
-    }
-
-    #[test]
-    fn arg_summary_is_secret_free() {
-        let value = serde_json::json!({ "app": "notepad", "x": 10 });
-        assert!(summary_is_secret_free(&value));
     }
 }

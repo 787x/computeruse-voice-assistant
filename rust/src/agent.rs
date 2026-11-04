@@ -53,32 +53,105 @@ pub struct ToolExecution {
     pub image: Option<ImageAttachment>,
 }
 
-/// Agent 的流式事件（界面据此更新状态）。
+/// 一次工具调用的稳定标识（同一个回合内唯一，连续同名工具也各自独立）。
+///
+/// 由回合 id + 步骤号 + 该步骤内的序号组成：不依赖模型给的 `call.id`
+/// （那可能缺失或被服务端复用），因此"连续两次 screenshot"一定是两张卡片。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ToolCallId(pub u64);
+
+/// Agent 的流式事件（界面据此更新时间线与状态）。
+///
+/// PR8 的扩展点（都是为了"按真实调用实例展示"）：
+///  - 每个事件都带 `turn`（回合 id）、`step`（第几步）与 `call_id`（工具调用实例）；
+///  - 思考内容**带真实文本**（`Reasoning`），不再只有字符数；
+///  - 工具结束事件区分"成功 / 失败 / 被拒绝 / 被取消"；
+///  - 参数摘要（`args_summary`）用于折叠展示，不含截图 base64。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// 可见回复的增量文本。
-    TextDelta(String),
-    /// 思考内容长度（**只带长度，不带内容**：思考过程不展示、不播报）。
-    Reasoning { step: usize, chars: usize },
+    TextDelta {
+        turn: u64,
+        step: usize,
+        text: String,
+    },
+    /// 思考内容增量（模型真的返回了 `reasoning_content` 才有）。
+    ///
+    /// `text` 是**本次新增**的片段；界面负责拼接去重。
+    /// 没有返回时不会有这个事件——绝不伪造思考。
+    ReasoningDelta {
+        turn: u64,
+        step: usize,
+        text: String,
+    },
+    /// 一步结束时的思考汇总（用于去重与"以最终结果为准"的对齐）。
+    ///
+    /// `text` 是本步**最终**的思考文本：界面用它替换流式拼接结果，
+    /// 因此同一段 reasoning 不会重复展示两遍。
+    ReasoningDone {
+        turn: u64,
+        step: usize,
+        chars: usize,
+        text: String,
+    },
     /// 模型开始调用工具（已解析出参数，尚未过权限）。
     ToolStart {
-        name: String,
-        args: Value,
+        turn: u64,
         step: usize,
+        call: ToolCallId,
+        name: String,
+        args_summary: Value,
     },
-    /// 工具调用结束（含被拒绝的情况）。
+    /// 工具调用结束（含被拒绝 / 被取消的情况）。
     ToolEnd {
-        name: String,
-        ok: bool,
-        text: String,
+        turn: u64,
         step: usize,
+        call: ToolCallId,
+        name: String,
+        status: ToolStatus,
+        /// 结果文本（已按上限截断；`denied` 时是拒绝原因）。
+        text: String,
+        ms: u64,
     },
     /// 需要用户确认（`ask`）。返回的 future 由界面 resolve。
     ConfirmationRequired(ConfirmationPrompt),
     /// 本回合结束。
     Done(TurnOutcome),
     /// 本回合失败（网络/协议/上下文装不下）。
-    Failed { reason: String },
+    Failed { turn: u64, reason: String },
+}
+
+/// 一次工具调用的终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    /// 成功执行。
+    Ok,
+    /// 执行失败（后端报错 / 参数不完整 / 响应不完整）。
+    Failed,
+    /// 权限拒绝（用户拒绝、策略拒绝、无确认通道）。
+    Denied,
+    /// 回合被取消，未执行或结果未知。
+    Cancelled,
+}
+
+impl ToolStatus {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Denied => "denied",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "成功",
+            Self::Failed => "失败",
+            Self::Denied => "已拒绝",
+            Self::Cancelled => "已取消",
+        }
+    }
 }
 
 /// 一次需要用户确认的请求（界面展示"允许 / 拒绝"）。
@@ -95,10 +168,17 @@ pub struct ConfirmationPrompt {
 #[derive(Debug, Clone)]
 pub struct StepRecord {
     pub step: usize,
+    pub call: ToolCallId,
     pub tool: String,
-    pub ok: bool,
+    pub status: ToolStatus,
     pub text: String,
     pub ms: u64,
+}
+
+impl StepRecord {
+    pub fn ok(&self) -> bool {
+        self.status == ToolStatus::Ok
+    }
 }
 
 /// 一回合的结果。
@@ -123,6 +203,10 @@ pub struct AgentConfig {
     pub context_policy: ContextPolicy,
     pub system_prompt: String,
     pub echo_reasoning: bool,
+    /// 回合身份：所有 `AgentEvent` 都带上它，界面据此把事件归到正确的 Session。
+    pub turn_id: u64,
+    /// 是否请求工具定义（连接测试这类"纯对话"回合传 `false`）。
+    pub use_tools: bool,
 }
 
 impl Default for AgentConfig {
@@ -136,6 +220,8 @@ impl Default for AgentConfig {
             ),
             system_prompt: crate::prompt::DEFAULT_SYSTEM_PROMPT.to_string(),
             echo_reasoning: false,
+            turn_id: 0,
+            use_tools: true,
         }
     }
 }
@@ -145,7 +231,13 @@ pub struct Agent {
     llm: LlmClient,
     tools: Arc<dyn ToolInvoker>,
     config: AgentConfig,
-    pub permissions: PermissionState,
+    /// 权限状态（`Arc` 共享：界面调整暂停/限时授权要能**在下一个工具判断前**生效，
+    /// 而不是等回合重启后才读到新值）。
+    pub permissions: Arc<std::sync::Mutex<PermissionState>>,
+    /// 审计日志（可选）。
+    pub audit: Option<crate::permissions::AuditLog>,
+    /// 本回合归属的会话 id（审计记录用）。
+    pub session_id: Option<String>,
 }
 
 impl Agent {
@@ -159,7 +251,28 @@ impl Agent {
             llm,
             tools,
             config,
+            permissions: Arc::new(std::sync::Mutex::new(permissions)),
+            audit: None,
+            session_id: None,
+        }
+    }
+
+    /// 带共享权限状态与审计的构造（工作线程走这一条）。
+    pub fn with_shared_state(
+        llm: LlmClient,
+        tools: Arc<dyn ToolInvoker>,
+        config: AgentConfig,
+        permissions: Arc<std::sync::Mutex<PermissionState>>,
+        audit: Option<crate::permissions::AuditLog>,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            llm,
+            tools,
+            config,
             permissions,
+            audit,
+            session_id,
         }
     }
 
@@ -179,8 +292,15 @@ impl Agent {
             context_window: self.config.context_policy.context_window,
             ..TurnOutcome::default()
         };
-        let tools = self.tools.tool_definitions();
+        let turn = self.config.turn_id;
+        let tools = if self.config.use_tools {
+            self.tools.tool_definitions()
+        } else {
+            Vec::new()
+        };
         let policy = self.config.context_policy;
+        // 工具调用实例 id：回合内单调递增，连续同名工具也各自独立。
+        let mut next_call_id: u64 = turn.saturating_mul(1_000_000);
 
         // 组装本轮工作集：system + 会话历史 + 本轮 user
         let mut messages: Vec<ChatMessage> = Vec::new();
@@ -201,7 +321,7 @@ impl Agent {
             outcome.text = reason.clone();
             outcome.failed = true;
             outcome.failure_reason = Some("context_overflow".to_string());
-            emit(AgentEvent::Failed { reason });
+            emit(AgentEvent::Failed { turn, reason });
             return outcome;
         }
         // 压缩后的工作集就是新的会话历史基准（被折叠的老回合不再累积）。
@@ -220,6 +340,8 @@ impl Agent {
                     policy,
                     &tools,
                     &std::collections::HashSet::new(),
+                    turn,
+                    &mut next_call_id,
                 );
             }
 
@@ -238,19 +360,40 @@ impl Agent {
                     outcome.text.clone()
                 };
                 sync_history(history, &messages);
-                emit(AgentEvent::Failed { reason });
+                emit(AgentEvent::Failed { turn, reason });
                 return outcome;
             }
 
+            let step_no = step as usize;
             let request_messages = strip_local_markers(&messages);
+            /*
+             * 思考内容走独立的回调：与可见正文/工具 JSON/系统提示词分离，
+             * 绝不进 `outcome.text`，因此也不可能被 TTS 读到。
+             * 去重规则：这里只转发**本次新增**的片段；最终结果由
+             * `ReasoningDone` 收口，界面据此裁剪流式拼接产生的重复。
+             */
+            let mut emitted_reasoning_chars: usize = 0;
             let chat = self
                 .llm
                 .chat(
                     &request_messages,
                     &tools,
                     cancel,
-                    |text| emit(AgentEvent::TextDelta(text.to_string())),
-                    |_reasoning| {},
+                    |text| {
+                        emit(AgentEvent::TextDelta {
+                            turn,
+                            step: step_no,
+                            text: text.to_string(),
+                        })
+                    },
+                    |reasoning| {
+                        emitted_reasoning_chars += reasoning.chars().count();
+                        emit(AgentEvent::ReasoningDelta {
+                            turn,
+                            step: step_no,
+                            text: reasoning.to_string(),
+                        })
+                    },
                 )
                 .await;
 
@@ -265,6 +408,8 @@ impl Agent {
                         policy,
                         &tools,
                         &std::collections::HashSet::new(),
+                        turn,
+                        &mut next_call_id,
                     );
                 }
                 Err(error) => {
@@ -272,7 +417,7 @@ impl Agent {
                     outcome.failed = true;
                     outcome.failure_reason = Some("llm_error".to_string());
                     sync_history(history, &messages);
-                    emit(AgentEvent::Failed { reason });
+                    emit(AgentEvent::Failed { turn, reason });
                     return outcome;
                 }
             };
@@ -286,20 +431,25 @@ impl Agent {
                     policy,
                     &tools,
                     &std::collections::HashSet::new(),
+                    turn,
+                    &mut next_call_id,
                 );
             }
 
-            let step = step as usize;
             if !result.text.is_empty() {
                 outcome.text.push_str(&result.text);
             }
             if !result.reasoning.is_empty() {
-                outcome.reasoning_chars += result.reasoning.chars().count();
-                // 只带长度，不带内容：思考过程不展示。
-                emit(AgentEvent::Reasoning {
-                    step,
-                    chars: result.reasoning.chars().count(),
+                let chars = result.reasoning.chars().count();
+                outcome.reasoning_chars += chars;
+                // 汇总事件：界面用它把流式片段对齐到最终文本（去重）。
+                emit(AgentEvent::ReasoningDone {
+                    turn,
+                    step: step_no,
+                    chars,
+                    text: result.reasoning.clone(),
                 });
+                let _ = emitted_reasoning_chars;
             }
 
             // ---- 响应完整性硬闸 ----------------------------------------------
@@ -333,21 +483,28 @@ impl Agent {
                         })
                         .collect();
                     for name in &broken_names {
+                        next_call_id += 1;
+                        let call = ToolCallId(next_call_id);
+                        let text = "响应不完整，未执行".to_string();
                         outcome.steps.push(StepRecord {
-                            step,
+                            step: step_no,
+                            call,
                             tool: name.clone(),
-                            ok: false,
-                            text: "响应不完整，未执行".to_string(),
+                            status: ToolStatus::Failed,
+                            text: text.clone(),
                             ms: 0,
                         });
                         emit(AgentEvent::ToolEnd {
+                            turn,
+                            step: step_no,
+                            call,
                             name: name.clone(),
-                            ok: false,
-                            text: "响应不完整，未执行".to_string(),
-                            step,
+                            status: ToolStatus::Failed,
+                            text,
+                            ms: 0,
                         });
                     }
-                    if step as u32 == self.config.max_steps {
+                    if step_no as u32 == self.config.max_steps {
                         hit_step_limit = true;
                     }
                     continue;
@@ -374,9 +531,8 @@ impl Agent {
                     outcome.failed = true;
                     outcome.failure_reason = Some("stream_error".to_string());
                     sync_history(history, &messages);
-                    emit(AgentEvent::Failed {
-                        reason: format!("模型响应异常（finish_reason={}）", result.finish_reason),
-                    });
+                    let reason = format!("模型响应异常（finish_reason={}）", result.finish_reason);
+                    emit(AgentEvent::Failed { turn, reason });
                     return outcome;
                 }
                 messages.push(assistant_message_from(
@@ -423,21 +579,28 @@ impl Agent {
                     } else {
                         call.name.clone()
                     };
+                    next_call_id += 1;
+                    let call_id = ToolCallId(next_call_id);
+                    let text = "参数不完整，未执行".to_string();
                     outcome.steps.push(StepRecord {
-                        step,
+                        step: step_no,
+                        call: call_id,
                         tool: name.clone(),
-                        ok: false,
-                        text: "参数不完整，未执行".to_string(),
+                        status: ToolStatus::Failed,
+                        text: text.clone(),
                         ms: 0,
                     });
                     emit(AgentEvent::ToolEnd {
+                        turn,
+                        step: step_no,
+                        call: call_id,
                         name,
-                        ok: false,
-                        text: "参数不完整，未执行".to_string(),
-                        step,
+                        status: ToolStatus::Failed,
+                        text,
+                        ms: 0,
                     });
                 }
-                if step as u32 == self.config.max_steps {
+                if step_no as u32 == self.config.max_steps {
                     hit_step_limit = true;
                 }
                 continue;
@@ -490,21 +653,28 @@ impl Agent {
                     names.join("、")
                 )));
                 for name in &names {
+                    next_call_id += 1;
+                    let call_id = ToolCallId(next_call_id);
+                    let text = "参数不完整，整批未执行".to_string();
                     outcome.steps.push(StepRecord {
-                        step,
+                        step: step_no,
+                        call: call_id,
                         tool: name.clone(),
-                        ok: false,
-                        text: "参数不完整，整批未执行".to_string(),
+                        status: ToolStatus::Failed,
+                        text: text.clone(),
                         ms: 0,
                     });
                     emit(AgentEvent::ToolEnd {
+                        turn,
+                        step: step_no,
+                        call: call_id,
                         name: name.clone(),
-                        ok: false,
-                        text: "参数不完整，整批未执行".to_string(),
-                        step,
+                        status: ToolStatus::Failed,
+                        text,
+                        ms: 0,
                     });
                 }
-                if step as u32 == self.config.max_steps {
+                if step_no as u32 == self.config.max_steps {
                     hit_step_limit = true;
                 }
                 continue;
@@ -537,21 +707,51 @@ impl Agent {
                         policy,
                         &tools,
                         &dispatched,
+                        turn,
+                        &mut next_call_id,
                     );
                 }
+                next_call_id += 1;
+                let call_id = ToolCallId(next_call_id);
                 let args = parse_args(&call.arguments);
                 emit(AgentEvent::ToolStart {
+                    turn,
+                    step: step_no,
+                    call: call_id,
                     name: call.name.clone(),
-                    args: args.clone(),
-                    step,
+                    args_summary: crate::permissions::summarize_args(&args),
                 });
 
                 // ---- 权限判断（执行前） -----------------------------------
-                let decision = PermissionGate::new(&self.permissions)
-                    .check(&call.name, &args, Some(confirmer), cancel)
-                    .await;
+                // 每次都从共享状态里读**当前**策略：界面改暂停/覆盖/限时授权后，
+                // 下一个工具判断立刻按新值处理，不会复用过期授权。
+                let decision = {
+                    let state = self
+                        .permissions
+                        .lock()
+                        .map(|guard| guard.clone())
+                        .unwrap_or_default();
+                    let gate = match &self.audit {
+                        Some(audit) => PermissionGate::new(&state).with_audit(
+                            audit.clone(),
+                            self.session_id.clone(),
+                            turn,
+                        ),
+                        None => PermissionGate::new(&state),
+                    };
+                    gate.check(&call.name, &args, Some(confirmer), cancel).await
+                };
                 if cancel.is_cancelled() {
                     // 确认阶段被取消：工具**没有**发出去，确定未执行。
+                    emit(AgentEvent::ToolEnd {
+                        turn,
+                        step: step_no,
+                        call: call_id,
+                        name: call.name.clone(),
+                        status: ToolStatus::Cancelled,
+                        text: "已中断，未执行".to_string(),
+                        ms: 0,
+                    });
                     return cancelled(
                         outcome,
                         &mut messages,
@@ -560,23 +760,29 @@ impl Agent {
                         policy,
                         &tools,
                         &dispatched,
+                        turn,
+                        &mut next_call_id,
                     );
                 }
                 if decision.denied() {
                     let denied = format!("已拒绝：{}", decision.reason);
                     messages.push(ChatMessage::tool_result(call.id.clone(), denied.clone()));
                     outcome.steps.push(StepRecord {
-                        step,
+                        step: step_no,
+                        call: call_id,
                         tool: call.name.clone(),
-                        ok: false,
+                        status: ToolStatus::Denied,
                         text: denied.clone(),
                         ms: 0,
                     });
                     emit(AgentEvent::ToolEnd {
+                        turn,
+                        step: step_no,
+                        call: call_id,
                         name: call.name.clone(),
-                        ok: false,
+                        status: ToolStatus::Denied,
                         text: denied,
-                        step,
+                        ms: 0,
                     });
                     continue;
                 }
@@ -587,6 +793,15 @@ impl Agent {
                 let started = std::time::Instant::now();
                 let executed = self.tools.invoke(&call.name, &args, cancel).await;
                 if cancel.is_cancelled() {
+                    emit(AgentEvent::ToolEnd {
+                        turn,
+                        step: step_no,
+                        call: call_id,
+                        name: call.name.clone(),
+                        status: ToolStatus::Cancelled,
+                        text: "已中断（状态未知）".to_string(),
+                        ms: started.elapsed().as_millis() as u64,
+                    });
                     return cancelled(
                         outcome,
                         &mut messages,
@@ -595,6 +810,8 @@ impl Agent {
                         policy,
                         &tools,
                         &dispatched,
+                        turn,
+                        &mut next_call_id,
                     );
                 }
                 match executed {
@@ -603,17 +820,21 @@ impl Agent {
                         let ms = started.elapsed().as_millis() as u64;
                         messages.push(ChatMessage::tool_result(call.id.clone(), text.clone()));
                         outcome.steps.push(StepRecord {
-                            step,
+                            step: step_no,
+                            call: call_id,
                             tool: call.name.clone(),
-                            ok: true,
+                            status: ToolStatus::Ok,
                             text: text.clone(),
                             ms,
                         });
                         emit(AgentEvent::ToolEnd {
+                            turn,
+                            step: step_no,
+                            call: call_id,
                             name: call.name.clone(),
-                            ok: true,
+                            status: ToolStatus::Ok,
                             text: text.clone(),
-                            step,
+                            ms,
                         });
 
                         // 截图：必须把图塞进对话，否则模型对屏幕就是瞎的。
@@ -635,12 +856,6 @@ impl Agent {
                                     "（这一轮已经附了 {} 张截图，达到单轮上限，{} 的这张图没有附上。请改用 get_app_state 这类文字描述来确认界面状态，不要假设屏幕没变化。）",
                                     images_attached, call.name
                                 )));
-                                emit(AgentEvent::ToolEnd {
-                                    name: call.name.clone(),
-                                    ok: true,
-                                    text: "截图超出单轮上限，未附图".to_string(),
-                                    step,
-                                });
                             }
                         }
                     }
@@ -653,6 +868,15 @@ impl Agent {
                              * 但我们没拿到结果——这条留在 `dispatched` 里，
                              * 收尾时写"状态未知"，不能声称没执行。
                              */
+                            emit(AgentEvent::ToolEnd {
+                                turn,
+                                step: step_no,
+                                call: call_id,
+                                name: call.name.clone(),
+                                status: ToolStatus::Cancelled,
+                                text: "已中断（状态未知）".to_string(),
+                                ms: started.elapsed().as_millis() as u64,
+                            });
                             return cancelled(
                                 outcome,
                                 &mut messages,
@@ -661,23 +885,29 @@ impl Agent {
                                 policy,
                                 &tools,
                                 &dispatched,
+                                turn,
+                                &mut next_call_id,
                             );
                         } else {
                             format!("工具执行失败：{}", error.user_message())
                         };
                         messages.push(ChatMessage::tool_result(call.id.clone(), message.clone()));
                         outcome.steps.push(StepRecord {
-                            step,
+                            step: step_no,
+                            call: call_id,
                             tool: call.name.clone(),
-                            ok: false,
+                            status: ToolStatus::Failed,
                             text: message.clone(),
                             ms: started.elapsed().as_millis() as u64,
                         });
                         emit(AgentEvent::ToolEnd {
+                            turn,
+                            step: step_no,
+                            call: call_id,
                             name: call.name.clone(),
-                            ok: false,
+                            status: ToolStatus::Failed,
                             text: message,
-                            step,
+                            ms: started.elapsed().as_millis() as u64,
                         });
                     }
                 }
@@ -685,7 +915,7 @@ impl Agent {
             // 这一批工具结果已经齐了，截图附件现在才能进来（不会插在结果之间）。
             messages.extend(pending_images);
 
-            if step as u32 == self.config.max_steps {
+            if step_no as u32 == self.config.max_steps {
                 hit_step_limit = true;
             }
         }
@@ -729,6 +959,8 @@ impl Agent {
                         policy,
                         &tools,
                         &std::collections::HashSet::new(),
+                        turn,
+                        &mut next_call_id,
                     );
                 }
                 Err(error) => {
@@ -779,6 +1011,8 @@ fn cancelled(
     policy: ContextPolicy,
     tools: &[Value],
     dispatched: &std::collections::HashSet<String>,
+    turn: u64,
+    next_call_id: &mut u64,
 ) -> TurnOutcome {
     outcome.cancelled = true;
     outcome.failed = true;
@@ -786,14 +1020,59 @@ fn cancelled(
     if outcome.text.is_empty() {
         outcome.text = "已中断".to_string();
     }
+    // 还没被时间线记下的工具调用（本批剩余那些），补一条"已取消"的终态，
+    // 保证界面上不会留下一个永远转圈的卡片。
+    let recorded: Vec<ToolCallId> = outcome.steps.iter().map(|step| step.call).collect();
+    for call in declared_tool_calls(messages) {
+        let name = call.name.clone();
+        if name.is_empty() {
+            continue;
+        }
+        let answered = call.id.clone();
+        if outcome_tracks(&recorded, messages, &answered) {
+            continue;
+        }
+        *next_call_id += 1;
+        let call_id = ToolCallId(*next_call_id);
+        emit(AgentEvent::ToolEnd {
+            turn,
+            step: 0,
+            call: call_id,
+            name,
+            status: ToolStatus::Cancelled,
+            text: if dispatched.contains(&answered) {
+                "已中断（状态未知）".to_string()
+            } else {
+                "已中断，未执行".to_string()
+            },
+            ms: 0,
+        });
+    }
     backfill_unanswered_tool_calls(messages, dispatched);
     outcome.context_tokens = estimate_request_tokens(messages, tools);
     outcome.context_window = policy.context_window;
     sync_history(history, messages);
     emit(AgentEvent::Failed {
+        turn,
         reason: "已中断".to_string(),
     });
     outcome
+}
+
+/// 历史里声明的 tool_calls（用于取消时为未记录的调用补终态）。
+fn declared_tool_calls(messages: &[ChatMessage]) -> Vec<crate::llm::ToolCall> {
+    messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .flat_map(|message| message.tool_calls.iter().cloned())
+        .collect()
+}
+
+/// 这个已声明的调用是否已经有真实终态（有 tool 结果即视为已落定）。
+fn outcome_tracks(_recorded: &[ToolCallId], messages: &[ChatMessage], tool_call_id: &str) -> bool {
+    messages.iter().any(|message| {
+        message.role == Role::Tool && message.tool_call_id.as_deref() == Some(tool_call_id)
+    })
 }
 
 /// 给历史里"声明了但没有结果"的 `tool_calls` 补一条如实说明。
