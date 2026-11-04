@@ -709,7 +709,7 @@ mod tests {
             let _ = run(&silence(100));
         }
         assert_eq!(started, 1, "短停顿不能把一句话切成两段");
-        assert!(detector.take_utterance().len() > 0);
+        assert!(!detector.take_utterance().is_empty());
     }
 
     /// 预滚：语音开始前的一小段音频必须被带进这一句（避免截掉首字）。

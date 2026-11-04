@@ -250,6 +250,8 @@ fn agent_config() -> AgentConfig {
         context_policy: resolve_context_policy(Some(1_000_000), Some(90), None),
         system_prompt: "test".to_string(),
         echo_reasoning: false,
+        turn_id: 1,
+        use_tools: true,
     }
 }
 
@@ -302,9 +304,11 @@ async fn run(
     let emit = move |event: AgentEvent| {
         let label = match &event {
             AgentEvent::ToolStart { name, .. } => format!("start:{name}"),
-            AgentEvent::ToolEnd { name, ok, .. } => format!("end:{name}:{ok}"),
-            AgentEvent::TextDelta(text) => format!("text:{text}"),
-            AgentEvent::Failed { reason } => format!("failed:{reason}"),
+            AgentEvent::ToolEnd { name, status, .. } => {
+                format!("end:{name}:{}", status.code())
+            }
+            AgentEvent::TextDelta { text, .. } => format!("text:{text}"),
+            AgentEvent::Failed { reason, .. } => format!("failed:{reason}"),
             _ => "other".to_string(),
         };
         sink.lock().unwrap().push(label);

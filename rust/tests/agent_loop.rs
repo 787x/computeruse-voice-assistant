@@ -355,6 +355,8 @@ fn agent_config() -> AgentConfig {
         context_policy: resolve_context_policy(Some(1_000_000), Some(90), None),
         system_prompt: "test system prompt".to_string(),
         echo_reasoning: false,
+        turn_id: 1,
+        use_tools: true,
     }
 }
 
@@ -374,13 +376,16 @@ async fn run_turn(
     let sink = events.clone();
     let emit = move |event: AgentEvent| {
         let label = match &event {
-            AgentEvent::TextDelta(text) => format!("text:{text}"),
-            AgentEvent::Reasoning { chars, .. } => format!("reasoning:{chars}"),
+            AgentEvent::TextDelta { text, .. } => format!("text:{text}"),
+            AgentEvent::ReasoningDone { chars, .. } => format!("reasoning:{chars}"),
+            AgentEvent::ReasoningDelta { .. } => "reasoning_delta".to_string(),
             AgentEvent::ToolStart { name, .. } => format!("tool_start:{name}"),
-            AgentEvent::ToolEnd { name, ok, .. } => format!("tool_end:{name}:{ok}"),
+            AgentEvent::ToolEnd { name, status, .. } => {
+                format!("tool_end:{name}:{}", status.code())
+            }
             AgentEvent::ConfirmationRequired(prompt) => format!("confirm:{}", prompt.tool),
             AgentEvent::Done(_) => "done".to_string(),
-            AgentEvent::Failed { reason } => format!("failed:{reason}"),
+            AgentEvent::Failed { reason, .. } => format!("failed:{reason}"),
         };
         sink.lock().unwrap().push(label);
     };
@@ -439,7 +444,7 @@ async fn single_tool_call_closes_the_loop() {
     assert_eq!(outcome.text, "窗口 3 个。");
     assert_eq!(tools.names(), vec!["list_windows"]);
     assert_eq!(outcome.steps.len(), 1);
-    assert!(outcome.steps[0].ok);
+    assert!(outcome.steps[0].ok());
     assert!(events
         .iter()
         .any(|event| event == "tool_start:list_windows"));
@@ -569,7 +574,7 @@ async fn denial_executes_zero_tool_calls() {
     );
     assert!(events
         .iter()
-        .any(|event| event == "tool_end:read_clipboard:false"));
+        .any(|event| event == "tool_end:read_clipboard:denied"));
     assert!(outcome
         .steps
         .iter()

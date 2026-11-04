@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{ReasoningEffort, ThinkingLevel};
@@ -122,7 +123,8 @@ pub fn build_request_fields(profile: &ProviderProfile, temperature: f64) -> Requ
 }
 
 /// 角色。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     System,
     User,
@@ -142,7 +144,13 @@ impl Role {
 }
 
 /// 消息内容：纯文本，或 OpenAI 多段内容（截图附件必须走数组）。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 会话持久化时按"可恢复且有界"的形态保存：
+///  - 文本原样保存；
+///  - 多段内容里的截图**不存 base64**（会撑爆会话文件），只保留说明文字，
+///    并标明"附件未保留"。这不会把消息结构改坏：下次请求时它只是没有图片的文本。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Content {
     Text(String),
     Parts(Vec<Value>),
@@ -170,7 +178,8 @@ impl Content {
 }
 
 /// 一个工具调用（模型产出）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -182,25 +191,66 @@ pub struct ToolCall {
 }
 
 /// 对话消息。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub role: Role,
     pub content: Content,
+    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
     pub tool_call_id: Option<String>,
     /// 思考内容。只用于协议回传，绝不进用户可见回复。
+    #[serde(default)]
     pub reasoning_content: Option<String>,
-    /// 程序生成的内部提示（"参数不完整，请重新生成"）。**绝不发往模型**。
+    /// 程序生成的内部提示（"参数不完整，请重新生成"）。**绝不发往模型**的标记位，
+    /// 但内容本身仍然发出去（模型要看得到这条提示）。
+    #[serde(default)]
     pub internal: bool,
     /// 产生这条消息的提供商 id（`None` = 未知/用户消息）。
     ///
     /// 用来解决跨提供商的私有字段问题：MiMo / DeepSeek 的 `reasoning_content`
     /// 是各自端点的私有协议上下文，发给另一家可能直接 400。历史里保留普通对话
     /// 与完整的工具调用链，只在提供商**不同**时剥掉 `reasoning_content`。
+    #[serde(default)]
     pub provider_id: Option<String>,
 }
 
 impl ChatMessage {
+    /// 会话持久化用的有界副本：截图 base64 不进会话文件。
+    ///
+    /// 只处理 `Content::Parts`：保留说明文字，把每个 `image_url` 段换成一条
+    /// 说明（"附件未保留"）。**结构仍是数组**，所以恢复后依然是一条合法的
+    /// 多段消息，不会让后续请求或压缩逻辑把它误当成普通用户文本。
+    pub fn for_storage(&self) -> Self {
+        let mut copy = self.clone();
+        if let Content::Parts(parts) = &self.content {
+            let mut kept = Vec::with_capacity(parts.len());
+            let mut dropped = 0usize;
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                    dropped += 1;
+                    continue;
+                }
+                kept.push(part.clone());
+            }
+            if dropped > 0 {
+                kept.push(json!({
+                    "type": "text",
+                    "text": format!("（这条消息原本附带 {dropped} 张截图；恢复会话时不保留图片，仅保留文字说明）")
+                }));
+            }
+            copy.content = Content::Parts(kept);
+        }
+        copy
+    }
+
+    /// 这条消息里有没有附件（截图）。
+    pub fn has_attachment(&self) -> bool {
+        matches!(&self.content, Content::Parts(parts)
+            if parts.iter().any(|part| part.get("type").and_then(Value::as_str) == Some("image_url")))
+    }
+
     pub fn text(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
@@ -794,8 +844,26 @@ impl LlmClient {
         }))
     }
 
-    /// 拉取可用模型列表（PR5 只在设置页做连通性检查时用）。
+    /// 拉取可用模型列表（只要 id，保留给既有测试与简单场景）。
     pub async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let json = self.list_models_json().await?;
+        Ok(json
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// 拉取 `/models` 的原始 JSON（分类与元数据解析在 `model_catalog` 里做）。
+    ///
+    /// 超时取 `min(timeout_ms, 15s)`：目录接口不该把界面卡住。
+    pub async fn list_models_json(&self) -> Result<Value, LlmError> {
         let url = format!("{}/models", self.profile.base_url.trim_end_matches('/'));
         let mut request = self.http.get(url);
         if !self.api_key.trim().is_empty() {
@@ -809,27 +877,63 @@ impl LlmClient {
             .await
             .map_err(|error| LlmError::Connect(error.to_string()))?;
         if !response.status().is_success() {
-            return Err(LlmError::Status {
-                status: response.status().as_u16(),
-                body: "模型列表请求失败".to_string(),
-            });
+            let status = response.status().as_u16();
+            let body = truncate(&response.text().await.unwrap_or_default(), 240);
+            return Err(LlmError::Status { status, body });
         }
-        let json: Value = response
-            .json()
+        response
+            .json::<Value>()
             .await
-            .map_err(|error| LlmError::Other(error.to_string()))?;
-        let ids = json
-            .get("data")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("id").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(ids)
+            .map_err(|error| LlmError::Other(format!("模型列表不是合法 JSON：{error}")))
+    }
+
+    /// 发一次**最小**对话请求（连接测试用，不产生工具调用、不带历史）。
+    ///
+    /// 与正常 `chat` 的区别只有两点：请求体带 `max_tokens: 16`（省费用），
+    /// 以及不传工具定义。推理字段仍按能力发送，所以测试结果与真实请求同源。
+    pub async fn probe(
+        &self,
+        prompt: &str,
+        signal: &crate::cancel::CancelToken,
+    ) -> Result<ChatResult, LlmError> {
+        let messages = [ChatMessage::user(prompt)];
+        let body = {
+            let mut body = self.build_body(&messages, &[], true);
+            if let Some(object) = body.as_object_mut() {
+                object.insert("max_tokens".to_string(), json!(16));
+            }
+            body
+        };
+        let mut request = self
+            .http
+            .post(self.endpoint())
+            .header("content-type", "application/json")
+            .json(&body);
+        if !self.api_key.trim().is_empty() {
+            request = request.header("authorization", format!("Bearer {}", self.api_key));
+        }
+        let timeout = std::time::Duration::from_millis(self.timeout_ms);
+        let response = tokio::select! {
+            result = request.send() => result,
+            _ = signal.cancelled() => return Err(LlmError::Aborted),
+            _ = tokio::time::sleep(timeout) => return Err(LlmError::Timeout(self.timeout_ms)),
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if signal.is_cancelled() {
+                    return Err(LlmError::Aborted);
+                }
+                return Err(LlmError::Connect(error.to_string()));
+            }
+        };
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = truncate(&response.text().await.unwrap_or_default(), 400);
+            return Err(LlmError::Status { status, body });
+        }
+        self.consume_stream(response, signal, &mut |_| {}, &mut |_| {})
+            .await
     }
 }
 

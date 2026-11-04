@@ -716,9 +716,9 @@ pub fn read_wav_16k(path: &Path) -> Result<Vec<f32>, String> {
         }
     }
     let mut resampler = crate::voice::pcm::StreamingResampler::new(spec.sample_rate)
-        .map_err(|error| format!("{error}"))?;
-    let mut out = resampler.push(&mono).map_err(|error| format!("{error}"))?;
-    out.extend(resampler.flush().map_err(|error| format!("{error}"))?);
+        .map_err(|error| error.to_string())?;
+    let mut out = resampler.push(&mono).map_err(|error| error.to_string())?;
+    out.extend(resampler.flush().map_err(|error| error.to_string())?);
     Ok(out)
 }
 
