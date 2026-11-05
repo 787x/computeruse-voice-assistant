@@ -364,10 +364,10 @@ pub struct ProviderConfig {
 
 impl ProviderConfig {
     pub fn selectable_models(&self) -> Vec<String> {
-        if let Some(enabled) = &self.enabled_models {
-            return enabled.clone();
-        }
-        let mut models = self.models.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let mut models = self
+            .enabled_models
+            .clone()
+            .unwrap_or_else(|| self.models.iter().map(|m| m.id.clone()).collect::<Vec<_>>());
         if !self.model.trim().is_empty() && !models.contains(&self.model) {
             models.insert(0, self.model.clone());
         }

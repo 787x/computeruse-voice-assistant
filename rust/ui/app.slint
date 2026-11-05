@@ -1565,7 +1565,8 @@ export component AppWindow inherits Window {
                         Text { text: "播报后端、音色与本地 TTS 在「语音」页统一编辑，一次保存生效。"; color: #55555c; wrap: word-wrap; }
                         Text { text: "聊天区启用模型（默认模型始终可选；目录项尚未经过聊天验证）"; color: #55555c; wrap: word-wrap; }
                         for name[i] in root.enabled-model-names : AppButton {
-                            label: (root.enabled-model-flags[i] ? "已启用 · " : "未启用 · ") + root.enabled-model-labels[i];
+                            label: (name == root.model-name ? "默认模型（始终可选） · " : root.enabled-model-flags[i] ? "已启用 · " : "未启用 · ") + root.enabled-model-labels[i];
+                            enabled: !root.settings-saving && name != root.model-name;
                             width: 100%;
                             clicked => {
                                 root.enabled-model-flags[i] = !root.enabled-model-flags[i];

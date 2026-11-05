@@ -21,6 +21,28 @@ use crate::secret::SecretStore;
 use crate::voice::speech::SpeechRuntime;
 use crate::voice::tts::{TtsBackend, TtsSettings};
 
+/// 单个提供商在设置页中的未保存字段。
+#[derive(Clone, Default)]
+pub struct ProviderDraft {
+    pub base_url: String,
+    pub model: String,
+    pub hint: i32,
+    pub thinking: i32,
+    pub effort: i32,
+    pub api_key: String,
+    pub rows: Vec<(String, bool)>,
+}
+
+impl std::fmt::Debug for ProviderDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderDraft")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
 /// 界面「保存」提交的全部内容。
 #[derive(Debug, Clone)]
 pub struct SaveRequest {
@@ -35,6 +57,7 @@ pub struct SaveRequest {
     pub model: String,
     pub enabled_models: Vec<String>,
     pub provider_enabled_models: BTreeMap<String, Vec<String>>,
+    pub provider_drafts: BTreeMap<String, ProviderDraft>,
     pub provider_hint: i32,
     pub api_key: String,
     // ---- 采样与预算 ----
@@ -366,6 +389,33 @@ pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Sett
             }
         }
     }
+    for (id, draft) in &request.provider_drafts {
+        if id == &next.provider_id {
+            continue;
+        }
+        if draft.model.trim().is_empty() {
+            return Err(format!("提供商 {id} 的模型名不能为空"));
+        }
+        upsert_provider(
+            &mut providers,
+            id,
+            &draft.base_url,
+            &draft.model,
+            provider_hint_for_index(draft.hint),
+            thinking_for_index(draft.thinking),
+            reasoning_effort_for_index(draft.effort),
+        );
+        if let Some(provider) = providers.iter_mut().find(|p| &p.id == id) {
+            provider.enabled_models = Some(
+                draft
+                    .rows
+                    .iter()
+                    .filter(|(_, enabled)| *enabled)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            );
+        }
+    }
     next.providers = providers;
 
     next.voice.kws_model_dir = request.kws_dir.clone();
@@ -580,22 +630,41 @@ pub fn apply_save(
     }
     *settings = next;
 
-    // 再写 Key：只写到目标提供商名下，留空 = 不动。
+    // Key 仅写入各自提供商；单项失败保留表单供用户重试。
     let key_provider = settings.provider_id.clone();
     let new_key = request.api_key.trim().to_string();
-    let key_error = if new_key.is_empty() {
+    let mut errors = Vec::new();
+    let mut mimo_key_changed = false;
+    for (id, key) in request
+        .provider_drafts
+        .iter()
+        .filter(|(id, _)| *id != &key_provider)
+        .map(|(id, draft)| (id.as_str(), draft.api_key.trim()))
+        .chain(std::iter::once((key_provider.as_str(), new_key.as_str())))
+    {
+        if key.is_empty() {
+            continue;
+        }
+        match secret.save(id, key) {
+            Ok(()) => {
+                if id == crate::ui::worker::MIMO_PROVIDER_ID {
+                    mimo_key_changed = true;
+                }
+            }
+            Err(error) => errors.push(format!("{id}: {error}")),
+        }
+    }
+    let key_error = if errors.is_empty() {
         None
     } else {
-        secret.save(&key_provider, &new_key).err()
+        Some(errors.join("；"))
     };
 
     restore_model_catalogs(settings, paths, secret, None);
 
     // 只有"给当前启用的云端后端"写入了新 Key 才算凭据变化。
-    let key_changed_for_active_backend = key_error.is_none()
-        && !new_key.is_empty()
-        && key_provider == crate::ui::worker::MIMO_PROVIDER_ID
-        && settings.tts.active_backend() == TtsBackend::Mimo;
+    let key_changed_for_active_backend =
+        mimo_key_changed && settings.tts.active_backend() == TtsBackend::Mimo;
     let tts_changed =
         tts_runtime_config_changed(&previous, settings, key_changed_for_active_backend);
     let speech_warning = if tts_changed {
@@ -639,6 +708,7 @@ mod tests {
             model: settings.model.clone(),
             enabled_models: settings.provider(&settings.provider_id).selectable_models(),
             provider_enabled_models: BTreeMap::new(),
+            provider_drafts: BTreeMap::new(),
             provider_hint: provider_hint_index(settings.provider_hint),
             api_key: String::new(),
             temperature: format!("{:.1}", settings.temperature),
@@ -661,6 +731,93 @@ mod tests {
             tts_local_speed: format!("{:.1}", settings.tts.local_speed),
             speak_mode: 0,
         }
+    }
+
+    #[test]
+    fn invalid_other_provider_draft_does_not_write_any_keys_or_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "cuava-invalid-drafts-{}",
+            crate::clock::now().unix_ms
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.api_key = "test-current-key".into();
+        request.provider_drafts.insert(
+            "deepseek".into(),
+            ProviderDraft {
+                base_url: "ftp://invalid".into(),
+                model: "test".into(),
+                api_key: "test-other-key".into(),
+                ..Default::default()
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        assert!(
+            !apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written()
+        );
+        assert!(!paths.settings_file().exists());
+        assert!(!secret.has("mimo"));
+        assert!(!secret.has("deepseek"));
+        assert_eq!(
+            request.provider_drafts["deepseek"].api_key,
+            "test-other-key"
+        );
+    }
+
+    #[test]
+    fn provider_fields_and_keys_are_saved_to_their_own_accounts() {
+        let root = std::env::temp_dir().join(format!(
+            "cuava-multi-drafts-{}",
+            crate::clock::now().unix_ms
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.provider_id = "deepseek".into();
+        request.base_url = "https://deepseek.example/v1".into();
+        request.model = "deepseek-test".into();
+        request.api_key = "test-deepseek-key".into();
+        request.enabled_models = vec!["deepseek-test".into()];
+        request.provider_drafts.insert(
+            "mimo".into(),
+            ProviderDraft {
+                base_url: "https://mimo.example/v1".into(),
+                model: "mimo-test".into(),
+                thinking: 1,
+                effort: 1,
+                api_key: "test-mimo-key".into(),
+                rows: vec![("mimo-test".into(), true)],
+                ..Default::default()
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        let loaded = config::load_settings(&paths).unwrap();
+        assert_eq!(loaded.provider("mimo").base_url, "https://mimo.example/v1");
+        assert_eq!(loaded.provider("mimo").model, "mimo-test");
+        assert_eq!(
+            loaded.provider("deepseek").base_url,
+            "https://deepseek.example/v1"
+        );
+        assert_eq!(loaded.provider("deepseek").model, "deepseek-test");
+        assert_eq!(
+            secret.load("mimo").unwrap().as_deref(),
+            Some("test-mimo-key")
+        );
+        assert_eq!(
+            secret.load("deepseek").unwrap().as_deref(),
+            Some("test-deepseek-key")
+        );
+        assert!(!std::fs::read_to_string(paths.settings_file())
+            .unwrap()
+            .contains("test-mimo-key"));
     }
 
     #[test]
@@ -689,12 +846,12 @@ mod tests {
         config::save_settings(&paths, &next).unwrap();
         let loaded = config::load_settings(&paths).unwrap();
         assert_eq!(
-            loaded.provider("mimo").selectable_models(),
-            vec!["mimo-choice"]
+            loaded.provider("mimo").enabled_models,
+            Some(vec!["mimo-choice".into()])
         );
         assert_eq!(
-            loaded.provider("deepseek").selectable_models(),
-            vec!["deepseek-choice"]
+            loaded.provider("deepseek").enabled_models,
+            Some(vec!["deepseek-choice".into()])
         );
     }
 

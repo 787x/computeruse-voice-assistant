@@ -88,7 +88,7 @@ pub enum UiCommand {
     /// 那时"清除"应该作用于界面显示的那家，而不是已保存配置里的那家。
     ClearApiKey(String),
     /// 切换提供商（界面据此回填地址与模型）。
-    ProviderChanged(i32, Option<Vec<(String, bool)>>),
+    ProviderChanged,
     /// 打开设置：按当前已保存的配置回填界面。
     OpenSettings,
     /// 切换设置分类（只改界面，不回填）。
@@ -297,7 +297,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     let model_drafts = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
         String,
-        Vec<(String, bool)>,
+        settings_ui::ProviderDraft,
     >::new()));
     let draft_provider = std::rc::Rc::new(std::cell::Cell::new(window.get_provider_index()));
 
@@ -337,10 +337,20 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let model_drafts = model_drafts.clone();
         let draft_provider = draft_provider.clone();
         let weak = window.as_weak();
+        let settings_paths = paths.clone();
         window.on_open_settings(move || {
             model_drafts.borrow_mut().clear();
             if let Some(window) = weak.upgrade() {
-                draft_provider.set(window.get_provider_index());
+                let index = config::load_settings(&settings_paths)
+                    .ok()
+                    .and_then(|settings| {
+                        PROVIDER_IDS
+                            .iter()
+                            .position(|id| *id == settings.provider_id)
+                    })
+                    .map(|i| i as i32)
+                    .unwrap_or_else(|| window.get_provider_index());
+                draft_provider.set(index);
             }
             let _ = tx.send(UiCommand::OpenSettings);
         });
@@ -369,19 +379,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 None => return,
             };
 
-            request.provider_enabled_models = model_drafts
-                .borrow()
-                .iter()
-                .map(|(id, rows)| {
-                    (
-                        id.clone(),
-                        rows.iter()
-                            .filter(|(_, enabled)| *enabled)
-                            .map(|(name, _)| name.clone())
-                            .collect(),
-                    )
-                })
-                .collect();
+            request.provider_drafts = model_drafts.borrow().clone();
             // 取一个新的代次；工作线程只有拿它回填才算"最新"。
             let generation = save_generation.fetch_add(1, Ordering::SeqCst) + 1;
             if tx
@@ -428,39 +426,48 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let model_drafts = model_drafts.clone();
         let draft_provider = draft_provider.clone();
         window.on_provider_changed(move |index| {
-            if let Some(window) = weak.upgrade() {
-                let names = window.get_enabled_model_names();
-                let flags = window.get_enabled_model_flags();
-                let rows = names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| (name.to_string(), flags.row_data(i).unwrap_or(false)))
-                    .collect();
-                model_drafts.borrow_mut().insert(
-                    provider_id_for_index(draft_provider.get()).to_string(),
-                    rows,
-                );
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let old_index = draft_provider.get();
+            let id = provider_id_for_index(index).to_string();
+            let saved = match config::load_settings(&paths_for_key) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    window.set_provider_index(old_index);
+                    window.set_settings_error(format!("无法读取供应商配置：{error}").into());
+                    return;
+                }
+            };
+            model_drafts.borrow_mut().insert(
+                provider_id_for_index(old_index).to_string(),
+                capture_provider_draft(&window),
+            );
+            let secret = SecretStore::new(paths_for_key.secret_file());
+            let mut saved = saved;
+            settings_ui::restore_model_catalogs(&mut saved, &paths_for_key, &secret, None);
+            let provider = saved.provider(&id);
+            window.set_has_key(secret.has(&id));
+            window.set_base_url(provider.base_url_or_default().into());
+            window.set_model_name(provider.model.clone().into());
+            window.set_api_key_input("".into());
+            window
+                .set_provider_hint_index(settings_ui::provider_hint_index(provider.provider_hint));
+            window.set_thinking_index(thinking_index(provider.thinking));
+            window.set_effort_index(reasoning_effort_index(provider.reasoning_effort));
+            fill_model_settings(&window, &provider);
+            if let Some(draft) = model_drafts.borrow().get(&id) {
+                window.set_base_url(draft.base_url.clone().into());
+                window.set_model_name(draft.model.clone().into());
+                window.set_api_key_input(draft.api_key.clone().into());
+                window.set_provider_hint_index(draft.hint);
+                window.set_thinking_index(draft.thinking);
+                window.set_effort_index(draft.effort);
+                apply_model_draft(&window, &draft.rows);
             }
             draft_provider.set(index);
-            let draft = model_drafts
-                .borrow()
-                .get(provider_id_for_index(index))
-                .cloned();
-            let _ = tx.send(UiCommand::ProviderChanged(index, draft));
-            let provider_id = provider_id_for_index(index).to_string();
-            // "该提供商有没有 Key" 要跟着下拉框变，否则界面会对着
-            // 一家没有 Key 的提供商显示"已保存"。这里只探测文件存在性，不读明文。
-            let has_key = SecretStore::new(paths_for_key.secret_file()).has(&provider_id);
-            if let Some(window) = weak.upgrade() {
-                // 同步回填该提供商的默认地址/模型（用户仍可手改）。
-                if let Some(provider) = config::get_provider(&provider_id) {
-                    window.set_base_url(provider.base_url.into());
-                    if !provider.default_model.is_empty() {
-                        window.set_model_name(provider.default_model.into());
-                    }
-                }
-                window.set_has_key(has_key);
-            }
+            window.set_models_busy(false);
+            let _ = tx.send(UiCommand::ProviderChanged);
         });
     }
     {
@@ -1671,29 +1678,8 @@ async fn run_worker(
                 let has_key = secret.has(&settings.provider_id);
                 apply_settings_to_ui(&weak, &settings, has_key);
             }
-            UiCommand::ProviderChanged(index, draft) => {
+            UiCommand::ProviderChanged => {
                 model_request += 1;
-                let provider = settings.provider(provider_id_for_index(index));
-                let has_key = secret.has(&provider.id);
-                with_window(&weak, move |window| {
-                    if window.get_provider_index() != index {
-                        return;
-                    }
-                    window.set_has_key(has_key);
-                    window.set_api_key_input("".into());
-                    window.set_base_url(provider.base_url_or_default().into());
-                    window.set_model_name(provider.model.clone().into());
-                    fill_model_settings(window, &provider);
-                    if let Some(rows) = draft {
-                        apply_model_draft(window, &rows);
-                    }
-                    window.set_provider_hint_index(settings_ui::provider_hint_index(
-                        provider.provider_hint,
-                    ));
-                    window.set_thinking_index(thinking_index(provider.thinking));
-                    window.set_effort_index(reasoning_effort_index(provider.reasoning_effort));
-                    window.set_models_busy(false);
-                });
             }
             UiCommand::ClearApiKey(provider_id) => {
                 match secret.clear(&provider_id) {
@@ -3284,6 +3270,7 @@ pub fn build_save_request(window: &AppWindow) -> SaveRequest {
             .map(|(_, name)| name.to_string())
             .collect(),
         provider_enabled_models: Default::default(),
+        provider_drafts: Default::default(),
         provider_hint: window.get_provider_hint_index(),
         api_key: window.get_api_key_input().to_string(),
         temperature: window.get_temperature().to_string(),
@@ -3628,7 +3615,7 @@ async fn wait_turn(
                         let has_key = secret.has(&settings.provider_id);
                         apply_settings_to_ui(weak, settings, has_key);
                     }
-                    Some(UiCommand::ProviderChanged(_, _)) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
+                    Some(UiCommand::ProviderChanged) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
                     Some(UiCommand::ClearApiKey(provider_id)) => {
                         /*
                          * 任务执行期间清除 Key：**真实执行**，不是只提示。
@@ -3719,7 +3706,7 @@ fn handle_save_all_ui(
 
     // 只有配置真的落盘了，才刷新"已生效"状态；失败时**不动**界面上的可编辑字段，
     // 否则会把用户刚输入的非法内容悄悄换回旧值，让他无从修改。
-    if outcome.config_written() {
+    if outcome.config_written() && !matches!(outcome, SaveOutcome::SavedKeyFailed(_)) {
         // 权限运行态跟着新档位/覆盖走（但不重置暂停与限时授权）。
         if let Ok(mut state) = permissions.lock() {
             state.mode = settings.permission_mode;
@@ -4481,6 +4468,24 @@ pub fn settings_summary(settings: &Settings, has_key: bool) -> String {
 pub fn summary_is_secret_free(value: &Value) -> bool {
     let text = value.to_string();
     !text.contains("sk-") && !text.contains("Bearer ")
+}
+
+fn capture_provider_draft(window: &AppWindow) -> settings_ui::ProviderDraft {
+    let flags = window.get_enabled_model_flags();
+    settings_ui::ProviderDraft {
+        base_url: window.get_base_url().to_string(),
+        model: window.get_model_name().to_string(),
+        hint: window.get_provider_hint_index(),
+        thinking: window.get_thinking_index(),
+        effort: window.get_effort_index(),
+        api_key: window.get_api_key_input().to_string(),
+        rows: window
+            .get_enabled_model_names()
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.to_string(), flags.row_data(i).unwrap_or(false)))
+            .collect(),
+    }
 }
 
 fn apply_model_draft(window: &AppWindow, rows: &[(String, bool)]) {
