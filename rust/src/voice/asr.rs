@@ -40,8 +40,9 @@ pub struct AsrConfig {
 
 /// 本构建是否带 CUDA 后端。
 ///
-/// `cuda` 是默认 feature，但可以关掉（`--no-default-features`）。
-/// 关掉时即使设置里要求 GPU 也只能走 CPU：界面会明确显示原因。
+/// `cuda` 是默认且**唯一受支持**的发行 feature（项目不再维护 CPU-only 版本）。
+/// 这个常量保留下来是为了让"没有 GPU 可用"与"构建里就没有 CUDA"这两种情况
+/// 在界面上仍能如实区分：没有设备时同一构建内回退 CPU 并说明原因。
 pub const fn gpu_compiled_in() -> bool {
     cfg!(feature = "cuda")
 }

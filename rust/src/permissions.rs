@@ -156,6 +156,13 @@ const CAPABILITIES: &[CapabilityInfo] = &[
         audit: false,
     },
     CapabilityInfo {
+        id: "web.search",
+        label: "联网搜索",
+        // 默认放行：问"今天天气"不该每次弹卡片。留痕是因为查询词会发给第三方。
+        level: Level::Allow,
+        audit: true,
+    },
+    CapabilityInfo {
         id: "system.settings",
         label: "修改系统设置",
         level: Level::Ask,
@@ -209,6 +216,14 @@ fn capability_info(id: &str) -> Option<&'static CapabilityInfo> {
 }
 
 /// 工具名 → 能力。没有映射的工具一律 deny。
+///
+/// PR12 恢复了旧版全部非音乐工具，能力映射与旧版 `TOOL_CAPABILITY` 一致：
+///  - `run_shell` → `system.shell`（默认 ask）；
+///  - `web_search` → `web.search`（默认 allow，但留痕：查询词会发给第三方）；
+///  - `get_current_time` / `system_info` / `app_control` → 只读能力（默认 allow）；
+///  - `launch_app` → `app.launch`（默认 allow）；`kill_app` → `app.close`（默认 ask）；
+///  - `files` 的细粒度分级在 [`classify`] 里按 `action` 决定，**绝不能**把删除
+///    归到读取能力下。
 pub fn tool_capability(tool: &str) -> Option<&'static str> {
     Some(match tool {
         "screenshot" => "screen.capture",
@@ -222,6 +237,17 @@ pub fn tool_capability(tool: &str) -> Option<&'static str> {
         "read_clipboard" => "clipboard.read",
         "write_clipboard" => "clipboard.write",
         "wait" => "none",
+        // ---- PR12：本地非音乐工具 ----
+        "run_shell" => "system.shell",
+        "web_search" => "web.search",
+        "launch_app" => "app.launch",
+        "kill_app" => "app.close",
+        "system_info" => "system.info",
+        "app_control" => "window.read",
+        "get_current_time" => "none",
+        // `files` 的默认能力是"读"；真正的分级在 `classify` 里按 action 覆盖。
+        // 这条兜底只用于"模型漏了 action"的情况——那种调用会被执行前的参数校验拦下。
+        "files" => "file.read",
         _ => return None,
     })
 }
@@ -323,6 +349,47 @@ pub fn classify(tool: &str, args: &serde_json::Value) -> Classification {
                 };
             }
         }
+    }
+
+    /*
+     * `files` 的细粒度分级：同一个工具名，列目录和删除的风险差着量级。
+     *
+     * 规则与旧版 `classify` 一致，且**删除永远不会落到读取能力下**：
+     *  - delete                         → file.delete（默认 ask）
+     *  - write / copy / move            → file.write（默认 ask）
+     *  - list / read / info / 未知 action → file.read（默认 allow）
+     *
+     * 未知 action 归到读取是安全的**因为**它会在动作之前被参数校验拒绝
+     * （`tools::files::Request::validate`）；也就是说这里最坏的结果是
+     * "一个本来就不会执行的调用被按读取放行"，不会造成写入或删除。
+     */
+    if tool == "files" {
+        let action = args
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let capability = match action.as_str() {
+            "delete" => "file.delete",
+            "write" | "copy" | "move" => "file.write",
+            _ => "file.read",
+        };
+        let base = capability_info(capability)
+            .map(|info| info.level)
+            .unwrap_or(Level::Ask);
+        return Classification {
+            capability,
+            level: base,
+            // 让用户在确认卡上看到"这次到底想做什么"，而不是只看到 files。
+            reason: if action.is_empty() {
+                "没有给 action（会在执行前被拒绝）".to_string()
+            } else {
+                format!("action={action}")
+            },
+            escalated: false,
+            unknown: false,
+        };
     }
 
     let base = capability_info(capability)
@@ -1519,5 +1586,172 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ---------------------------------------------------------------
+    // PR12：新工具的能力映射与 files 的按 action 分级
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn restored_tools_map_to_the_legacy_capabilities() {
+        for (tool, capability) in [
+            ("run_shell", "system.shell"),
+            ("web_search", "web.search"),
+            ("launch_app", "app.launch"),
+            ("kill_app", "app.close"),
+            ("system_info", "system.info"),
+            ("app_control", "window.read"),
+            ("get_current_time", "none"),
+            ("files", "file.read"),
+        ] {
+            assert_eq!(tool_capability(tool), Some(capability), "{tool}");
+        }
+        // 旧版工具映射不能被这次改动挪走。
+        assert_eq!(tool_capability("screenshot"), Some("screen.capture"));
+        assert_eq!(tool_capability("read_clipboard"), Some("clipboard.read"));
+        assert_eq!(tool_capability("open_application"), Some("app.launch"));
+        assert_eq!(tool_capability("not_a_tool"), None);
+    }
+
+    /// **删除绝不能被伪装成读取**：这是本 PR 最容易犯的错。
+    #[test]
+    fn files_actions_map_to_their_own_capabilities() {
+        for action in ["list", "read", "info"] {
+            let verdict = classify("files", &serde_json::json!({"action": action}));
+            assert_eq!(verdict.capability, "file.read", "{action}");
+            assert_eq!(verdict.level, Level::Allow, "{action} 只读应当直接放行");
+        }
+        for action in ["write", "copy", "move"] {
+            let verdict = classify("files", &serde_json::json!({"action": action}));
+            assert_eq!(verdict.capability, "file.write", "{action}");
+            assert_eq!(verdict.level, Level::Ask, "{action} 必须询问");
+        }
+        let verdict = classify("files", &serde_json::json!({"action": "delete"}));
+        assert_eq!(verdict.capability, "file.delete");
+        assert_eq!(verdict.level, Level::Ask);
+        assert_ne!(verdict.capability, "file.read");
+        assert!(verdict.reason.contains("action=delete"), "确认卡要说明动作");
+    }
+
+    /// 大小写/空白不能绕过分级；漏 action 时归到读取，但会在执行前被参数校验拒绝。
+    #[test]
+    fn files_action_parsing_is_case_insensitive_and_fails_closed() {
+        let verdict = classify("files", &serde_json::json!({"action": " DELETE "}));
+        assert_eq!(verdict.capability, "file.delete");
+        let verdict = classify("files", &serde_json::json!({"action": "Write"}));
+        assert_eq!(verdict.capability, "file.write");
+        let verdict = classify("files", &serde_json::json!({}));
+        assert_eq!(verdict.capability, "file.read");
+        assert!(verdict.reason.contains("没有给 action"));
+    }
+
+    /// 只读工具在标准档**不需要**逐次确认：这是"日常便利不被安全改造牺牲"的落点。
+    #[tokio::test]
+    async fn read_only_new_tools_do_not_prompt_in_standard_mode() {
+        let state = gate(PermissionMode::Standard);
+        for (tool, args) in [
+            ("system_info", serde_json::json!({})),
+            ("app_control", serde_json::json!({"action":"list"})),
+            ("get_current_time", serde_json::json!({})),
+            ("web_search", serde_json::json!({"query":"天气"})),
+            ("files", serde_json::json!({"action":"list","path":"C:\\"})),
+        ] {
+            let decision = PermissionGate::new(&state)
+                .check(tool, &args, None, &CancelToken::new())
+                .await;
+            assert!(decision.allow, "{tool} 不该要求确认：{decision:?}");
+            assert_eq!(decision.level, Level::Allow, "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_and_delete_still_require_confirmation() {
+        let state = gate(PermissionMode::Standard);
+        let shell = PermissionGate::new(&state)
+            .check(
+                "run_shell",
+                &args(serde_json::json!({"command":"Get-Date"})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!shell.allow, "没有确认通道时 run_shell 必须落到拒绝");
+        assert_eq!(shell.capability, "system.shell");
+
+        let delete = PermissionGate::new(&state)
+            .check(
+                "files",
+                &args(serde_json::json!({"action":"delete","path":"C:\\tmp\\a.txt"})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!delete.allow);
+        assert_eq!(delete.capability, "file.delete");
+
+        // 有确认通道时点击允许即可执行。
+        let allowed = PermissionGate::new(&state)
+            .check(
+                "run_shell",
+                &args(serde_json::json!({"command":"Get-Date"})),
+                Some(&YES),
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(allowed.allow);
+        assert_eq!(allowed.channel, "click");
+    }
+
+    /// 免确认档下新工具同样不再询问；但未知工具、暂停与显式 deny 仍然生效。
+    #[tokio::test]
+    async fn pass_through_covers_new_tools_but_keeps_hard_limits() {
+        let state = gate(PermissionMode::PassThrough);
+        for tool in ["run_shell", "kill_app", "launch_app"] {
+            let decision = PermissionGate::new(&state)
+                .check(
+                    tool,
+                    &args(serde_json::json!({"command":"x","name":"notepad","query":"微信"})),
+                    None,
+                    &CancelToken::new(),
+                )
+                .await;
+            assert!(decision.allow, "{tool} 在免确认下应放行：{decision:?}");
+            assert_eq!(decision.channel, "unattended");
+        }
+    }
+
+    /// 宽松档把 `file.write` / `file.delete` 降为放行，但 `system.shell` 仍是 ask。
+    #[tokio::test]
+    async fn permissive_mode_demotes_file_actions_but_not_shell() {
+        let state = gate(PermissionMode::Permissive);
+        let delete = PermissionGate::new(&state)
+            .check(
+                "files",
+                &args(serde_json::json!({"action":"delete","path":"C:\\tmp\\a.txt"})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(delete.allow, "宽松档下删除放行：{delete:?}");
+        let shell = PermissionGate::new(&state)
+            .check(
+                "run_shell",
+                &args(serde_json::json!({"command":"Get-Date"})),
+                None,
+                &CancelToken::new(),
+            )
+            .await;
+        assert!(!shell.allow, "宽松档不放开执行命令");
+    }
+
+    #[test]
+    fn web_search_capability_is_registered_and_audited() {
+        assert!(capabilities().iter().any(|item| item.id == "web.search"));
+        let info = capabilities()
+            .iter()
+            .find(|item| item.id == "web.search")
+            .unwrap();
+        assert_eq!(info.level, Level::Allow);
+        assert!(info.audit, "查询词会发给第三方，必须留痕");
     }
 }

@@ -29,25 +29,22 @@ cargo build --release
 .\target\release\cuava.exe
 ```
 
-仅用于开发和测试的 CPU-only 构建（不可作为正式发行）：
-
-```powershell
-cargo build --release --no-default-features
-```
-
+**不提供 CPU-only 构建**：本项目 Whisper 只维护启用 CUDA 的构建，CUDA 是默认推理后端，
+CPU 只作为**同一构建内**的运行时回退（没有可用 GPU 时自动走 CPU，状态条如实显示）。
+不再创建、也不维护 `--no-default-features` 的 CPU-only 版本。
 
 **构建前置（语音相关）**
 
 - CMake + Ninja：whisper.cpp 由 `whisper-rs-sys` 现场编译。
-- **CUDA Toolkit**（仅默认构建需要）：`nvcc` 与 `cudart`/`cublas` 在 PATH 上。
-  没有它就用 `--no-default-features`，不要用默认构建硬扛。
+- **CUDA Toolkit**：`nvcc` 与 `cudart`/`cublas` 在 PATH 上。这是唯一受支持的构建方式；
+  没有 CUDA 工具链就无法构建，不要改用 `--no-default-features`。
 - `libclang.dll`：`whisper-rs-sys` 用 bindgen 生成绑定。装过 LLVM 就设
   `LIBCLANG_PATH` 指向它的 `bin`；没装也可以从 PyPI 的 `libclang` wheel 里取
   （解压后指向 `libclang-*.data/platlib/clang/native`）。
 - sherpa-onnx 用**静态库**（crate 默认 feature），产物不需要随包分发 DLL。
-  预编译包由构建脚本自动下载；直连 GitHub 慢时，用 `SHERPA_ONNX_LIB_DIR`
-  指向已解压的 `...static-MD-Release-lib/lib`，或用 `SHERPA_ONNX_ARCHIVE_DIR`
-  指向存放离线压缩包的目录。
+  预编译包由构建脚本自动下载。**直连 GitHub 通常不可达，先设好代理**：
+  `HTTP_PROXY` / `HTTPS_PROXY`（`build.rs` 用 `ureq`，只读环境变量，不读 git 配置与系统代理）。
+  也可以用 `SHERPA_ONNX_LIB_DIR` 指向已解压的 `...static-MD-Release-lib/lib`。
 - **必须用 `-MD-` 那份静态包**。`-MT-` 是静态 CRT，链接时会报
   `LNK2038 RuntimeLibrary 不匹配（MT vs MD）`——Rust 的 MSVC 默认是 `/MD`。
 - 仓库路径过长（尤其含中文）时，MSVC 偶发 `cl.exe error D8050 / c1.dll`；
@@ -79,7 +76,7 @@ cargo build --release --no-default-features
 
 **默认构建带 CUDA**：`cargo build --release` 会编译 whisper.cpp 的 CUDA 后端，
 需要本机有 CUDA Toolkit（`nvcc` + `cudart` + `cublas`）与 NVIDIA 驱动。
-没有 CUDA 工具链的开发机 / CI 可用 `--no-default-features` 构建仅供测试的 CPU-only 版本，
+没有 CUDA 工具链的机器不构建：本项目只维护 CUDA 构建，CPU 只在同一构建内做运行时回退。
 代码与行为完全一致，只是后端与延迟不同。
 
 界面状态条显示的是**实际**后端，不是设置里的期望值：
@@ -89,7 +86,6 @@ cargo build --release --no-default-features
 | 默认 CUDA 构建 + 可用 GPU | 用 CUDA 推理 | `Whisper CUDA` |
 | CUDA 构建但没有可用设备 | 不去请求 GPU，直接用 CPU | `Whisper CPU（没有检测到可用的 CUDA 设备）` |
 | CUDA 构建 + 设备在但初始化失败 | 同一模型改用 CPU 初始化 | `Whisper CPU（CUDA：…）` |
-| CPU-only 构建 | 只用 CPU | `Whisper CPU（本构建未启用 CUDA）` |
 | 模型文件损坏/缺失 | 报错，**不**降级 | `语音不可用：…` |
 | CUDA 与 CPU 都失败 | 报错 | `语音不可用：…` |
 
@@ -272,8 +268,7 @@ cargo test                 # 单元 + 集成（Mock LLM/SSE、配置与密钥、
 cargo fmt --check
 cargo clippy --all-targets
 
-# 没有 CUDA 工具链时：同一条命令加 --no-default-features
-cargo test --no-default-features
+# 测试同样只跑 CUDA 构建（不提供 --no-default-features 的 CPU-only 版本）
 ```
 
 语音生命周期（关麦/重开/取消/迟到结果/后端回退）由**不依赖设备与模型**的
@@ -290,7 +285,7 @@ cargo test --test voice_e2e -- --nocapture --test-threads=1
 它验证五件事：真实 KWS 能命中「小爱同学」且不误触发其它语音；
 VAD 能在真实录音的静音处端点；whisper.cpp 能把中文语音转录成可提交文本；
 异步 ASR 工作线程的结果归属；以及启动后回报的**实际后端**
-（CPU-only 构建必须是 CPU，且必须说明原因）。逐句给结果与耗时。
+（推理后端必须是 CUDA 或同一构建内的 CPU 回退，且必须说明实际用的是哪一个）。逐句给结果与耗时。
 
 与 faster-whisper 的对照（**开发实验，不是产品依赖**）：
 
@@ -339,7 +334,19 @@ rust/
     ├── cua/
     │   ├── bridge.rs      PowerShell 5.1 NDJSON 桥接（串行、超时换进程）
     │   ├── tools.rs       12 个 CUA 工具 + 参数校验 + 模型面信封
-    │   └── invoker.rs     把工具接到 Agent
+    │   └── invoker.rs     把 CUA 工具接到 Agent
+    ├── tools/             Rust 本地工具（PR12：恢复旧版非音乐工具）
+    │   ├── spec.rs        共用工具定义与参数宽化（CUA 与本地同一套）
+    │   ├── error.rs       ArgError / LocalError / ToolError（取消语义统一）
+    │   ├── process.rs     PowerShell 子进程：超时/取消/进程树/输出上限
+    │   ├── shell.rs       run_shell
+    │   ├── files.rs       files（list/read/write/copy/move/delete/info）
+    │   ├── procs.rs       app_control / kill_app
+    │   ├── launch.rs      launch_app（开始菜单级名字解析）
+    │   ├── sysinfo.rs     system_info（直接 Win32，不跑子进程）
+    │   ├── clock_tool.rs  get_current_time + 报时间的本地直接回答
+    │   ├── web_search.rs  Tavily 联网搜索（独立 Key，条件启用）
+    │   └── registry.rs    统一分发：CUA + 本地 + 搜索交给同一个 Agent
     └── ui/worker.rs       后台工作线程（tokio）+ 界面状态同步
 ```
 
@@ -351,8 +358,24 @@ rust/
   `left_click` / `type` / `key` / `scroll` / `set_value` / `wait` / `read_clipboard`。
 - **保留的 CUA 语义**：`state_id` + `element_index` 必须成对；`frame_id` 与截图栅格坐标；
   截图按真实 media type（`image/png` / `image/jpeg`）交给多模态模型；工具参数在动作前校验。
+- **本地工具（PR12）**：恢复旧版全部非音乐工具，与 CUA 一起交给**同一个** Agent。
+  - `run_shell`（PowerShell 5.1、非交互、默认 30 秒超时、输出上限 4000 字、准确退出码）；
+  - `files`（list / read / write / copy / move / delete / info；读放行、写与删按权限分级）；
+  - `app_control`（list / find，只读）、`kill_app`（总是结束整棵进程树，保护系统关键进程与自身）；
+  - `launch_app`（开始菜单级名字解析，支持中文名，不只认绝对路径）；
+  - `system_info`（CPU / 内存 / 磁盘 / 电池 / 开机时长，拿不到的字段明确标注）；
+  - `get_current_time`（只读本地日期、时间、星期、时区偏移）。
+  配好独立的 Tavily Key 后还会多一个 `web_search`；没有 Key 时它**不会**出现在工具列表里。
+  工具总数与构成在设置「工具与联网」页显示，区分无条件可用与条件启用。
+- **本地时间直接回答（PR12）**：「现在几点 / 今天几号 / 星期几」用本机时钟直接答，
+  不经过 LLM、不需要 Key、不触发 `run_shell` 的确认框，也不需要网络。
+- **联网搜索（PR12）**：Tavily `POST /search` + `Authorization: Bearer`；Key 存 DPAPI 的
+  独立槽位（不复用模型 Key）；结果含摘要与来源、5 分钟缓存、8 秒超时、可取消；
+  网络失败不影响本地工具。设置页提供 Key、启用开关、可用性测试与清除。
 - **权限**：执行前统一判断；`allow` 不弹确认，`ask` 走界面确认，`deny` 不执行，未知工具拒绝。
-  三档预设（standard / conservative / permissive）。
+  包括 `run_shell`→`system.shell`、`files` 按 action 分到 `file.read`/`file.write`/`file.delete`、
+  `web_search`→`web.search`、`kill_app`→`app.close`。
+  四档预设（标准 / 保守 / 宽松 / 免确认）。
 - **提供商协议**：MiMo `thinking` 与 DeepSeek `reasoning_effort` 的映射、`reasoning_content`
   与可见回复分离、SSE 分片工具调用归并、多工具调用配对。
 - **上下文**：默认 1M 窗口 / 90% 触发压缩；模型有更小可信窗口时取 min；装不下如实报错。
@@ -393,7 +416,8 @@ rust/
 | MiMo-V2.5-TTS、ONNX 本地 TTS、音频播放、字幕、语音打断 | PR7 |
 | 完整 HUD / 设置页、音乐模块、定时模型切换、旧数据迁移、安装器 | PR8 |
 | 语音确认（`ask` 目前只有点击确认） | PR7 与语音一起 |
-| 联网搜索、文件工具、命令执行、音乐控制 | 未排期；默认提示词已如实说明这些能力不存在 |
+| 联网搜索、文件工具、命令执行 | **PR12 已实现**（见上文「本地工具」；没有 Tavily Key 时不公布 `web_search`） |
+| 音乐控制 | 未排期；默认提示词已如实说明该能力不存在 |
 | 托盘常驻、开机自启、全局快捷键 | 未排期 |
 
 ### PR6 的已知限制
@@ -406,7 +430,7 @@ rust/
   `assets/test/wake-word.wav` 实测并不含该唤醒词，不能用作正向用例。
   真机唤醒需要用户自己录音验证。
 - **性能**：CUDA 下 `small` 单句约 0.15~0.25 秒；CPU 8 线程约 2.3 秒，
-  日常短指令会感到停顿。默认构建带 CUDA，没有 CUDA 环境时仅开发测试可用 `--no-default-features`；正式发行仅使用 CUDA 构建。
+日常短指令会感到停顿。只维护 CUDA 构建；没有可用 GPU 时同一构建内自动回退 CPU。
 - **CUDA 运行库**：正式包按实际导入包含所需 NVIDIA redist；驱动独立安装。缺 DLL 到进程起不来时，应用内回退无法生效。
 - **GPU 是否真的在用**：用 ggml 的设备枚举 + 初始化结果判断，不是「设置里要求了 GPU」；
   但底层没有暴露「本上下文实际用了哪个后端」的查询接口，因此这里不做更强的承诺。

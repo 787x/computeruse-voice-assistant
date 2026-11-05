@@ -469,6 +469,35 @@ impl ProviderConfig {
     }
 }
 
+/// 联网搜索（Tavily）的设置。**Key 不在这里**——它和模型 Key 一样存进 DPAPI
+/// 的 [`crate::secret::SecretStore`]，但用的是**独立的一格**（见 [`SEARCH_SECRET_ID`]）。
+///
+/// 为什么必须独立：模型 Key 属于某家 LLM 提供商，把它发给 Tavily 既是凭据泄漏，
+/// 也会让搜索报 401——用户看到的却是"模型服务坏了"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSettings {
+    /// 联网搜索整体启用（关闭时即使有 Key 也不公布工具）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// 联网搜索 Key 在 `SecretStore` 里的槽位名。
+///
+/// 不叫 `tavily` 之类"提供商 id"是为了不和 `provider_ids()` 混淆：
+/// 它**不是**一个模型提供商，永远不会出现在模型下拉里。
+pub const SEARCH_SECRET_ID: &str = "web-search";
+
+/// 联网搜索的端点（写死官方地址：用户没有理由把它指到别处，
+/// 而多一个可配置项就多一个"Key 被发到陌生服务器"的入口）。
+pub const SEARCH_ENDPOINT: &str = "https://api.tavily.com/search";
+
 /// 一套命名模型方案：「提供商 + 模型 + 推理档位」。
 ///
 /// 不含 Key：Key 永远按提供商从 `SecretStore` 取，方案只描述"用哪家哪套参数"。
@@ -714,6 +743,10 @@ pub struct Settings {
     /// 语音合成设置（PR7）。同样带 `serde(default)`，并且**默认关闭**。
     #[serde(default)]
     pub tts: crate::voice::tts::TtsSettings,
+    /// 联网搜索设置（PR12）。旧配置没有这一段时按默认（启用）读取，
+    /// 但**没有 Key** 仍然不会公布工具——启用状态不等于可用。
+    #[serde(default)]
+    pub search: SearchSettings,
 }
 
 fn default_schema_version() -> u32 {
@@ -762,6 +795,7 @@ impl Default for Settings {
             model_schedule: ScheduleSettings::default(),
             voice: crate::voice::settings::VoiceSettings::default(),
             tts: crate::voice::tts::TtsSettings::default(),
+            search: SearchSettings::default(),
         }
     }
 }
@@ -1244,6 +1278,11 @@ impl AppPaths {
     /// 审计导出目录。
     pub fn exports_dir(&self) -> PathBuf {
         self.root.join("exports")
+    }
+
+    /// 应用索引缓存（仅诊断用，不参与启动）。
+    pub fn app_index_file(&self) -> PathBuf {
+        self.root.join("app-index.json")
     }
 
     /// 截图落盘目录（不参与模型输入，仅供排查）。

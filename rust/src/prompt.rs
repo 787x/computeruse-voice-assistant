@@ -107,12 +107,24 @@ mod tests {
         for name in crate::cua::tools::DEFAULT_TOOL_NAMES {
             assert!(
                 DEFAULT_SYSTEM_PROMPT.contains(&format!("{name}：")),
-                "missing tool: {name}"
+                "缺少 CUA 工具说明：{name}"
             );
         }
-        assert!(DEFAULT_SYSTEM_PROMPT.contains("当前没有 web_search"));
-        assert!(DEFAULT_SYSTEM_PROMPT
-            .contains("当前没有 files、app_control、kill_app、system_info、run_shell"));
+        // PR12：本地工具与时间必须有说明（否则模型不知道该用哪个）。
+        for name in crate::tools::LOCAL_TOOL_NAMES {
+            assert!(
+                DEFAULT_SYSTEM_PROMPT.contains(&format!("{name}：")),
+                "缺少本地工具说明：{name}"
+            );
+        }
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("get_current_time："));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("web_search："));
+        // 但**必须**说清它是有条件的：没有 Key 就不存在。
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("只有请求里出现了这个工具才可用"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("请求里没有出现的工具就是不可用"));
+        // 旧版"当前没有 …"的说法已经过时，不能再出现。
+        assert!(!DEFAULT_SYSTEM_PROMPT.contains("当前没有 web_search"));
+        assert!(!DEFAULT_SYSTEM_PROMPT.contains("当前没有 files、app_control"));
     }
 
     #[test]

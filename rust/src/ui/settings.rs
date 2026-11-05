@@ -75,6 +75,11 @@ pub struct SaveRequest {
     // ---- 权限 ----
     pub permission_index: i32,
     pub permission_overrides: Vec<i32>,
+    // ---- 联网搜索（PR12）----
+    /// Tavily API Key 草稿（留空 = 不改动已有的 Key；"清除"是单独的动作）。
+    pub search_api_key: String,
+    /// 「启用联网搜索」开关（写进 `Settings::search.enabled`）。
+    pub search_enabled: bool,
     // ---- 播报 ----
     pub tts_enabled: bool,
     pub tts_backend_index: i32,
@@ -421,6 +426,8 @@ pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Sett
     next.voice.kws_model_dir = request.kws_dir.clone();
     next.voice.whisper_model = request.whisper_file.clone();
     next.voice.keywords_file = request.keywords_file.clone();
+    // ---- 联网搜索（Key 不在这里：它只写 SecretStore 的独立槽位） ----
+    next.search.enabled = request.search_enabled;
     // ---- 播报 ----
     next.tts.enabled = request.tts_enabled;
     next.tts.backend = tts_backend_for_index(request.tts_backend_index);
@@ -660,6 +667,24 @@ pub fn apply_save(
         Some(errors.join("；"))
     };
 
+    /*
+     * 联网搜索的 Key 写进**独立槽位**（`SEARCH_SECRET_ID`）。
+     *
+     * 三条与模型 Key 相同的语义：
+     *  - 留空 = 不改动已有 Key（"清除"是设置页的单独按钮）；
+     *  - 写失败不静默：作为 `SavedKeyFailed` 的一部分如实告诉用户；
+     *  - 绝不借用任何模型提供商的 Key（两条写入路径完全独立）。
+     */
+    let mut search_key_error: Option<String> = None;
+    let search_key = request.search_api_key.trim();
+    let mut search_key_written = false;
+    if !search_key.is_empty() {
+        match secret.save_search_key(search_key) {
+            Ok(()) => search_key_written = true,
+            Err(error) => search_key_error = Some(format!("联网搜索 Key 没有写入：{error}")),
+        }
+    }
+
     restore_model_catalogs(settings, paths, secret, None);
 
     // 只有"给当前启用的云端后端"写入了新 Key 才算凭据变化。
@@ -671,6 +696,13 @@ pub fn apply_save(
         speech.apply_settings(&settings.tts, secret).err()
     } else {
         None
+    };
+    let _ = search_key_written;
+
+    let key_error = match (key_error, search_key_error) {
+        (Some(left), Some(right)) => Some(format!("{left}；{right}")),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
     };
 
     match (key_error, speech_warning) {
@@ -722,6 +754,8 @@ mod tests {
             system_prompt: String::new(),
             permission_index: permission_mode_index(settings.permission_mode),
             permission_overrides: vec![0; crate::permissions::capabilities().len()],
+            search_api_key: String::new(),
+            search_enabled: settings.search.enabled,
             tts_enabled: false,
             tts_backend_index: 0,
             tts_mimo_voice: String::new(),
@@ -1105,6 +1139,87 @@ mod tests {
         assert!(
             tts_runtime_config_changed(&previous, &previous.clone(), true),
             "换了当前后端的 Key 必须重建引擎"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // PR12：联网搜索设置与独立 Key
+    // ---------------------------------------------------------------
+
+    /// 「启用联网搜索」开关落进配置，但不影响模型提供商。
+    #[test]
+    fn search_settings_are_saved_without_touching_providers() {
+        let root = std::env::temp_dir().join(format!(
+            "cuava-search-settings-{}",
+            crate::clock::now().unix_ms
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let before_provider = settings.provider_id.clone();
+        let mut request = base_request(&settings);
+        request.search_enabled = false;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+
+        let loaded = config::load_settings(&paths).unwrap();
+        assert!(!loaded.search.enabled);
+        assert_eq!(loaded.provider_id, before_provider, "搜索开关不能改提供商");
+        // 开关本身不需要 Key。
+        assert!(!secret.has_search_key());
+    }
+
+    /// 搜索 Key 写进**独立槽位**，与模型提供商的 Key 互不影响。
+    #[cfg(windows)]
+    #[test]
+    fn search_key_is_written_to_its_own_slot_only() {
+        let root =
+            std::env::temp_dir().join(format!("cuava-search-key-{}", crate::clock::now().unix_ms));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.api_key = "test-model-key".into();
+        request.search_api_key = "tvly-search-key".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        let outcome = apply_save(&paths, &secret, &mut settings, &mut speech, &request);
+        assert!(outcome.config_written(), "{}", outcome.message());
+
+        assert_eq!(
+            secret.load_search_key().unwrap().as_deref(),
+            Some("tvly-search-key")
+        );
+        assert_eq!(
+            secret.load(&settings.provider_id).unwrap().as_deref(),
+            Some("test-model-key"),
+            "模型 Key 必须写到它自己的提供商名下"
+        );
+        // 配置文件里不出现任何一个 Key。
+        let text = std::fs::read_to_string(paths.settings_file()).unwrap();
+        assert!(!text.contains("tvly-search-key"));
+        assert!(!text.contains("test-model-key"));
+
+        // 留空 = 不改动已保存的搜索 Key。
+        let mut second = base_request(&settings);
+        second.search_api_key = String::new();
+        let _ = apply_save(&paths, &secret, &mut settings, &mut speech, &second);
+        assert_eq!(
+            secret.load_search_key().unwrap().as_deref(),
+            Some("tvly-search-key"),
+            "留空不能把已有 Key 抹掉"
+        );
+
+        // 清除只影响搜索这一格。
+        secret.clear_search_key().unwrap();
+        assert!(!secret.has_search_key());
+        assert_eq!(
+            secret.load(&settings.provider_id).unwrap().as_deref(),
+            Some("test-model-key"),
+            "清搜索 Key 不能顺手清模型 Key"
         );
     }
 }

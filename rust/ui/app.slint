@@ -629,7 +629,25 @@ export component AppWindow inherits Window {
     in-out property <string> connection-hint: "";
     in-out property <string> connection-code: "";
 
-    // 权限确认（ask）
+    // ---- 联网搜索与工具总览（PR12） ----
+    // Tavily Key 的**草稿**输入（留空 = 不改动已保存的 Key）。
+    in-out property <string> search-key-input: "";
+    // 是否已有可用的搜索 Key（决定"清除"按钮与提示）。
+    in-out property <bool> search-key-saved: false;
+    // 「启用联网搜索」开关（写进配置的 search.enabled）。
+    in-out property <bool> search-enabled: true;
+    // 可用性测试的状态："" | "testing" | "ok" | "failed" | "none"
+    in-out property <string> search-code: "";
+    in-out property <string> search-hint: "";
+    in-out property <bool> search-testing: false;
+    // 当前**实际公布给模型**的工具清单（一行一个，带 ✓/× 与来源）。
+    in-out property <[string]> tool-overview: [];
+    // 工具总数与构成的一句话（区分无条件可用与条件启用）。
+    in-out property <string> tool-summary: "";
+    callback test-search-key(key: string);
+    callback clear-search-key();
+
+    // ---- 权限确认（ask） ----
     in-out property <bool> confirm-open: false;
     in-out property <string> confirm-tool: "";
     in-out property <string> confirm-label: "";
@@ -1248,9 +1266,9 @@ export component AppWindow inherits Window {
 
                 ScrollView {
                     content-width: self.width;
-                    content-height: tool-list.preferred-height;
+                    content-height: tool-cards.preferred-height;
 
-                    tool-list := VerticalLayout {
+                    tool-cards := VerticalLayout {
                         spacing: 6px;
 
                         if root.tools.length == 0 : Text {
@@ -2080,7 +2098,149 @@ export component AppWindow inherits Window {
                             }
 
                             Text {
-                                text: "当前版本没有音乐控制与联网搜索，相关设置在迁移对照里明确标注为后续实现。";
+                                text: "本版仍没有音乐控制；联网搜索、文件、命令与系统信息工具在「工具与联网」页配置与查看。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ===== 5. 工具与联网（PR12） =====
+                        if root.settings-tab-index == 5 : VerticalLayout {
+                            spacing: 10px;
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "可用工具总览";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            // 区分"无条件可用"与"条件启用"：这是 Done Criteria 的要求。
+                            Text {
+                                text: root.tool-summary;
+                                font-size: 12px;
+                                color: Theme.text-color;
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle {
+                                height: 210px;
+                                border-radius: 6px;
+                                background: #fafafb;
+                                border-width: 1px;
+                                border-color: #e3e3e6;
+
+                                ScrollView {
+                                    content-width: self.width;
+                                    content-height: tool-inventory.preferred-height;
+
+                                    tool-inventory := VerticalLayout {
+                                        padding: 6px;
+                                        spacing: 2px;
+                                        for line in root.tool-overview: Text {
+                                            text: line;
+                                            font-size: 11px;
+                                            color: #55555c;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "这张表就是模型实际看到的工具清单：标 × 的不会出现在请求里。工具能否执行还取决于「权限」页的档位与逐能力覆盖；未知工具一律拒绝。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle { height: 1px; background: #e3e3e6; }
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "联网搜索（Tavily）";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                AppButton {
+                                    label: root.search-enabled ? "联网搜索：已启用" : "联网搜索：已禁用";
+                                    clicked => {
+                                        root.search-enabled = !root.search-enabled;
+                                        root.settings-dirty = true;
+                                        root.settings-error = "";
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: "Tavily Key"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
+                                AppLineEdit {
+                                    enabled: !root.settings-saving;
+                                    text <=> root.search-key-input;
+                                    placeholder-text: root.search-key-saved ? "已保存（留空则不修改）" : "尚未保存";
+                                    input-type-password: true;
+                                    edited => { root.settings-dirty = true; root.settings-error = ""; root.search-code = ""; }
+                                }
+                                AppButton {
+                                    label: root.search-testing ? "测试中…" : root.search-code == "ok" ? "测试成功" : root.search-code == "failed" ? "测试失败" : "测试可用性";
+                                    text-color: root.search-code == "ok" ? #1f7a3a : root.search-code == "failed" || root.search-code == "none" ? #a02020 : #1f1f22;
+                                    enabled: !root.settings-saving && !root.search-testing;
+                                    clicked => {
+                                        root.search-testing = true;
+                                        root.search-code = "testing";
+                                        root.test-search-key(root.search-key-input);
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                AppButton {
+                                    label: "清除已保存的搜索 Key";
+                                    enabled: root.search-key-saved && !root.settings-saving;
+                                    clicked => { root.clear-search-key(); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            if root.search-hint != "" : Text {
+                                text: root.search-hint;
+                                font-size: 11px;
+                                color: root.search-code == "ok" ? #1f7a3a : (root.search-code == "failed" || root.search-code == "none" ? #a02020 : #55555c);
+                                wrap: word-wrap;
+                            }
+
+                            Text {
+                                text: "Tavily 是**独立的第三方搜索服务**，与模型 Key 分开保存（同样用 DPAPI 加密），不会复用模型 Key。查询词会发给 api.tavily.com，按账户配额计费；没有有效 Key 时 web_search 不会出现在模型可调用的工具里。填好 Key 后无需重启即可启用。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle { height: 1px; background: #e3e3e6; }
+
+                            Text {
+                                color: Theme.text-color;
+                                text: "关于「执行命令」与时间";
+                                font-size: 13px;
+                                font-weight: 600;
+                            }
+
+                            Text {
+                                text: "run_shell 在本机跑一条 PowerShell 命令（Windows PowerShell 5.1、非交互、默认 30 秒超时、输出截断到 4000 字），能力是「执行命令」，标准档每次都会询问。它和 Computer Use 不是一回事：CUA 看屏幕、点控件、敲键盘；run_shell 不碰界面，只跑命令行。要操作界面请用 CUA 工具。";
+                                font-size: 11px;
+                                color: #8a8a90;
+                                wrap: word-wrap;
+                            }
+
+                            Text {
+                                text: "「现在几点」「今天几号」「星期几」由本机时钟直接回答（不需要模型 Key、不联网、也不会触发 run_shell 的确认框）；复杂任务可以调只读的 get_current_time 取准确时间。";
                                 font-size: 11px;
                                 color: #8a8a90;
                                 wrap: word-wrap;

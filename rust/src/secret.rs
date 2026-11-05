@@ -141,6 +141,42 @@ impl SecretStore {
             .collect()
     }
 
+    /// 读联网搜索（Tavily）的 Key。
+    ///
+    /// 为什么单独一对方法而不是复用 `load("tavily")`：搜索 Key **不是**一个模型提供商，
+    /// 它不能出现在模型下拉里、也不能被"切换提供商"的清空逻辑碰到。
+    /// 用一个固定槽位 + 专门的入口，这两件事都不会误伤。
+    pub fn load_search_key(&self) -> Result<Option<String>, SecretError> {
+        read_secret_file(&self.search_key_path())
+    }
+
+    /// 写联网搜索 Key（空串 = 删除）。
+    pub fn save_search_key(&self, plaintext: &str) -> Result<(), SecretError> {
+        if plaintext.is_empty() {
+            return self.clear_search_key();
+        }
+        if plaintext.starts_with("enc:") {
+            return Err(SecretError::LegacyEncrypted);
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        write_secret_file(&self.search_key_path(), plaintext)
+    }
+
+    /// 是否已有联网搜索 Key。
+    pub fn has_search_key(&self) -> bool {
+        self.search_key_path().is_file()
+    }
+
+    /// 清除联网搜索 Key（不影响任何模型提供商的 Key）。
+    pub fn clear_search_key(&self) -> Result<(), SecretError> {
+        remove_secret_file(&self.search_key_path())
+    }
+
+    /// 联网搜索 Key 的密文文件路径（供测试与排查）。
+    pub fn search_key_path(&self) -> PathBuf {
+        self.path_for(crate::config::SEARCH_SECRET_ID)
+    }
+
     /// 把 PR5 早期的单 Key 文件迁移到 `provider_id` 名下。
     ///
     /// 规则：
@@ -513,5 +549,58 @@ mod tests {
         assert_eq!(sanitize_provider_id("../../etc"), "______etc");
         assert_eq!(sanitize_provider_id("   "), "unknown");
         assert_eq!(sanitize_provider_id("a/b"), "a_b");
+    }
+
+    /// 联网搜索的 Key 是一个**独立槽位**：不撞任何提供商，也能单独清掉。
+    #[cfg(windows)]
+    #[test]
+    fn search_key_uses_its_own_slot_and_never_touches_provider_keys() {
+        let dir = unique_temp_dir("cuava-secret-search");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SecretStore::new(&dir);
+
+        store.save("mimo", "sk-mimo-key").unwrap();
+        assert!(!store.has_search_key());
+
+        store.save_search_key("tvly-search-key").unwrap();
+        assert!(store.has_search_key());
+        assert_eq!(
+            store.load_search_key().unwrap().as_deref(),
+            Some("tvly-search-key")
+        );
+        // 模型 Key 一个都不能被影响。
+        assert_eq!(store.load("mimo").unwrap().as_deref(), Some("sk-mimo-key"));
+        assert_eq!(store.load("deepseek").unwrap(), None);
+        // 搜索 Key 也不能出现在"提供商 Key"列表里。
+        assert!(!store
+            .masked_keys(&["mimo", "deepseek"])
+            .iter()
+            .any(|(id, _)| id == "web-search"));
+
+        // 明文不落盘。
+        let raw = std::fs::read_to_string(store.search_key_path()).unwrap();
+        assert!(!raw.contains("tvly-search-key"));
+
+        store.clear_search_key().unwrap();
+        assert!(!store.has_search_key());
+        assert_eq!(
+            store.load("mimo").unwrap().as_deref(),
+            Some("sk-mimo-key"),
+            "清搜索 Key 不能顺手清模型 Key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn search_key_rejects_legacy_electron_values() {
+        let dir = unique_temp_dir("cuava-secret-search-enc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SecretStore::new(&dir);
+        let error = store.save_search_key("enc:abcdef==").unwrap_err();
+        assert!(matches!(error, SecretError::LegacyEncrypted));
+        assert!(!store.has_search_key());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
