@@ -21,3 +21,11 @@ pub mod timeline;
 pub mod worker;
 
 pub use worker::{run_app, UiCommand};
+
+mod background;
+
+mod instance;
+
+mod hud_window;
+
+mod autostart;

@@ -19,6 +19,7 @@ fn main() {
     slint_build::compile("ui/app.slint").expect("failed to compile ui/app.slint");
     check_sherpa_link_mode();
     check_tts_cuda();
+    compile_windows_resources();
 }
 
 /// `tts-static` 与 `tts-cuda` 不能同时开：sherpa-onnx-sys 会直接报错，
@@ -75,4 +76,24 @@ fn check_tts_cuda() {
             "SHERPA_ONNX_LIB_DIR={dir} 里没有 sherpa-onnx-c-api.lib（shared 链接需要导入库）。\n{hint}"
         );
     }
+}
+
+/// Use the SDK resource compiler already required by the Windows MSVC toolchain.
+fn compile_windows_resources() {
+    println!("cargo:rerun-if-changed=assets/windows.rc");
+    println!("cargo:rerun-if-changed=assets/cuava.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let output =
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("cuava.res");
+    let status = std::process::Command::new("rc.exe")
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&output)
+        .arg("assets/windows.rc")
+        .status()
+        .expect("需要 Windows SDK rc.exe，请使用 x64 MSVC 开发者命令行");
+    assert!(status.success(), "Windows 图标/版本资源编译失败");
+    println!("cargo:rustc-link-arg-bin=cuava={}", output.display());
 }

@@ -1,0 +1,19 @@
+{
+  "Base": "74af9e0",
+  "SetupSHA256": "6A9FDDAE78DF73C8D9B878EB8DA9A2DBC15191411126971CFB5640F292997C42",
+  "ZipSHA256": "96F747C30D595C6D02F822441DCF54A175C7A93B2728EF28409029C7689850F0",
+  "FailurePID": 8904,
+  "FailureExit": 1,
+  "FailureDiagnostic": "[install]\r\nstage=uninstaller-failed\r\ntarget=D:\\Projects\\computeruse-voice-assistant\\.tmp\\pr9-minimal-uninstaller-fail\r\npid=8904\r\n",
+  "FailedInstallDidNotReplaceRegistration": true,
+  "InstallPID": 33612,
+  "InstallExit": 0,
+  "RegisteredCorrectPath": true,
+  "UninstallerBytes": 54104,
+  "UninstallerMZ": true,
+  "UninstallPID": 28972,
+  "UninstallExit": 0,
+  "TestExeRemoved": true,
+  "TestRegistrationRemoved": true,
+  "RealLongVoiceTest": "未执行：此前用户暂缓真实语音验收，本轮不自动开启麦克风或调用真实账户"
+}

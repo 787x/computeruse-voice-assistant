@@ -1,0 +1,50 @@
+[
+  {
+    "file": "kaldi-decoder-core.lib",
+    "sha256": "a55a14b429a08621f1a122f1a9b589802af155cb1c1c1f018a79e5883e619623"
+  },
+  {
+    "file": "kaldi-native-fbank-core.lib",
+    "sha256": "531e0128eac4dad1304ea887e1fd4b33450d9a0360fcb27c5e9cbe72c2cfbfff"
+  },
+  {
+    "file": "kissfft-float.lib",
+    "sha256": "905fcfa7733c445dca31eee3c3fe4e9a66f2f22ba2351601efca01b00ecb2efa"
+  },
+  {
+    "file": "onnxruntime.lib",
+    "sha256": "8d606b2c3439fabb286efd841f8158bb7f80972108d6005778e08fd1edb56011"
+  },
+  {
+    "file": "sherpa-onnx-c-api.lib",
+    "sha256": "b47b49877f8e0f012725c481a01e1b738cb49e95e3826389649748589e8429a0"
+  },
+  {
+    "file": "sherpa-onnx-core.lib",
+    "sha256": "0b6f8cacfa1773acb69e78288ddd3817466cba30c9de33f6ec260bc3e8a187be"
+  },
+  {
+    "file": "sherpa-onnx-cxx-api.lib",
+    "sha256": "2cc7dcd1ffa2f6b549527202ce6b4f02cde035fe54d3ffa49c72382220603ea6"
+  },
+  {
+    "file": "sherpa-onnx-fst.lib",
+    "sha256": "91af861f3e4e7b7d92487b42d470b673ea8de09dbcff976d028d406b77647da8"
+  },
+  {
+    "file": "sherpa-onnx-fstfar.lib",
+    "sha256": "51530a6ed3bdb9fb372758ee965c07c22c2606f6305f5596cb52786a8758f744"
+  },
+  {
+    "file": "sherpa-onnx-kaldifst-core.lib",
+    "sha256": "4ebd1f7923f34fa9a2b41af85c4cf6cd297bf79f20a6fc34c9c3c22d366b25ce"
+  },
+  {
+    "file": "ssentencepiece_core.lib",
+    "sha256": "6049334efe9c70ba56739afdbad94508fd56d051981ee9474ed17acda6d87260"
+  },
+  {
+    "file": "utf8proc.lib",
+    "sha256": "487983d18ad71080db2dc144c739b966e106994b291f63d658f74b3c5041d0ce"
+  }
+]
