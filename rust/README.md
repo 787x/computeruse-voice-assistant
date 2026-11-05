@@ -29,7 +29,7 @@ cargo build --release
 .\target\release\cuava.exe
 ```
 
-没有 CUDA Toolkit 的机器用 CPU-only 构建（同一份代码）：
+仅用于开发和测试的 CPU-only 构建（不可作为正式发行）：
 
 ```powershell
 cargo build --release --no-default-features
@@ -79,7 +79,7 @@ cargo build --release --no-default-features
 
 **默认构建带 CUDA**：`cargo build --release` 会编译 whisper.cpp 的 CUDA 后端，
 需要本机有 CUDA Toolkit（`nvcc` + `cudart` + `cublas`）与 NVIDIA 驱动。
-没有 CUDA 工具链的开发机 / CI 用 `--no-default-features` 构建 CPU-only 版本，
+没有 CUDA 工具链的开发机 / CI 可用 `--no-default-features` 构建仅供测试的 CPU-only 版本，
 代码与行为完全一致，只是后端与延迟不同。
 
 界面状态条显示的是**实际**后端，不是设置里的期望值：
@@ -105,9 +105,9 @@ whisper.cpp 在请求 GPU 却找不到设备时会**静默**退回 CPU，只看�
 | CUDA | **155 ms** | **0.041** | 正确 |
 
 - CUDA 版运行时需要 CUDA 运行库（`cudart64_*.dll`、`cublas64_*.dll` 等），
-  它们**不在**本仓库里，需要随发布包分发或由用户安装。
+  它们**不在**本仓库里，正式包根据实际依赖随包分发。
   如果这些 DLL 缺失到进程在 `main()` 之前就无法启动，**应用内 CPU 回退帮不上忙**；
-  这种环境的统一打包留给 PR8，不要把它当成「已验证可回退」。
+  正式包按实际导入收集匹配的运行库，详见 `packaging/README.md`。
 - 设置里关掉 GPU（`voice.useGpu = false`）时就只用 CPU，状态条不会显示 CUDA。
 
 开发期直接 `cargo run` 也可以。**不需要**安装或启动 Electron、WebView、Node 或 Python。
@@ -133,7 +133,7 @@ whisper.cpp 在请求 GPU 却找不到设备时会**静默**退回 CPU，只看�
   `espeak-ng-data/` 就一并带上），或在设置里直接指定目录。**模型不随源码提交、不自动下载。**
   音色编号（sid）与语速（0.5~2.0）可调；缺文件/编号越界会明确报错，不会假装成功。
 - **执行提供者**：配置项 `localProvider` 默认 `"cuda"`。
-  默认构建链接的是**静态 CPU 版** sherpa-onnx（整个程序是单文件、不带 DLL），
+  默认构建链接的是**静态 CPU 版** sherpa-onnx（不引入 TTS 的动态库；Whisper CUDA 仍需要运行库），
   这种构建里本地 TTS 实际就是 CPU，标签会写 `cpu（本构建未启用 CUDA TTS）`。
   要真的用 CUDA，按下一节构建 `--features tts-cuda` 的版本。低配机器可写 `"localProvider": "cpu"`。
 
@@ -164,7 +164,7 @@ RTX 5070 Laptop 参考数据（同一文本 ≈6.9 秒音频，同一二进制�
 首次 8.5 秒是 cuDNN 句柄与显存分配，程序启用本地 TTS 后会在**后台预热**
 （`TtsEngine::warm_up`），第一句回复的延迟因此只付一次。
 
-开启步骤（CUDA 版 sherpa 只提供 DLL，所以只能是 shared 链接，**不再是单文件**）：
+开启步骤（CUDA 版 sherpa 只提供 DLL，所以只能是 shared 链接）：
 
 1. 下载 `sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda.tar.bz2`
    （CUDA 12 的机器用 `cuda-12.x` 那个包），解压；
@@ -178,7 +178,7 @@ RTX 5070 Laptop 参考数据（同一文本 ≈6.9 秒音频，同一二进制�
 
 | feature | sherpa-onnx 链接 | 用途 |
 | --- | --- | --- |
-| （都不开） | 静态库（CPU） | 默认分发形态：单文件、无 DLL |
+| （都不开） | 静态库（CPU） | 默认 TTS 链接方式；Whisper CUDA 仍需 DLL |
 | `tts-static` | 静态库（CPU） | 显式要求静态链接 |
 | `tts-cuda` | shared（GPU 运行时） | 本地 TTS 走 CUDA，需要 `SHERPA_ONNX_LIB_DIR` |
 
@@ -406,9 +406,8 @@ rust/
   `assets/test/wake-word.wav` 实测并不含该唤醒词，不能用作正向用例。
   真机唤醒需要用户自己录音验证。
 - **性能**：CUDA 下 `small` 单句约 0.15~0.25 秒；CPU 8 线程约 2.3 秒，
-  日常短指令会感到停顿。默认构建带 CUDA，没有 CUDA 环境就用 `--no-default-features`。
-- **CUDA 运行库未随包分发**：`cudart64_*.dll` / `cublas64_*.dll` 需要用户安装
-  或随安装包分发（PR8）。缺 DLL 到进程起不来时，应用内回退无法生效。
+  日常短指令会感到停顿。默认构建带 CUDA，没有 CUDA 环境时仅开发测试可用 `--no-default-features`；正式发行仅使用 CUDA 构建。
+- **CUDA 运行库**：正式包按实际导入包含所需 NVIDIA redist；驱动独立安装。缺 DLL 到进程起不来时，应用内回退无法生效。
 - **GPU 是否真的在用**：用 ggml 的设备枚举 + 初始化结果判断，不是「设置里要求了 GPU」；
   但底层没有暴露「本上下文实际用了哪个后端」的查询接口，因此这里不做更强的承诺。
 
@@ -421,7 +420,9 @@ rust/
 `--background` 不显示主窗口、不开麦，`--settings` 打开设置；同一用户登录会话只持有一套运行时。
 HUD 使用当前已接受的语音事件与确认请求，不建立第二套 Agent。
 托盘的登录启动默认关闭，显式启用后只注册当前用户 `CUAVA-Rust` 启动项。
-首次使用、模型、离线导入、CPU 构建/安装/卸载说明见 [发行说明](packaging/README.md)。
+首次使用、模型、离线导入、CUDA 构建/安装/卸载说明见 [发行说明](packaging/README.md)。
 架构与实际验收边界见 [PR9 决策文档](../docs/14-PR9-原生HUD与发行架构决策.md)。
 
 首次启动失败请检查 `%LOCALAPPDATA%\cuava\startup.log`；日志只记启动阶段和错误类别，不含 Key、请求正文或语音内容。原生依赖在 main 前加载失败时无法写此日志，须结合 Windows 进程退出码与依赖检查定位。
+
+正式发行只提供 Whisper CUDA 构建与同一构建内 CPU 运行时回退。构建与再分发说明见 `packaging/README.md`；进程加载期缺少 CUDA DLL 时不能依赖内部回退。
