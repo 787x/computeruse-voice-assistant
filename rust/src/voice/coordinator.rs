@@ -95,6 +95,8 @@ pub enum ListenPurpose {
     /// 常规：必须听到唤醒词。
     #[default]
     Wake,
+    /// 用户点击麦克风后的一次直通指令。
+    Manual,
     /// 播报期间听打断短语。
     BargeIn,
     /// 权限确认期间听「允许 / 拒绝」。
@@ -105,6 +107,7 @@ impl ListenPurpose {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Wake => "wake",
+            Self::Manual => "manual",
             Self::BargeIn => "barge-in",
             Self::Confirm => "confirm",
         }
@@ -113,6 +116,7 @@ impl ListenPurpose {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Wake => "唤醒词",
+            Self::Manual => "点击识别",
             Self::BargeIn => "打断聆听",
             Self::Confirm => "语音确认",
         }
@@ -1362,6 +1366,28 @@ mod tests {
         // 同一个结果不会再次被接受（poll 不会重复发事件）。
         assert!(!machine.poll());
         assert_eq!(recorder.finals().len(), 1);
+    }
+
+    #[test]
+    fn manual_click_recognizes_without_wake_and_keeps_its_purpose() {
+        let recorder = Recorder::default();
+        let active = ActiveSession::new();
+        let asr = FakeAsr {
+            immediate: Some(Ok("列出窗口".into())),
+            ..FakeAsr::new()
+        };
+        let mut machine = machine_with(12, &recorder, &active, asr);
+        machine.start_listening();
+        assert!(machine.begin_direct(ListenPurpose::Manual, 0));
+        machine.finish(1.0, AUDIO.to_vec());
+        assert!(machine.poll());
+        assert_eq!(recorder.finals().len(), 1);
+        assert!(recorder.kinds().iter().any(|event| matches!(event, VoiceEventKind::Final { purpose: ListenPurpose::Manual, text, .. } if text == "列出窗口")));
+        assert!(!recorder
+            .kinds()
+            .iter()
+            .any(|event| matches!(event, VoiceEventKind::Woke { .. })));
+        assert!(!machine.poll());
     }
 
     /// 直通聆听（打断词）：不需要唤醒词，Final 必须带上当时的目的。

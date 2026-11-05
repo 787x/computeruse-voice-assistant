@@ -29,7 +29,6 @@ use crate::session::{TimelineItem, TurnStatus};
 use crate::ui::sessions::{
     publish_audit, publish_session_list, publish_session_title, publish_timeline, SessionRuntime,
 };
-#[cfg(test)]
 use crate::ui::settings::permission_mode_for_index;
 use crate::ui::settings::{
     self as settings_ui, apply_save, permission_mode_index, reasoning_effort_index, thinking_index,
@@ -80,7 +79,9 @@ pub enum UiCommand {
     ///
     /// `generation` 用来作废在途的保存：取消之后，工作线程会丢弃排队中/过期的
     /// 保存请求，不会"用户点了取消却还是偷偷存了一份旧表单"。
-    CancelSettings { generation: u64 },
+    CancelSettings {
+        generation: u64,
+    },
     /// 清除**指定提供商**的 Key（界面当前选中的那一家）。
     ///
     /// 必须带 provider_id：设置页可以切到别家而不保存，
@@ -107,7 +108,10 @@ pub enum UiCommand {
     /// 选择会话（空 id = 不做改动）。
     SelectSession(String),
     /// 重命名会话（空 id = 当前会话）。
-    RenameSession { id: String, title: String },
+    RenameSession {
+        id: String,
+        title: String,
+    },
     /// 删除会话（空 id = 当前会话）。
     DeleteSession(String),
     /// 输入区的模型下拉被选中。
@@ -119,15 +123,23 @@ pub enum UiCommand {
     /// 权限档位被选中（立即生效，不等保存）。
     PermissionModePicked(i32),
     /// 逐能力覆盖被选中（立即生效，不等保存）。
-    OverridePicked { row: i32, choice: i32 },
+    OverridePicked {
+        row: i32,
+        choice: i32,
+    },
     /// 暂停 / 恢复。
     TogglePause,
     /// 会话内限时允许某能力。
-    GrantCapability { capability: String, minutes: i32 },
+    GrantCapability {
+        capability: String,
+        minutes: i32,
+    },
     /// 导出审计。
     ExportAudit,
     /// 启用/关闭麦克风监听（界面开关）。
     SetVoiceEnabled(bool),
+    DictateNow,
+    QuickPermissionPicked(i32),
     /// 语音线程发回的事件（内部消息，不是用户动作）。
     Voice(VoiceEvent),
     /// 播报层发回的事件（状态/字幕/提示）。
@@ -563,6 +575,14 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let tx = command_tx.clone();
+        let direct_tx = command_tx.clone();
+        window.on_dictate_now(move || {
+            let _ = direct_tx.send(UiCommand::DictateNow);
+        });
+        let permission_tx = command_tx.clone();
+        window.on_quick_permission_picked(move |index| {
+            let _ = permission_tx.send(UiCommand::QuickPermissionPicked(index));
+        });
         window.on_set_voice_enabled(move |enabled| {
             // 立即反映开关状态；真正的启动/停止由工作线程完成，失败会回报原因。
             let _ = tx.send(UiCommand::SetVoiceEnabled(enabled));
@@ -947,6 +967,7 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
     let mut selected_index: i32 = -1;
     let mut groups = Vec::<slint::SharedString>::new();
     let mut providers = Vec::<slint::SharedString>::new();
+    let mut model_names = Vec::<slint::SharedString>::new();
     for provider_id in settings.provider_ids() {
         let provider = settings.provider(&provider_id);
         let mut models = provider.selectable_models();
@@ -976,13 +997,30 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
                 format!("{provider_label} · {model}（还没 Key）")
             };
             providers.push(provider_label.clone().into());
+            model_names.push(model.clone().into());
             labels.push(label.into());
         }
     }
     window.set_model_provider_groups(ModelRc::new(VecModel::from(groups)));
     window.set_model_option_providers(ModelRc::new(VecModel::from(providers)));
+    window.set_model_option_names(ModelRc::new(VecModel::from(model_names)));
     window.set_model_option_labels(ModelRc::new(VecModel::from(labels)));
     window.set_model_choice_index(selected_index);
+    window.set_model_choice_label(selection.model.clone().into());
+    let mut messages = vec![crate::llm::ChatMessage::system(
+        prompt::resolve_system_prompt(settings.system_prompt.as_deref()),
+    )];
+    messages.extend(sessions.history());
+    let used = crate::context::estimate_request_tokens(
+        &messages,
+        &crate::cua::tools::tools_for_request(crate::cua::tools::DEFAULT_TOOL_NAMES),
+    );
+    let limit = settings
+        .effective_context_window_of(&selection.provider_id, &selection.model)
+        .max(1);
+    window.set_context_usage((used as f64 / limit as f64).clamp(0.0, 0.99999) as f32);
+    window.set_context_known(true);
+    window.set_context_text(format!("上下文估算 {used} / {limit} tokens").into());
 
     // 推理档位：只对声明了协议的提供商显示（自定义端点不注入专属字段）。
     let capability = settings.provider(&selection.provider_id).capability();
@@ -2005,6 +2043,42 @@ async fn run_worker(
                     }
                 }
             }
+            UiCommand::DictateNow => {
+                if voice.manual_armed || voice.route.active_session().current().is_some() {
+                    voice.disable(&weak);
+                } else {
+                    speech.stop();
+                    voice.manual_temporary = !voice
+                        .handle
+                        .as_ref()
+                        .is_some_and(|handle| handle.is_running());
+                    voice.manual_armed = true;
+                    with_window(&weak, |w| w.set_voice_manual(true));
+                    voice.set_listen_mode(ListenPurpose::Manual, 0);
+                    voice.enable(&weak, &paths, &settings, &command_tx);
+                    if voice.handle.is_none() {
+                        voice.manual_armed = false;
+                        voice.manual_temporary = false;
+                        with_window(&weak, |w| w.set_voice_manual(false));
+                    } else {
+                        set_status(&weak, "请直接说指令，无需唤醒词");
+                    }
+                }
+            }
+            UiCommand::QuickPermissionPicked(index) => {
+                let mut next = settings.clone();
+                next.permission_mode = permission_mode_for_index(index);
+                match config::save_settings(&paths, &next) {
+                    Ok(()) => {
+                        settings = next;
+                        if let Ok(mut state) = permissions.lock() {
+                            state.mode = settings.permission_mode;
+                        }
+                        publish_permission_state(&weak, &permissions);
+                    }
+                    Err(error) => set_status(&weak, &format!("权限保存失败：{error}")),
+                }
+            }
             UiCommand::SetVoiceEnabled(enabled) => {
                 apply_voice_enabled(
                     &weak,
@@ -2241,6 +2315,8 @@ struct VoiceRuntime {
     route: VoiceRoute,
     /// 聆听模式（唤醒词 / 打断 / 语音确认）：音频线程读取。
     mode: ListenMode,
+    manual_armed: bool,
+    manual_temporary: bool,
 }
 
 impl VoiceRuntime {
@@ -2249,6 +2325,8 @@ impl VoiceRuntime {
             handle: None,
             route: VoiceRoute::default(),
             mode: ListenMode::new(),
+            manual_armed: false,
+            manual_temporary: false,
         }
     }
 
@@ -2320,6 +2398,9 @@ impl VoiceRuntime {
     ///
     /// 与「偏好保存」无关：即使 `settings.json` 写失败，这里也必须真的关掉。
     fn disable(&mut self, weak: &slint::Weak<AppWindow>) {
+        with_window(weak, |w| w.set_voice_manual(false));
+        self.manual_armed = false;
+        self.manual_temporary = false;
         // 先让还在识别的结果过期，再停线程：迟到的文本不会落到新实例上。
         self.route.close();
         if let Some(mut handle) = self.handle.take() {
@@ -2353,6 +2434,9 @@ impl VoiceRuntime {
                 set_voice_state(weak, &state);
                 set_status(weak, &state.label());
                 if !state.is_active() {
+                    with_window(weak, |w| w.set_voice_manual(false));
+                    self.manual_armed = false;
+                    self.manual_temporary = false;
                     // 线程已结束或即将结束：释放句柄，但保留界面上的原因。
                     self.route.close();
                     if let Some(mut handle) = self.handle.take() {
@@ -2390,6 +2474,10 @@ impl VoiceRuntime {
                         let _ = request_id;
                         set_status(weak, "请说「允许」或「拒绝」（也可以直接点按钮）")
                     }
+                    ListenPurpose::Manual => {
+                        self.manual_armed = false;
+                        set_status(weak, "正在听，请说指令");
+                    }
                     ListenPurpose::Wake => {}
                 }
                 VoiceOutcome::None
@@ -2399,6 +2487,10 @@ impl VoiceRuntime {
                 VoiceOutcome::None
             }
             VoiceEventKind::Rejected { turn, reason } => {
+                with_window(weak, |w| w.set_voice_manual(false));
+                if self.manual_temporary {
+                    self.disable(weak);
+                }
                 self.route.release(event.instance, turn);
                 // 空转录/太短属于「没听清」，给一句可读的提示；
                 // 不需要弹窗，也不能触发工具。直通聆听时保持安静更合适。
@@ -2434,9 +2526,15 @@ impl VoiceRuntime {
                     }
                     return VoiceOutcome::None;
                 }
+                if purpose == ListenPurpose::Manual {
+                    with_window(weak, |w| w.set_voice_manual(false));
+                }
+                if purpose == ListenPurpose::Manual && self.manual_temporary {
+                    self.disable(weak);
+                }
                 set_transcript(weak, &text);
                 match purpose {
-                    ListenPurpose::Wake => {
+                    ListenPurpose::Wake | ListenPurpose::Manual => {
                         if agent_busy {
                             set_status(weak, "上一轮还在跑；这句话没有执行");
                             return VoiceOutcome::None;
@@ -2486,6 +2584,8 @@ fn sync_listen_mode(voice: &mut VoiceRuntime, speech: &SpeechRuntime, confirmer:
         (ListenPurpose::Confirm, request_id)
     } else if speech.is_speaking() {
         (ListenPurpose::BargeIn, 0)
+    } else if voice.manual_armed {
+        (ListenPurpose::Manual, 0)
     } else {
         (ListenPurpose::Wake, 0)
     };
@@ -3428,6 +3528,7 @@ async fn wait_turn(
                      *  - 打断词与语音确认**照常生效**：它们不启动回合。
                      *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
                      */
+                    Some(UiCommand::DictateNow) | Some(UiCommand::QuickPermissionPicked(_)) => { set_status(weak, "请先结束当前回合再切换"); }
                     Some(UiCommand::SetVoiceEnabled(enabled)) => {
                         apply_voice_enabled(weak, paths, settings, voice, command_tx, enabled);
                     }
@@ -3941,6 +4042,8 @@ fn finish_session_turn(
     let failed = outcome.failed;
     let cancelled = outcome.cancelled;
     let reason = outcome.failure_reason.clone();
+    let context_ratio = (outcome.context_tokens as f64 / turn_settings.context_window.max(1) as f64)
+        .clamp(0.0, 0.99999) as f32;
     let context_text = format!(
         "上下文 ≈ {} / {} tokens（{}% 触发压缩）",
         outcome.context_tokens,
@@ -3952,6 +4055,8 @@ fn finish_session_turn(
         let Some(window) = weak.upgrade() else { return };
         window.set_busy(false);
         window.set_context_text(context_text.into());
+        window.set_context_usage(context_ratio);
+        window.set_context_known(true);
         let status = if cancelled {
             "已中断".to_string()
         } else if failed {
@@ -4657,13 +4762,18 @@ mod tests {
         sync_listen_mode(&mut voice, &speech, &confirmer);
         assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
 
+        voice.manual_armed = true;
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Manual);
+
         // 有挂起的确认：听「允许 / 拒绝」，并带上请求 id。
         let _wait = install_pending(&confirmer, 42);
         sync_listen_mode(&mut voice, &speech, &confirmer);
         assert_eq!(voice.mode.purpose(), ListenPurpose::Confirm);
         assert_eq!(voice.mode.get().1, 42);
 
-        // 确认结束后回到唤醒词。
+        // 点击识别不能抢占挂起确认；取消点击请求后回到唤醒词。
+        voice.manual_armed = false;
         confirmer.abort_pending();
         sync_listen_mode(&mut voice, &speech, &confirmer);
         assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
