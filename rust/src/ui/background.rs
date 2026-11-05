@@ -11,7 +11,7 @@ pub struct BackgroundUi {
 impl BackgroundUi {
     pub fn new(window: &AppWindow) -> Result<Self, slint::PlatformError> {
         let tray = BackgroundTray::new()?;
-        let hud = VoiceHud::new()?;
+        let hud = super::hud_window::create()?;
         let manual = std::rc::Rc::new(std::cell::Cell::new(false));
         let placement = std::rc::Rc::new(super::hud_window::Placement::default());
         let weak = window.as_weak();

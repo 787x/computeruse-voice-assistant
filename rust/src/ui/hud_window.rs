@@ -6,6 +6,21 @@ thread_local! { static CREATING: std::cell::Cell<bool> = const { std::cell::Cell
 pub fn creating_hud() -> bool {
     CREATING.with(|v| v.get())
 }
+// Slint creates its adapter (and captures WindowAttributes) during component new(),
+// before show(). Keep this scoped to HUD creation, including unwinding/nesting.
+fn with_hud_attributes<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CREATING.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(CREATING.with(|v| v.replace(true)));
+    f()
+}
+pub fn create() -> Result<VoiceHud, slint::PlatformError> {
+    with_hud_attributes(VoiceHud::new)
+}
 
 type Geometry = (i32, i32, i32, i32, u64);
 type Viewport = ([i32; 4], u64);
@@ -52,16 +67,7 @@ impl Placement {
                         Some(old)
                     })
                     .flatten();
-                struct Reset;
-                impl Drop for Reset {
-                    fn drop(&mut self) {
-                        CREATING.with(|v| v.set(false));
-                    }
-                }
-                CREATING.with(|v| v.set(true));
-                let reset = Reset;
-                let result = hud.show();
-                drop(reset);
+                let result = with_hud_attributes(|| hud.show());
                 if let Some(old) = style {
                     hud.window().with_winit_window(|w| {
                         if let Ok(handle) = w.window_handle() {
@@ -169,10 +175,13 @@ mod native_tests {
     #[ignore = "requires interactive Windows desktop with a foreground editor"]
     fn native_first_and_retained_show_preserve_foreground() {
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let hooks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_hooks = hooks.clone();
         slint::BackendSelector::new()
             .backend_name("winit".into())
-            .with_winit_window_attributes_hook(|a| {
+            .with_winit_window_attributes_hook(move |a| {
                 if creating_hud() {
+                    observed_hooks.set(observed_hooks.get() + 1);
                     a.with_active(false)
                 } else {
                     a
@@ -180,7 +189,13 @@ mod native_tests {
             })
             .select()
             .unwrap();
-        let hud = VoiceHud::new().unwrap();
+        let hud = create().unwrap();
+        assert_eq!(
+            hooks.get(),
+            1,
+            "HUD attributes must be captured during new()"
+        );
+        assert!(!creating_hud());
         let placement = Placement::default();
         let timer = slint::Timer::default();
         let step = std::cell::Cell::new(0);
@@ -191,6 +206,7 @@ mod native_tests {
                 // SAFETY: observation only, no handle is retained beyond this callback.
                 let before = unsafe { GetForegroundWindow() };
                 placement.show(&hud);
+                placement.show(&hud); // Already visible: must also preserve foreground.
                 let after = unsafe { GetForegroundWindow() };
                 assert_eq!(before, after, "HUD activated on step {}", step.get());
                 eprintln!(

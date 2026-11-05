@@ -21,7 +21,7 @@ with_active(false) 仅保护初次显示，不能独立满足持续无焦点唤�
 因此允许仅在 HUD 的当前 UI 线程、借用中的 HWND 上使用 windows crate 的必要 unsafe 调用：
 用前台窗口所属显示器的 rcWork
 定位，失败回退主显示器。不设置永久 NOACTIVATE 或穿透样式，按钮允许用户主动点击。
-更正：Slint hide 不保证释放 winit 窗口，不能依赖重建实现无焦点。新窗口由 HUD 显示调用栈内的线程局部标记选择 inactive 属性；存活 HWND 在 show 期间临时设置 NOACTIVATE，之后恢复原样式。
+更正：Slint hide 不保证释放 winit 窗口，不能依赖重建实现无焦点。新窗口由 HUD 组件创建调用栈内的线程局部标记选择 inactive 属性（不能等到 show 才设置）；存活 HWND 在 show 期间临时设置 NOACTIVATE，之后恢复原样式。
 已显示时不重复 show，以免进入 winit 后续 SW_SHOW 路径。
 替代方案是直接用 Win32 绘制窗口或永久禁止激活；前者重复窗口系统，后者影响交互，均不采用。
 不缓存 HWND；每次通过 Slint/winit 借用取得，窗口重建后重新获取。
@@ -101,3 +101,20 @@ CPU包不启用CUDA，GGML_NATIVE/AVX/AVX2/FMA/F16C均OFF，直接导入无CUDA/
 真实KWS→ASR→Agent→实际TTS字幕/打断完整一轮，用户选择暂缓；干净VM检查用户明确“这项先不做”，已有VM正常关闭、未回滚/清数据。重新登录后的自启、真实音频故障/退出音频资源、多显示器负坐标/热插拔、GPU包缺库场景均未执行。不把Mock或开发机测试当作这些验收。
 
 旧Electron/LX源码、发行入口、模型、Key和用户数据保留；音乐账户/播放器、联网搜索等尚未移植。PR保持草稿，不宣称全部原始Done Criteria已达成，不合并或发布Release。
+
+## 最后一轮时序修复（基线9617fac，2026-11-05）
+
+核对锁定的上游源码：i-slint-backend-winit 1.18.1 的 lib.rs::create_window_adapter 在组件 new 时执行 window_attributes_hook；WinitWindowAdapter::new 将结果缓存为 WinitWindowOrNone::None，show 后才使用该属性创建 HWND。因此仅包围 show 的标记太晚，即使先前无焦点测试通过也不能证明创建属性正确。
+
+新增小型 Safe Rust create()，用可嵌套且 panic 时恢复原值的作用域包围 VoiceHud::new；生产和原生测试共用该入口。显示作用域与已有 HWND 临时 NOACTIVATE 处理保留，不新增 unsafe，不改后端、运行时或权限路径。原生测试断言 new 阶段恰有一次 HUD hook，持续可见重复调用也保持前台不变。
+
+本轮 CPU release、clippy all-targets/no-default-features、fmt及48项UI单测通过（3项交互测试默认ignored，历史警告保留）。显式执行真实桌面焦点测试，首次/持续/隐藏重显三轮前台HWND均为0x40824；用户在记事本输入并确认输入正常，安装版HUD按钮可点击。本项不经过真实KWS。
+
+本轮重新从最新源码打包，安装PID24848退出0，目标卸载注册项匹配、安装EXE与release哈希一致、脚本BOM正确，从C:\Windows和Windows-only PATH启动新隔离配置PID12996。完整退出/卸载结果见 verification/pr9-last-round.json；旧构建证据仅作为历史记录，不作为本次候选结果。
+
+- 安装器 SHA-256：A5D8883CD56484E448D65FE4731F5EBBB8FAE4175C355EFB9B78ADDDB9136297
+- ZIP SHA-256：8B89695A7F44598A96C7A7020BBADDC9B3371865025A011677CF434E27EEB06A
+
+真实语音全链路、干净VM、多物理显示器和正式发行许可验收仍未执行/未完成，保持草稿，不合并或发布。本轮不再扩大修复范围。
+
+本轮卸载PID11804退出0，测试EXE和卸载注册项移除，原有用户数据5个文件哈希不变，隔离Session/模型标记保留，自启Run值不变，退出后子进程0。测试前备份的原有安装登记和快捷方式已恢复。打包脚本真实只读CUA调用通过。数据、进程和SHA记录均对应本轮构建。
