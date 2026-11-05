@@ -12,3 +12,7 @@
 
 
 核对依据：sherpa-onnx [v2.0.1 发布记录](https://github.com/k2-fsa/sherpa-onnx/releases/tag/v2.0.1)及其 cmake 构建清单。ONNX 静态归档内能匹配到 1.28.2 版本字符串。预编译包原目录只含 lib，故补取与该版本构建依赖相对应的原作者通知，并保留实际链接归档哈希；不把 Cargo crate 的顶层许可误当为整个原生归档的许可。
+
+- NVIDIA CUDA：仅使用与构建 Toolkit 哈希一致的 NVIDIA 官方 redist 文件；随包保留许可证、PE 导入和 SHA-256。驱动提供 nvcuda.dll。正式发布前核对对应版本许可及再分发条件。参考 https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ 的 redist 清单说明。
+
+本机 CUDA 13.4.1 构建的初步 PE 扫描：EXE 导入 cublas64_13.dll，后者导入 cublasLt64_13.dll；未发现 cudart DLL 导入。CUDA Runtime 静态链接时仍须遵守 NVIDIA 许可，最终以本次包内 PE 清单为准。

@@ -1,4 +1,4 @@
-﻿# CUAVA Rust CPU 发行候选
+﻿# CUAVA Rust CUDA 发行候选
 
 本目录为原生 Slint 版本，无 Electron/WebView、Node、Python、Rust 或 CUDA Toolkit 运行要求。
 当前为未签名候选，系统可能提示未知发布者。不要关闭安全功能；正式使用前核对来源和 SHA-256。
@@ -17,12 +17,12 @@
 在设置的语音输入/播报页面选择资源路径，不依赖工作目录。
 
 - KWS：sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01 目录；需要 encoder/decoder/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx 与 tokens.txt。建议放 AppData/Roaming/cuava/models。唤醒词文件 kws-keywords.txt 首次开启时生成，保存后按设置提示重新加载。
-- Whisper：选择本地 ggml 格式模型文件，例如 ggml-base.bin；CPU 包只用 CPU。模型越大延迟/内存越高。
+- Whisper：选择本地 ggml 格式模型文件，例如 ggml-base.bin；默认使用 CUDA；设置关闭 GPU 或初始化失败时在同一构建中回退 CPU。模型越大延迟/内存越高。
 - ONNX TTS：选择 Kokoro 多语言模型目录，包含 model.onnx、voices.bin、tokens.txt、espeak-ng-data 和对应语言词典；具体文件以设置错误提示及 rust/README.md 的 Kokoro 部署说明为准。
 - MiMo：在 MiMo 提供商下重新输入 Key，选择云端播报。只有显式开启后才发送助手可见正文合成。
 
 模型从原作者发行处取得，下载前自行确认许可、语言、体积与官方 SHA-256。
-程序不会猜测模型文件或许可。此包没有 GPU 加速库；CUDA 版缺 DLL 时可能在入口前失败，不能视为自动 CPU 回退。当前不提供经过发布验收的 GPU 包。
+程序不会猜测模型文件或许可。需要兼容 NVIDIA GPU、驱动及随包 CUDA 运行库；加载期 DLL 缺失可能使进程无法启动，Rust 内部 CPU 回退无法处理这种情况。CPU 回退仅适用于进程成功加载后的 GPU 初始化失败或关闭 GPU。Whisper CUDA 与实验性 ONNX TTS CUDA 是独立能力，本发行未启用后者。
 
 ## 旧版导入
 
@@ -42,21 +42,14 @@ enc: safeStorage 与 Rust DPAPI 不兼容，所有 Key 均不导入；按提供�
 | 提供商 Key、模型、唤醒词、方案/时段 | 需要手动重新配置 |
 | 音乐登录/播放器、搜索服务、角色动画/音色、GPT-SoVITS | 尚未移植 |
 
-## 干净 Windows 10/11 x64 验收清单
+## CUDA 发行构建与验收
 
-在没有 Rust、Node、Python、Electron/WebView、CUDA Toolkit、源码和 Cargo 缓存的 VM：
-安装 CPU 包，从任意工作目录启动，配置测试账户后使用文本 Agent 和只读 CUA；
-确认 exe 旁 cua.ps1 正常、TEMP 可写、缺模型/无麦克风仍能打开设置。
-自愿部署模型后在真机验证 KWS、隐藏主窗口后 HUD 不抢前台输入焦点、确认按钮、字幕和停止播报。
-在 100/150/200% DPI、多屏负坐标、拔插显示器后重复唤醒，确认不覆盖任务栏。
-退出后检查无音频输出和 PowerShell 子进程；重启/二次启动/登录启动关闭后再登录均须验证。
-最后卸载，确认 Rust 用户数据及旧 Electron 数据仍保留。构建通过不能替代上述验收。
+在 x64 MSVC Developer PowerShell 准备 CUDA Toolkit 13.4.1（设置 CUDA_PATH）、CMake、Ninja、LIBCLANG_PATH、sherpa-onnx 静态 MD 库、NSIS、微软 CRT Redist，以及与 Toolkit 相同版本的 NVIDIA 官方 Windows x64 redist 解压目录。`package.ps1` 在全新 Cargo target 中执行默认 feature 的 `cargo build --release --locked`，检查 CMake CUDA 配置和 PE 导入，拒绝使用外部 EXE；它不会启用实验性 `tts-cuda`。
 
-## 可复现打包（维护者）
+    ./rust/packaging/package.ps1 -CudaRedist <NVIDIA-redist目录> -MsvcRedist <微软CRT-redist目录> -MakeNsis <makensis.exe>
 
-在 x64 MSVC Developer PowerShell，准备 CMake/Ninja、LIBCLANG_PATH 和 sherpa-onnx 静态 MD 包。
-执行 `./rust/packaging/build-cpu.ps1`；该脚本关闭 Whisper 主机专用指令集，并清除该依赖的 release 缓存，避免旧 CUDA/native 构建混入。
-然后执行 `./rust/packaging/package.ps1 -CpuExe C:/cuava-cpu-target/release/cuava.exe -MsvcRedist <VS许可Redist目录/x64/Microsoft.VC145.CRT> -MakeNsis <makensis.exe>`。
-输出到 dist-rust，打印 ZIP/安装器 SHA-256。工具链仅维护者构建需要，用户不需要。
+脚本根据 PE 导入递归收集 NVIDIA 运行库，要求其与构建 Toolkit 的文件哈希一致，记录导入、文件哈希及来源。`nvcuda.dll` 由 NVIDIA 驱动提供，不随包复制。输出 ZIP 和安装器均为 CUDA 候选；正式发布前须审查 NVIDIA、MSVC、Slint 的许可。
+
+在兼容 NVIDIA 驱动的 Windows x64 上，从非源码工作目录安装和启动，使用真实 Whisper 模型确认 UI 显示 `Whisper CUDA` 且转录正确；然后关闭 `voice.useGpu`，确认同一 EXE 显示 `Whisper CPU` 且转录正确。退出、卸载并确认用户数据保留。缺少加载期 DLL 会导致启动失败，不可宣称会自动回退。构建通过不能替代实机验收。
 
 安装诊断记录在 `%TEMP%\cuava-install-diagnostic.ini`，含本次 PID、目标目录和阶段；应同时核对安装进程退出码、目标文件及 EXE 哈希，不能仅根据退出码或旧日志判定成功。目标 EXE 被占用时安装器返回非零并提示先正常退出，不强杀进程。Slint 托盘使用编译内嵌图标，确保后台首次创建时图标已经可用。

@@ -92,7 +92,7 @@ SetErrorLevel 1
 Abort "无法生成可用卸载程序，安装尚未完成，不登记安装信息。请检查安装目录写入权限后重试。"
 uninstaller_ready:
 ClearErrors
-WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayName" "CUAVA Rust (unsigned CPU candidate)"
+WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayName" "CUAVA Rust (unsigned CUDA candidate)"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayVersion" "0.1.0"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "InstallLocation" "$INSTDIR"
@@ -119,20 +119,8 @@ Delete "$SMPROGRAMS\CUAVA Rust\CUAVA.lnk"
 RMDir "$SMPROGRAMS\CUAVA Rust"
 skip_metadata:
 # Only installation-owned files. Never recursively delete user data/models.
-Delete "$INSTDIR\cuava.exe"
-Delete "$INSTDIR\cua.ps1"
-Delete "$INSTDIR\import-legacy.ps1"
-Delete "$INSTDIR\README.md"
-Delete "$INSTDIR\msvcp140.dll"
-Delete "$INSTDIR\msvcp140_1.dll"
-Delete "$INSTDIR\msvcp140_2.dll"
-Delete "$INSTDIR\msvcp140_atomic_wait.dll"
-Delete "$INSTDIR\msvcp140_codecvt_ids.dll"
-Delete "$INSTDIR\vcruntime140.dll"
-Delete "$INSTDIR\vcruntime140_1.dll"
-Delete "$INSTDIR\vcruntime140_threads.dll"
-Delete "$INSTDIR\vccorlib140.dll"
-Delete "$INSTDIR\concrt140.dll"
+!include "${STAGE}\uninstall-files.nsh"
+Delete "$INSTDIR\uninstall-files.nsh"
 RMDir /r "$INSTDIR\licenses"
 Delete "$INSTDIR\Uninstall.exe"
 RMDir "$INSTDIR"
