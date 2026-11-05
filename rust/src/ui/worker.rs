@@ -1525,7 +1525,8 @@ async fn run_worker(
      * 联网搜索（PR12）：Key 是**独立的一格**，与模型 Key 分开存。
      *
      * 启动时读一次；之后设置页保存会调用 `set_api_key` 原地换掉（不需要重启）。
-     * 没有 Key 时 `web_search` 不会公布给模型（见 `ToolRegistry::tool_definitions`）。
+     * `web_search` 真正可用要**同时**满足：设置里启用 + 有 Key
+     * （见 `ToolRegistry::search_ready`）。
      */
     let search_key = secret.load_search_key().ok().flatten().unwrap_or_default();
     let web_search = Arc::new(WebSearch::new(search_key));
@@ -1533,10 +1534,19 @@ async fn run_worker(
     //
     // 用 `Arc` 共享**同一份**：应用索引与搜索缓存都在里面，
     // 每轮新建一份会让 `launch_app` 每次都重新建索引（1~2 秒）。
-    let tools_registry = Arc::new(ToolRegistry::new(toolkit.clone(), web_search.clone()));
-    // 预热应用索引：第一次 `launch_app` 时就不用等那 1~2 秒。
-    tools_registry.warm_app_index(&CancelToken::new()).await;
-    publish_tool_overview(&weak, &tools_registry, &settings);
+    let tools_registry = Arc::new(ToolRegistry::new(
+        toolkit.clone(),
+        web_search.clone(),
+        settings.search.enabled,
+    ));
+    /*
+     * 预热应用索引必须**放到后台**：建索引要跑一次 PowerShell（1~2 秒，
+     * 冷启动更久），失败时还会等满超时。在这里直接 await 会让工作线程
+     * 在收到第一条命令之前一直卡着——用户点"打开设置"没反应。
+     * 首次 `launch_app` 仍会按需建索引，所以预热失败不影响可用性。
+     */
+    tools_registry.spawn_warm_app_index();
+    publish_tool_overview(&weak, &tools_registry);
 
     // 会话历史由会话运行时持有（按会话隔离）；回合期间只读一份快照。
     let mut turn_cancel: Option<CancelToken> = None;
@@ -1555,6 +1565,12 @@ async fn run_worker(
 
     let mut model_request = 0u64;
     let connection_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    /*
+     * 联网搜索 Key 的**测试代次**：每次测试、改草稿后重测、保存、清除 Key
+     * 都会推进它。迟到的测试结果只在代次未变时才回填界面，
+     * 所以旧结果永远不会覆盖更新的状态。
+     */
+    let search_test_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
     // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
@@ -1694,6 +1710,7 @@ async fn run_worker(
                         &request,
                         generation,
                         &save_generation,
+                        &search_test_generation,
                     );
                     // 保存成功后刷新输入区的模型下拉（选项/归属可能变了）。
                     {
@@ -1723,7 +1740,7 @@ async fn run_worker(
                 let has_key = secret.has(&settings.provider_id);
                 apply_settings_to_ui(&weak, &settings, has_key);
                 // 工具总览与实际公布清单同源，每次打开都按**此刻**的能力刷新。
-                publish_tool_overview(&weak, &tools_registry, &settings);
+                publish_tool_overview(&weak, &tools_registry);
             }
             UiCommand::ProviderChanged => {
                 model_request += 1;
@@ -1769,27 +1786,29 @@ async fn run_worker(
              */
             UiCommand::ClearSearchKey => match secret.clear_search_key() {
                 Ok(()) => {
+                    // 清 Key 立刻推进测试代次：在途的陈旧测试结果不许再回填。
+                    search_test_generation.fetch_add(1, Ordering::SeqCst);
                     tools_registry.search().set_api_key("");
-                    publish_tool_overview(&weak, &tools_registry, &settings);
+                    publish_tool_overview(&weak, &tools_registry);
                     set_status(&weak, "已清除联网搜索的 Key（web_search 不再公布给模型）");
                 }
                 Err(error) => set_status(&weak, &format!("清除联网搜索 Key 失败：{error}")),
             },
             UiCommand::TestSearchKey(draft_key) => {
                 /*
-                 * 可用性测试：真的打一次接口。
+                 * 可用性测试：真的打一次接口，但**只读不写**。
                  *
                  * 用**草稿优先**：用户刚填了 Key 想先试一下、还没保存，
                  * 这时拿已保存的旧 Key 去测只会给出误导性的结论。
-                 * 但测试**不写盘**——保存是另一个显式动作。
+                 * 测试结果只用于显示；不写盘、不改共享客户端。
                  */
                 let key = if draft_key.trim().is_empty() {
                     secret.load_search_key().ok().flatten().unwrap_or_default()
                 } else {
                     draft_key.trim().to_string()
                 };
-                let revision = tools_registry.search().revision();
-                handle_test_search_key(&weak, key, revision, tools_registry.search().clone());
+                let generation = search_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                handle_test_search_key(&weak, key, generation, &search_test_generation);
             }
             // ---- 设置分类导航 ----
             UiCommand::SettingsTab(index) => {
@@ -1800,7 +1819,7 @@ async fn run_worker(
                 }
                 publish_audit(&weak, &audit.recent(crate::permissions::MAX_AUDIT_RECORDS));
                 // 「工具与联网」页要显示**当前**能力（搜索 Key 可能在别处被改过）。
-                publish_tool_overview(&weak, &tools_registry, &settings);
+                publish_tool_overview(&weak, &tools_registry);
             }
             // ---- 模型发现与连通性测试 ----
             UiCommand::TestConnection(draft) => {
@@ -2112,6 +2131,7 @@ async fn run_worker(
                         &mut speech,
                         &settings,
                         next_turn_id,
+                        &input,
                         &answer,
                         TurnSource::Text,
                     );
@@ -2159,6 +2179,7 @@ async fn run_worker(
                             &tools_registry,
                             &command_tx,
                             &save_generation,
+                            &search_test_generation,
                             &mut model_request,
                             TurnSource::Text,
                         )
@@ -2272,6 +2293,7 @@ async fn run_worker(
                             &mut speech,
                             &settings,
                             next_turn_id,
+                            &prompt.text,
                             &answer,
                             TurnSource::Voice,
                         );
@@ -2320,6 +2342,7 @@ async fn run_worker(
                                 &tools_registry,
                                 &command_tx,
                                 &save_generation,
+                                &search_test_generation,
                                 &mut model_request,
                                 TurnSource::Voice,
                             )
@@ -3511,16 +3534,34 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
 /// 为什么复用同一条收尾路径：用户看到的必须还是"一个回合"——一条用户消息、
 /// 一条助手回复、状态从忙碌回到完成；只是这一轮**没有**模型调用与工具卡片。
 /// 不走 Agent 也就不会被权限询问、不会消耗 Key，更不会在断网时失败。
+///
+/// **同时写进有效 LLM 历史**：否则用户接着问"那再过三小时呢"时，模型看不到
+/// 上一轮问过什么、答了什么，只能反问或者凭空猜。这里补的是与普通回合
+/// 完全同形的 `user` + `assistant` 两条消息，所以：
+///  - 后续追问能关联到这一轮；
+///  - 历史随会话落盘，切换/重启后仍能恢复；
+///  - Session 隔离照旧（只写当前会话的历史）。
+#[allow(clippy::too_many_arguments)]
 fn finish_quick_answer(
     weak: &slint::Weak<AppWindow>,
     sessions: &mut SessionRuntime,
     speech: &mut SpeechRuntime,
     settings: &Settings,
     turn_id: TurnId,
+    question: &str,
     answer: &str,
     source: TurnSource,
 ) {
+    // 1) 可见时间线（用户消息在启动回合时已经写过，这里只补助手回复）。
     sessions.push_or_extend_assistant(turn_id, answer);
+    // 2) 发给 LLM 的历史：必须成对写入，否则下一轮模型只看到"助手凭空说了句话"。
+    let mut history = sessions.history();
+    history.push(crate::llm::ChatMessage::user(question));
+    history.push(crate::llm::ChatMessage::text(
+        crate::llm::Role::Assistant,
+        answer,
+    ));
+    sessions.set_history(history);
     sessions.set_last_turn(turn_id, TurnStatus::Completed);
     if let Err(error) = sessions.save_current() {
         set_status(weak, &format!("会话保存失败：{error}"));
@@ -3544,11 +3585,7 @@ fn finish_quick_answer(
 /// 为什么要在界面里列出来：任务书要求"没有实现的工具不能显示为可执行"。
 /// 这份清单直接来自 [`ToolRegistry::statuses`]，而它同时也是
 /// `tool_definitions()` 的来源，两者不可能漂移。
-fn publish_tool_overview(
-    weak: &slint::Weak<AppWindow>,
-    registry: &ToolRegistry,
-    settings: &Settings,
-) {
+fn publish_tool_overview(weak: &slint::Weak<AppWindow>, registry: &ToolRegistry) {
     let statuses = registry.statuses();
     let inventory = registry.inventory();
     let mut labels: Vec<slint::SharedString> = Vec::new();
@@ -3570,15 +3607,23 @@ fn publish_tool_overview(
         )));
     }
     let summary = inventory.summary();
-    let search_enabled = registry.search().enabled();
-    let search_setting = settings.search.enabled;
-    let search_hint = if !search_enabled {
-        "联网搜索未配置 Key：不会出现在模型的工具列表里。填好 Key 后无需重启即可启用。".to_string()
-    } else if !search_setting {
-        "联网搜索已配置 Key，但「启用联网搜索」是关闭的：当前不会使用（这里只是记录，工具公布以 Key 为准）。".to_string()
-    } else {
-        "联网搜索已启用：查询词会发给 Tavily（第三方，按次计费）。本地工具不受网络影响。"
-            .to_string()
+    // 三个状态必须分开说清楚：有没有 Key、开关是否打开、此刻是否真的可用。
+    let has_key = registry.search().enabled();
+    let setting_on = registry.search_setting_enabled();
+    let ready = registry.search_ready();
+    let search_hint = match (has_key, setting_on) {
+        (false, _) => {
+            "联网搜索未配置 Key：不会出现在模型的工具列表里。填好 Key 后无需重启即可启用。"
+                .to_string()
+        }
+        (true, false) => "联网搜索已配置 Key，但「启用联网搜索」是关闭的：当前不会公布也不会执行；\
+Key 仍然保存着，重新打开开关立即恢复。"
+            .to_string(),
+        (true, true) if ready => {
+            "联网搜索已启用：查询词会发给 Tavily（第三方，按次计费）。本地工具不受网络影响。"
+                .to_string()
+        }
+        (true, true) => "联网搜索配置异常（Key 与开关都在，但工具未就绪）".to_string(),
     };
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -3586,7 +3631,8 @@ fn publish_tool_overview(
             window.set_tool_overview(ModelRc::new(VecModel::from(labels)));
             window.set_tool_summary(summary.into());
             window.set_search_hint(search_hint.into());
-            window.set_search_key_saved(search_enabled);
+            // 「清除 Key」按钮看的是**有没有 Key**，与开关无关（关掉开关不该禁用清除）。
+            window.set_search_key_saved(has_key);
         }
     });
 }
@@ -3614,6 +3660,7 @@ async fn wait_turn(
     tools_registry: &ToolRegistry,
     command_tx: &tokio::sync::mpsc::UnboundedSender<UiCommand>,
     save_generation: &Arc<std::sync::atomic::AtomicU64>,
+    search_test_generation: &Arc<std::sync::atomic::AtomicU64>,
     model_request: &mut u64,
     source: TurnSource,
 ) -> TurnWait {
@@ -3703,6 +3750,7 @@ async fn wait_turn(
                                 &request,
                                 generation,
                                 save_generation,
+                                search_test_generation,
                             );
                         }
                     }
@@ -3860,8 +3908,10 @@ async fn wait_turn(
                         // 只清搜索 Key：模型提供商的 Key 一个都不动。
                         match secret.clear_search_key() {
                             Ok(()) => {
+                                // 清 Key 让在途的测试结果失效。
+                                search_test_generation.fetch_add(1, Ordering::SeqCst);
                                 tools_registry.search().set_api_key("");
-                                publish_tool_overview(weak, tools_registry, settings);
+                                publish_tool_overview(weak, tools_registry);
                                 set_status(weak, "已清除联网搜索的 Key（web_search 不再公布给模型）");
                             }
                             Err(error) => {
@@ -3871,19 +3921,20 @@ async fn wait_turn(
                     }
                     Some(UiCommand::TestSearchKey(key)) => {
                         /*
-                         * 可用性测试：真的打一次接口。
+                         * 可用性测试：真的打一次接口，但**只读不写**。
                          *
                          * 用**草稿优先**：用户刚填了 Key 想先试一下、还没保存，
                          * 这时拿已保存的旧 Key 去测只会给出误导性的结论。
-                         * 但测试**不写盘**——保存是另一个显式动作。
+                         * 测试结果只用于显示；不写盘、不改共享客户端。
                          */
                         let key = if key.trim().is_empty() {
                             secret.load_search_key().ok().flatten().unwrap_or_default()
                         } else {
                             key.trim().to_string()
                         };
-                        let revision = tools_registry.search().revision();
-                        handle_test_search_key(weak, key, revision, tools_registry.search().clone());
+                        let generation =
+                            search_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                        handle_test_search_key(weak, key, generation, search_test_generation);
                     }
                     None => return TurnWait::Quit,
                 }
@@ -3894,13 +3945,18 @@ async fn wait_turn(
 
 /// 联网搜索 Key 的可用性测试（后台执行，结果回填设置页）。
 ///
-/// 为什么要带 `revision`：用户在测试期间可能又改了 Key 并保存——
-/// 那次更年轻的改动作废本次结果，否则界面会显示一个已经过时的"可用/不可用"。
+/// **测试绝没有副作用**：它只用一个临时客户端打一次接口，不碰共享 `WebSearch`、
+/// 不写 `SecretStore`、也不改变当前可用的工具集。只有用户显式点「保存」并且
+/// 保存成功，才会更新实际运行用的 Key（见 `handle_save_all_ui`）。
+///
+/// 为什么要带 `generation`：测试期间用户可能又改了草稿、又测了一次、
+/// 切走了页面，或者保存/清除了 Key——这些都会把代次推进，
+/// 迟到的旧结果因此不会覆盖更新的状态。
 fn handle_test_search_key(
     weak: &slint::Weak<AppWindow>,
     key: String,
-    revision: u64,
-    search: Arc<WebSearch>,
+    generation: u64,
+    generation_counter: &Arc<std::sync::atomic::AtomicU64>,
 ) {
     if key.trim().is_empty() {
         with_window(weak, |window| {
@@ -3911,31 +3967,26 @@ fn handle_test_search_key(
         return;
     }
     /*
-     * 测试用的客户端与工具用的**共用同一个端点与传输层**，但 Key 用草稿：
-     * 这样"测试通过"与"实际可用"是同一件事，而不是两套实现给出的两个结论。
+     * 临时客户端：与工具用的**共用同一个端点与传输层**（所以"测试通过"
+     * 与"实际可用"是同一件事），但 Key 只活在这个局部对象里。
      */
     let probe = Arc::new(WebSearch::with_endpoint(
         crate::config::SEARCH_ENDPOINT,
         key.trim(),
     ));
     let weak = weak.clone();
+    let counter = generation_counter.clone();
     tokio::spawn(async move {
         let cancel = CancelToken::new();
         let outcome = crate::tools::web_search::probe_key(&probe, &cancel).await;
-        /*
-         * 测试通过后把草稿 Key 换进**真正的**客户端（不写盘）。
-         *
-         * 这样"测试成功"当场就能让 `web_search` 可用；但保存仍然需要用户点「保存」，
-         * 否则一次测试就等于偷偷改了配置。`revision` 核对保证：期间用户又改了
-         * Key 的话，这次迟到的结果不会覆盖更新的值。
-         */
-        if outcome.is_ok() && search.revision() == revision {
-            search.set_api_key(key.trim());
-        }
         let (code, hint) = match &outcome {
             Ok(detail) => ("ok", detail.clone()),
             Err(error) => ("failed", error.user_message()),
         };
+        // 迟到的结果不许覆盖更新的状态（改草稿/重测/保存/清除都会推进代次）。
+        if counter.load(Ordering::SeqCst) != generation {
+            return;
+        }
         let weak_ui = weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = weak_ui.upgrade() {
@@ -3970,6 +4021,7 @@ fn handle_save_all_ui(
     request: &SaveRequest,
     generation: u64,
     save_generation: &Arc<std::sync::atomic::AtomicU64>,
+    search_test_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> SaveOutcome {
     let reload_voice = voice_running
         && (settings.voice.kws_model_dir != request.kws_dir
@@ -3983,24 +4035,37 @@ fn handle_save_all_ui(
     set_status(weak, &status);
 
     /*
-     * 联网搜索 Key：从 SecretStore 读回**当前生效**的那一份，换进共享客户端。
+     * 联网搜索：只有**显式保存成功**才更新实际运行用的凭据与启用状态。
      *
-     * 为什么在这里重读而不是直接用 request 里的草稿：草稿可能因为写盘失败而
-     * 没能落盘；以磁盘为准才不会出现"界面说已保存、实际 Key 还是旧的"。
+     * Key 从 SecretStore 读回**当前生效**的那一份（草稿可能因为写盘失败而没落盘；
+     * 以磁盘为准才不会出现"界面说已保存、实际 Key 还是旧的"）。
+     * 关闭开关**不清 Key**，所以重新打开时 Key 仍在、立即恢复可用。
      */
     if outcome.config_written() {
+        // 保存会改变"实际生效的凭据/开关"，在途的测试结果从此失去意义。
+        search_test_generation.fetch_add(1, Ordering::SeqCst);
         let current = secret.load_search_key().ok().flatten().unwrap_or_default();
-        if registry.search().set_api_key(&current) {
-            eprintln!(
-                "[search] 联网搜索 Key 已更新，工具可用性：{}",
-                if registry.search().enabled() {
-                    "已启用"
-                } else {
-                    "未配置"
-                }
-            );
-        }
-        publish_tool_overview(weak, registry, settings);
+        registry.search().set_api_key(&current);
+        registry.set_search_enabled(settings.search.enabled);
+        eprintln!(
+            "[search] 联网搜索已保存：开关={}，Key={}，工具可用={}",
+            if settings.search.enabled {
+                "启用"
+            } else {
+                "关闭"
+            },
+            if current.trim().is_empty() {
+                "未配置"
+            } else {
+                "已配置"
+            },
+            if registry.search_ready() {
+                "是"
+            } else {
+                "否"
+            }
+        );
+        publish_tool_overview(weak, registry);
     }
 
     /*
@@ -5316,7 +5381,7 @@ mod tests {
         let paths = AppPaths::with_root(&root);
         let secret = SecretStore::new(paths.secret_file());
         let settings = Settings::default();
-        let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+        let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
 
         let confirmer = Arc::new(confirmer_without_ui());
         let permissions = Arc::new(std::sync::Mutex::new(PermissionState::default()));
@@ -5352,7 +5417,7 @@ mod tests {
     #[test]
     fn tool_overview_lists_exactly_what_is_published() {
         use crate::agent::ToolInvoker;
-        let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+        let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
         let published: Vec<String> = registry
             .tool_definitions()
             .iter()
@@ -5386,7 +5451,7 @@ mod tests {
         let paths = AppPaths::with_root(&root);
         let secret = SecretStore::new(paths.secret_file());
         let settings = Settings::default();
-        let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+        let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
 
         let confirmer = Arc::new(confirmer_without_ui());
         let permissions = Arc::new(std::sync::Mutex::new(PermissionState::default()));
@@ -5419,6 +5484,150 @@ mod tests {
         // 原来的令牌不能被拒绝路径换掉。
         assert!(running.is_some(), "拒绝新回合不能清掉正在跑的那一轮");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **本地报时必须进入有效 LLM 历史**：否则追问"那再过三小时呢"时，
+    /// 模型看不到上一轮问过什么、答了什么。
+    #[test]
+    fn quick_time_answer_is_written_to_the_llm_history() {
+        let root = unique_test_root("quick-answer-history");
+        let paths = AppPaths::with_root(&root);
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1_000);
+        let mut speech = SpeechRuntime::new(tokio::sync::mpsc::unbounded_channel().0);
+        let settings = Settings::default();
+
+        let turn_id = 1;
+        sessions.push_timeline(turn_id, TimelineItem::user("现在几点"));
+        let answer = "现在是晚上8点9分。";
+        finish_quick_answer(
+            &slint::Weak::default(),
+            &mut sessions,
+            &mut speech,
+            &settings,
+            turn_id,
+            "现在几点",
+            answer,
+            TurnSource::Text,
+        );
+
+        // 历史里成对出现 user + assistant，且就是这一问一答。
+        let history = sessions.history();
+        assert_eq!(history.len(), 2, "应恰好写入一问一答：{history:?}");
+        assert_eq!(history[0].role, crate::llm::Role::User);
+        assert_eq!(history[1].role, crate::llm::Role::Assistant);
+        let text_of = |message: &crate::llm::ChatMessage| match &message.content {
+            crate::llm::Content::Text(text) => text.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(text_of(&history[0]), "现在几点");
+        assert_eq!(text_of(&history[1]), answer);
+
+        // 时间线里也照旧有一条可见的助手回复。
+        assert!(sessions.timeline().iter().any(|item| item.kind
+            == crate::session::TimelineKind::Assistant
+            && item.text == answer));
+
+        // 落盘后可恢复（切换/重启后仍能关联上一轮）。
+        sessions.save_current().unwrap();
+        let reopened = SessionRuntime::open(&paths);
+        let restored = reopened.history();
+        assert_eq!(restored.len(), 2, "历史必须随会话恢复：{restored:?}");
+        assert_eq!(text_of(&restored[1]), answer);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 快速回答只写**当前**会话：Session 隔离照旧。
+    #[test]
+    fn quick_answer_history_stays_in_its_own_session() {
+        let root = unique_test_root("quick-answer-isolation");
+        let paths = AppPaths::with_root(&root);
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1_000);
+        let first = sessions.current_id().to_string();
+        let mut speech = SpeechRuntime::new(tokio::sync::mpsc::unbounded_channel().0);
+        let settings = Settings::default();
+
+        sessions.push_timeline(1, TimelineItem::user("现在几点"));
+        finish_quick_answer(
+            &slint::Weak::default(),
+            &mut sessions,
+            &mut speech,
+            &settings,
+            1,
+            "现在几点",
+            "现在是晚上8点9分。",
+            TurnSource::Text,
+        );
+        assert_eq!(sessions.history().len(), 2);
+
+        // 新建一个会话：历史是空的，不继承上一会话的时间问答。
+        let second = sessions.create(2_000, "新会话");
+        assert_ne!(first, second);
+        assert!(
+            sessions.history().is_empty(),
+            "新会话不该继承另一个会话的历史"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 测试 Key **不得**改动共享客户端或 SecretStore。
+    #[tokio::test]
+    async fn draft_key_test_has_no_side_effects() {
+        let root = unique_test_root("search-key-test");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        // 已保存一把 Key，并让它生效。
+        secret.save_search_key("tvly-saved").unwrap();
+        let search = Arc::new(WebSearch::new("tvly-saved"));
+        let registry = Arc::new(ToolRegistry::new(None, search.clone(), true));
+        assert!(registry.search_ready());
+
+        // 用一份**不同**的草稿去测试（指向不可达端点，结果必失败）。
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(2));
+        handle_test_search_key(
+            &slint::Weak::default(),
+            "tvly-draft-not-saved".to_string(),
+            2,
+            &generation,
+        );
+        // 等后台任务跑完它的网络尝试。
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // 共享客户端仍是已保存的那把（草稿没有偷偷生效）。
+        assert!(search.enabled());
+        assert_eq!(
+            secret.load_search_key().unwrap().as_deref(),
+            Some("tvly-saved"),
+            "测试不能写 SecretStore"
+        );
+        // 工具集没有变化。
+        use crate::agent::ToolInvoker as _;
+        assert!(registry
+            .tool_definitions()
+            .iter()
+            .any(|value| value["function"]["name"] == "web_search"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 迟到的测试结果不能覆盖更新的代次（改草稿/重测/保存/清除都会推进）。
+    #[tokio::test]
+    async fn stale_key_test_result_is_dropped() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        // 模拟"测试开始时是第 5 代，结果回来时已经是第 6 代"。
+        generation.fetch_add(1, Ordering::SeqCst);
+        handle_test_search_key(
+            &slint::Weak::default(),
+            "tvly-late".to_string(),
+            5,
+            &generation,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // 代次没被这次测试改动（它只读不写）。
+        assert_eq!(generation.load(Ordering::SeqCst), 6);
     }
 
     fn unique_test_root(prefix: &str) -> std::path::PathBuf {

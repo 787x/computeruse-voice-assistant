@@ -320,18 +320,31 @@ impl Request {
                 path.display()
             )));
         }
-        let bytes = std::fs::read(&path)
-            .map_err(|error| ToolError::failed(format!("读取 {} 失败：{error}", path.display())))?;
-        let total = bytes.len();
-        let slice = if total > MAX_READ_BYTES {
-            &bytes[..MAX_READ_BYTES]
-        } else {
-            &bytes[..]
-        };
+        /*
+         * 只读前 `MAX_READ_BYTES`：不能先 `std::fs::read` 整个文件再截断。
+         *
+         * 那个写法会把一个 4 GB 的日志整个载进内存（然后再丢掉 99.995%），
+         * 结果是助手在被要求"看一眼这个日志开头"时直接吃光内存。
+         * 原大小从 metadata 拿，截断提示照样准确。
+         */
+        let total = meta.len();
+        let mut buffer = Vec::with_capacity(MAX_READ_BYTES.min(total as usize));
+        {
+            use std::io::Read as _;
+            let file = std::fs::File::open(&path).map_err(|error| {
+                ToolError::failed(format!("读取 {} 失败：{error}", path.display()))
+            })?;
+            // `take` 在读取层就停住，不会把后面的字节读进内存。
+            file.take(MAX_READ_BYTES as u64)
+                .read_to_end(&mut buffer)
+                .map_err(|error| {
+                    ToolError::failed(format!("读取 {} 失败：{error}", path.display()))
+                })?;
+        }
+        let truncated = total > MAX_READ_BYTES as u64;
         // 截断可能切在多字节字符中间：用 lossy 解码，尾部替换字符不可避免，
         // 但整个文本不会因此变成乱码。
-        let text = String::from_utf8_lossy(slice).to_string();
-        let truncated = total > MAX_READ_BYTES;
+        let text = String::from_utf8_lossy(&buffer).to_string();
         let head = if truncated {
             format!(
                 "读取 {}（{total} 字节，只取前 {MAX_READ_BYTES} 字节）：",
@@ -369,6 +382,29 @@ impl Request {
             .ok_or_else(|| ToolError::Arg(ArgError::new("需要 dest")))?;
         let meta = std::fs::metadata(&path)
             .map_err(|error| ToolError::failed(format!("{} 不可用：{error}", path.display())))?;
+        /*
+         * 目录复制的边界检查必须在这里做，**在创建任何目录之前**。
+         *
+         * 之前在 `copy_dir` 里先 `create_dir_all(to)` 再遍历源目录：
+         * `src -> src\Backup` 时目标一建出来就成了源的内容，遍历时会被当成
+         * 待复制目录再复制一遍，于是 `src\Backup\Backup\Backup\…` 无限增长
+         * （或者撞上 Windows 的路径长度上限后留下半截残骸）。
+         */
+        if meta.is_dir() && !move_it {
+            if same_dir(&path, &dest) {
+                return Err(ToolError::Arg(ArgError::new(format!(
+                    "目标目录与源目录相同：{}（这会把目录复制到它自己里面）",
+                    path.display()
+                ))));
+            }
+            if is_inside(&path, &dest) {
+                return Err(ToolError::Arg(ArgError::new(format!(
+                    "目标目录不能位于源目录之内：{} → {}",
+                    path.display(),
+                    dest.display()
+                ))));
+            }
+        }
         if let Some(parent) = dest.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|error| {
@@ -444,7 +480,104 @@ struct Entry {
     size: u64,
 }
 
+/// 判定两个路径是否指向同一个目录（Windows 语义：大小写不敏感）。
+///
+/// 为什么要先 `canonicalize`：`src`、`src\.`、`src\..\src`、`SRC` 都是同一个目录，
+/// 只比字符串会让 `src -> src` 漏过去，然后 `copy_dir` 在已经存在的目标里
+/// 再遍历自己，最终生成 `src\src\src\…`。
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => normalize_for_compare(&left) == normalize_for_compare(&right),
+        // 目标可能还不存在：退回逐组件比较（同样大小写不敏感）。
+        _ => {
+            let left: Vec<String> = a
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                .collect();
+            let right: Vec<String> = b
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                .collect();
+            left == right
+        }
+    }
+}
+
+fn normalize_for_compare(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase()
+}
+
+/// `child` 是否位于 `parent` 之内（含任意深度的相对路径与 `..`）。
+fn is_inside(parent: &Path, child: &Path) -> bool {
+    let parent = match std::fs::canonicalize(parent) {
+        Ok(path) => normalize_for_compare(&path),
+        Err(_) => normalize_for_compare(parent),
+    };
+    let child = match std::fs::canonicalize(child) {
+        Ok(path) => normalize_for_compare(&path),
+        Err(_) => {
+            // 目标不存在时按组件解析：先尽量把已存在的父目录规范化。
+            let mut resolved = child.to_path_buf();
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            loop {
+                if let Ok(path) = std::fs::canonicalize(&resolved) {
+                    let mut rebuilt = normalize_for_compare(&path);
+                    for part in tail.iter().rev() {
+                        rebuilt.push('\\');
+                        rebuilt.push_str(&part.to_string_lossy().to_lowercase());
+                    }
+                    return is_prefix(&parent, &rebuilt);
+                }
+                match (
+                    resolved.file_name().map(|name| name.to_os_string()),
+                    resolved.parent(),
+                ) {
+                    (Some(name), Some(parent_dir)) => {
+                        tail.push(name);
+                        let next = parent_dir.to_path_buf();
+                        resolved = next;
+                    }
+                    _ => return is_prefix(&parent, &normalize_for_compare(child)),
+                }
+            }
+        }
+    };
+    if parent == child {
+        // 同一个目录不算"在里面"——由调用方用 same_dir 单独报错。
+        return false;
+    }
+    is_prefix(&parent, &child)
+}
+
+/// 字符串前缀判断，但必须在分隔符处截断：`C:\src2` 不属于 `C:\src`。
+fn is_prefix(parent: &str, child: &str) -> bool {
+    if parent.is_empty() {
+        return false;
+    }
+    match child.strip_prefix(parent) {
+        Some(rest) => rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/'),
+        None => false,
+    }
+}
+
 fn copy_dir(from: &Path, to: &Path) -> Result<(), ToolError> {
+    // **先校验再创建目录**：一旦 `create_dir_all(to)` 先把目标建出来，
+    // 目标就成了源的一部分，接下来的遍历会把刚建的目录当成内容再复制一遍。
+    if same_dir(from, to) {
+        return Err(ToolError::Arg(ArgError::new(format!(
+            "目标目录与源目录相同：{}（这会把目录复制到它自己里面）",
+            from.display()
+        ))));
+    }
+    if is_inside(from, to) {
+        return Err(ToolError::Arg(ArgError::new(format!(
+            "目标目录不能位于源目录之内：{} → {}",
+            from.display(),
+            to.display()
+        ))));
+    }
     std::fs::create_dir_all(to)
         .map_err(|error| ToolError::failed(format!("无法创建 {}：{error}", to.display())))?;
     let read = std::fs::read_dir(from)
@@ -454,6 +587,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), ToolError> {
         let target = to.join(item.file_name());
         let is_dir = item.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
         if is_dir {
+            // 逐层再校验：目标可能是通过符号链接/联接点绕进源的。
             copy_dir(&source, &target)?;
         } else {
             std::fs::copy(&source, &target).map_err(|error| {
@@ -560,6 +694,167 @@ mod tests {
         assert!(text.contains("已移动"), "{text}");
         assert!(!copied.exists());
         assert!(moved.is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **目录复制不能递归复制自身**：这三种情况都必须在创建目标之前被拒绝。
+    #[tokio::test]
+    async fn copying_a_directory_into_itself_is_refused() {
+        let root = temp_root("copy-self");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        let cancel = crate::cancel::CancelToken::new();
+
+        // 1) src -> src/Backup（目标在源之内）
+        let backup = src.join("Backup");
+        let error = run(
+            &json!({
+                "action":"copy",
+                "path": src.to_string_lossy(),
+                "dest": backup.to_string_lossy()
+            }),
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_argument(), "{}", error.user_message());
+        assert!(
+            error.user_message().contains("不能位于源目录之内"),
+            "{}",
+            error.user_message()
+        );
+        // 关键：**一个目录都不该被建出来**（否则下次遍历会把它当内容）。
+        assert!(!backup.exists(), "被拒绝时不能留下目标目录");
+
+        // 2) src -> src（同一个目录）
+        let error = run(
+            &json!({
+                "action":"copy",
+                "path": src.to_string_lossy(),
+                "dest": src.to_string_lossy()
+            }),
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_argument());
+        assert!(
+            error.user_message().contains("与源目录相同"),
+            "{}",
+            error.user_message()
+        );
+
+        // 2b) 写法不同但仍是同一个目录（`src\.`、大写、`..` 绕一圈）。
+        for alias in [
+            src.join("."),
+            PathBuf::from(src.to_string_lossy().to_lowercase()),
+            src.join("..").join("src"),
+        ] {
+            let error = run(
+                &json!({
+                    "action":"copy",
+                    "path": src.to_string_lossy(),
+                    "dest": alias.to_string_lossy()
+                }),
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.is_argument(),
+                "{}：{}",
+                alias.display(),
+                error.user_message()
+            );
+        }
+
+        // 3) 正常并列目录复制仍然可用，且内容完整。
+        let dest = root.join("dest");
+        let text = run(
+            &json!({
+                "action":"copy",
+                "path": src.to_string_lossy(),
+                "dest": dest.to_string_lossy()
+            }),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(text.contains("已复制"), "{text}");
+        assert_eq!(
+            std::fs::read(dest.join("a.txt")).unwrap(),
+            b"hello".to_vec()
+        );
+        // 没有生成嵌套的 src/src 之类。
+        assert!(!dest.join("src").exists(), "不应复制出嵌套的源目录");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 子目录判定要在分隔符处截断：`src2` 不属于 `src`。
+    #[test]
+    fn path_containment_does_not_confuse_siblings() {
+        let root = temp_root("containment");
+        let src = root.join("src");
+        let sibling = root.join("src2");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        assert!(is_inside(&src, &src.join("nested")));
+        assert!(is_inside(&src, &src.join("a").join("b")));
+        assert!(!is_inside(&src, &sibling), "同名前缀的兄弟目录不算在内");
+        assert!(
+            !is_inside(&src, &src),
+            "自己不算在自己里面（由 same_dir 负责）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `read` 必须**只读前 200KB**，不能先把整个大文件载进内存。
+    #[tokio::test]
+    async fn read_only_loads_the_first_200kb() {
+        let root = temp_root("read-limit");
+        let big = root.join("big.bin");
+        // 2 MB：远大于上限，但足够小以便测试快速。
+        let total = 2 * 1024 * 1024usize;
+        std::fs::write(&big, vec![b'A'; total]).unwrap();
+        let cancel = crate::cancel::CancelToken::new();
+
+        let text = run(
+            &json!({"action":"read","path": big.to_string_lossy()}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        // 头部如实给出**原文件**大小与截断长度。
+        assert!(text.contains(&format!("{total} 字节")), "{text}");
+        assert!(
+            text.contains(&format!("只取前 {MAX_READ_BYTES} 字节")),
+            "{text}"
+        );
+        // 正文只含前 200KB 的 'A'，不多不少。
+        let body = text.split_once('\n').map(|(_, body)| body).unwrap_or("");
+        assert_eq!(
+            body.trim_end_matches('\n').len(),
+            MAX_READ_BYTES,
+            "只应返回前 200KB"
+        );
+
+        // 小文件仍然完整返回、不标截断。
+        let small = root.join("small.txt");
+        std::fs::write(&small, b"hi").unwrap();
+        let text = run(
+            &json!({"action":"read","path": small.to_string_lossy()}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(!text.contains("只取前"), "小文件不该标截断：{text}");
+        assert!(text.ends_with("hi"), "{text}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

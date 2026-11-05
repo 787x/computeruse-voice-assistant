@@ -37,6 +37,12 @@ pub struct PsOutcome {
     pub code: i32,
     /// 是否因为超时被我们终止。
     pub killed: bool,
+    /// 终止时是否**确认**整棵进程树都已结束。
+    ///
+    /// `killed = true` 但这里是 `false` 时，只能说明"我们发出了终止请求"，
+    /// 可能有子进程还活着——调用方必须如实说"状态可能未知"，
+    /// 不能写"已终止整棵树"。
+    pub tree_terminated: bool,
     pub elapsed_ms: u64,
     /// 输出是否因为超过上限被截断。
     pub truncated: bool,
@@ -126,9 +132,12 @@ pub async fn run_powershell(
     };
 
     let killed = !matches!(ending, Ending::Exited(_));
+    // 终止是否**成功**必须如实记录：`taskkill /T` 也可能失败（拒绝访问、
+    // 进程已脱离进程树、目标已是僵尸），那时不能声称"整棵树都结束了"。
+    let mut tree_terminated = true;
     if killed {
         // 先杀整棵树，再收尸：否则 `powershell.exe` 退出了、它起的子进程还在跑。
-        let _ = kill_tree(pid).await;
+        tree_terminated = kill_tree(pid).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
     }
 
@@ -150,6 +159,7 @@ pub async fn run_powershell(
             _ => -1,
         },
         killed,
+        tree_terminated,
         elapsed_ms,
         stdout_bytes,
         stderr_bytes,
@@ -309,6 +319,58 @@ mod tests {
         assert!(outcome.killed, "超时必须标注为被终止");
         assert_eq!(outcome.code, -1);
         assert!(outcome.elapsed_ms < 10_000, "不能真的等满 30 秒");
+    }
+
+    /// 终止**成功**时才会声称"整棵树已结束"；子进程还在时不能这么写。
+    ///
+    /// 这里覆盖的是结果字段本身：`killed` 与 `tree_terminated` 是两个独立事实，
+    /// `shell::run` 的报告据此区分"已终止"与"状态可能未知"。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn successful_timeout_reports_a_terminated_tree() {
+        let cancel = CancelToken::new();
+        let outcome = run_powershell(
+            "Start-Sleep -Seconds 5",
+            None,
+            Duration::from_millis(500),
+            &cancel,
+            4000,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.killed);
+        // 正常情况下 `taskkill /F /T` 能成功，于是可以确认整棵树结束。
+        assert!(
+            outcome.tree_terminated,
+            "成功终止时必须标记树已结束，否则报告会说成状态未知"
+        );
+    }
+
+    /// `taskkill` 失败时**不能**声称整棵树结束（结果必须允许表达"未知"）。
+    #[test]
+    fn tree_termination_flag_can_express_unknown_state() {
+        let outcome = PsOutcome {
+            killed: true,
+            tree_terminated: false,
+            ..PsOutcome::default()
+        };
+        assert!(outcome.killed && !outcome.tree_terminated);
+        // 这种组合必须能被报表层识别为"状态可能未知"。
+        let reported =
+            crate::tools::shell::describe_termination(&outcome, Duration::from_millis(500));
+        assert!(
+            reported.contains("未能确认"),
+            "终止未确认时必须如实说明：{reported}"
+        );
+        let confirmed = PsOutcome {
+            killed: true,
+            tree_terminated: true,
+            ..PsOutcome::default()
+        };
+        let reported =
+            crate::tools::shell::describe_termination(&confirmed, Duration::from_millis(500));
+        assert!(reported.contains("被杀"), "{reported}");
+        assert!(!reported.contains("未能确认"), "{reported}");
     }
 
     #[cfg(windows)]

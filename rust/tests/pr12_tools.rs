@@ -280,7 +280,7 @@ async fn start_chat_mock(tool: &str, args: &Value) -> MockHttp {
 
 #[tokio::test]
 async fn without_keys_the_published_tool_set_is_local_only() {
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
     let names: Vec<String> = registry
         .tool_definitions()
         .iter()
@@ -304,10 +304,56 @@ async fn without_keys_the_published_tool_set_is_local_only() {
     assert!(!names.contains(&"screenshot".to_string()));
 }
 
+/// **关闭开关时即使有 Key 也不公布**（本 PR 修的缺陷）。
+/// 公布、统计、状态提示与实际调用必须一致。
+#[tokio::test]
+async fn disabled_search_setting_hides_the_tool_even_with_a_saved_key() {
+    let search = Arc::new(WebSearch::new("tvly-saved"));
+    let registry = ToolRegistry::new(None, search.clone(), false);
+
+    let names: Vec<String> = registry
+        .tool_definitions()
+        .iter()
+        .filter_map(|value| value["function"]["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(!names.contains(&"web_search".to_string()), "{names:?}");
+    assert_eq!(registry.inventory().conditional(), 0);
+    assert_eq!(registry.inventory().total(), 7);
+
+    let status = registry
+        .statuses()
+        .into_iter()
+        .find(|item| item.name == "web_search")
+        .unwrap();
+    assert!(!status.available);
+    assert!(status.reason.contains("关闭"), "{}", status.reason);
+
+    // 运行时硬调也要被拒（不是"列表里没有但还能调"）。
+    let error = registry
+        .invoke("web_search", &json!({"query": "天气"}), &CancelToken::new())
+        .await
+        .unwrap_err();
+    assert!(!error.is_cancelled());
+    assert!(
+        error.user_message().contains("关闭"),
+        "{}",
+        error.user_message()
+    );
+
+    // 重新打开立即恢复，Key 没被清掉。
+    registry.set_search_enabled(true);
+    assert!(search.enabled(), "关开关不能清 Key");
+    assert!(registry
+        .tool_definitions()
+        .iter()
+        .any(|value| value["function"]["name"] == "web_search"));
+    assert_eq!(registry.inventory().conditional(), 1);
+}
+
 #[tokio::test]
 async fn search_key_publishes_web_search_without_a_restart() {
     let search = Arc::new(WebSearch::new(""));
-    let registry = ToolRegistry::new(None, search.clone());
+    let registry = ToolRegistry::new(None, search.clone(), true);
     assert!(!registry
         .tool_definitions()
         .iter()
@@ -383,7 +429,7 @@ async fn time_answers_come_from_the_local_clock_only() {
     assert!(clock_tool::try_direct_answer("今天天气怎么样").is_none());
 
     // 工具路径：走注册表，结果里带日期/时间/星期/时区。
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
     let execution = registry
         .invoke("get_current_time", &json!({}), &CancelToken::new())
         .await
@@ -550,7 +596,7 @@ async fn network_failure_does_not_break_local_tools() {
         "http://127.0.0.1:1/search",
         "tvly-test",
     ));
-    let registry = ToolRegistry::new(None, search.clone());
+    let registry = ToolRegistry::new(None, search.clone(), true);
     let cancel = CancelToken::new();
 
     let error = registry
@@ -586,7 +632,7 @@ async fn network_failure_does_not_break_local_tools() {
 async fn real_file_round_trip_through_the_registry() {
     let root = test_dir("files");
     let file = root.join("笔记.txt");
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
     let cancel = CancelToken::new();
 
     let text = registry
@@ -639,7 +685,7 @@ async fn real_file_round_trip_through_the_registry() {
 
 #[tokio::test]
 async fn system_info_reports_unavailable_fields_honestly() {
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
     let text = registry
         .invoke("system_info", &json!({"detail": true}), &CancelToken::new())
         .await
@@ -656,7 +702,7 @@ async fn system_info_reports_unavailable_fields_honestly() {
 
 #[tokio::test]
 async fn app_control_find_is_read_only_and_honest_about_missing_processes() {
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
     let text = registry
         .invoke(
             "app_control",
@@ -671,7 +717,7 @@ async fn app_control_find_is_read_only_and_honest_about_missing_processes() {
 
 #[tokio::test]
 async fn kill_app_refuses_protected_processes_before_touching_anything() {
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
     let error = registry
         .invoke("kill_app", &json!({"name":"explorer"}), &CancelToken::new())
         .await
@@ -680,9 +726,93 @@ async fn kill_app_refuses_protected_processes_before_touching_anything() {
     assert!(error.user_message().contains("系统关键进程"));
 }
 
+/// **通配符绝不能变成"结束一批系统进程"**：这些名字必须在动作前被拒绝，
+/// 且在拒绝时不会有任何 `taskkill` 被发出（否则 `svchost*` 会顺带命中并结束
+/// 整批关键进程——`PROTECTED` 只按原始字符串比较，兜不住它）。
+#[tokio::test]
+async fn kill_app_rejects_wildcards_before_any_taskkill() {
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
+    let cancel = CancelToken::new();
+    for name in [
+        "*",
+        "chrome*",
+        "svchost*",
+        "?hrome",
+        "[a-z]hrome",
+        "chrome,notepad",
+    ] {
+        let error = registry
+            .invoke("kill_app", &json!({"name": name}), &cancel)
+            .await;
+        let error = match error {
+            Ok(execution) => panic!("「{name}」必须被拒绝，却返回成功：{}", execution.text),
+            Err(error) => error,
+        };
+        assert!(
+            error.is_argument(),
+            "「{name}」必须在动作前被拒绝：{}",
+            error.user_message()
+        );
+    }
+}
+
+/// 目录复制不能把目录复制进它自己（否则会生成无限嵌套目录）。
+#[tokio::test]
+async fn copying_a_directory_into_itself_is_refused_through_the_registry() {
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
+    let root = test_dir("registry-copy-self");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"x").unwrap();
+    let cancel = CancelToken::new();
+
+    for dest in [src.clone(), src.join("Backup")] {
+        let error = registry
+            .invoke(
+                "files",
+                &json!({
+                    "action":"copy",
+                    "path": src.to_string_lossy(),
+                    "dest": dest.to_string_lossy()
+                }),
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.is_argument(),
+            "{} → {} 必须被拒绝：{}",
+            src.display(),
+            dest.display(),
+            error.user_message()
+        );
+    }
+    // 没有留下无限嵌套的残骸。
+    assert!(!src.join("Backup").exists(), "被拒绝时不能创建目标目录");
+    // 正常并列目录复制仍然可用。
+    let ok_dest = root.join("ok");
+    let text = registry
+        .invoke(
+            "files",
+            &json!({
+                "action":"copy",
+                "path": src.to_string_lossy(),
+                "dest": ok_dest.to_string_lossy()
+            }),
+            &cancel,
+        )
+        .await
+        .unwrap()
+        .text;
+    assert!(text.contains("已复制"), "{text}");
+    assert!(ok_dest.join("a.txt").is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn shell_reports_exit_code_and_truncation() {
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("")), true);
     let text = registry
         .invoke(
             "run_shell",
@@ -838,7 +968,7 @@ async fn denied_run_shell_never_executes_through_the_agent() {
     let command = format!("New-Item -Path '{}' -ItemType File", marker.display());
     let mock = start_chat_mock("run_shell", &json!({"command": command})).await;
 
-    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
     let confirmer = RecordingConfirmer::new(false);
     let (outcome, events, statuses) = run_agent_turn(
         &format!("{}/v1", mock.base_url),
@@ -873,7 +1003,7 @@ async fn allowed_run_shell_executes_and_returns_to_the_same_agent() {
     );
     let mock = start_chat_mock("run_shell", &json!({"command": command})).await;
 
-    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
     let confirmer = RecordingConfirmer::new(true);
     let (outcome, events, statuses) = run_agent_turn(
         &format!("{}/v1", mock.base_url),
@@ -915,7 +1045,7 @@ async fn denied_file_delete_leaves_the_file_intact() {
     )
     .await;
 
-    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
     let confirmer = RecordingConfirmer::new(false);
     let (_outcome, _events, statuses) = run_agent_turn(
         &format!("{}/v1", mock.base_url),
@@ -943,7 +1073,7 @@ async fn pass_through_executes_without_prompting() {
     );
     let mock = start_chat_mock("run_shell", &json!({"command": command})).await;
 
-    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
     let confirmer = RecordingConfirmer::new(false); // 即便如此也不该被问到
     let (_outcome, _events, statuses) = run_agent_turn(
         &format!("{}/v1", mock.base_url),
@@ -964,7 +1094,7 @@ async fn pass_through_executes_without_prompting() {
 #[tokio::test]
 async fn time_tool_executes_without_any_prompt_and_without_a_key() {
     let mock = start_chat_mock("get_current_time", &json!({})).await;
-    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
     let confirmer = RecordingConfirmer::new(false);
     let (_outcome, _events, statuses) = run_agent_turn(
         &format!("{}/v1", mock.base_url),
@@ -982,7 +1112,7 @@ async fn time_tool_executes_without_any_prompt_and_without_a_key() {
 #[tokio::test]
 async fn unknown_tool_is_denied_even_in_pass_through() {
     let mock = start_chat_mock("os_shutdown", &json!({})).await;
-    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new(""))));
+    let registry = Arc::new(ToolRegistry::new(None, Arc::new(WebSearch::new("")), true));
     let confirmer = RecordingConfirmer::new(true);
     let (_outcome, _events, statuses) = run_agent_turn(
         &format!("{}/v1", mock.base_url),
@@ -1003,7 +1133,7 @@ async fn unknown_tool_is_denied_even_in_pass_through() {
 /// 用户看到的是"工具明明在列表里却永远失败"。
 #[test]
 fn every_publishable_tool_has_a_capability() {
-    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("tvly-x")));
+    let registry = ToolRegistry::new(None, Arc::new(WebSearch::new("tvly-x")), true);
     for value in registry.tool_definitions() {
         let name = value["function"]["name"].as_str().unwrap();
         assert!(
@@ -1023,7 +1153,7 @@ fn every_publishable_tool_has_a_capability() {
 #[test]
 fn inventory_separates_always_on_tools_from_conditional_ones() {
     let search = Arc::new(WebSearch::new(""));
-    let registry = ToolRegistry::new(None, search.clone());
+    let registry = ToolRegistry::new(None, search.clone(), true);
     let inventory = registry.inventory();
     assert_eq!(inventory.always(), 7);
     assert_eq!(inventory.conditional(), 0);

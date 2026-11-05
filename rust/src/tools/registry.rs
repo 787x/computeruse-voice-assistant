@@ -131,6 +131,11 @@ pub struct ToolRegistry {
     /// CUA 后端；`None` = 找不到 `cua.ps1`（此时 CUA 工具不公布，本地工具照常可用）。
     cua: Option<Arc<CuaToolkit>>,
     search: Arc<WebSearch>,
+    /// 「启用联网搜索」开关（来自 `Settings::search.enabled`）。
+    ///
+    /// 用 `AtomicBool` 而不是每轮重建注册表：设置保存后要**立刻**影响下一轮
+    /// 的工具定义与运行时调用，而注册表是共享的（应用索引与搜索缓存都在里面）。
+    search_enabled: std::sync::atomic::AtomicBool,
     /// 应用索引（`launch_app` 用；带 TTL，跨调用复用）。
     app_index: tokio::sync::Mutex<launch::AppIndex>,
     /// `run_shell` 的默认工作目录（用户目录）。
@@ -144,14 +149,36 @@ impl ToolRegistry {
     ///
     /// `cua` 为 `None` 时**只**公布本地工具：没有 CUA 后端不该让"看时间"""
     /// 查系统状态"一起失效（旧版也是这个取向）。
-    pub fn new(cua: Option<Arc<CuaToolkit>>, search: Arc<WebSearch>) -> Self {
+    ///
+    /// `search_enabled` 是用户设置里的开关：**开关关闭时即使有 Key 也不公布**。
+    pub fn new(cua: Option<Arc<CuaToolkit>>, search: Arc<WebSearch>, search_enabled: bool) -> Self {
         Self {
             cua,
             search,
+            search_enabled: std::sync::atomic::AtomicBool::new(search_enabled),
             app_index: tokio::sync::Mutex::new(launch::AppIndex::new()),
             home: user_home(),
             index_error: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 更新「启用联网搜索」开关（保存设置后调用，立即生效）。
+    pub fn set_search_enabled(&self, enabled: bool) {
+        self.search_enabled
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// 用户是否启用了联网搜索（不看有没有 Key）。
+    pub fn search_setting_enabled(&self) -> bool {
+        self.search_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `web_search` 此刻是否**真的可用**：开关打开**且**有 Key。
+    ///
+    /// 这是公布、执行、统计、状态提示的**唯一**判据——四者必须一致，
+    /// 否则会出现"总览说可用、请求里却没有"或"模型调用了被拒"。
+    pub fn search_ready(&self) -> bool {
+        self.search_setting_enabled() && self.search.enabled()
     }
 
     /// 测试/隔离环境用：显式指定默认工作目录。
@@ -193,7 +220,7 @@ impl ToolRegistry {
             },
             local: LOCAL_TOOL_NAMES.len(),
             time: 1,
-            search_enabled: self.search.enabled(),
+            search_enabled: self.search_ready(),
         }
     }
 
@@ -230,17 +257,21 @@ impl ToolRegistry {
                 reason: String::new(),
             });
         }
-        let search_enabled = self.search.enabled();
+        // 与 `tool_definitions()` **同一个判据**：开关关闭时即使有 Key 也不可用。
+        let search_ready = self.search_ready();
+        let reason = if search_ready {
+            String::new()
+        } else if !self.search_setting_enabled() {
+            "「启用联网搜索」是关闭的（有 Key 也不公布；打开后立即生效）".to_string()
+        } else {
+            "没有配置联网搜索的 API Key（不会公布给模型）".to_string()
+        };
         out.push(ToolStatus {
             name: web_search::TOOL_NAME.to_string(),
             source: ToolSource::Search,
             read_only: true,
-            available: search_enabled,
-            reason: if search_enabled {
-                String::new()
-            } else {
-                "没有配置联网搜索的 API Key（不会公布给模型）".to_string()
-            },
+            available: search_ready,
+            reason,
         });
         // 应用索引失败不影响工具可用，但要让用户看得见（否则"按名字启动"会莫名失败）。
         if let Ok(error) = self.index_error.lock() {
@@ -265,6 +296,11 @@ impl ToolRegistry {
     }
 
     /// 预热应用索引（可选；第一次 `launch_app` 也会自动建）。
+    ///
+    /// **不要在工作线程的启动路径上直接 await 它**：建索引要跑一次 PowerShell
+    /// （约 1~2 秒，冷启动更久），失败时还可能等满超时——那段时间里工作线程
+    /// 收不到"打开设置""发消息"等命令，用户看到的是界面没反应。
+    /// 调用方应该用 [`Self::spawn_warm_app_index`]。
     pub async fn warm_app_index(&self, cancel: &CancelToken) {
         let result = {
             let mut index = self.app_index.lock().await;
@@ -273,6 +309,18 @@ impl ToolRegistry {
         if let Ok(mut slot) = self.index_error.lock() {
             *slot = result.err().map(|error| error.user_message());
         }
+    }
+
+    /// 在**后台任务**里预热应用索引：立即返回，不占用调用方。
+    ///
+    /// 需要 `Arc<Self>`：任务要活过这次调用。首次 `launch_app` 仍会按需建索引，
+    /// 所以预热失败/没跑完都不影响可用性。
+    pub fn spawn_warm_app_index(self: &Arc<Self>) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            // 用独立令牌：预热不该被某个回合的取消连带打断。
+            registry.warm_app_index(&CancelToken::new()).await;
+        });
     }
 }
 
@@ -300,8 +348,9 @@ impl crate::agent::ToolInvoker for ToolRegistry {
         }
         // 2) 本地工具（含只读时间）。
         out.extend(Self::local_specs().iter().map(ToolSpec::to_request_value));
-        // 3) 联网搜索：**没有 Key 就不公布**（旧版 `listTools` 也是这个语义）。
-        if self.search.enabled() {
+        // 3) 联网搜索：**开关打开且配了 Key 才公布**。
+        //    关掉开关不清 Key，重新打开立即恢复（Key 仍在 SecretStore 里）。
+        if self.search_ready() {
             out.push(web_search::spec().to_request_value());
         }
         out
@@ -353,9 +402,19 @@ impl ToolRegistry {
             }
             "system_info" => Ok(text_of(sysinfo::run(args, cancel).await?)),
             TIME_TOOL_NAME => Ok(text_of(clock_tool::run(args, cancel).await?)),
-            web_search::TOOL_NAME => Ok(text_of(
-                web_search::run(self.search.clone(), args, cancel).await?,
-            )),
+            web_search::TOOL_NAME => {
+                // 运行时也要服从同一个判据：关闭开关后即使模型硬调也不能搜。
+                if !self.search_ready() {
+                    return Err(ToolError::failed(if self.search_setting_enabled() {
+                        "联网搜索没有配置 API Key（在设置的「联网与工具」里填写）".to_string()
+                    } else {
+                        "联网搜索已在设置里关闭（打开后立即生效）".to_string()
+                    }));
+                }
+                Ok(text_of(
+                    web_search::run(self.search.clone(), args, cancel).await?,
+                ))
+            }
             // ---- Computer Use（截图要带回图像） ----
             other => match self.cua.as_ref() {
                 Some(toolkit) if crate::cua::tools::DEFAULT_TOOL_NAMES.contains(&other) => {
@@ -384,7 +443,7 @@ mod tests {
     use crate::agent::ToolInvoker;
 
     fn registry() -> ToolRegistry {
-        ToolRegistry::new(None, Arc::new(WebSearch::new("")))
+        ToolRegistry::new(None, Arc::new(WebSearch::new("")), true)
     }
 
     #[test]
@@ -419,7 +478,7 @@ mod tests {
     #[test]
     fn search_is_published_only_when_a_key_exists() {
         let search = Arc::new(WebSearch::new(""));
-        let registry = ToolRegistry::new(None, search.clone());
+        let registry = ToolRegistry::new(None, search.clone(), true);
         assert!(!registry
             .tool_definitions()
             .iter()
@@ -434,6 +493,98 @@ mod tests {
             .any(|value| value["function"]["name"] == "web_search"));
         assert_eq!(registry.inventory().conditional(), 1);
         assert!(registry.inventory().summary().contains("已启用"));
+    }
+
+    /// **关闭开关时即使有 Key 也不公布**——这是本 PR 修的缺陷之一。
+    ///
+    /// 公布、统计、状态提示必须与"实际会发给 LLM 的定义"完全一致，
+    /// 否则会出现"总览说可用、请求里却没有"。
+    #[test]
+    fn disabled_setting_hides_search_even_with_a_key() {
+        let search = Arc::new(WebSearch::new("tvly-saved-key"));
+        let registry = ToolRegistry::new(None, search.clone(), false);
+        assert!(search.enabled(), "Key 本身还在");
+        assert!(!registry.search_ready(), "开关关闭时不算可用");
+
+        let names: Vec<String> = registry
+            .tool_definitions()
+            .iter()
+            .filter_map(|value| value["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(!names.contains(&"web_search".to_string()), "{names:?}");
+        assert_eq!(registry.inventory().conditional(), 0);
+        assert_eq!(registry.inventory().total(), 7, "7 = 本地 6 + 时间 1");
+
+        // 工具总览与定义同源：不可用且写明原因。
+        let status = registry
+            .statuses()
+            .into_iter()
+            .find(|item| item.name == "web_search")
+            .unwrap();
+        assert!(!status.available);
+        assert!(
+            status.reason.contains("关闭"),
+            "原因应说明开关是关的：{}",
+            status.reason
+        );
+
+        // 重新打开**立即**恢复（Key 没被清掉，不需要重启）。
+        registry.set_search_enabled(true);
+        assert!(registry.search_ready());
+        assert!(registry
+            .tool_definitions()
+            .iter()
+            .any(|value| value["function"]["name"] == "web_search"));
+        assert_eq!(registry.inventory().conditional(), 1);
+    }
+
+    /// 关掉开关不该清 Key：重新打开时仍然用原来那把。
+    #[test]
+    fn toggling_the_setting_never_touches_the_key() {
+        let search = Arc::new(WebSearch::new("tvly-keep-me"));
+        let registry = ToolRegistry::new(None, search.clone(), true);
+        registry.set_search_enabled(false);
+        assert!(search.enabled(), "关开关不能清 Key");
+        registry.set_search_enabled(true);
+        assert!(search.enabled());
+        assert!(registry.search_ready());
+    }
+
+    /// 运行时调用同样服从开关：关闭后即使模型硬调也拒绝，且原因可读。
+    #[tokio::test]
+    async fn disabled_setting_blocks_the_runtime_call() {
+        let search = Arc::new(WebSearch::new("tvly-key"));
+        let registry = ToolRegistry::new(None, search.clone(), false);
+        let error = registry
+            .invoke(
+                web_search::TOOL_NAME,
+                &serde_json::json!({"query": "天气"}),
+                &CancelToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_cancelled());
+        assert!(
+            error.user_message().contains("关闭"),
+            "{}",
+            error.user_message()
+        );
+
+        // 打开后不再被"开关"拦下（这里会走到网络并失败，但错误性质不同）。
+        registry.set_search_enabled(true);
+        let error = registry
+            .invoke(
+                web_search::TOOL_NAME,
+                &serde_json::json!({"query": "天气"}),
+                &CancelToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !error.user_message().contains("已在设置里关闭"),
+            "{}",
+            error.user_message()
+        );
     }
 
     #[test]
@@ -457,7 +608,7 @@ mod tests {
             crate::cua::bridge::PwshBridge::new(crate::cua::bridge::BridgeOptions::new("nope.ps1"));
         let toolkit = Arc::new(CuaToolkit::new(bridge, None));
         let search = Arc::new(WebSearch::new(""));
-        let registry = ToolRegistry::new(Some(toolkit), search.clone());
+        let registry = ToolRegistry::new(Some(toolkit), search.clone(), true);
 
         // 没有搜索 Key：12 + 6 + 1 = 19。
         let inventory = registry.inventory();

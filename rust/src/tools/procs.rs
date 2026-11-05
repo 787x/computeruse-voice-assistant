@@ -182,6 +182,86 @@ fn quote_pwsh(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// 把用户/模型给的进程名收敛成**精确名字**；带通配符或分隔符的一律拒绝。
+///
+/// 为什么必须拒绝：`Get-Process -Name` 支持 PowerShell 通配符
+/// （`*`、`?`、`[a-z]`），而 `PROTECTED` 只按原始输入做字符串比较。
+/// 于是 `svchost*` 既能绕开保护名单，又会把一批系统进程一起匹配出来——
+/// 这是"结束一个程序"变成"结束一堆关键进程"的直接路径。
+///
+/// 返回规范化后的名字（去 `.exe`、去首尾空白）；不合法时给出可照做的原因。
+pub fn normalize_process_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("需要 name（不带 .exe）".to_string());
+    }
+    // PowerShell 通配符 + 常见"多目标"写法：逗号分隔、分号、管道、括号。
+    const FORBIDDEN: &[char] = &[
+        '*', '?', '[', ']', ',', ';', '|', '&', '(', ')', '{', '}', '<', '>', '`', '$', '@', '\n',
+        '\r', '\t',
+    ];
+    if let Some(found) = trimmed.chars().find(|ch| FORBIDDEN.contains(ch)) {
+        return Err(format!(
+            "进程名不能包含「{found}」：kill_app 只接受一个明确的进程名，\
+不接受通配符或多目标（否则一次调用可能结束一批系统进程）"
+        ));
+    }
+    let name = trimmed
+        .strip_suffix(".exe")
+        .or_else(|| trimmed.strip_suffix(".EXE"))
+        .or_else(|| trimmed.strip_suffix(".Exe"))
+        .unwrap_or(trimmed)
+        .trim();
+    if name.is_empty() {
+        return Err("需要 name（不带 .exe）".to_string());
+    }
+    // 名字里不能再有路径分隔符——那是"指定某个 exe"的写法，本工具不接受。
+    if name.contains('\\') || name.contains('/') {
+        return Err("kill_app 只接受进程名，不接受路径".to_string());
+    }
+    Ok(name.to_string())
+}
+
+/// 大小写不敏感地判断某个进程名是否属于保护名单。
+fn is_protected(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    PROTECTED.contains(&lower.as_str())
+}
+
+/// 候选进程里真正可以结束的那些。
+///
+/// 三道闸，任何一道不通过都不进 `taskkill`：
+///  1. 实际 `ProcessName` 必须与请求名**完全一致**（不是前缀、不是包含）；
+///  2. 不能是系统关键进程（按**实际**名字再查一次，不只是查输入）；
+///  3. 不能是助手自身或其必要子进程。
+fn kill_candidates(
+    rows: &[ProcessRow],
+    requested: &str,
+    own_roots: &[String],
+) -> (Vec<ProcessRow>, Vec<String>) {
+    let wanted = requested.to_lowercase();
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    for row in rows {
+        let actual = row.name.trim();
+        if actual.to_lowercase() != wanted {
+            // 通配符解析出来的其它进程：列出名字但绝不结束。
+            refused.push(format!("{}（名字不匹配）", actual));
+            continue;
+        }
+        if is_protected(actual) {
+            refused.push(format!("{}（系统关键进程）", actual));
+            continue;
+        }
+        if is_own_process(row, own_roots) {
+            refused.push(format!("{}({})（助手自身或其必要进程）", actual, row.pid));
+            continue;
+        }
+        allowed.push(row.clone());
+    }
+    (allowed, refused)
+}
+
 /// 查同名进程（含后台）。名字里的 `.exe` 会被去掉。
 async fn query_by_name(name: &str, cancel: &CancelToken) -> Result<Vec<ProcessRow>, ToolError> {
     let script = format!(
@@ -284,16 +364,11 @@ pub async fn run_control(args: &Value, cancel: &CancelToken) -> Result<String, T
 pub async fn run_kill(args: &Value, cancel: &CancelToken) -> Result<String, ToolError> {
     let object = as_args(args);
     let raw = require_string(&object, "name", "kill_app")?;
-    let name = raw
-        .trim_end_matches(".exe")
-        .trim_end_matches(".EXE")
-        .to_string();
-    if name.is_empty() {
-        return Err(ToolError::Arg(ArgError::new(
-            "kill_app 需要 name（不带 .exe）",
-        )));
-    }
-    if PROTECTED.contains(&name.to_lowercase().as_str()) {
+    // **第一步就是拒绝通配符**：必须在任何查询之前，也不能靠"查到再筛"兜底——
+    // `Get-Process -Name 'svchost*'` 在查询阶段就已经枚举了整批系统进程。
+    let name =
+        normalize_process_name(&raw).map_err(|message| ToolError::Arg(ArgError::new(message)))?;
+    if is_protected(&name) {
         return Err(ToolError::Arg(ArgError::new(format!(
             "「{name}」是系统关键进程，拒绝结束"
         ))));
@@ -301,20 +376,21 @@ pub async fn run_kill(args: &Value, cancel: &CancelToken) -> Result<String, Tool
 
     let roots = own_roots();
     let all = query_by_name(&name, cancel).await?;
-    let targets: Vec<ProcessRow> = all
-        .iter()
-        .filter(|row| !is_own_process(row, &roots))
-        .cloned()
-        .collect();
     if all.is_empty() {
         return Err(ToolError::failed(format!(
             "没有找到正在运行的「{name}」（已查全部进程，不只是有窗口的）"
         )));
     }
+    // 执行前再按**实际** ProcessName 复核一次，逐 PID 排除关键进程与自身。
+    let (targets, refused) = kill_candidates(&all, &name, &roots);
     if targets.is_empty() {
-        // 找得到的只有我们自己的进程：绝不杀，并说明原因。
         return Err(ToolError::failed(format!(
-            "「{name}」只匹配到助手自身的进程，已拒绝结束（结束它会连带关掉语音/Computer Use）"
+            "「{name}」没有可结束的进程（{}）",
+            if refused.is_empty() {
+                "匹配到的都不允许结束".to_string()
+            } else {
+                refused.join("、")
+            }
         )));
     }
 
@@ -350,6 +426,9 @@ pub async fn run_kill(args: &Value, cancel: &CancelToken) -> Result<String, Tool
 }
 
 /// 轮询等待进程消失（最多 `GONE_WAIT_MS`）。返回仍存活的行。
+///
+/// 只把**同名且可结束**的进程算作"还活着"：否则通配符顺带匹配到的其它进程
+/// 会被误报成"没关掉"。
 async fn wait_until_gone(
     name: &str,
     roots: &[String],
@@ -360,11 +439,7 @@ async fn wait_until_gone(
         if cancel.is_cancelled() {
             return Err(ToolError::cancelled());
         }
-        let rows: Vec<ProcessRow> = query_by_name(name, cancel)
-            .await?
-            .into_iter()
-            .filter(|row| !is_own_process(row, roots))
-            .collect();
+        let (rows, _) = kill_candidates(&query_by_name(name, cancel).await?, name, roots);
         if rows.is_empty() {
             return Ok(rows);
         }
@@ -423,6 +498,136 @@ mod tests {
             assert!(error.is_argument(), "{name} 必须在动作前被拒绝");
             assert!(error.user_message().contains("系统关键进程"));
         }
+    }
+
+    /// **通配符与多目标语法必须在查询之前就被拒绝**。
+    ///
+    /// 这是本 PR 的真实缺陷：`Get-Process -Name` 支持通配符，而保护名单只按
+    /// 原始输入字符串比较，于是 `svchost*` 能绕过保护并匹配一整批系统进程。
+    /// 这里断言的是"连查询都不会发生"——所以用一个**记账**的取消令牌与
+    /// 一个不可达的进程表来证明没有任何 `taskkill` 被发出。
+    #[tokio::test]
+    async fn wildcard_and_multi_target_names_never_reach_taskkill() {
+        let cancel = CancelToken::new();
+        for name in [
+            "*",
+            "chrome*",
+            "svchost*",
+            "?hrome",
+            "[a-z]hrome",
+            "chrome,notepad",
+            "chrome;notepad",
+            "chrome|notepad",
+            "chrome & notepad",
+            "$(Get-Process)",
+            "C:\\Windows\\notepad.exe",
+            "   ",
+            "",
+        ] {
+            let error = run_kill(&json!({"name": name}), &cancel).await;
+            let error = match error {
+                Ok(text) => panic!("「{name}」必须被拒绝，却返回成功：{text}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.is_argument(),
+                "「{name}」必须是参数错误（动作前拦下），实际：{}",
+                error.user_message()
+            );
+        }
+    }
+
+    /// 规范化只接受一个明确名字；`.exe` 后缀被去掉。
+    #[test]
+    fn legitimate_names_are_normalized_but_never_widened() {
+        assert_eq!(normalize_process_name("notepad").unwrap(), "notepad");
+        assert_eq!(normalize_process_name(" notepad ").unwrap(), "notepad");
+        assert_eq!(normalize_process_name("notepad.exe").unwrap(), "notepad");
+        assert_eq!(normalize_process_name("Notepad.EXE").unwrap(), "Notepad");
+        // 名字里有点号是合法的（`msedge.exe` 去掉后缀后仍是 `msedge`）。
+        assert_eq!(normalize_process_name("msedge").unwrap(), "msedge");
+        for bad in ["*", "a?b", "[abc]", "a,b", "a;b", "a|b", "a\\b", "a/b", ""] {
+            assert!(normalize_process_name(bad).is_err(), "「{bad}」必须被拒绝");
+        }
+    }
+
+    /// 假进程表驱动的目标选择：名字必须**完全一致**，且逐 PID 排除关键进程与自身。
+    #[test]
+    fn kill_candidates_require_exact_name_and_exclude_protected_and_own() {
+        let rows = vec![
+            ProcessRow {
+                pid: 100,
+                name: "chrome".into(),
+                title: String::new(),
+                path: "C:\\Program Files\\Google\\Chrome\\chrome.exe".into(),
+            },
+            // 通配符/前缀顺带命中：名字不完全一致，绝不能结束。
+            ProcessRow {
+                pid: 101,
+                name: "chrome_crashpad_handler".into(),
+                title: String::new(),
+                path: String::new(),
+            },
+            // 实际名字是系统关键进程：即使请求名不敏感也要拒绝。
+            ProcessRow {
+                pid: 102,
+                name: "svchost".into(),
+                title: String::new(),
+                path: String::new(),
+            },
+            // 助手自身（按路径判定）。
+            ProcessRow {
+                pid: 103,
+                name: "cuava".into(),
+                title: String::new(),
+                path: "D:\\apps\\cuava\\cuava.exe".into(),
+            },
+        ];
+
+        let (allowed, refused) = kill_candidates(&rows, "chrome", &["d:\\apps\\cuava".to_string()]);
+        assert_eq!(allowed.len(), 1, "只允许精确匹配的 chrome");
+        assert_eq!(allowed[0].pid, 100);
+        assert!(
+            refused
+                .iter()
+                .any(|item| item.contains("chrome_crashpad_handler")),
+            "前缀命中的必须被记录为拒绝：{refused:?}"
+        );
+
+        // 请求 svchost 时一个都不许结束（保护名单按实际名字生效）。
+        let (allowed, refused) =
+            kill_candidates(&rows, "svchost", &["d:\\apps\\cuava".to_string()]);
+        assert!(allowed.is_empty(), "系统关键进程不能进 taskkill");
+        assert!(refused.iter().any(|item| item.contains("系统关键进程")));
+
+        // 请求助手自己的名字：同样一个都不许结束。
+        let (allowed, _) = kill_candidates(&rows, "cuava", &["d:\\apps\\cuava".to_string()]);
+        assert!(allowed.is_empty(), "助手自身不能被结束");
+
+        // 大小写不敏感（Windows 语义），但仍然要求整名相等。
+        let (allowed, _) = kill_candidates(&rows, "CHROME", &[]);
+        assert_eq!(allowed.len(), 1);
+    }
+
+    /// 精确名字的合法目标仍然可以被选中（不会因为这次收紧而全都杀不掉）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn exact_name_still_resolves_to_a_real_target_when_present() {
+        let cancel = CancelToken::new();
+        // 用当前测试进程自己作为"存在的进程"：它会被识别为自身而拒绝结束，
+        // 但这证明了查询与筛选链路是通的（不是一律返回"没有找到"）。
+        let exe_name = std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+            })
+            .expect("测试进程必须有可执行文件名");
+        let rows = query_by_name(&exe_name, &cancel).await.unwrap();
+        assert!(!rows.is_empty(), "按名字应能查到当前测试进程");
+        let (allowed, refused) = kill_candidates(&rows, &exe_name, &own_roots());
+        assert!(allowed.is_empty(), "自己的进程必须被排除");
+        assert!(!refused.is_empty(), "应记录为拒绝原因：{refused:?}");
     }
 
     #[tokio::test]

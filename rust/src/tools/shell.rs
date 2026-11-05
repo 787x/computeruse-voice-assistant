@@ -121,20 +121,13 @@ pub async fn run(
     let risks = assess_risk(&command);
     let mut parts = vec![
         format!("命令：{command}"),
-        format!(
-            "退出码：{}{}，耗时 {}ms",
-            outcome.code,
-            if outcome.killed {
-                format!(
-                    "（超时 {}ms 被杀，可能已有部分副作用）",
-                    timeout.as_millis()
-                )
-            } else {
-                String::new()
-            },
-            outcome.elapsed_ms
-        ),
+        format!("退出码：{}，耗时 {}ms", outcome.code, outcome.elapsed_ms),
     ];
+    // 终止相关的说明单独一段：它决定"能不能声称整棵树都结束了"。
+    let termination = describe_termination(&outcome, timeout);
+    if !termination.is_empty() {
+        parts.push(termination);
+    }
     if !risks.is_empty() {
         parts.push(format!("风险：{}", risks.join("、")));
     }
@@ -164,15 +157,37 @@ pub async fn run(
     if stdout.is_empty() && stderr.is_empty() {
         parts.push("（没有输出）".to_string());
     }
-    if outcome.killed {
-        // 诚实说明：命令被终止，但它运行期间写下的东西不会自动回滚。
-        parts.push(
-            "（命令在超时后被终止。终止只保证不再继续执行，已经产生的文件或系统变更不会被撤销；\
-需要确认实际状态时，请重新读一次现场。）"
-                .to_string(),
+    Ok(parts.join("\n"))
+}
+
+/// 超时终止的说明。
+///
+/// 两件事**必须分开说**：
+///  1. 命令是被我们终止的（`killed`），且它写下的东西不会回滚；
+///  2. 整棵进程树是否**确认**结束（`tree_terminated`）——`taskkill /T` 也可能失败，
+///     那时只能写"状态可能未知"，不能声称"子进程都结束了"。
+///
+/// 抽成独立函数是为了让"未确认"这条路径能被直接测试（不需要真的让
+/// `taskkill` 失败）。
+pub fn describe_termination(
+    outcome: &crate::tools::process::PsOutcome,
+    timeout: Duration,
+) -> String {
+    if !outcome.killed {
+        return String::new();
+    }
+    let mut text = format!(
+        "（超时 {}ms 被杀，可能已有部分副作用；终止不会撤销已经产生的文件或系统变更，\
+需要确认时请重新读一次现场）",
+        timeout.as_millis()
+    );
+    if !outcome.tree_terminated {
+        text.push_str(
+            "\n（注意：终止请求已发出，但未能确认它启动的子进程都已结束——\
+这一轮的最终状态可能未知，需要时请用 app_control 确认。）",
         );
     }
-    Ok(parts.join("\n"))
+    text
 }
 
 #[cfg(test)]
@@ -245,8 +260,12 @@ mod tests {
         .unwrap();
         assert!(text.contains("被杀"), "{text}");
         assert!(
-            text.contains("已经产生的文件或系统变更不会被撤销"),
-            "{text}"
+            text.contains("可能已有部分副作用"),
+            "必须说明副作用可能已发生：{text}"
+        );
+        assert!(
+            text.contains("终止不会撤销已经产生的文件或系统变更"),
+            "必须说明终止不回滚：{text}"
         );
     }
 }
