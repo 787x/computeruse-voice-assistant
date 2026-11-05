@@ -3260,6 +3260,8 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
             window.set_probe_revision(window.get_probe_revision().wrapping_add(1));
+            window.set_prompt_mode(prompt::preset_index(saved.system_prompt.as_deref()));
+            window.set_silver_wolf_prompt(prompt::SILVER_WOLF_SYSTEM_PROMPT.into());
             window.set_prompt_custom(saved.system_prompt.is_some());
             window.set_system_prompt(
                 prompt::resolve_system_prompt(saved.system_prompt.as_deref()).into(),

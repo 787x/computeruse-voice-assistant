@@ -160,6 +160,7 @@ component AppTextEdit inherits Rectangle {
 /// 选项用 `TouchArea` 自绘：不依赖 `ListView` 的主题样式。
 /// 支持键盘：空格/回车展开，上下移动，回车确认，Esc 关闭。
 component AppComboBox inherits Rectangle {
+    in property <bool> permission-colors: false;
     in property <[string]> options: [];
     in-out property <int> index: 0;
     in property <bool> enabled: true;
@@ -191,7 +192,7 @@ component AppComboBox inherits Rectangle {
         width: parent.width - 34px;
         height: parent.height;
         text: current-text();
-        color: enabled ? #1f1f22 : #a8a8b0;
+        color: !enabled ? #a8a8b0 : root.permission-colors ? (root.index >= 2 ? #e87524 : #777780) : #1f1f22;
         font-size: 13px;
         vertical-alignment: center;
         overflow: elide;
@@ -275,7 +276,7 @@ component AppComboBox inherits Rectangle {
                         width: parent.width - 16px;
                         height: parent.height;
                         text: option;
-                        color: #1f1f22;
+                        color: root.permission-colors ? (index >= 2 ? #e87524 : #777780) : #1f1f22;
                         font-size: 13px;
                         vertical-alignment: center;
                         overflow: elide;
@@ -614,6 +615,8 @@ export component AppWindow inherits Window {
 
     // ---- 系统提示词（PR8） ----
     in-out property <bool> prompt-custom: false;
+    in-out property <int> prompt-mode: 0;
+    in-out property <string> silver-wolf-prompt: "";
     in-out property <string> system-prompt: "";
     in-out property <string> default-prompt: "";
     in-out property <string> prompt-hint: "";
@@ -1122,7 +1125,7 @@ export component AppWindow inherits Window {
                             }
                             Rectangle {
                                 width: 76px; height: 34px; border-radius: 7px; background: permission-touch.has-hover ? #eeeeef : transparent;
-                                Text { text: root.permission-mode-labels[root.permission-index]; color: #e87524; font-size: 11px; overflow: elide; vertical-alignment: center; horizontal-alignment: center; }
+                                Text { text: root.permission-mode-labels[root.permission-index]; color: root.permission-index >= 2 ? #e87524 : #777780; font-size: 11px; overflow: elide; vertical-alignment: center; horizontal-alignment: center; }
                                 permission-touch := TouchArea { enabled: !root.busy; clicked => { permissions-popup.show(); } }
                                 permissions-popup := PopupWindow {
                                     width: 270px; height: 240px; x: 0px; y: -250px; close-policy: close-on-click-outside;
@@ -1133,7 +1136,7 @@ export component AppWindow inherits Window {
                                             Text { text: "工具权限"; color: #777780; }
                                             for mode[i] in root.permission-mode-labels : Rectangle {
                                                 height: 32px; border-radius: 6px; background: i == root.permission-index ? #eeeeef : permission-choice.has-hover ? #f0f1f3 : transparent;
-                                                Text { x: 8px; width: parent.width - 16px; height: parent.height; text: mode + (i == root.permission-index ? " · 当前" : ""); color: #242428; vertical-alignment: center; overflow: elide; }
+                                                Text { x: 8px; width: parent.width - 16px; height: parent.height; text: mode + (i == root.permission-index ? " · 当前" : ""); color: i >= 2 ? #e87524 : #777780; vertical-alignment: center; overflow: elide; }
                                                 permission-choice := TouchArea { enabled: !root.busy; clicked => { root.quick-permission-picked(i); permissions-popup.close(); } }
                                             }
                                             Rectangle {
@@ -1724,17 +1727,19 @@ export component AppWindow inherits Window {
                                 spacing: 10px;
                                 Text { text: "模式"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
                                 AppComboBox {
-                                    options: ["使用内置默认", "使用自定义"];
-                                    index: root.prompt-custom ? 1 : 0;
+                                    options: ["默认（小爱同学）", "银狼", "自定义"];
+                                    index: root.prompt-mode;
                                     picked(index) => {
-                                        root.prompt-custom = index == 1;
+                                        root.prompt-mode = index;
+                                        root.prompt-custom = index != 0;
+                                        if index == 1 { root.system-prompt = root.silver-wolf-prompt; }
                                         root.settings-dirty = true;
                                         root.prompt-hint = "";
                                     }
                                 }
                             }
 
-                            if root.prompt-custom : AppTextEdit {
+                            if root.prompt-mode == 2 : AppTextEdit {
                                 text <=> root.system-prompt;
                                 edited => { root.settings-dirty = true; root.settings-error = ""; }
                             }
@@ -1751,9 +1756,11 @@ export component AppWindow inherits Window {
                                 AppButton {
                                     label: "恢复默认";
                                     clicked => {
+                                        root.prompt-mode = 0;
+                                        root.prompt-custom = false;
                                         root.system-prompt = root.default-prompt;
                                         root.settings-dirty = true;
-                                        root.prompt-hint = "已填入默认提示词（保存后生效）";
+                                        root.prompt-hint = "已恢复默认（小爱同学），保存后生效";
                                     }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
@@ -1790,6 +1797,7 @@ export component AppWindow inherits Window {
                                 Text { text: "档位"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
                                 AppComboBox {
                                     enabled: !root.settings-saving;
+                                    permission-colors: true;
                                     options: root.permission-mode-labels;
                                     index <=> root.permission-index;
                                     picked(index) => {
