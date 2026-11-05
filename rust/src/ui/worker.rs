@@ -88,7 +88,7 @@ pub enum UiCommand {
     /// 那时"清除"应该作用于界面显示的那家，而不是已保存配置里的那家。
     ClearApiKey(String),
     /// 切换提供商（界面据此回填地址与模型）。
-    ProviderChanged(i32),
+    ProviderChanged(i32, Option<Vec<(String, bool)>>),
     /// 打开设置：按当前已保存的配置回填界面。
     OpenSettings,
     /// 切换设置分类（只改界面，不回填）。
@@ -295,6 +295,12 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // 这样超时/取消/更晚完成的旧保存都不会覆盖用户的新编辑。
     let save_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    let model_drafts = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
+        String,
+        Vec<(String, bool)>,
+    >::new()));
+    let draft_provider = std::rc::Rc::new(std::cell::Cell::new(window.get_provider_index()));
+
     // ---- 界面 → 工作线程 ----
     {
         let tx = command_tx.clone();
@@ -328,7 +334,14 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
          * 工作线程是唯一持有权威配置的地方。
          */
         let tx = command_tx.clone();
+        let model_drafts = model_drafts.clone();
+        let draft_provider = draft_provider.clone();
+        let weak = window.as_weak();
         window.on_open_settings(move || {
+            model_drafts.borrow_mut().clear();
+            if let Some(window) = weak.upgrade() {
+                draft_provider.set(window.get_provider_index());
+            }
             let _ = tx.send(UiCommand::OpenSettings);
         });
     }
@@ -348,13 +361,27 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let tx = command_tx.clone();
         let weak = window.as_weak();
         let save_generation = save_generation.clone();
+        let model_drafts = model_drafts.clone();
         window.on_save_all(move || {
             // 界面上读一次当前全部字段（工作线程持有权威配置副本）。
-            let request = match weak.upgrade() {
+            let mut request = match weak.upgrade() {
                 Some(window) => build_save_request(&window),
                 None => return,
             };
 
+            request.provider_enabled_models = model_drafts
+                .borrow()
+                .iter()
+                .map(|(id, rows)| {
+                    (
+                        id.clone(),
+                        rows.iter()
+                            .filter(|(_, enabled)| *enabled)
+                            .map(|(name, _)| name.clone())
+                            .collect(),
+                    )
+                })
+                .collect();
             // 取一个新的代次；工作线程只有拿它回填才算"最新"。
             let generation = save_generation.fetch_add(1, Ordering::SeqCst) + 1;
             if tx
@@ -398,8 +425,28 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let tx = command_tx.clone();
         let weak = window.as_weak();
         let paths_for_key = paths.clone();
+        let model_drafts = model_drafts.clone();
+        let draft_provider = draft_provider.clone();
         window.on_provider_changed(move |index| {
-            let _ = tx.send(UiCommand::ProviderChanged(index));
+            if let Some(window) = weak.upgrade() {
+                let names = window.get_enabled_model_names();
+                let flags = window.get_enabled_model_flags();
+                let rows = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.to_string(), flags.row_data(i).unwrap_or(false)))
+                    .collect();
+                model_drafts.borrow_mut().insert(
+                    provider_id_for_index(draft_provider.get()).to_string(),
+                    rows,
+                );
+            }
+            draft_provider.set(index);
+            let draft = model_drafts
+                .borrow()
+                .get(provider_id_for_index(index))
+                .cloned();
+            let _ = tx.send(UiCommand::ProviderChanged(index, draft));
             let provider_id = provider_id_for_index(index).to_string();
             // "该提供商有没有 Key" 要跟着下拉框变，否则界面会对着
             // 一家没有 Key 的提供商显示"已保存"。这里只探测文件存在性，不读明文。
@@ -1588,6 +1635,10 @@ async fn run_worker(
                         &mut settings,
                         &mut speech,
                         &permissions,
+                        voice
+                            .handle
+                            .as_ref()
+                            .is_some_and(|handle| handle.is_running()),
                         &request,
                         generation,
                         &save_generation,
@@ -1620,7 +1671,7 @@ async fn run_worker(
                 let has_key = secret.has(&settings.provider_id);
                 apply_settings_to_ui(&weak, &settings, has_key);
             }
-            UiCommand::ProviderChanged(index) => {
+            UiCommand::ProviderChanged(index, draft) => {
                 model_request += 1;
                 let provider = settings.provider(provider_id_for_index(index));
                 let has_key = secret.has(&provider.id);
@@ -1633,6 +1684,9 @@ async fn run_worker(
                     window.set_base_url(provider.base_url_or_default().into());
                     window.set_model_name(provider.model.clone().into());
                     fill_model_settings(window, &provider);
+                    if let Some(rows) = draft {
+                        apply_model_draft(window, &rows);
+                    }
                     window.set_provider_hint_index(settings_ui::provider_hint_index(
                         provider.provider_hint,
                     ));
@@ -2043,17 +2097,29 @@ async fn run_worker(
                 }
             }
             UiCommand::DictateNow => {
-                if voice.manual_armed || voice.route.active_session().current().is_some() {
-                    voice.disable(&weak);
+                if voice.manual_armed
+                    || voice.route.pending.is_some()
+                    || voice.route.active_session().current().is_some()
+                {
+                    if voice.manual_temporary {
+                        voice.disable(&weak);
+                    } else {
+                        voice.set_listen_mode(ListenPurpose::Wake, 0);
+                        voice.cancel_pending();
+                        voice.manual_armed = false;
+                        with_window(&weak, |w| w.set_voice_manual(false));
+                        set_status(&weak, "已取消识别，继续等待唤醒词");
+                    }
                 } else {
                     speech.stop();
                     voice.manual_temporary = !voice
                         .handle
                         .as_ref()
                         .is_some_and(|handle| handle.is_running());
+                    voice.manual_request = voice.manual_request.wrapping_add(1);
                     voice.manual_armed = true;
                     with_window(&weak, |w| w.set_voice_manual(true));
-                    voice.set_listen_mode(ListenPurpose::Manual, 0);
+                    voice.set_listen_mode(ListenPurpose::Manual, voice.manual_request);
                     voice.enable(&weak, &paths, &settings, &command_tx);
                     if voice.handle.is_none() {
                         voice.manual_armed = false;
@@ -2315,6 +2381,7 @@ struct VoiceRuntime {
     mode: ListenMode,
     manual_armed: bool,
     manual_temporary: bool,
+    manual_request: u64,
 }
 
 impl VoiceRuntime {
@@ -2325,6 +2392,7 @@ impl VoiceRuntime {
             mode: ListenMode::new(),
             manual_armed: false,
             manual_temporary: false,
+            manual_request: 0,
         }
     }
 
@@ -2399,6 +2467,7 @@ impl VoiceRuntime {
         with_window(weak, |w| w.set_voice_manual(false));
         self.manual_armed = false;
         self.manual_temporary = false;
+        self.set_listen_mode(ListenPurpose::Wake, 0);
         // 先让还在识别的结果过期，再停线程：迟到的文本不会落到新实例上。
         self.route.close();
         if let Some(mut handle) = self.handle.take() {
@@ -2462,6 +2531,12 @@ impl VoiceRuntime {
                 purpose,
                 request_id,
             } => {
+                if purpose == ListenPurpose::Manual
+                    && (self.mode.purpose() != ListenPurpose::Manual
+                        || request_id != self.manual_request)
+                {
+                    return VoiceOutcome::None;
+                }
                 self.route.bind(event.instance, turn);
                 set_voice_state(weak, &VoiceState::Capturing);
                 match purpose {
@@ -2485,9 +2560,15 @@ impl VoiceRuntime {
                 VoiceOutcome::None
             }
             VoiceEventKind::Rejected { turn, reason } => {
+                if self.route.pending != Some(turn) {
+                    return VoiceOutcome::None;
+                }
                 with_window(weak, |w| w.set_voice_manual(false));
                 if self.manual_temporary {
                     self.disable(weak);
+                } else if self.mode.purpose() == ListenPurpose::Manual {
+                    self.set_listen_mode(ListenPurpose::Wake, 0);
+                    self.manual_armed = false;
                 }
                 self.route.release(event.instance, turn);
                 // 空转录/太短属于「没听清」，给一句可读的提示；
@@ -2526,6 +2607,8 @@ impl VoiceRuntime {
                 }
                 if purpose == ListenPurpose::Manual {
                     with_window(weak, |w| w.set_voice_manual(false));
+                    self.set_listen_mode(ListenPurpose::Wake, 0);
+                    self.manual_armed = false;
                 }
                 if purpose == ListenPurpose::Manual && self.manual_temporary {
                     self.disable(weak);
@@ -2583,7 +2666,7 @@ fn sync_listen_mode(voice: &mut VoiceRuntime, speech: &SpeechRuntime, confirmer:
     } else if speech.is_speaking() {
         (ListenPurpose::BargeIn, 0)
     } else if voice.manual_armed {
-        (ListenPurpose::Manual, 0)
+        (ListenPurpose::Manual, voice.manual_request)
     } else {
         (ListenPurpose::Wake, 0)
     };
@@ -3200,6 +3283,7 @@ pub fn build_save_request(window: &AppWindow) -> SaveRequest {
             })
             .map(|(_, name)| name.to_string())
             .collect(),
+        provider_enabled_models: Default::default(),
         provider_hint: window.get_provider_hint_index(),
         api_key: window.get_api_key_input().to_string(),
         temperature: window.get_temperature().to_string(),
@@ -3423,6 +3507,7 @@ async fn wait_turn(
                                 settings,
                                 speech,
                                 permissions,
+                                voice.handle.as_ref().is_some_and(|handle| handle.is_running()),
                                 &request,
                                 generation,
                                 save_generation,
@@ -3543,7 +3628,7 @@ async fn wait_turn(
                         let has_key = secret.has(&settings.provider_id);
                         apply_settings_to_ui(weak, settings, has_key);
                     }
-                    Some(UiCommand::ProviderChanged(_)) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
+                    Some(UiCommand::ProviderChanged(_, _)) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
                     Some(UiCommand::ClearApiKey(provider_id)) => {
                         /*
                          * 任务执行期间清除 Key：**真实执行**，不是只提示。
@@ -3601,12 +3686,21 @@ fn handle_save_all_ui(
     settings: &mut Settings,
     speech: &mut SpeechRuntime,
     permissions: &Arc<std::sync::Mutex<PermissionState>>,
+    voice_running: bool,
     request: &SaveRequest,
     generation: u64,
     save_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> SaveOutcome {
+    let reload_voice = voice_running
+        && (settings.voice.kws_model_dir != request.kws_dir
+            || settings.voice.whisper_model != request.whisper_file);
     let outcome = apply_save(paths, secret, settings, speech, request);
-    set_status(weak, &outcome.message());
+    let status = if outcome.config_written() && reload_voice {
+        format!("{}；请重新开启麦克风以加载新的语音模型", outcome.message())
+    } else {
+        outcome.message()
+    };
+    set_status(weak, &status);
 
     /*
      * 落盘期间用户可能已经取消、或又点了一次保存。
@@ -4389,9 +4483,26 @@ pub fn summary_is_secret_free(value: &Value) -> bool {
     !text.contains("sk-") && !text.contains("Bearer ")
 }
 
+fn apply_model_draft(window: &AppWindow, rows: &[(String, bool)]) {
+    let names: Vec<slint::SharedString> =
+        rows.iter().map(|(name, _)| name.clone().into()).collect();
+    let labels: Vec<slint::SharedString> = rows
+        .iter()
+        .map(|(name, _)| format!("{name} · 保留选择，未验证").into())
+        .collect();
+    window.set_enabled_model_names(ModelRc::new(VecModel::from(names)));
+    window.set_enabled_model_labels(ModelRc::new(VecModel::from(labels)));
+    window.set_enabled_model_flags(ModelRc::new(VecModel::from(
+        rows.iter().map(|(_, enabled)| *enabled).collect::<Vec<_>>(),
+    )));
+}
+
 /// 设置目录与启用集合分别回填；停用不会删除目录。
 fn fill_model_settings(window: &AppWindow, provider: &config::ProviderConfig) {
     let mut names: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
+    if !provider.model.trim().is_empty() && !names.contains(&provider.model) {
+        names.push(provider.model.clone());
+    }
     for name in provider.selectable_models() {
         if !names.contains(&name) {
             names.push(name);
@@ -4406,13 +4517,13 @@ fn fill_model_settings(window: &AppWindow, provider: &config::ProviderConfig) {
     let labels: Vec<slint::SharedString> = names
         .iter()
         .map(|name| {
-            let source = if old_endpoint {
-                "旧端点选择，未验证"
-            } else if provider
+            let source = if provider
                 .model_meta(name)
                 .is_some_and(|m| m.source == config::ModelSource::Discovered)
             {
                 "服务端目录，未验证"
+            } else if old_endpoint {
+                "旧端点选择，未验证"
             } else {
                 "手动，未验证"
             };
@@ -4497,6 +4608,7 @@ mod tests {
             &secret,
             ""
         ));
+        assert_eq!(settings.provider("deepseek").models_origin_url, endpoint);
         fetch.ok = false;
         fetch.models = vec![config::ModelOption::manual("failed-model")];
         assert!(!remember_fetched_models(
@@ -4508,6 +4620,7 @@ mod tests {
             ""
         ));
         assert_eq!(settings.provider("deepseek").models[0].id, "found-model");
+        assert_eq!(settings.provider("deepseek").models_origin_url, endpoint);
     }
 
     #[test]
@@ -4749,6 +4862,45 @@ mod tests {
         };
         assert!(VoiceOutcome::Prompt(prompt).into_prompt().is_some());
         assert!(VoiceOutcome::None.into_prompt().is_none());
+    }
+
+    #[test]
+    fn cancelled_manual_start_and_final_cannot_bind_after_rearming() {
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let turn = VoiceTurn {
+            instance,
+            session: 1,
+        };
+        voice.manual_request = 2;
+        voice.manual_armed = true;
+        voice.set_listen_mode(ListenPurpose::Manual, 2);
+        let weak = slint::Weak::default();
+        let start = VoiceEvent {
+            instance,
+            kind: VoiceEventKind::DirectStarted {
+                turn,
+                purpose: ListenPurpose::Manual,
+                request_id: 1,
+            },
+        };
+        assert!(voice.on_event(&weak, start, false).into_prompt().is_none());
+        let final_event = VoiceEvent {
+            instance,
+            kind: VoiceEventKind::Final {
+                turn,
+                text: "执行操作".into(),
+                audio_seconds: 1.0,
+                decode_ms: 1,
+                purpose: ListenPurpose::Manual,
+                request_id: 1,
+            },
+        };
+        assert!(voice
+            .on_event(&weak, final_event, false)
+            .into_prompt()
+            .is_none());
+        assert!(voice.route.pending.is_none());
     }
 
     /// 旧实例的迟到事件不得改界面状态。

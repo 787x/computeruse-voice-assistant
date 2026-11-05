@@ -34,6 +34,7 @@ pub struct SaveRequest {
     pub base_url: String,
     pub model: String,
     pub enabled_models: Vec<String>,
+    pub provider_enabled_models: BTreeMap<String, Vec<String>>,
     pub provider_hint: i32,
     pub api_key: String,
     // ---- 采样与预算 ----
@@ -354,6 +355,17 @@ pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Sett
     if let Some(provider) = providers.iter_mut().find(|p| p.id == next.provider_id) {
         provider.enabled_models = Some(request.enabled_models.clone());
     }
+    for (id, enabled) in &request.provider_enabled_models {
+        if id != &next.provider_id {
+            if let Some(provider) = providers.iter_mut().find(|p| &p.id == id) {
+                provider.enabled_models = Some(enabled.clone());
+            } else {
+                let mut provider = current.provider(id);
+                provider.enabled_models = Some(enabled.clone());
+                providers.push(provider);
+            }
+        }
+    }
     next.providers = providers;
 
     next.voice.kws_model_dir = request.kws_dir.clone();
@@ -473,6 +485,7 @@ pub fn restore_model_catalogs(
             .unwrap_or(&saved_key);
         if let Some(models) = cache.models_for(&id, &provider.base_url_or_default(), key) {
             provider.remember_models(models);
+            provider.models_origin_url = provider.base_url_or_default();
             if legacy {
                 let enabled = provider
                     .enabled_models
@@ -625,6 +638,7 @@ mod tests {
             base_url: settings.base_url.clone(),
             model: settings.model.clone(),
             enabled_models: settings.provider(&settings.provider_id).selectable_models(),
+            provider_enabled_models: BTreeMap::new(),
             provider_hint: provider_hint_index(settings.provider_hint),
             api_key: String::new(),
             temperature: format!("{:.1}", settings.temperature),
@@ -647,6 +661,41 @@ mod tests {
             tts_local_speed: format!("{:.1}", settings.tts.local_speed),
             speak_mode: 0,
         }
+    }
+
+    #[test]
+    fn provider_drafts_are_saved_together_and_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "cuava-provider-drafts-{}",
+            crate::clock::now().unix_ms
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.provider_id = "deepseek".into();
+        let deepseek = settings.provider("deepseek");
+        request.base_url = deepseek.base_url_or_default();
+        request.model = deepseek.model;
+        request.enabled_models = vec!["deepseek-choice".into()];
+        request
+            .provider_enabled_models
+            .insert("mimo".into(), vec!["mimo-choice".into()]);
+        let next = build_candidate(&settings, &request).unwrap();
+        assert_ne!(
+            settings.provider("mimo").selectable_models(),
+            vec!["mimo-choice"]
+        );
+        config::save_settings(&paths, &next).unwrap();
+        let loaded = config::load_settings(&paths).unwrap();
+        assert_eq!(
+            loaded.provider("mimo").selectable_models(),
+            vec!["mimo-choice"]
+        );
+        assert_eq!(
+            loaded.provider("deepseek").selectable_models(),
+            vec!["deepseek-choice"]
+        );
     }
 
     #[test]

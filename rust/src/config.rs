@@ -364,10 +364,10 @@ pub struct ProviderConfig {
 
 impl ProviderConfig {
     pub fn selectable_models(&self) -> Vec<String> {
-        let mut models = self
-            .enabled_models
-            .clone()
-            .unwrap_or_else(|| self.models.iter().map(|m| m.id.clone()).collect());
+        if let Some(enabled) = &self.enabled_models {
+            return enabled.clone();
+        }
+        let mut models = self.models.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
         if !self.model.trim().is_empty() && !models.contains(&self.model) {
             models.insert(0, self.model.clone());
         }
@@ -986,6 +986,7 @@ impl Settings {
             return false;
         }
         provider.remember_models(models);
+        provider.models_origin_url = provider.base_url_or_default();
         if let Some(existing) = self.providers.iter_mut().find(|p| p.id == id) {
             *existing = provider;
         } else {
