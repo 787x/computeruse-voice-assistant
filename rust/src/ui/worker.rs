@@ -2038,8 +2038,7 @@ async fn run_worker(
                         }
                     }
                     TurnStart::Rejected(status) => {
-                        set_busy(&weak, false);
-                        set_status(&weak, &status);
+                        finish_rejected_turn(&weak, &mut sessions, next_turn_id, &status);
                     }
                 }
             }
@@ -2174,8 +2173,7 @@ async fn run_worker(
                             }
                         }
                         TurnStart::Rejected(status) => {
-                            set_busy(&weak, false);
-                            set_status(&weak, &status);
+                            finish_rejected_turn(&weak, &mut sessions, next_turn_id, &status);
                         }
                     }
                 }
@@ -3043,7 +3041,10 @@ fn start_turn(
     }
     let Some(toolkit) = toolkit.clone() else {
         set_busy(weak, false);
-        return TurnStart::Rejected("Computer Use 后端不可用，无法执行指令".to_string());
+        return TurnStart::Rejected(
+            "Computer Use 后端不可用：未找到 cua.ps1，请使用完整发行包或设置 CUAVA_CUA_SCRIPT"
+                .to_string(),
+        );
     };
 
     /*
@@ -3987,6 +3988,27 @@ fn append_assistant_delta(window: &AppWindow, delta: &str) {
 ///
 /// 顺序很重要：会话历史/时间线/状态先落盘，界面只是它的投影。
 /// 这样"界面显示有结果"与"磁盘上真的有"是同一件事。
+fn finish_rejected_turn(
+    weak: &slint::Weak<AppWindow>,
+    sessions: &mut SessionRuntime,
+    turn_id: TurnId,
+    reason: &str,
+) {
+    sessions.push_timeline(turn_id, TimelineItem::system(format!("启动失败：{reason}")));
+    sessions.set_last_turn(turn_id, TurnStatus::Failed);
+    let save_error = sessions.save_current().err();
+    publish_session_list(weak, sessions);
+    publish_timeline(weak, sessions);
+    set_busy(weak, false);
+    set_status(
+        weak,
+        &match save_error {
+            Some(error) => format!("启动失败：{reason}；会话保存失败：{error}"),
+            None => format!("启动失败：{reason}"),
+        },
+    );
+}
+
 fn finish_session_turn(
     weak: &slint::Weak<AppWindow>,
     sessions: &mut SessionRuntime,
@@ -4788,6 +4810,31 @@ mod tests {
         let mut wait = install_pending(&confirmer, 9);
         assert!(confirmer.submit(9, ConfirmAnswer::deny_voice("用户说：不要")));
         assert!(!wait.try_recv().unwrap().allow);
+    }
+
+    #[test]
+    fn rejected_turn_is_saved_as_failed_after_restart() {
+        let paths = AppPaths::with_root(unique_test_root("rejected-restart"));
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1000);
+        sessions.push_timeline(1, TimelineItem::user("你好"));
+        sessions.set_last_turn(1, TurnStatus::Interrupted);
+        sessions.save_current().unwrap();
+        finish_rejected_turn(
+            &slint::Weak::default(),
+            &mut sessions,
+            1,
+            "端点配置无效：测试",
+        );
+        let reopened = SessionRuntime::open(&paths);
+        assert_eq!(
+            reopened.current().unwrap().last_turn_status,
+            TurnStatus::Failed
+        );
+        assert!(reopened
+            .timeline()
+            .iter()
+            .any(|item| item.text.contains("启动失败：端点配置无效：测试")));
     }
 
     /// 没有 CUA 后端时不能启动回合，且必须给出可读原因。
