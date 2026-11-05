@@ -61,6 +61,7 @@ fn server(
 }
 fn draft(url: &str, key: &str) -> ProbeDraft {
     ProbeDraft {
+        revision: 0,
         provider_id: "deepseek".into(),
         base_url: url.into(),
         model: "draft-model".into(),
@@ -142,6 +143,13 @@ async fn restart_restores_only_current_endpoint_account_and_keeps_manual_models(
     };
     settings.remember_discovered_models("deepseek", &url, &[ModelOption::manual("manual")]);
     config::save_settings(&paths, &settings).unwrap();
+    // 模拟旧版文件缺少启用字段，但发现目录已在独立缓存里。
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(paths.settings_file()).unwrap()).unwrap();
+    for provider in legacy["providers"].as_array_mut().unwrap() {
+        provider.as_object_mut().unwrap().remove("enabledModels");
+    }
+    std::fs::write(paths.settings_file(), serde_json::to_vec(&legacy).unwrap()).unwrap();
     let provider = settings.provider("deepseek");
     let mut cache = ModelCache::with_path(paths.model_cache_file());
     assert!(
@@ -158,6 +166,10 @@ async fn restart_restores_only_current_endpoint_account_and_keeps_manual_models(
             .iter()
             .any(|m| m.id == id));
     }
+    assert!(restarted
+        .provider("deepseek")
+        .selectable_models()
+        .contains(&"a-two".into()));
     secrets.save("deepseek", "account-b").unwrap();
     restore_model_catalogs(&mut restarted, &paths, &secrets, None);
     assert_eq!(

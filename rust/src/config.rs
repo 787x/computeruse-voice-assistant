@@ -354,9 +354,26 @@ pub struct ProviderConfig {
     /// 已知模型（手动添加 + 在线目录缓存）。有界：见 [`Self::max_models`]。
     #[serde(default)]
     pub models: Vec<ModelOption>,
+    /// None 为旧配置：保留目录中全部模型。Some 为用户显式启用集合。
+    #[serde(default)]
+    pub enabled_models: Option<Vec<String>>,
+    /// 启用集合来自的端点；地址改变后保留选择但不将旧目录视为已验证。
+    #[serde(default)]
+    pub models_origin_url: String,
 }
 
 impl ProviderConfig {
+    pub fn selectable_models(&self) -> Vec<String> {
+        let mut models = self
+            .enabled_models
+            .clone()
+            .unwrap_or_else(|| self.models.iter().map(|m| m.id.clone()).collect::<Vec<_>>());
+        if !self.model.trim().is_empty() && !models.contains(&self.model) {
+            models.insert(0, self.model.clone());
+        }
+        models
+    }
+
     /// 每个提供商最多保留的模型条目：在线目录可能很长，但设置文件不该无限膨胀。
     pub const MAX_MODELS: usize = 80;
 
@@ -404,6 +421,15 @@ impl ProviderConfig {
 
     /// 记下/更新一个模型（保留手动添加的模型，清掉过期的目录缓存）。
     pub fn remember_models(&mut self, discovered: &[ModelOption]) {
+        if self.enabled_models.is_none() {
+            let mut enabled = self.selectable_models();
+            for model in discovered {
+                if !enabled.contains(&model.id) {
+                    enabled.push(model.id.clone());
+                }
+            }
+            self.enabled_models = Some(enabled);
+        }
         let manual: Vec<ModelOption> = self
             .models
             .iter()
@@ -869,6 +895,8 @@ impl Settings {
             return;
         }
         let entry = ProviderConfig {
+            enabled_models: None,
+            models_origin_url: String::new(),
             id: provider_id.clone(),
             name: get_provider(&provider_id)
                 .map(|info| info.name.to_string())
@@ -910,6 +938,8 @@ impl Settings {
         let info = get_provider(provider_id);
         let is_active = provider_id == self.provider_id;
         ProviderConfig {
+            enabled_models: None,
+            models_origin_url: String::new(),
             id: provider_id.to_string(),
             name: info.map(|i| i.name.to_string()).unwrap_or_default(),
             base_url: if is_active && !self.base_url.trim().is_empty() {
@@ -956,6 +986,7 @@ impl Settings {
             return false;
         }
         provider.remember_models(models);
+        provider.models_origin_url = provider.base_url_or_default();
         if let Some(existing) = self.providers.iter_mut().find(|p| p.id == id) {
             *existing = provider;
         } else {
@@ -1529,6 +1560,8 @@ mod tests {
         let mut settings = Settings::default();
         settings.context_window = 1_000_000;
         settings.providers = vec![ProviderConfig {
+            enabled_models: None,
+            models_origin_url: String::new(),
             id: "mimo".to_string(),
             name: String::new(),
             base_url: "https://api.xiaomimimo.com/v1".to_string(),
@@ -1692,6 +1725,8 @@ mod tests {
         let mut settings = Settings::default();
         settings.providers = vec![
             ProviderConfig {
+                enabled_models: None,
+                models_origin_url: String::new(),
                 id: "mimo".to_string(),
                 name: String::new(),
                 base_url: "https://api.xiaomimimo.com/v1".to_string(),
@@ -1702,6 +1737,8 @@ mod tests {
                 models: Vec::new(),
             },
             ProviderConfig {
+                enabled_models: None,
+                models_origin_url: String::new(),
                 id: "deepseek".to_string(),
                 name: String::new(),
                 base_url: "https://api.deepseek.com/v1".to_string(),

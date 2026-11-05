@@ -21,15 +21,43 @@ use crate::secret::SecretStore;
 use crate::voice::speech::SpeechRuntime;
 use crate::voice::tts::{TtsBackend, TtsSettings};
 
+/// 单个提供商在设置页中的未保存字段。
+#[derive(Clone, Default)]
+pub struct ProviderDraft {
+    pub base_url: String,
+    pub model: String,
+    pub hint: i32,
+    pub thinking: i32,
+    pub effort: i32,
+    pub api_key: String,
+    pub rows: Vec<(String, bool)>,
+}
+
+impl std::fmt::Debug for ProviderDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderDraft")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
 /// 界面「保存」提交的全部内容。
 #[derive(Debug, Clone)]
 pub struct SaveRequest {
+    pub kws_dir: String,
+    pub whisper_file: String,
+    pub keywords_file: String,
     pub model_plans_json: String,
     pub model_schedule_json: String,
     // ---- 当前生效的提供商（模型页顶部） ----
     pub provider_id: String,
     pub base_url: String,
     pub model: String,
+    pub enabled_models: Vec<String>,
+    pub provider_enabled_models: BTreeMap<String, Vec<String>>,
+    pub provider_drafts: BTreeMap<String, ProviderDraft>,
     pub provider_hint: i32,
     pub api_key: String,
     // ---- 采样与预算 ----
@@ -347,8 +375,52 @@ pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Sett
         next.thinking,
         next.reasoning_effort,
     );
+    if let Some(provider) = providers.iter_mut().find(|p| p.id == next.provider_id) {
+        provider.enabled_models = Some(request.enabled_models.clone());
+    }
+    for (id, enabled) in &request.provider_enabled_models {
+        if id != &next.provider_id {
+            if let Some(provider) = providers.iter_mut().find(|p| &p.id == id) {
+                provider.enabled_models = Some(enabled.clone());
+            } else {
+                let mut provider = current.provider(id);
+                provider.enabled_models = Some(enabled.clone());
+                providers.push(provider);
+            }
+        }
+    }
+    for (id, draft) in &request.provider_drafts {
+        if id == &next.provider_id {
+            continue;
+        }
+        if draft.model.trim().is_empty() {
+            return Err(format!("提供商 {id} 的模型名不能为空"));
+        }
+        upsert_provider(
+            &mut providers,
+            id,
+            &draft.base_url,
+            &draft.model,
+            provider_hint_for_index(draft.hint),
+            thinking_for_index(draft.thinking),
+            reasoning_effort_for_index(draft.effort),
+        );
+        if let Some(provider) = providers.iter_mut().find(|p| &p.id == id) {
+            provider.enabled_models = Some(
+                draft
+                    .rows
+                    .iter()
+                    .filter(|(_, enabled)| *enabled)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            );
+        }
+    }
     next.providers = providers;
 
+    next.voice.kws_model_dir = request.kws_dir.clone();
+    next.voice.whisper_model = request.whisper_file.clone();
+    next.voice.keywords_file = request.keywords_file.clone();
     // ---- 播报 ----
     next.tts.enabled = request.tts_enabled;
     next.tts.backend = tts_backend_for_index(request.tts_backend_index);
@@ -380,6 +452,9 @@ fn upsert_provider(
             if existing.base_url_or_default().trim_end_matches('/')
                 != base_url.trim().trim_end_matches('/')
             {
+                if existing.models_origin_url.is_empty() {
+                    existing.models_origin_url = existing.base_url_or_default();
+                }
                 existing.models.clear();
             }
             existing.base_url = base_url.to_string();
@@ -391,6 +466,8 @@ fn upsert_provider(
         }
         None => {
             let mut entry = ProviderConfig {
+                enabled_models: None,
+                models_origin_url: String::new(),
                 id: id.to_string(),
                 name: config::get_provider(id)
                     .map(|info| info.name.to_string())
@@ -444,6 +521,10 @@ pub fn restore_model_catalogs(
     let cache = crate::model_catalog::ModelCache::with_path(paths.model_cache_file());
     for id in settings.provider_ids() {
         let mut provider = settings.provider(&id);
+        let legacy = provider.enabled_models.is_none();
+        if legacy {
+            provider.enabled_models = Some(provider.selectable_models());
+        }
         provider
             .models
             .retain(|model| model.source == config::ModelSource::Manual);
@@ -454,6 +535,18 @@ pub fn restore_model_catalogs(
             .unwrap_or(&saved_key);
         if let Some(models) = cache.models_for(&id, &provider.base_url_or_default(), key) {
             provider.remember_models(models);
+            provider.models_origin_url = provider.base_url_or_default();
+            if legacy {
+                let enabled = provider
+                    .enabled_models
+                    .as_mut()
+                    .expect("legacy selection initialized");
+                for model in models {
+                    if !enabled.contains(&model.id) {
+                        enabled.push(model.id.clone());
+                    }
+                }
+            }
         }
         if let Some(existing) = settings.providers.iter_mut().find(|p| p.id == id) {
             *existing = provider;
@@ -477,6 +570,48 @@ pub fn apply_save(
         Err(error) => return SaveOutcome::NotSaved(error),
     };
 
+    // 仅校验本次明确更改的路径；缺省模型不阻止文字 Agent 或其它设置保存。
+    let voice_paths = crate::voice::settings::VoicePaths::resolve(paths);
+    if next.voice.kws_model_dir != previous.voice.kws_model_dir
+        && !next.voice.kws_model_dir.trim().is_empty()
+    {
+        if let Some(error) = voice_paths
+            .resolve_kws_model(&next.voice.kws_model_dir)
+            .error()
+        {
+            return SaveOutcome::NotSaved(error.into());
+        }
+    }
+    if next.voice.whisper_model != previous.voice.whisper_model
+        && !next.voice.whisper_model.trim().is_empty()
+    {
+        if let Some(error) = voice_paths
+            .resolve_whisper_model(&next.voice.whisper_model)
+            .error()
+        {
+            return SaveOutcome::NotSaved(error.into());
+        }
+    }
+    if next.voice.keywords_file != previous.voice.keywords_file
+        && !next.voice.keywords_file.trim().is_empty()
+        && (!std::path::Path::new(&next.voice.keywords_file).is_file()
+            || crate::voice::settings::keyword_labels(std::path::Path::new(
+                &next.voice.keywords_file,
+            ))
+            .is_empty())
+    {
+        return SaveOutcome::NotSaved("关键词文件不存在或没有有效关键词".into());
+    }
+    if next.tts.local_model_dir != previous.tts.local_model_dir
+        && !next.tts.local_model_dir.trim().is_empty()
+    {
+        if let Err(error) =
+            crate::voice::tts::local::resolve_model_dir(&next.tts.local_model_dir, paths)
+        {
+            return SaveOutcome::NotSaved(error);
+        }
+    }
+
     let pending_key = request.api_key.trim();
     restore_model_catalogs(
         &mut next,
@@ -495,22 +630,41 @@ pub fn apply_save(
     }
     *settings = next;
 
-    // 再写 Key：只写到目标提供商名下，留空 = 不动。
+    // Key 仅写入各自提供商；单项失败保留表单供用户重试。
     let key_provider = settings.provider_id.clone();
     let new_key = request.api_key.trim().to_string();
-    let key_error = if new_key.is_empty() {
+    let mut errors = Vec::new();
+    let mut mimo_key_changed = false;
+    for (id, key) in request
+        .provider_drafts
+        .iter()
+        .filter(|(id, _)| *id != &key_provider)
+        .map(|(id, draft)| (id.as_str(), draft.api_key.trim()))
+        .chain(std::iter::once((key_provider.as_str(), new_key.as_str())))
+    {
+        if key.is_empty() {
+            continue;
+        }
+        match secret.save(id, key) {
+            Ok(()) => {
+                if id == crate::ui::worker::MIMO_PROVIDER_ID {
+                    mimo_key_changed = true;
+                }
+            }
+            Err(error) => errors.push(format!("{id}: {error}")),
+        }
+    }
+    let key_error = if errors.is_empty() {
         None
     } else {
-        secret.save(&key_provider, &new_key).err()
+        Some(errors.join("；"))
     };
 
     restore_model_catalogs(settings, paths, secret, None);
 
     // 只有"给当前启用的云端后端"写入了新 Key 才算凭据变化。
-    let key_changed_for_active_backend = key_error.is_none()
-        && !new_key.is_empty()
-        && key_provider == crate::ui::worker::MIMO_PROVIDER_ID
-        && settings.tts.active_backend() == TtsBackend::Mimo;
+    let key_changed_for_active_backend =
+        mimo_key_changed && settings.tts.active_backend() == TtsBackend::Mimo;
     let tts_changed =
         tts_runtime_config_changed(&previous, settings, key_changed_for_active_backend);
     let speech_warning = if tts_changed {
@@ -544,11 +698,17 @@ mod tests {
 
     fn base_request(settings: &Settings) -> SaveRequest {
         SaveRequest {
+            kws_dir: settings.voice.kws_model_dir.clone(),
+            whisper_file: settings.voice.whisper_model.clone(),
+            keywords_file: settings.voice.keywords_file.clone(),
             model_plans_json: serde_json::to_string(&settings.model_plans).unwrap(),
             model_schedule_json: serde_json::to_string(&settings.model_schedule).unwrap(),
             provider_id: settings.provider_id.clone(),
             base_url: settings.base_url.clone(),
             model: settings.model.clone(),
+            enabled_models: settings.provider(&settings.provider_id).selectable_models(),
+            provider_enabled_models: BTreeMap::new(),
+            provider_drafts: BTreeMap::new(),
             provider_hint: provider_hint_index(settings.provider_hint),
             api_key: String::new(),
             temperature: format!("{:.1}", settings.temperature),
@@ -571,6 +731,178 @@ mod tests {
             tts_local_speed: format!("{:.1}", settings.tts.local_speed),
             speak_mode: 0,
         }
+    }
+
+    #[test]
+    fn invalid_other_provider_draft_does_not_write_any_keys_or_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "cuava-invalid-drafts-{}",
+            crate::clock::now().unix_ms
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.api_key = "test-current-key".into();
+        request.provider_drafts.insert(
+            "deepseek".into(),
+            ProviderDraft {
+                base_url: "ftp://invalid".into(),
+                model: "test".into(),
+                api_key: "test-other-key".into(),
+                ..Default::default()
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        assert!(
+            !apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written()
+        );
+        assert!(!paths.settings_file().exists());
+        assert!(!secret.has("mimo"));
+        assert!(!secret.has("deepseek"));
+        assert_eq!(
+            request.provider_drafts["deepseek"].api_key,
+            "test-other-key"
+        );
+    }
+
+    #[test]
+    fn provider_fields_and_keys_are_saved_to_their_own_accounts() {
+        let root = std::env::temp_dir().join(format!(
+            "cuava-multi-drafts-{}",
+            crate::clock::now().unix_ms
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.provider_id = "deepseek".into();
+        request.base_url = "https://deepseek.example/v1".into();
+        request.model = "deepseek-test".into();
+        request.api_key = "test-deepseek-key".into();
+        request.enabled_models = vec!["deepseek-test".into()];
+        request.provider_drafts.insert(
+            "mimo".into(),
+            ProviderDraft {
+                base_url: "https://mimo.example/v1".into(),
+                model: "mimo-test".into(),
+                thinking: 1,
+                effort: 1,
+                api_key: "test-mimo-key".into(),
+                rows: vec![("mimo-test".into(), true)],
+                ..Default::default()
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        let loaded = config::load_settings(&paths).unwrap();
+        assert_eq!(loaded.provider("mimo").base_url, "https://mimo.example/v1");
+        assert_eq!(loaded.provider("mimo").model, "mimo-test");
+        assert_eq!(
+            loaded.provider("deepseek").base_url,
+            "https://deepseek.example/v1"
+        );
+        assert_eq!(loaded.provider("deepseek").model, "deepseek-test");
+        assert_eq!(
+            secret.load("mimo").unwrap().as_deref(),
+            Some("test-mimo-key")
+        );
+        assert_eq!(
+            secret.load("deepseek").unwrap().as_deref(),
+            Some("test-deepseek-key")
+        );
+        assert!(!std::fs::read_to_string(paths.settings_file())
+            .unwrap()
+            .contains("test-mimo-key"));
+    }
+
+    #[test]
+    fn provider_drafts_are_saved_together_and_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "cuava-provider-drafts-{}",
+            crate::clock::now().unix_ms
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.provider_id = "deepseek".into();
+        let deepseek = settings.provider("deepseek");
+        request.base_url = deepseek.base_url_or_default();
+        request.model = deepseek.model;
+        request.enabled_models = vec!["deepseek-choice".into()];
+        request
+            .provider_enabled_models
+            .insert("mimo".into(), vec!["mimo-choice".into()]);
+        let next = build_candidate(&settings, &request).unwrap();
+        assert_ne!(
+            settings.provider("mimo").selectable_models(),
+            vec!["mimo-choice"]
+        );
+        config::save_settings(&paths, &next).unwrap();
+        let loaded = config::load_settings(&paths).unwrap();
+        assert_eq!(
+            loaded.provider("mimo").enabled_models,
+            Some(vec!["mimo-choice".into()])
+        );
+        assert_eq!(
+            loaded.provider("deepseek").enabled_models,
+            Some(vec!["deepseek-choice".into()])
+        );
+    }
+
+    #[test]
+    fn enabled_models_and_multiline_prompt_survive_save_and_catalog_refresh() {
+        let root = std::env::temp_dir().join(format!("cuava-pr11-{}", crate::clock::now().unix_ms));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(root);
+        let mut settings = Settings::default();
+        let endpoint = settings.provider("mimo").base_url_or_default();
+        settings.remember_discovered_models(
+            "mimo",
+            &endpoint,
+            &[
+                config::ModelOption::manual("one"),
+                config::ModelOption::manual("two"),
+            ],
+        );
+        let mut request = base_request(&settings);
+        request.enabled_models = vec!["one".into(), "two".into()];
+        request.custom_prompt = true;
+        request.system_prompt = (0..60).map(|i| format!("第{i}行：中文提示词\n")).collect();
+        let next = build_candidate(&settings, &request).unwrap();
+        config::save_settings(&paths, &next).unwrap();
+        let mut restored = config::load_settings(&paths).unwrap();
+        assert_eq!(restored.system_prompt, Some(request.system_prompt));
+        restored.remember_discovered_models(
+            "mimo",
+            &endpoint,
+            &[config::ModelOption::manual("three")],
+        );
+        let models = restored.provider("mimo").selectable_models();
+        assert!(models.contains(&"one".into()) && models.contains(&"two".into()));
+        assert!(!models.contains(&"three".into()));
+        assert!(restored
+            .provider("mimo")
+            .models
+            .iter()
+            .any(|m| m.id == "three"));
+        request = base_request(&restored);
+        request.enabled_models = vec!["one".into()];
+        let disabled = build_candidate(&restored, &request).unwrap();
+        assert!(disabled
+            .provider("mimo")
+            .models
+            .iter()
+            .any(|m| m.id == "two"));
+        assert!(!disabled
+            .provider("mimo")
+            .selectable_models()
+            .contains(&"two".into()));
     }
 
     #[test]

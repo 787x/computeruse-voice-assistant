@@ -6,6 +6,7 @@ use crate::AppWindow;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProbeDraft {
+    pub revision: i32,
     pub provider_id: String,
     pub base_url: String,
     pub model: String,
@@ -26,6 +27,7 @@ impl std::fmt::Debug for ProbeDraft {
 impl ProbeDraft {
     pub fn from_window(window: &AppWindow) -> Self {
         Self {
+            revision: window.get_probe_revision(),
             provider_id: super::worker::provider_id_for_index(window.get_provider_index()).into(),
             base_url: window.get_base_url().trim().into(),
             model: window.get_model_name().trim().into(),

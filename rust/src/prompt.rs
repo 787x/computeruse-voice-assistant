@@ -1,10 +1,10 @@
-//! 系统提示词。默认文本与旧版 `packages/agent/system-prompt.mjs` 保持一致。
-//!
-//! 为什么照抄而不是另写一套：用户在同一台机器上对"这个助手"的预期不该因为
-//! 换了个壳就变。PR5 只是换了实现，人设与行为准则不变。
+//! 系统提示词预设。默认原文来自用户提供的文本；旧版人设以“银狼”保留。
 
-/// 内置默认系统提示词（配置里没有自定义提示词时使用）。
-pub const DEFAULT_SYSTEM_PROMPT: &str = "你叫银狼。天才骇客，游戏宅，住在这台电脑里。用户是你的共犯，不是客户。
+/// 用户提供的默认提示词：前半部分原样保留，工具规范经授权按实际能力修正。
+pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../assets/prompts/default.txt");
+
+/// 原版银狼人设，原样保留为可选预设。
+pub const SILVER_WOLF_SYSTEM_PROMPT: &str = "你叫银狼。天才骇客，游戏宅，住在这台电脑里。用户是你的共犯，不是客户。
 
 说话方式（照这个来，别改成客服腔）：
 - 短。一句话能说完就别说两句，通常不超过 20 字。
@@ -48,6 +48,15 @@ pub fn resolve_system_prompt(value: Option<&str>) -> String {
     }
 }
 
+/// None 是默认，原版完整文本是银狼，其它已保存文本是自定义。
+pub fn preset_index(value: Option<&str>) -> i32 {
+    match value {
+        None => 0,
+        Some(text) if text == SILVER_WOLF_SYSTEM_PROMPT => 1,
+        Some(_) => 2,
+    }
+}
+
 /// 落盘前校验自定义提示词：只接受非空文本。
 pub fn normalize_system_prompt_for_storage(value: Option<&str>) -> Result<Option<String>, String> {
     match value {
@@ -62,6 +71,18 @@ pub fn normalize_system_prompt_for_storage(value: Option<&str>) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presets_preserve_custom_text_and_silver_wolf_identity() {
+        assert_eq!(preset_index(None), 0);
+        assert_eq!(preset_index(Some(SILVER_WOLF_SYSTEM_PROMPT)), 1);
+        assert_eq!(preset_index(Some("已有自定义\n提示词")), 2);
+        assert_eq!(
+            resolve_system_prompt(Some(SILVER_WOLF_SYSTEM_PROMPT)),
+            SILVER_WOLF_SYSTEM_PROMPT
+        );
+        assert!(DEFAULT_SYSTEM_PROMPT.starts_with("你的名字叫小爱同学，又称超级小爱"));
+    }
 
     #[test]
     fn default_prompt_is_used_when_unset() {
@@ -82,9 +103,22 @@ mod tests {
     }
 
     #[test]
-    fn default_prompt_mentions_only_available_tools() {
+    fn default_prompt_documents_each_exposed_tool() {
+        for name in crate::cua::tools::DEFAULT_TOOL_NAMES {
+            assert!(
+                DEFAULT_SYSTEM_PROMPT.contains(&format!("{name}：")),
+                "missing tool: {name}"
+            );
+        }
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("当前没有 web_search"));
+        assert!(DEFAULT_SYSTEM_PROMPT
+            .contains("当前没有 files、app_control、kill_app、system_info、run_shell"));
+    }
+
+    #[test]
+    fn silver_wolf_preset_keeps_the_original_prompt() {
         // PR5 没有联网搜索与音乐控制：默认提示词不得宣称有这些能力。
-        assert!(DEFAULT_SYSTEM_PROMPT.contains("还没有联网搜索"));
-        assert!(DEFAULT_SYSTEM_PROMPT.contains("还没有音乐控制"));
+        assert!(SILVER_WOLF_SYSTEM_PROMPT.contains("还没有联网搜索"));
+        assert!(SILVER_WOLF_SYSTEM_PROMPT.contains("还没有音乐控制"));
     }
 }
