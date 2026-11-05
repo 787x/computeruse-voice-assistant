@@ -89,6 +89,9 @@ pub struct WebSearch {
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// 只用于"设置页改了 Key 之后，旧代次的测试结果不许覆盖新状态"。
     revision: AtomicU64,
+    /// 本次请求的整体时限。生产固定为 [`TIMEOUT`]；测试可以缩短，
+    /// 免得每个超时用例都真等 8 秒（语义完全相同，只是数值不同）。
+    timeout: Duration,
     http: reqwest::Client,
 }
 
@@ -104,11 +107,18 @@ impl WebSearch {
             api_key: Mutex::new(api_key.into().trim().to_string()),
             cache: Mutex::new(HashMap::new()),
             revision: AtomicU64::new(0),
+            timeout: TIMEOUT,
             http: reqwest::Client::builder()
                 .user_agent("cuava/0.1 (computer-use desktop)")
                 .build()
                 .expect("reqwest client 构建失败（TLS 后端不可用）"),
         }
+    }
+
+    /// 测试用：缩短整体时限，避免超时用例真的等满 8 秒。
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// 是否有可用的 Key（空 = 这个工具不存在，模型不会看到它）。
@@ -184,6 +194,14 @@ impl WebSearch {
             return Err(ToolError::cancelled());
         }
 
+        /*
+         * 整体超时用**一个 deadline**贯穿三个阶段：发请求 → 收响应头 → 读响应体。
+         *
+         * 之前每个阶段各自 `sleep(TIMEOUT)`，最坏情况是 8+8+8 秒；更糟的是
+         * 错误分支直接 `response.text().await`，既不看超时也不看取消——
+         * 服务器回完 401 响应头后把响应体吊住，工具就会一直卡在那里。
+         */
+        let deadline = tokio::time::Instant::now() + self.timeout;
         let started = Instant::now();
         let request = self
             .http
@@ -199,10 +217,10 @@ impl WebSearch {
         let response = tokio::select! {
             result = request.send() => result,
             _ = cancel.cancelled() => return Err(ToolError::cancelled()),
-            _ = tokio::time::sleep(TIMEOUT) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 return Err(ToolError::failed(format!(
                     "搜索超时（{}ms 内 Tavily 没有响应）",
-                    TIMEOUT.as_millis()
+                    self.timeout.as_millis()
                 )));
             }
         };
@@ -221,15 +239,32 @@ impl WebSearch {
 
         let status = response.status();
         if !status.is_success() {
-            let body = truncate(&response.text().await.unwrap_or_default(), 160);
+            /*
+             * 非 2xx：**响应体也要受同一个 deadline 与取消约束**。
+             *
+             * 读取失败/超时不能吞掉状态码本身——401/429 的提示比"超时"更有用，
+             * 所以这里退回空 body 继续走 `describe_status`，只是明确标注
+             * "响应体没读完"。取消则按取消处理（回合已经不需要这个结果）。
+             */
+            let body = match read_error_body(response, cancel, deadline).await {
+                BodyRead::Text(text) => text,
+                BodyRead::TimedOut => {
+                    return Err(ToolError::failed(describe_status(
+                        status.as_u16(),
+                        "（响应体未在超时内读完）",
+                    )));
+                }
+                BodyRead::Cancelled => return Err(ToolError::cancelled()),
+                BodyRead::Failed => String::new(),
+            };
             return Err(ToolError::failed(describe_status(status.as_u16(), &body)));
         }
 
-        // 读 body 也可能被取消/超时拖住：同样要能中断。
+        // 读 body 同样受同一个 deadline 与取消约束。
         let payload = tokio::select! {
             result = response.json::<Value>() => result,
             _ = cancel.cancelled() => return Err(ToolError::cancelled()),
-            _ = tokio::time::sleep(TIMEOUT) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 return Err(ToolError::failed("搜索超时（响应体没有在限定时间内读完）"));
             }
         };
@@ -267,6 +302,37 @@ impl WebSearch {
             );
         }
         Ok(outcome)
+    }
+}
+
+/// 读取错误响应体的结果。**必须区分"超时""取消""读失败"**：
+/// 三者对调用方的含义完全不同（前者重试、中者丢弃、后者仍可看状态码）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyRead {
+    /// 读到了（可能被截断）。
+    Text(String),
+    /// 超过了整体 deadline。
+    TimedOut,
+    /// 用户取消。
+    Cancelled,
+    /// 传输层错误（连接断了等）：没有内容，但状态码仍然有效。
+    Failed,
+}
+
+/// 读错误响应体，受**同一个 deadline** 与取消约束。
+async fn read_error_body(
+    response: reqwest::Response,
+    cancel: &CancelToken,
+    deadline: tokio::time::Instant,
+) -> BodyRead {
+    let read = tokio::select! {
+        result = response.text() => result,
+        _ = cancel.cancelled() => return BodyRead::Cancelled,
+        _ = tokio::time::sleep_until(deadline) => return BodyRead::TimedOut,
+    };
+    match read {
+        Ok(text) => BodyRead::Text(truncate(&text, 160)),
+        Err(_) => BodyRead::Failed,
     }
 }
 

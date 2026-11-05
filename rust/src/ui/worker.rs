@@ -305,6 +305,15 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // 这样超时/取消/更晚完成的旧保存都不会覆盖用户的新编辑。
     let save_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    /*
+     * 联网搜索 Key 的**测试代次**（单调递增）。
+     *
+     * 必须在界面侧也持有：用户只要**改动 Key 输入框**就要立刻作废在途测试，
+     * 而改输入框是纯 Slint 事件，不经过工作线程的命令通道。
+     * 其余推进点（重测、保存、清除 Key）在工作线程里做。
+     */
+    let search_test_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let model_drafts = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
         String,
         settings_ui::ProviderDraft,
@@ -639,6 +648,19 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         /*
+         * **用户一改 Key 输入框就作废在途测试**。
+         *
+         * 这条必须留在界面侧：改输入框是纯 Slint 事件，不经过工作线程。
+         * 少了它就会出现"测 Key A → 改成 Key B → A 的迟到结果被显示成
+         * B 的测试结果"——用户会拿着一个错的 Key 去保存。
+         */
+        let generation = search_test_generation.clone();
+        window.on_search_key_edited(move || {
+            generation.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    {
+        /*
          * 确认答复必须带请求 id：重复点击、上一次确认的迟到点击都会被丢弃，
          * 不会让"下一次工具"白捡一次授权。
          */
@@ -727,6 +749,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 command_tx,
                 confirmer,
                 save_generation,
+                search_test_generation,
             ));
             /*
              * 工作线程结束 = 待处理回合已被取消、PowerShell 子进程已释放。
@@ -1501,6 +1524,7 @@ async fn run_worker(
     command_tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
     confirmer: Arc<UiConfirmer>,
     save_generation: Arc<std::sync::atomic::AtomicU64>,
+    search_test_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Computer Use 后端：懒启动（第一次真正调用时才拉起 PowerShell）。
     let script = BridgeOptions::resolve_default_script();
@@ -1565,12 +1589,6 @@ async fn run_worker(
 
     let mut model_request = 0u64;
     let connection_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    /*
-     * 联网搜索 Key 的**测试代次**：每次测试、改草稿后重测、保存、清除 Key
-     * 都会推进它。迟到的测试结果只在代次未变时才回填界面，
-     * 所以旧结果永远不会覆盖更新的状态。
-     */
-    let search_test_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 语音线程发事件回工作线程：复用同一条命令通道，主循环天然串行处理。
     // 实例号/会话号的归属核对也在 `VoiceRuntime` 里，旧实例的迟到事件不会生效。
@@ -3988,7 +4006,18 @@ fn handle_test_search_key(
             return;
         }
         let weak_ui = weak.clone();
+        let counter_for_ui = counter.clone();
         let _ = slint::invoke_from_event_loop(move || {
+            /*
+             * 在**真正改界面之前**再确认一次代次。
+             *
+             * `invoke_from_event_loop` 只是把闭包排进事件队列：从排队到执行之间
+             * 用户完全可能已经改了草稿（那条路径在界面侧推进代次）。
+             * 少了这次复核，迟到的 Key A 结果仍会盖在 Key B 的输入之上。
+             */
+            if counter_for_ui.load(Ordering::SeqCst) != generation {
+                return;
+            }
             if let Some(window) = weak_ui.upgrade() {
                 window.set_search_testing(false);
                 window.set_search_code(code.into());
@@ -5628,6 +5657,77 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         // 代次没被这次测试改动（它只读不写）。
         assert_eq!(generation.load(Ordering::SeqCst), 6);
+    }
+
+    /// **问题 2 的核心回归**：测 Key A 期间把草稿改成 Key B，
+    /// A 的迟到结果不能当成 B 的结论。
+    ///
+    /// 这里直接驱动"界面侧改草稿"这条路径（`on_search_key_edited` 推进代次），
+    /// 而测试用的是 Key A 的旧代次 —— 结果必须被丢弃。
+    #[tokio::test]
+    async fn editing_the_draft_invalidates_an_in_flight_test() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // 用户点「测试可用性」：工作线程推进到第 1 代，用 Key A 开始测。
+        let started_with = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(started_with, 1);
+        let key_a = "tvly-key-A";
+        handle_test_search_key(
+            &slint::Weak::default(),
+            key_a.to_string(),
+            started_with,
+            &generation,
+        );
+
+        // 用户随即把输入框改成 Key B（界面侧同步推进代次）。
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        // 等 Key A 的后台任务跑完（指向真实端点会失败，但不重要）。
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // A 的结果必须被丢弃：代次已经不等于它开始时的 1。
+        assert_ne!(
+            generation.load(Ordering::SeqCst),
+            started_with,
+            "改草稿必须让在途测试失效"
+        );
+        // 而且这次测试本身不会再推进代次（只读）。
+        let after = generation.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(generation.load(Ordering::SeqCst), after);
+    }
+
+    /// 测试成功后**不保存**，实际运行凭据与工具集保持不变。
+    #[tokio::test]
+    async fn successful_looking_test_without_save_keeps_runtime_credentials() {
+        let root = unique_test_root("search-test-no-save");
+        let paths = AppPaths::with_root(&root);
+        let secret = SecretStore::new(paths.secret_file());
+        secret.save_search_key("tvly-saved-key").unwrap();
+        let search = Arc::new(WebSearch::new("tvly-saved-key"));
+        let registry = Arc::new(ToolRegistry::new(None, search.clone(), true));
+        assert!(registry.search_ready());
+
+        // 用另一把草稿做测试（无论成功失败，都不该改运行时）。
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(3));
+        handle_test_search_key(
+            &slint::Weak::default(),
+            "tvly-draft".to_string(),
+            3,
+            &generation,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // 运行凭据仍是已保存那把；SecretStore 未被写入。
+        let loaded = secret.load_search_key().unwrap().unwrap_or_default();
+        assert_eq!(loaded, "tvly-saved-key", "测试不得写 SecretStore");
+        assert!(registry.search_ready());
+        use crate::agent::ToolInvoker as _;
+        assert!(registry
+            .tool_definitions()
+            .iter()
+            .any(|value| value["function"]["name"] == "web_search"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn unique_test_root(prefix: &str) -> std::path::PathBuf {

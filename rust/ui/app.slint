@@ -646,6 +646,9 @@ export component AppWindow inherits Window {
     in-out property <string> tool-summary: "";
     callback test-search-key(key: string);
     callback clear-search-key();
+    // 用户改动了 Key 输入框：工作线程据此作废在途的可用性测试，
+    // 避免旧 Key 的迟到结果被显示成新 Key 的测试结论。
+    callback search-key-edited();
 
     // ---- 权限确认（ask） ----
     in-out property <bool> confirm-open: false;
@@ -2185,7 +2188,16 @@ export component AppWindow inherits Window {
                                     text <=> root.search-key-input;
                                     placeholder-text: root.search-key-saved ? "已保存（留空则不修改）" : "尚未保存";
                                     input-type-password: true;
-                                    edited => { root.settings-dirty = true; root.settings-error = ""; root.search-code = ""; }
+                                    edited => {
+                                        root.settings-dirty = true;
+                                        root.settings-error = "";
+                                        root.search-code = "";
+                                        // 改了草稿 = 旧的测试结论不再对应当前输入：
+                                        // 立刻作废在途测试，并解除"测试中"状态。
+                                        root.search-key-edited();
+                                        root.search-testing = false;
+                                        root.search-hint = "";
+                                    }
                                 }
                                 AppButton {
                                     label: root.search-testing ? "测试中…" : root.search-code == "ok" ? "测试成功" : root.search-code == "failed" ? "测试失败" : "测试可用性";

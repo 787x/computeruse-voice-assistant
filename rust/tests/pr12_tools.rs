@@ -53,6 +53,17 @@ enum Reply {
     Json(u16, Value),
     /// 200 但**不返回**，用来测超时。
     Hang(Duration),
+    /// **先发出响应头，再把响应体吊住**。
+    ///
+    /// 这是问题 3 的关键场景：错误分支的 `response.text().await` 会一直等，
+    /// 只有真正受 deadline 与取消约束的实现才会退出。
+    HeadOnlyHang {
+        status: u16,
+        /// 声明一个比实际发送量大得多的 content-length，让客户端确实在等 body。
+        declared_len: usize,
+        body_prefix: String,
+        hang: Duration,
+    },
 }
 
 impl MockHttp {
@@ -140,6 +151,21 @@ impl MockHttp {
                         }
                         Reply::Hang(delay) => {
                             tokio::time::sleep(delay).await;
+                        }
+                        Reply::HeadOnlyHang {
+                            status,
+                            declared_len,
+                            body_prefix,
+                            hang,
+                        } => {
+                            // 先完整发出响应头 + 一小段 body，再停住不动。
+                            // 客户端会认为还有 (declared_len - prefix) 字节在路上。
+                            let head = format!(
+                                "HTTP/1.1 {status} Error\r\ncontent-type: application/json\r\ncontent-length: {declared_len}\r\nconnection: close\r\n\r\n{body_prefix}"
+                            );
+                            let _ = socket.write_all(head.as_bytes()).await;
+                            let _ = socket.flush().await;
+                            tokio::time::sleep(hang).await;
                         }
                     }
                     let _ = socket.flush().await;
@@ -552,6 +578,102 @@ async fn http_401_and_429_produce_actionable_messages() {
     let text = error.user_message();
     assert!(text.contains("429"), "{text}");
     assert!(text.contains("限流") || text.contains("额度"), "{text}");
+}
+
+/// **问题 3 的核心回归**：服务器发完错误响应头后把响应体吊住。
+///
+/// 修复前错误分支直接 `response.text().await`，既不看超时也不看取消，
+/// 这一条会一直挂到 mock 那边 30 秒之后才结束。
+#[tokio::test]
+async fn hanging_error_body_still_times_out() {
+    let mock = MockHttp::start(|_path, _index| Reply::HeadOnlyHang {
+        status: 429,
+        declared_len: 4096,
+        body_prefix: "{\"detail\":\"rate".to_string(),
+        hang: Duration::from_secs(30),
+    })
+    .await;
+    // 把整体时限缩短到 1 秒：验证的是"受 deadline 约束"，不是具体数值。
+    let search = WebSearch::with_endpoint(format!("{}/search", mock.base_url), "tvly-test")
+        .with_timeout(Duration::from_millis(1000));
+    let started = std::time::Instant::now();
+    let error = search
+        .search("挂住的错误体", 5, &CancelToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "错误响应体必须受整体超时约束，实际耗时 {:?}",
+        started.elapsed()
+    );
+    let message = error.user_message();
+    // 状态码信息不能因为读 body 超时而丢失。
+    assert!(message.contains("429"), "{message}");
+    assert!(
+        message.contains("限流") || message.contains("额度"),
+        "429 的原有提示要保留：{message}"
+    );
+    assert!(message.contains("响应体未在超时内读完"), "{message}");
+}
+
+/// 错误响应体挂起期间取消：必须立刻返回"已中断"，而不是等满超时。
+#[tokio::test]
+async fn hanging_error_body_can_be_cancelled() {
+    let mock = MockHttp::start(|_path, _index| Reply::HeadOnlyHang {
+        status: 401,
+        declared_len: 4096,
+        body_prefix: "{\"detail\":\"invalid".to_string(),
+        hang: Duration::from_secs(30),
+    })
+    .await;
+    // 整体时限给足 30 秒：如果取消不生效，这条测试会跑到超时才结束。
+    let search = WebSearch::with_endpoint(format!("{}/search", mock.base_url), "tvly-test")
+        .with_timeout(Duration::from_secs(30));
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+    });
+    let started = std::time::Instant::now();
+    let error = search.search("取消错误体", 5, &cancel).await.unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "取消必须立刻生效，实际耗时 {:?}",
+        started.elapsed()
+    );
+    assert!(error.is_cancelled(), "{}", error.user_message());
+}
+
+/// 401/429 在**响应体立即可读**时仍给出原有的分类提示（不因为这次改动而退化）。
+#[tokio::test]
+async fn immediate_error_bodies_keep_their_classification() {
+    let mock = MockHttp::start(|_path, index| {
+        if index == 0 {
+            Reply::Json(401, json!({"detail": "invalid api key"}))
+        } else {
+            Reply::Json(429, json!({"detail": "rate limited"}))
+        }
+    })
+    .await;
+    let search = WebSearch::with_endpoint(format!("{}/search", mock.base_url), "tvly-bad");
+    let cancel = CancelToken::new();
+
+    let unauthorized = search.search("a", 5, &cancel).await.unwrap_err();
+    let message = unauthorized.user_message();
+    assert!(message.contains("401"), "{message}");
+    assert!(message.contains("Tavily API Key"), "{message}");
+    // body 内容仍然进到提示里（便于排查）。
+    assert!(message.contains("invalid api key"), "{message}");
+
+    let limited = search.search("b", 5, &cancel).await.unwrap_err();
+    let message = limited.user_message();
+    assert!(message.contains("429"), "{message}");
+    assert!(
+        message.contains("限流") || message.contains("额度"),
+        "{message}"
+    );
+    assert!(message.contains("rate limited"), "{message}");
 }
 
 #[tokio::test]
