@@ -1,0 +1,16 @@
+{
+  "Date": "2026-11-05",
+  "UserConfirmedWizardCompleted": true,
+  "CandidateSHA256": "11077A098E8D34414CA07624520E4A641D18C3023BB722CEF85F56CDBDD27FFB",
+  "InstallLocation": null,
+  "ExeExists": true,
+  "ExeSHA256": "3C888F3E85D0D93716C82C435BE806FEB8C882B2EB751F7B548491B83A6CDFFA",
+  "ReleaseSHA256": "3C888F3E85D0D93716C82C435BE806FEB8C882B2EB751F7B548491B83A6CDFFA",
+  "CuaExists": true,
+  "CuaBOM": "239-187-191",
+  "StartMenuTarget": "C:\\Users\\34530\\AppData\\Local\\Programs\\CUAVA-Rust\\cuava.exe",
+  "DesktopTarget": "C:\\Users\\34530\\AppData\\Local\\Programs\\CUAVA-Rust\\cuava.exe",
+  "Diagnostic": "[install]\r\nstage=success\r\ntarget=C:\\Users\\34530\\AppData\\Local\\Programs\\CUAVA-Rust\r\npid=24264\r\n",
+  "ExistingPortablePID": 37064,
+  "IsCleanVM": false
+}

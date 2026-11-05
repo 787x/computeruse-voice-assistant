@@ -71,11 +71,20 @@ CreateDirectory "$SMPROGRAMS\CUAVA Rust"
 CreateShortcut "$SMPROGRAMS\CUAVA Rust\CUAVA.lnk" "$INSTDIR\cuava.exe"
 CreateShortcut "$DESKTOP\CUAVA Rust.lnk" "$INSTDIR\cuava.exe"
 WriteUninstaller "$INSTDIR\Uninstall.exe"
+ClearErrors
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayName" "CUAVA Rust (unsigned CPU candidate)"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayVersion" "0.1.0"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "InstallLocation" "$INSTDIR"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayIcon" "$INSTDIR\cuava.exe"
+IfErrors registration_failed
+ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "InstallLocation"
+StrCmp $0 $INSTDIR registration_ready
+registration_failed:
+WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "registration-failed"
+SetErrorLevel 1
+Abort "程序文件已写入，但无法登记当前用户卸载信息；安装尚未完成。请检查当前用户注册表写入权限。"
+registration_ready:
 SectionEnd
 Section "Uninstall"
 SetShellVarContext current
