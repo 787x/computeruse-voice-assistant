@@ -453,6 +453,21 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        super::local_models::wire(&window, paths.clone());
+        window.on_model_match_count(|labels, query| {
+            labels
+                .iter()
+                .filter(|label| label.to_lowercase().contains(&query.to_lowercase()))
+                .count() as i32
+        });
+        window.on_model_group_matches(|labels, providers, group, query| {
+            labels.iter().enumerate().any(|(i, label)| {
+                providers.row_data(i).as_ref() == Some(&group)
+                    && label.to_lowercase().contains(&query.to_lowercase())
+            })
+        });
+        window
+            .on_model_matches(|label, query| label.to_lowercase().contains(&query.to_lowercase()));
         // ---- 模型发现与连通性 ----
         let tx = command_tx.clone();
         let weak = window.as_weak();
@@ -930,9 +945,11 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
     );
     let mut labels: Vec<slint::SharedString> = Vec::new();
     let mut selected_index: i32 = -1;
+    let mut groups = Vec::<slint::SharedString>::new();
+    let mut providers = Vec::<slint::SharedString>::new();
     for provider_id in settings.provider_ids() {
         let provider = settings.provider(&provider_id);
-        let mut models: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
+        let mut models = provider.selectable_models();
         if !provider.model.trim().is_empty() && !models.contains(&provider.model) {
             models.insert(0, provider.model.clone());
         }
@@ -940,6 +957,7 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
             continue;
         }
         let provider_label = provider.display_name();
+        groups.push(provider_label.clone().into());
         let requires_key = config::get_provider(&provider_id)
             .map(|info| info.api_key_required)
             .unwrap_or(true);
@@ -957,9 +975,12 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
             } else {
                 format!("{provider_label} · {model}（还没 Key）")
             };
+            providers.push(provider_label.clone().into());
             labels.push(label.into());
         }
     }
+    window.set_model_provider_groups(ModelRc::new(VecModel::from(groups)));
+    window.set_model_option_providers(ModelRc::new(VecModel::from(providers)));
     window.set_model_option_labels(ModelRc::new(VecModel::from(labels)));
     window.set_model_choice_index(selected_index);
 
@@ -1564,22 +1585,22 @@ async fn run_worker(
             UiCommand::ProviderChanged(index) => {
                 model_request += 1;
                 let provider = settings.provider(provider_id_for_index(index));
+                let has_key = secret.has(&provider.id);
                 with_window(&weak, move |window| {
                     if window.get_provider_index() != index {
                         return;
                     }
+                    window.set_has_key(has_key);
+                    window.set_api_key_input("".into());
                     window.set_base_url(provider.base_url_or_default().into());
                     window.set_model_name(provider.model.clone().into());
+                    fill_model_settings(window, &provider);
                     window.set_provider_hint_index(settings_ui::provider_hint_index(
                         provider.provider_hint,
                     ));
                     window.set_thinking_index(thinking_index(provider.thinking));
                     window.set_effort_index(reasoning_effort_index(provider.reasoning_effort));
                     window.set_models_busy(false);
-                    window.set_discovered_models(ModelRc::new(VecModel::from(Vec::<
-                        slint::SharedString,
-                    >::new(
-                    ))));
                 });
             }
             UiCommand::ClearApiKey(provider_id) => {
@@ -1686,6 +1707,41 @@ async fn run_worker(
                             if draft.matches_window(window) {
                                 window.set_model_list_hint(fetch.summary().into());
                                 if fetch.ok {
+                                    let names = window.get_enabled_model_names();
+                                    let flags = window.get_enabled_model_flags();
+                                    let mut names: Vec<slint::SharedString> =
+                                        names.iter().collect();
+                                    let mut flags: Vec<bool> = flags.iter().collect();
+                                    for id in fetch.ids() {
+                                        if !names.iter().any(|n| n.as_str() == id) {
+                                            names.push(id.into());
+                                            flags.push(false);
+                                        }
+                                    }
+                                    let labels: Vec<slint::SharedString> = names
+                                        .iter()
+                                        .map(|name| {
+                                            format!(
+                                                "{name} · {}，未验证",
+                                                if fetch.ids().iter().any(|id| id == name.as_str())
+                                                {
+                                                    "服务端目录"
+                                                } else {
+                                                    "手动/保留选择"
+                                                }
+                                            )
+                                            .into()
+                                        })
+                                        .collect();
+                                    window.set_enabled_model_labels(ModelRc::new(VecModel::from(
+                                        labels,
+                                    )));
+                                    window.set_enabled_model_names(ModelRc::new(VecModel::from(
+                                        names,
+                                    )));
+                                    window.set_enabled_model_flags(ModelRc::new(VecModel::from(
+                                        flags,
+                                    )));
                                     window.set_discovered_models(ModelRc::new(VecModel::from(
                                         fetch
                                             .ids()
@@ -3017,6 +3073,9 @@ fn view_after_clear(
 /// 从当前配置里原样保留。
 pub fn build_save_request(window: &AppWindow) -> SaveRequest {
     SaveRequest {
+        kws_dir: window.get_kws_dir().to_string(),
+        whisper_file: window.get_whisper_file().to_string(),
+        keywords_file: window.get_keywords_file().to_string(),
         model_plans_json: window.get_model_plans_json().to_string(),
         model_schedule_json: window.get_model_schedule_json().to_string(),
         provider_id: PROVIDER_IDS
@@ -3026,6 +3085,20 @@ pub fn build_save_request(window: &AppWindow) -> SaveRequest {
             .to_string(),
         base_url: window.get_base_url().to_string(),
         model: window.get_model_name().to_string(),
+        enabled_models: window
+            .get_enabled_model_names()
+            .iter()
+            .collect::<Vec<_>>()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                window
+                    .get_enabled_model_flags()
+                    .row_data(*i)
+                    .unwrap_or(false)
+            })
+            .map(|(_, name)| name.to_string())
+            .collect(),
         provider_hint: window.get_provider_hint_index(),
         api_key: window.get_api_key_input().to_string(),
         temperature: window.get_temperature().to_string(),
@@ -3067,6 +3140,9 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
     let effort = reasoning_effort_index(settings.reasoning_effort);
     let base_url = settings.base_url.clone();
     let model = settings.model.clone();
+    let provider = settings.provider(&settings.provider_id);
+    let voice = settings.voice.clone();
+    let saved = settings.clone();
     let plans = serde_json::to_string_pretty(&settings.model_plans).unwrap_or_default();
     let schedule_enabled = settings.model_schedule.enabled;
     let schedule_default = settings.model_schedule.default_plan_id.clone();
@@ -3083,6 +3159,32 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            window.set_probe_revision(window.get_probe_revision().wrapping_add(1));
+            window.set_prompt_custom(saved.system_prompt.is_some());
+            window.set_system_prompt(
+                prompt::resolve_system_prompt(saved.system_prompt.as_deref()).into(),
+            );
+            window.set_default_prompt(prompt::DEFAULT_SYSTEM_PROMPT.into());
+            window.set_temperature(saved.temperature.to_string().into());
+            window.set_max_steps(saved.max_steps.to_string().into());
+            window.set_timeout_ms(saved.timeout_ms.to_string().into());
+            window.set_context_window(saved.context_window.to_string().into());
+            window.set_compress_percent(saved.context_compress_percent.to_string().into());
+            window.set_tts_enabled(saved.tts.enabled);
+            window.set_tts_backend_index(tts_backend_index(saved.tts.backend));
+            window.set_tts_mimo_voice(saved.tts.mimo_voice.into());
+            window.set_tts_mimo_style(saved.tts.mimo_style.into());
+            window.set_tts_local_dir(saved.tts.local_model_dir.into());
+            window.set_tts_local_sid(saved.tts.local_sid.to_string().into());
+            window.set_tts_local_speed(saved.tts.local_speed.to_string().into());
+            window.set_tts_speak_mode(speak_mode_code(
+                saved.tts.speak_voice_turns,
+                saved.tts.speak_text_turns,
+            ));
+            window.set_kws_dir(voice.kws_model_dir.into());
+            window.set_whisper_file(voice.whisper_model.into());
+            window.set_keywords_file(voice.keywords_file.into());
+            window.set_local_model_check("点击检查以解析路径并验证文件".into());
             window.set_model_plans_json(plans.into());
             window.set_model_schedule_json(schedule.into());
             window.set_schedule_enabled(schedule_enabled);
@@ -3091,15 +3193,15 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
             window.set_provider_index(provider_index);
             window.set_base_url(base_url.into());
             window.set_model_name(model.into());
+            fill_model_settings(&window, &provider);
             window.set_provider_hint_index(hint_index);
             window.set_thinking_index(thinking);
             window.set_effort_index(effort);
             window.set_api_key_input("".into());
             window.set_connection_hint("".into());
+            window.set_connection_code("".into());
             window.set_model_list_hint("".into());
-            window.set_discovered_models(ModelRc::new(VecModel::from(
-                Vec::<slint::SharedString>::new(),
-            )));
+
             window.set_discovered_model_index(-1);
             window.set_has_key(has_key);
             window.set_permission_index(permission_index);
@@ -3912,7 +4014,7 @@ fn handle_model_pick(
     let mut candidates: Vec<(String, String)> = Vec::new();
     for provider_id in settings.provider_ids() {
         let provider = settings.provider(&provider_id);
-        let mut models: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
+        let mut models = provider.selectable_models();
         if !provider.model.trim().is_empty() && !models.contains(&provider.model) {
             models.insert(0, provider.model.clone());
         }
@@ -4156,6 +4258,48 @@ pub fn settings_summary(settings: &Settings, has_key: bool) -> String {
 pub fn summary_is_secret_free(value: &Value) -> bool {
     let text = value.to_string();
     !text.contains("sk-") && !text.contains("Bearer ")
+}
+
+/// 设置目录与启用集合分别回填；停用不会删除目录。
+fn fill_model_settings(window: &AppWindow, provider: &config::ProviderConfig) {
+    let mut names: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
+    for name in provider.selectable_models() {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let enabled = provider.selectable_models();
+    let old_endpoint = !provider.models_origin_url.is_empty()
+        && !super::model_probe::same_endpoint(
+            &provider.models_origin_url,
+            &provider.base_url_or_default(),
+        );
+    let labels: Vec<slint::SharedString> = names
+        .iter()
+        .map(|name| {
+            let source = if old_endpoint {
+                "旧端点选择，未验证"
+            } else if provider
+                .model_meta(name)
+                .is_some_and(|m| m.source == config::ModelSource::Discovered)
+            {
+                "服务端目录，未验证"
+            } else {
+                "手动，未验证"
+            };
+            format!("{name} · {source}").into()
+        })
+        .collect();
+    window.set_enabled_model_labels(ModelRc::new(VecModel::from(labels)));
+    window.set_enabled_model_flags(ModelRc::new(VecModel::from(
+        names
+            .iter()
+            .map(|n| enabled.contains(n))
+            .collect::<Vec<_>>(),
+    )));
+    let names: Vec<slint::SharedString> = names.into_iter().map(Into::into).collect();
+    window.set_enabled_model_names(ModelRc::new(VecModel::from(names.clone())));
+    window.set_discovered_models(ModelRc::new(VecModel::from(names)));
 }
 
 #[cfg(test)]

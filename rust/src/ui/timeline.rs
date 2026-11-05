@@ -70,11 +70,14 @@ impl TimelineView {
                     last_assistant = Some(key);
                 }
                 TimelineKind::Reasoning => {
+                    if item.text.trim().is_empty() {
+                        continue;
+                    }
                     last_assistant = None;
                     // 思考用独立的浅灰气泡，角色写「思考」：一眼能看出它不播报。
                     view.entries.push(crate::ChatEntry {
                         role: "思考".into(),
-                        text: item.text.into(),
+                        text: item.text.trim_end().into(),
                         detail: "模型返回的推理内容（不朗读）".into(),
                         tint: parse_hex_color("#f4f4f7"),
                     });
