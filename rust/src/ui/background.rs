@@ -137,10 +137,14 @@ impl BackgroundUi {
                         {
                             placement.show(&h);
                         }
-                        if w.get_confirm_open()
-                            || (w.get_voice_enabled()
-                                && (woke || w.get_busy() || w.get_speech_active()))
-                        {
+                        if keeps_auto_hud_active(
+                            woke,
+                            w.get_voice_enabled(),
+                            w.get_voice_state().as_str(),
+                            w.get_busy(),
+                            w.get_speech_active(),
+                            w.get_confirm_open(),
+                        ) {
                             idle_since.set(std::time::Instant::now());
                         } else if should_hide(
                             manual.get(),
@@ -188,9 +192,72 @@ mod tests {
 fn should_hide(manual: bool, asking: bool, microphone: bool, idle_seconds: u64) -> bool {
     !manual && !asking && (!microphone || idle_seconds >= 4)
 }
+fn keeps_auto_hud_active(
+    woke: bool,
+    microphone: bool,
+    voice_state: &str,
+    busy: bool,
+    speech: bool,
+    asking: bool,
+) -> bool {
+    asking
+        || (microphone
+            && (woke || matches!(voice_state, "capturing" | "transcribing") || busy || speech))
+}
 #[cfg(test)]
 mod visibility_tests {
     use super::*;
+    #[test]
+    fn long_capture_and_transcription_only_expire_after_completion_or_failure() {
+        for terminal in ["listening", "error"] {
+            let mut last_active = 0;
+            for second in 0..30 {
+                let state = match second {
+                    0..=9 => "capturing",
+                    10..=19 => "transcribing",
+                    _ => terminal,
+                };
+                if keeps_auto_hud_active(second == 0, true, state, false, false, false) {
+                    last_active = second;
+                }
+                assert_eq!(
+                    should_hide(false, false, true, second - last_active),
+                    second >= 23
+                );
+            }
+        }
+    }
+    #[test]
+    fn agent_speech_and_ask_keep_active_but_microphone_off_semantics_remain() {
+        assert!(keeps_auto_hud_active(
+            false,
+            true,
+            "listening",
+            true,
+            false,
+            false
+        ));
+        assert!(keeps_auto_hud_active(
+            false,
+            true,
+            "listening",
+            false,
+            true,
+            false
+        ));
+        assert!(keeps_auto_hud_active(
+            false, false, "off", false, false, true
+        ));
+        assert!(!keeps_auto_hud_active(
+            false,
+            false,
+            "capturing",
+            true,
+            true,
+            false
+        ));
+        assert!(should_hide(false, false, false, 0));
+    }
     #[test]
     fn manual_survives_idle_and_microphone_off() {
         assert!(!should_hide(true, false, false, 20));

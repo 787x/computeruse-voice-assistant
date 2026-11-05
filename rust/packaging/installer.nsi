@@ -43,6 +43,9 @@ StrCmp $0 "blocked-in-use" 0 generic_failure
 SetErrorLevel 2
 Return
 generic_failure:
+StrCmp $0 "uninstaller-failed" 0 +3
+SetErrorLevel 1
+Return
 WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "failed"
 SetErrorLevel 1
 FunctionEnd
@@ -70,7 +73,24 @@ files_ready:
 CreateDirectory "$SMPROGRAMS\CUAVA Rust"
 CreateShortcut "$SMPROGRAMS\CUAVA Rust\CUAVA.lnk" "$INSTDIR\cuava.exe"
 CreateShortcut "$DESKTOP\CUAVA Rust.lnk" "$INSTDIR\cuava.exe"
+ClearErrors
 WriteUninstaller "$INSTDIR\Uninstall.exe"
+IfErrors uninstaller_failed
+IfFileExists "$INSTDIR\Uninstall.exe" 0 uninstaller_failed
+FileOpen $0 "$INSTDIR\Uninstall.exe" r
+IfErrors uninstaller_failed
+FileReadByte $0 $1
+FileReadByte $0 $2
+FileSeek $0 0 END $3
+FileClose $0
+IntCmp $1 77 0 uninstaller_failed uninstaller_failed
+IntCmp $2 90 0 uninstaller_failed uninstaller_failed
+IntCmp $3 128 uninstaller_failed uninstaller_failed uninstaller_ready
+uninstaller_failed:
+WriteINIStr "$TEMP\cuava-install-diagnostic.ini" "install" "stage" "uninstaller-failed"
+SetErrorLevel 1
+Abort "无法生成可用卸载程序，安装尚未完成，不登记安装信息。请检查安装目录写入权限后重试。"
+uninstaller_ready:
 ClearErrors
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayName" "CUAVA Rust (unsigned CPU candidate)"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayVersion" "0.1.0"
