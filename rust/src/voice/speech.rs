@@ -53,6 +53,8 @@ pub struct SpeechRuntime {
     shared: Option<Arc<PlaybackShared>>,
     speaking: Option<Speaking>,
     next_speech_id: SpeechId,
+    settings_revision: u64,
+    stop_revision: u64,
     /// 最近一次播报的全部句子（回声防护用）。
     recent: Arc<Mutex<Vec<String>>>,
     /// 当前配置（切后端/换音色后重建引擎）。
@@ -85,6 +87,8 @@ impl SpeechRuntime {
             shared: None,
             speaking: None,
             next_speech_id: 0,
+            settings_revision: 0,
+            stop_revision: 0,
             recent: Arc::new(Mutex::new(Vec::new())),
             settings: TtsSettings::default(),
         }
@@ -98,6 +102,7 @@ impl SpeechRuntime {
         settings: &TtsSettings,
         secret: &SecretStore,
     ) -> Result<(), String> {
+        self.settings_revision = self.settings_revision.wrapping_add(1);
         self.stop();
         if self.settings.output_device != settings.output_device
             || settings.active_backend() == super::tts::TtsBackend::Off
@@ -265,25 +270,7 @@ impl SpeechRuntime {
     }
 
     pub fn append(&mut self, id: SpeechId, text: String) -> Result<(), String> {
-        let budget = self
-            .engine
-            .as_ref()
-            .map(|e| e.text_byte_budget())
-            .unwrap_or(1024)
-            .max(4);
-        let mut parts = Vec::new();
-        for sentence in super::tts::prepare_incremental(&text).sentences {
-            let mut part = String::new();
-            for c in sentence.chars() {
-                if part.len() + c.len_utf8() > budget {
-                    parts.push(std::mem::take(&mut part));
-                }
-                part.push(c);
-            }
-            if !part.is_empty() {
-                parts.push(part);
-            }
-        }
+        let parts = self.sentence_parts(&text);
         for part in parts {
             let result = self
                 .speaking
@@ -302,6 +289,60 @@ impl SpeechRuntime {
             }
         }
         Ok(())
+    }
+
+    fn sentence_parts(&self, text: &str) -> Vec<String> {
+        let budget = self
+            .engine
+            .as_ref()
+            .map(|e| e.text_byte_budget())
+            .unwrap_or(1024)
+            .max(4);
+        let mut parts = Vec::new();
+        for sentence in super::tts::prepare_incremental(text).sentences {
+            let mut part = String::new();
+            for c in sentence.chars() {
+                if part.len() + c.len_utf8() > budget {
+                    parts.push(std::mem::take(&mut part));
+                }
+                part.push(c);
+            }
+            if !part.is_empty() {
+                parts.push(part);
+            }
+        }
+        parts
+    }
+    pub(crate) fn can_append(&self, id: SpeechId, text: &str) -> bool {
+        self.speaking
+            .as_ref()
+            .filter(|s| s.speech_id == id)
+            .and_then(|s| s.input.as_ref())
+            .is_some_and(|tx| tx.capacity() >= self.sentence_parts(text).len())
+    }
+    /// Agent 已结束后的有限尾队列；不阻塞 worker，stop 的同一令牌使其永久失效。
+    pub(crate) fn finish_pending(
+        &mut self,
+        id: SpeechId,
+        pending: std::collections::VecDeque<String>,
+    ) {
+        let parts: Vec<_> = pending
+            .iter()
+            .flat_map(|s| self.sentence_parts(s))
+            .collect();
+        if let Some(s) = self.speaking.as_mut().filter(|s| s.speech_id == id) {
+            if let Some(tx) = s.input.take() {
+                let cancel = s.cancel.clone();
+                tokio::spawn(async move {
+                    for part in parts {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            result = tx.send(part) => if result.is_err() { return; },
+                        }
+                    }
+                });
+            }
+        }
     }
 
     pub fn finish(&mut self, id: SpeechId) {
@@ -397,7 +438,14 @@ impl SpeechRuntime {
     }
 
     /// 停止播报（**只停声音**：不取消 Agent 回合，不结算任何权限请求）。
+    pub fn settings_revision(&self) -> u64 {
+        self.settings_revision
+    }
+    pub fn stop_revision(&self) -> u64 {
+        self.stop_revision
+    }
     pub fn stop(&mut self) {
+        self.stop_revision = self.stop_revision.wrapping_add(1);
         let Some(speaking) = self.speaking.as_ref() else {
             return;
         };
@@ -904,6 +952,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_agent_text_waits_for_queue_capacity_and_finishes_in_order() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::new(FakeEngine {
+            chunks: vec![vec![0.25; 240]],
+            sample_rate: 24_000,
+            fail: None,
+            started: started.clone(),
+        });
+        let (mut runtime, _, shared) = runtime_with(engine);
+        let mut settings = crate::config::Settings::default();
+        settings.tts.enabled = true;
+        settings.tts.backend = crate::voice::tts::TtsBackend::Mimo;
+        let mut incremental = crate::ui::worker::IncrementalSpeech::default();
+        let weak = slint::Weak::default();
+        incremental.event(
+            &crate::agent::AgentEvent::SpeechEligible { turn: 15, step: 0 },
+            15,
+            &settings,
+            crate::ui::worker::TurnSource::Voice,
+            &mut runtime,
+            &weak,
+        );
+        for i in 0..100 {
+            incremental.event(
+                &crate::agent::AgentEvent::TextDelta {
+                    turn: 15,
+                    step: 0,
+                    text: format!("第{i}句。"),
+                },
+                15,
+                &settings,
+                crate::ui::worker::TurnSource::Voice,
+                &mut runtime,
+                &weak,
+            );
+        }
+        incremental.finish(&mut runtime, &weak);
+        for _ in 0..2000 {
+            shared.pull(&mut vec![0.0; 1200]);
+            if !runtime.is_speaking() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(shared.progress().drained());
+        assert_eq!(
+            *started.lock().unwrap(),
+            (0..100).map(|i| format!("第{i}句")).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn slow_sse_first_audio_precedes_final_text() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let started = Arc::new(Mutex::new(Vec::new()));
@@ -911,9 +1011,9 @@ mod tests {
             chunks: vec![vec![0.25; 2400]],
             sample_rate: 24_000,
             fail: None,
-            started,
+            started: started.clone(),
         });
-        let (mut runtime, _, shared) = runtime_with(engine);
+        let (runtime, _, shared) = runtime_with(engine);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let playback = shared.clone();
@@ -940,6 +1040,62 @@ mod tests {
                     }
                 }
             }
+            let first_request: serde_json::Value = serde_json::from_slice(
+                &received[received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..],
+            )
+            .unwrap();
+            assert!(!first_request["tools"].as_array().unwrap().is_empty());
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket
+                .write_all(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"操作已完成。\"}}]}\n\n"
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert_eq!(
+                playback.progress().pushed_frames,
+                0,
+                "仅收到工具决策前正文时不能播报"
+            );
+            let initial = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"list_windows","arguments":"{}"}}]}}]});
+            socket.write_all(format!("data: {initial}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n").as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            assert_eq!(
+                playback.progress().pushed_frames,
+                0,
+                "工具决策正文不得提前朗读"
+            );
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 65536];
+            let mut received = Vec::new();
+            loop {
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(count > 0);
+                received.extend_from_slice(&request[..count]);
+                if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&received[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if received.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let closing_request: serde_json::Value = serde_json::from_slice(
+                &received[received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..],
+            )
+            .unwrap();
+            assert!(closing_request
+                .get("tools")
+                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)));
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
             socket
                 .write_all(
@@ -971,25 +1127,84 @@ mod tests {
             ..Default::default()
         };
         let client = crate::llm::LlmClient::new(settings.profile(), "", 0.0, 5000).unwrap();
-        let id = runtime.begin(15).unwrap();
-        let mut sentences = super::super::incremental::Sentences::default();
-        let result = client
-            .chat(
-                &[crate::llm::ChatMessage::user("test")],
-                &[],
-                &CancelToken::new(),
-                |text| {
-                    for sentence in sentences.push(text).unwrap() {
-                        runtime.append(id, sentence).unwrap();
-                    }
-                },
-                |_| {},
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.text, "第一句。第二句。");
-        runtime.finish(id);
+        struct TestWindowTool;
+        impl crate::agent::ToolInvoker for TestWindowTool {
+            fn tool_definitions(&self) -> Vec<serde_json::Value> {
+                vec![
+                    serde_json::json!({"type":"function","function":{"name":"list_windows","description":"list windows","parameters":{"type":"object","properties":{}}}}),
+                ]
+            }
+            fn invoke<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a serde_json::Value,
+                _: &'a CancelToken,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::agent::ToolExecution, crate::cua::ToolError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::agent::ToolExecution {
+                        text: "已列出窗口".into(),
+                        image: None,
+                    })
+                })
+            }
+        }
+        struct Deny;
+        impl crate::permissions::Confirmer for Deny {
+            fn confirm<'a>(
+                &'a self,
+                _: crate::permissions::ConfirmRequest,
+                _: &'a CancelToken,
+            ) -> crate::permissions::ConfirmFuture<'a> {
+                Box::pin(async { crate::permissions::ConfirmAnswer::deny_click() })
+            }
+        }
+        let mut settings = settings;
+        settings.tts.enabled = true;
+        settings.tts.backend = crate::voice::tts::TtsBackend::Mimo;
+        settings.tts.speak_voice_turns = true;
+        let mut agent = crate::agent::Agent::new(
+            client,
+            Arc::new(TestWindowTool),
+            crate::agent::AgentConfig {
+                turn_id: 15,
+                max_steps: 1,
+                use_tools: true,
+                ..Default::default()
+            },
+            crate::permissions::PermissionState::new(crate::config::PermissionMode::Standard),
+        );
+        let pipeline = Mutex::new((crate::ui::worker::IncrementalSpeech::default(), runtime));
+        let emit = |event| {
+            let mut guard = pipeline.lock().unwrap();
+            let (incremental, runtime) = &mut *guard;
+            incremental.event(
+                &event,
+                15,
+                &settings,
+                crate::ui::worker::TurnSource::Voice,
+                runtime,
+                &slint::Weak::default(),
+            );
+        };
+        let result = agent
+            .run("test", &mut Vec::new(), &CancelToken::new(), &Deny, &emit)
+            .await;
+        assert!(result.text.ends_with("第一句。第二句。"));
+        assert_eq!(result.steps.len(), 1);
+        assert!(result.steps[0].ok());
+        assert!(!result.failed);
+        let (mut incremental, mut runtime) = pipeline.into_inner().unwrap();
+        incremental.finish(&mut runtime, &slint::Weak::default());
         server.await.unwrap();
+        wait_until_end_marked(&shared).await;
+        assert_eq!(*started.lock().unwrap(), vec!["第一句", "第二句"]);
     }
 
     #[tokio::test]
