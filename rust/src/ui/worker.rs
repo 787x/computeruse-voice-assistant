@@ -1911,7 +1911,7 @@ async fn run_worker(
                 model_request += 1;
             }
             UiCommand::ClearApiKey(provider_id) => {
-                match secret.clear(&provider_id) {
+                match clear_model_key(&weak, &secret, &settings, &mut speech, &provider_id) {
                     Ok(()) => {
                         settings_ui::restore_model_catalogs(&mut settings, &paths, &secret, None);
                         let picker_settings = settings.clone();
@@ -3182,6 +3182,41 @@ fn seed_tts_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, speech: &Spee
     }
 }
 
+/// 空闲与忙碌分支共用：先清密钥，再停止并丢弃持有旧 Key 的官方 MiMo 引擎。
+fn clear_model_key(
+    weak: &slint::Weak<AppWindow>,
+    secret: &SecretStore,
+    settings: &Settings,
+    speech: &mut SpeechRuntime,
+    provider_id: &str,
+) -> Result<(), String> {
+    secret.clear(provider_id).map_err(|e| e.to_string())?;
+    if provider_id == crate::voice::tts::mimo::KEY_PROVIDER
+        && settings.tts.active_backend() == crate::voice::tts::TtsBackend::Mimo
+    {
+        // 缺 Key 是清除后的预期状态。apply_settings 会 stop/取消合成并先清掉旧引擎，
+        // 再记录不可用原因；不能把成功清除密钥误报成失败。
+        let _ = speech.apply_settings(&settings.tts, secret);
+        // 仅更新运行状态，不用已保存 TTS 配置覆盖用户正在编辑的语音设置草稿。
+        let available = speech.is_available();
+        let label = speech
+            .engine_label()
+            .or_else(|| speech.engine_error().map(str::to_string))
+            .unwrap_or_else(|| "播报不可用：请配置 MiMo Key".into());
+        if !available {
+            set_speech_unavailable(weak, &label);
+        }
+        let backend_index = tts_backend_index(settings.tts.backend);
+        with_window(weak, move |window| {
+            window.set_tts_backend_ready(available);
+            window.set_tts_active_backend_index(backend_index);
+            window.set_tts_active_ready(available);
+            window.set_tts_active_label(label.into());
+        });
+    }
+    Ok(())
+}
+
 /// 把**已保存并生效**的播报配置推给界面。
 ///
 /// 这里同时写入两组值：
@@ -4041,7 +4076,7 @@ async fn wait_turn(
                          * 界面反馈与空闲路径保持一致：状态按被清除的那家（= 界面选中那家）算，
                          * 端点摘要仍按已生效的配置算。
                          */
-                        match secret.clear(&provider_id) {
+                        match clear_model_key(weak, secret, settings, speech, &provider_id) {
                             Ok(()) => {
                                 settings_ui::restore_model_catalogs(settings, paths, secret, None);
                                 let picker_settings = settings.clone(); sessions.set_key_presence(super::endpoint_cards::key_presence(settings, secret));
@@ -5172,6 +5207,114 @@ mod tests {
     fn speech_without_engine() -> SpeechRuntime {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         SpeechRuntime::new(tx)
+    }
+
+    struct KeyClearEngine;
+    impl crate::voice::tts::TtsEngine for KeyClearEngine {
+        fn label(&self) -> String {
+            "key-clear-test-engine".into()
+        }
+        fn start(
+            &self,
+            _: crate::voice::tts::SynthRequest,
+        ) -> Result<crate::voice::tts::SpeechStream, String> {
+            let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(crate::voice::tts::SpeechStream::new(rx))
+        }
+    }
+    #[tokio::test]
+    async fn clearing_official_mimo_key_revokes_engine_stops_speech_and_new_key_recovers() {
+        let paths = AppPaths::with_root(unique_test_root("mimo-key-revoke"));
+        let secret = SecretStore::new(paths.secret_file());
+        secret.save("mimo", "old-dummy-key").unwrap();
+        let mut settings = Settings::default();
+        settings.tts.enabled = true;
+        settings.tts.backend = crate::voice::tts::TtsBackend::Mimo;
+        let mut speech = SpeechRuntime::new(tokio::sync::mpsc::unbounded_channel().0);
+        speech.apply_settings(&settings.tts, &secret).unwrap();
+        assert!(speech.is_available());
+        // 假扬声器/合成引擎验证停止语义；不会访问声卡或真实云端。
+        speech.attach_playback_for_test(Arc::new(crate::voice::playback::PlaybackShared::new(
+            24000, 1,
+        )));
+        speech.attach_engine_for_test(Arc::new(KeyClearEngine));
+        speech.speak(1, "第一句。第二句。").unwrap();
+        assert!(speech.is_speaking());
+        clear_model_key(
+            &slint::Weak::default(),
+            &secret,
+            &settings,
+            &mut speech,
+            "mimo",
+        )
+        .unwrap();
+        assert!(!secret.has("mimo"));
+        assert!(!speech.is_available());
+        assert!(!speech.is_speaking());
+        assert!(speech.engine_error().unwrap().contains("Key"));
+        assert!(speech.speak(2, "不应继续使用旧凭据").is_err());
+        // 与 SaveEndpoint / apply_save 一致的恢复路径，构建新引擎（不发真实音频请求）。
+        secret.save("mimo", "new-dummy-key").unwrap();
+        speech.apply_settings(&settings.tts, &secret).unwrap();
+        assert!(speech.is_available());
+        assert!(speech.engine_error().is_none());
+        speech.shutdown();
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+    #[tokio::test]
+    async fn clearing_other_instances_or_cloud_key_with_local_tts_keeps_engine_and_playback() {
+        let paths = AppPaths::with_root(unique_test_root("other-key-clear"));
+        let secret = SecretStore::new(paths.secret_file());
+        for backend in [
+            crate::voice::tts::TtsBackend::Mimo,
+            crate::voice::tts::TtsBackend::Local,
+        ] {
+            let mut settings = Settings::default();
+            settings.tts.enabled = true;
+            settings.tts.backend = backend;
+            let mut speech = SpeechRuntime::new(tokio::sync::mpsc::unbounded_channel().0);
+            speech.attach_playback_for_test(Arc::new(crate::voice::playback::PlaybackShared::new(
+                24000, 1,
+            )));
+            speech.attach_engine_for_test(Arc::new(KeyClearEngine));
+            let id = speech.speak(1, "保留当前播放").unwrap();
+            for provider_id in ["mimo-second", "deepseek", "gateway"] {
+                secret.save(provider_id, "dummy-key").unwrap();
+                clear_model_key(
+                    &slint::Weak::default(),
+                    &secret,
+                    &settings,
+                    &mut speech,
+                    provider_id,
+                )
+                .unwrap();
+                assert!(!secret.has(provider_id));
+                assert_eq!(
+                    speech.engine_label().as_deref(),
+                    Some("key-clear-test-engine")
+                );
+                assert_eq!(speech.current_speech_id(), Some(id));
+                assert!(speech.is_speaking());
+            }
+            if backend == crate::voice::tts::TtsBackend::Local {
+                secret.save("mimo", "dummy-key").unwrap();
+                clear_model_key(
+                    &slint::Weak::default(),
+                    &secret,
+                    &settings,
+                    &mut speech,
+                    "mimo",
+                )
+                .unwrap();
+                assert_eq!(
+                    speech.engine_label().as_deref(),
+                    Some("key-clear-test-engine")
+                );
+                assert!(speech.is_speaking());
+            }
+            speech.shutdown();
+        }
+        std::fs::remove_dir_all(paths.root).unwrap();
     }
 
     #[test]

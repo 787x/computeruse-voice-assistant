@@ -344,6 +344,21 @@ fn merge_catalog(c: &mut EndpointCard, models: &[ModelOption]) {
     c.catalog_origin = c.url.trim().trim_end_matches('/').into();
 }
 
+/// 用户明确获取始终刷新网络，同时与现有磁盘缓存共享候选及凭据隔离。
+async fn fetch_catalog(
+    provider: &ProviderConfig,
+    key: &str,
+    cache_path: std::path::PathBuf,
+) -> crate::model_catalog::ModelFetch {
+    crate::model_catalog::fetch_models(
+        provider,
+        key,
+        &mut crate::model_catalog::ModelCache::with_path(cache_path),
+        true,
+    )
+    .await
+}
+
 pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedSender<UiCommand>) {
     let weak = w.as_weak();
     w.on_add_endpoint(move |kind| {
@@ -499,6 +514,7 @@ pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedS
                         c.status.to_string(),
                     );
                     let test = op == "test";
+                    let cache_path = paths.model_cache_file();
                     std::thread::spawn(move || {
                         let runtime =
                             tokio::runtime::Runtime::new().expect("model request runtime");
@@ -514,13 +530,7 @@ pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedS
                                 .await;
                                 (Some(result.ok()), result.message(), Vec::new())
                             } else {
-                                let result = crate::model_catalog::fetch_models(
-                                    &p,
-                                    &key,
-                                    &mut crate::model_catalog::ModelCache::new(),
-                                    true,
-                                )
-                                .await;
+                                let result = fetch_catalog(&p, &key, cache_path).await;
                                 (
                                     None,
                                     result.error.unwrap_or_default(),
@@ -897,6 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_instances_use_their_own_http_endpoint_key_model_and_protocol() {
+        let (cache_paths, _) = isolated();
         let mut settings = Settings::default();
         let mut servers = Vec::new();
         let kinds = [
@@ -960,13 +971,7 @@ mod tests {
             draft.rows = ModelRc::new(VecModel::from(rows));
             assert!(provider(&draft).is_err());
             let request = header(&draft);
-            let result = crate::model_catalog::fetch_models(
-                &request,
-                &key,
-                &mut crate::model_catalog::ModelCache::new(),
-                true,
-            )
-            .await;
+            let result = fetch_catalog(&request, &key, cache_paths.model_cache_file()).await;
             assert!(result.ok, "{:?}", result.error);
             merge_catalog(&mut draft, &result.models);
             assert!(draft.rows.iter().any(|m| m.id.is_empty()));
@@ -979,5 +984,15 @@ mod tests {
         for server in servers {
             server.join().unwrap();
         }
+        let cache = crate::model_catalog::ModelCache::with_path(cache_paths.model_cache_file());
+        assert_eq!(cache.len(), 5);
+        for i in 0..5 {
+            let p = settings.provider(&format!("instance-{i}"));
+            assert!(cache
+                .models_for(&p.id, &p.base_url, &format!("test-key-{i}"))
+                .is_some());
+            assert!(cache.models_for(&p.id, &p.base_url, "wrong-key").is_none());
+        }
+        std::fs::remove_dir_all(cache_paths.root).unwrap();
     }
 }
