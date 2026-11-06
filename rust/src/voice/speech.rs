@@ -210,7 +210,26 @@ impl SpeechRuntime {
                 .clone()
                 .unwrap_or_else(|| "语音播报未开启".to_string())
         })?;
-        let plan = prepare_speech(text);
+        let mut plan = prepare_speech(text);
+        let budget = engine.text_byte_budget();
+        plan.sentences = plan
+            .sentences
+            .into_iter()
+            .flat_map(|sentence| {
+                let mut pieces = Vec::new();
+                let mut part = String::new();
+                for c in sentence.chars() {
+                    if part.len() + c.len_utf8() > budget && !part.is_empty() {
+                        pieces.push(std::mem::take(&mut part));
+                    }
+                    part.push(c);
+                }
+                if !part.is_empty() {
+                    pieces.push(part);
+                }
+                pieces
+            })
+            .collect();
         if plan.is_empty() {
             return Err("没有可播报的文本".to_string());
         }
@@ -238,6 +257,7 @@ impl SpeechRuntime {
         let events = self.events.clone();
         let sentences = plan.sentences.clone();
         let style = self.settings.mimo_style.clone();
+        let volume = self.settings.volume;
         let engine_for_task = engine.clone();
         let active = Arc::new(AtomicBool::new(true));
         // 字幕队列：合成端写入"哪一句从哪一帧开始"，监控端在设备真的播到
@@ -257,6 +277,7 @@ impl SpeechRuntime {
                 turn,
                 sentences,
                 style,
+                volume,
                 synth_cancel.clone(),
             )
             .await;
@@ -367,6 +388,7 @@ async fn synthesize_all(
     turn: TurnId,
     sentences: Vec<String>,
     style: String,
+    volume: f32,
     cancel: CancelToken,
 ) -> Result<(), SynthFailure> {
     let mut feed = Feed::new(speech_id);
@@ -391,7 +413,12 @@ async fn synthesize_all(
             };
             let Some(event) = event else { break };
             match event {
-                TtsEvent::Chunk(chunk) => {
+                TtsEvent::Chunk(mut chunk) => {
+                    if volume != 1.0 {
+                        for sample in &mut chunk.samples {
+                            *sample *= volume;
+                        }
+                    }
                     if first_chunk {
                         /*
                          * 字幕与**实际播放**对齐：记下这一句的第一个样本会落在
@@ -746,6 +773,28 @@ mod tests {
             if shared.pull(&mut sink) == 0 {
                 break;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn pr14_volume_changes_real_pcm_without_changing_text() {
+        for volume in [0.0, 0.5, 1.0] {
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let engine = Arc::new(FakeEngine {
+                chunks: vec![vec![0.8; 2400]],
+                sample_rate: 24_000,
+                fail: None,
+                started: started.clone(),
+            });
+            let (mut runtime, _rx, shared) = runtime_with(engine);
+            runtime.settings.volume = volume;
+            runtime.speak(1, "音量测试。").unwrap();
+            wait_until_end_marked(&shared).await;
+            let mut output = vec![0.0; 100];
+            assert!(shared.pull(&mut output) > 0);
+            assert!(output.iter().all(|v| (*v - 0.8 * volume).abs() < 0.0001));
+            assert_eq!(started.lock().unwrap().as_slice(), &["音量测试"]);
+            runtime.stop();
         }
     }
 

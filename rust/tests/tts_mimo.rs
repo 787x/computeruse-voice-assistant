@@ -213,6 +213,9 @@ impl MockServer {
 /// **构造**这一小段放进锁里：端点在 `MimoTts::new` 时就被算好并固定下来，
 /// 之后的请求不受别的用例改环境变量影响。
 fn engine_for(case: &str, reply: Reply) -> MimoTts {
+    engine_settings(case, reply, None)
+}
+fn engine_settings(case: &str, reply: Reply, settings: Option<TtsSettings>) -> MimoTts {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     let server = MockServer::global();
     server.install(case, reply);
@@ -228,13 +231,13 @@ fn engine_for(case: &str, reply: Reply) -> MimoTts {
         );
     }
     MimoTts::new(
-        &TtsSettings {
+        &settings.unwrap_or(TtsSettings {
             enabled: true,
             backend: TtsBackend::Mimo,
             mimo_voice: "alloy".to_string(),
             mimo_style: "语速稍快".to_string(),
             ..TtsSettings::default()
-        },
+        }),
         "sk-mimo-test-key".to_string(),
     )
     .expect("构造 MiMo 引擎")
@@ -544,7 +547,8 @@ async fn malformed_tail_event_is_reported() {
     assert_eq!(samples, 1);
     assert!(!finished, "尾事件报错不能算正常播完");
     let message = failure.expect("尾事件的错误必须上报");
-    assert!(message.contains("upstream failed"), "{message}");
+    assert!(message.contains("MiMo TTS 返回错误"), "{message}");
+    assert!(!message.contains("upstream failed"), "不回显不可信响应正文");
 }
 
 /// 正常结束（`[DONE]` 在最后一个没有空行结尾的事件里）仍然要成功。
@@ -573,4 +577,74 @@ async fn done_marker_without_trailing_blank_line_finishes() {
     assert!(failure.is_none(), "{failure:?}");
     assert_eq!(samples, 1);
     assert!(finished, "最后一个事件就是 [DONE] 时也必须正常结束");
+}
+
+#[tokio::test]
+async fn pr14_tags_and_rate_are_independent_in_every_real_request() {
+    let case = "pr14-styles";
+    let engine = engine_settings(
+        case,
+        Reply::Script(vec![audio_event(&[0, 1, 0, 2]), done_event()]),
+        Some(TtsSettings {
+            mimo_tags: vec!["温柔".into(), "清亮".into()],
+            mimo_style: "  自然表达\n保留空白  ".into(),
+            mimo_speed: 1.5,
+            ..TtsSettings::default()
+        }),
+    );
+    for text in ["第一句。", "第二句。"] {
+        let mut r = request(90);
+        r.text = text.into();
+        let (_, error, finished) = drain(engine.start(r).unwrap()).await;
+        assert!(finished && error.is_none());
+    }
+    let recorded = MockServer::global().recorded(case);
+    assert_eq!(recorded.len(), 2);
+    for (i, r) in recorded.iter().enumerate() {
+        assert_eq!(
+            r.body["messages"][1]["content"],
+            format!("(温柔 清亮){}", ["第一句。", "第二句。"][i])
+        );
+        let instruction = r.body["messages"][0]["content"].as_str().unwrap();
+        assert!(instruction.starts_with("  自然表达\n保留空白  "));
+        assert!(instruction.contains("1.50") && instruction.contains("近似"));
+        assert!(r.body["audio"].get("voice").is_none());
+    }
+}
+#[tokio::test]
+async fn pr14_nonstream_wav_really_decodes_and_finishes() {
+    let mut wav = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(
+            &mut wav,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 24000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        writer.write_sample(1234i16).unwrap();
+        writer.write_sample(-1234i16).unwrap();
+        writer.finalize().unwrap();
+    }
+    let data = base64::engine::general_purpose::STANDARD.encode(wav.into_inner());
+    let body = serde_json::json!({"choices":[{"message":{"audio":{"data":data}}}]})
+        .to_string()
+        .into_bytes();
+    let engine = engine_settings(
+        "pr14-wav",
+        Reply::Script(vec![body]),
+        Some(TtsSettings {
+            mimo_streaming: false,
+            ..TtsSettings::default()
+        }),
+    );
+    let (samples, error, finished) = drain(engine.start(request(91)).unwrap()).await;
+    assert_eq!(samples, 2);
+    assert!(error.is_none() && finished);
+    let r = MockServer::global().recorded("pr14-wav");
+    assert_eq!(r[0].body["stream"], false);
+    assert_eq!(r[0].body["audio"]["format"], "wav");
 }

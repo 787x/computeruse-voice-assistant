@@ -48,11 +48,21 @@ pub struct MimoTts {
     voice: String,
     style: String,
     timeout_ms: u64,
+    prefix: String,
+    streaming: bool,
+    key_source: String,
     http: reqwest::Client,
 }
 
 impl MimoTts {
     pub fn new(settings: &TtsSettings, api_key: String) -> Result<Self, String> {
+        let settings = settings.clone().normalized()?;
+        if settings.mimo_model != DEFAULT_MODEL {
+            return Err("自定义模型尚无经验证的音频协议，请使用 mimo-v2.5-tts".into());
+        }
+        if super::styles::prefix(&settings.mimo_tags).len() > 2996 {
+            return Err("标签前缀过长，已占满 MiMo 3000 字节预算，请减少标签".into());
+        }
         let base = std::env::var(BASE_URL_ENV)
             .ok()
             .filter(|value| {
@@ -65,7 +75,7 @@ impl MimoTts {
             .user_agent("cuava/0.1 (computer-use desktop)")
             .build()
             .map_err(|error| format!("无法创建 TTS HTTP 客户端：{error}"))?;
-        Ok(Self {
+        let engine = Self {
             endpoint,
             api_key,
             model: if settings.mimo_model.trim().is_empty() {
@@ -74,10 +84,35 @@ impl MimoTts {
                 settings.mimo_model.trim().to_string()
             },
             voice: settings.mimo_voice.trim().to_string(),
-            style: settings.mimo_style.trim().to_string(),
+            style: if settings.mimo_speed == 1.0 {
+                settings.mimo_style.clone()
+            } else {
+                format!(
+                    "{}{}请以约 {:.2} 倍正常语速朗读（近似指导，不保证精确倍率）。",
+                    settings.mimo_style,
+                    if settings.mimo_style.is_empty() {
+                        ""
+                    } else {
+                        "\n"
+                    },
+                    settings.mimo_speed
+                )
+            },
+            prefix: super::styles::prefix(&settings.mimo_tags),
+            streaming: settings.mimo_streaming,
+            key_source: "已提供 Key".into(),
             timeout_ms: settings.timeout_ms.clamp(5_000, 120_000),
             http,
-        })
+        };
+        if engine.style.len() > 3000 {
+            return Err("自然语言说明与语速指导合计超过3000 UTF-8字节，请缩短说明".into());
+        }
+        Ok(engine)
+    }
+
+    pub fn with_key_source(mut self, source: &str) -> Self {
+        self.key_source = source.into();
+        self
     }
 
     pub fn endpoint(&self) -> &str {
@@ -87,20 +122,24 @@ impl MimoTts {
     /// 组装请求体（导出给测试：界面里配置的就是实际发的）。
     pub fn build_body(&self, text: &str) -> Value {
         let mut messages: Vec<Value> = Vec::new();
-        let style = self.style.trim();
+        let style = &self.style;
         if !style.is_empty() {
             messages.push(json!({ "role": "user", "content": style }));
         }
-        messages.push(json!({ "role": "assistant", "content": text }));
+        messages
+            .push(json!({ "role": "assistant", "content": format!("{}{}", self.prefix, text) }));
         let mut audio = serde_json::Map::new();
-        audio.insert("format".to_string(), json!("pcm16"));
+        audio.insert(
+            "format".to_string(),
+            json!(if self.streaming { "pcm16" } else { "wav" }),
+        );
         if !self.voice.is_empty() {
             audio.insert("voice".to_string(), json!(self.voice));
         }
         json!({
             "model": self.model,
             "messages": messages,
-            "stream": true,
+            "stream": self.streaming,
             "audio": Value::Object(audio),
         })
     }
@@ -137,10 +176,56 @@ impl MimoTts {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = String::new();
             return Err(describe_status(status, &body));
         }
 
+        if !self.streaming {
+            let bytes = tokio::select! {
+                _ = request.cancel.cancelled() => return Ok(Outcome::Cancelled),
+                result = tokio::time::timeout(Duration::from_millis(self.timeout_ms), response.bytes()) => result.map_err(|_| "MiMo WAV 响应超时")?.map_err(|_| "MiMo WAV 传输失败")?,
+            };
+            let json: Value =
+                serde_json::from_slice(&bytes).map_err(|_| "MiMo 非流式响应不是 JSON")?;
+            let data = json
+                .pointer("/choices/0/message/audio/data")
+                .and_then(Value::as_str)
+                .ok_or("MiMo 未返回 WAV 音频")?;
+            let wav = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|_| "MiMo WAV 编码无效")?;
+            let mut reader = hound::WavReader::new(std::io::Cursor::new(wav))
+                .map_err(|_| "MiMo 返回的 WAV 无效")?;
+            let spec = reader.spec();
+            if spec.channels == 0
+                || spec.sample_rate == 0
+                || spec.sample_format != hound::SampleFormat::Int
+                || spec.bits_per_sample != 16
+            {
+                return Err("MiMo WAV 必须为有效 PCM16".into());
+            }
+            let samples = reader
+                .samples::<i16>()
+                .map(|v| v.map(|v| int_to_float(v as i64, 16)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "MiMo WAV 音频不完整")?;
+            if samples.is_empty() || samples.len() % spec.channels as usize != 0 {
+                return Err("MiMo WAV 音频为空或帧不完整".into());
+            }
+            if request.cancel.is_cancelled() {
+                return Ok(Outcome::Cancelled);
+            }
+            let _ = tx.send(TtsEvent::Chunk(SpeechChunk {
+                speech_id: request.speech_id,
+                turn: request.turn,
+                sentence: request.sentence,
+                sample_rate: spec.sample_rate,
+                channels: spec.channels,
+                format: AudioFormat::Pcm16Le,
+                samples,
+            }));
+            return Ok(Outcome::Finished);
+        }
         let mut stream = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
         let mut events: Vec<String> = Vec::new();
@@ -280,8 +365,20 @@ enum Outcome {
 }
 
 impl TtsEngine for MimoTts {
+    fn text_byte_budget(&self) -> usize {
+        3000usize.saturating_sub(self.prefix.len())
+    }
     fn label(&self) -> String {
-        format!("MiMo {}（24k 单声道）", self.model)
+        format!(
+            "MiMo {} · {} · {}",
+            self.model,
+            if self.streaming {
+                "流式 PCM"
+            } else {
+                "非流式 WAV"
+            },
+            self.key_source
+        )
     }
 
     fn start(&self, request: SynthRequest) -> Result<SpeechStream, String> {
@@ -346,7 +443,14 @@ fn pump_events(
     match parse_payload(payload) {
         ParsedEvent::Done => Ok(true),
         ParsedEvent::Ignored => Ok(false),
-        ParsedEvent::Error(message) => Err(format!("MiMo TTS 返回错误：{message}")),
+        ParsedEvent::Error(message) => Err(format!(
+            "MiMo TTS 返回错误（{}）：请检查配置与额度",
+            if message.is_empty() {
+                "无说明"
+            } else {
+                "服务端拒绝"
+            }
+        )),
         ParsedEvent::Audio(base64) => {
             let added = decoder.push_base64(&base64)?;
             if added > 0 {

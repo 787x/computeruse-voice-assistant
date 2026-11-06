@@ -81,10 +81,20 @@ pub struct SaveRequest {
     /// 「启用联网搜索」开关（写进 `Settings::search.enabled`）。
     pub search_enabled: bool,
     // ---- 播报 ----
+    pub tts_key: String,
+    pub tts_clear_key: bool,
     pub tts_enabled: bool,
     pub tts_backend_index: i32,
     pub tts_mimo_voice: String,
     pub tts_mimo_style: String,
+    pub tts_mimo_model: String,
+    pub tts_mimo_tags: String,
+    pub tts_mimo_streaming: bool,
+    pub tts_mimo_reuse_key: bool,
+    pub tts_mimo_speed: String,
+    pub tts_volume: String,
+    pub tts_output_device: String,
+
     pub tts_local_dir: String,
     pub tts_local_sid: String,
     pub tts_local_speed: String,
@@ -433,6 +443,14 @@ pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Sett
     next.tts.backend = tts_backend_for_index(request.tts_backend_index);
     next.tts.mimo_voice = request.tts_mimo_voice.clone();
     next.tts.mimo_style = request.tts_mimo_style.clone();
+    next.tts.mimo_model = request.tts_mimo_model.clone();
+    next.tts.mimo_tags = crate::voice::tts::styles::decode(&request.tts_mimo_tags);
+    next.tts.mimo_streaming = request.tts_mimo_streaming;
+    next.tts.mimo_reuse_key = request.tts_mimo_reuse_key;
+    next.tts.mimo_speed = parse_f32("MiMo语速", &request.tts_mimo_speed, current.tts.mimo_speed)?;
+    next.tts.volume = parse_f32("音量", &request.tts_volume, current.tts.volume)?;
+    next.tts.output_device = request.tts_output_device.clone();
+
     next.tts.local_model_dir = request.tts_local_dir.clone();
     next.tts.local_sid = parse_i32("音色编号", &request.tts_local_sid, current.tts.local_sid)?;
     next.tts.local_speed = parse_f32("语速", &request.tts_local_speed, current.tts.local_speed)?;
@@ -505,18 +523,34 @@ pub fn tts_runtime_config_changed(
 ) -> bool {
     let a = &previous.tts;
     let b = &next.tts;
-    a.enabled != b.enabled
-        || a.backend != b.backend
-        || a.mimo_model != b.mimo_model
-        || a.mimo_voice != b.mimo_voice
-        || a.mimo_style != b.mimo_style
-        || a.local_model_dir != b.local_model_dir
-        || a.local_sid != b.local_sid
-        || (a.local_speed - b.local_speed).abs() > f32::EPSILON
-        || a.local_provider != b.local_provider
+    if a.active_backend() != b.active_backend() {
+        return true;
+    }
+    if a.active_backend() == TtsBackend::Off {
+        return false;
+    }
+    a.volume != b.volume
         || a.output_device != b.output_device
         || a.timeout_ms != b.timeout_ms
-        || key_changed_for_active_backend
+        || match a.active_backend() {
+            TtsBackend::Mimo => {
+                a.mimo_model != b.mimo_model
+                    || a.mimo_voice != b.mimo_voice
+                    || a.mimo_style != b.mimo_style
+                    || a.mimo_tags != b.mimo_tags
+                    || a.mimo_streaming != b.mimo_streaming
+                    || a.mimo_reuse_key != b.mimo_reuse_key
+                    || a.mimo_speed != b.mimo_speed
+                    || key_changed_for_active_backend
+            }
+            TtsBackend::Local => {
+                a.local_model_dir != b.local_model_dir
+                    || a.local_sid != b.local_sid
+                    || a.local_speed != b.local_speed
+                    || a.local_provider != b.local_provider
+            }
+            TtsBackend::Off => false,
+        }
 }
 
 /// 持久目录优先；仅为旧配置、缺失目录或更换端点补充匹配缓存，不覆盖已有条目。
@@ -657,7 +691,16 @@ pub fn apply_save(
     let key_provider = settings.provider_id.clone();
     let new_key = request.api_key.trim().to_string();
     let mut errors = Vec::new();
-    let mut mimo_key_changed = false;
+    let effective_key = |tts: &TtsSettings| {
+        secret.load("mimo-tts").ok().flatten().or_else(|| {
+            if tts.mimo_reuse_key {
+                secret.load("mimo").ok().flatten()
+            } else {
+                None
+            }
+        })
+    };
+    let previous_key = effective_key(&previous.tts);
     for (id, key) in request
         .provider_drafts
         .iter()
@@ -669,12 +712,19 @@ pub fn apply_save(
             continue;
         }
         match secret.save(id, key) {
-            Ok(()) => {
-                if id == crate::ui::worker::MIMO_PROVIDER_ID {
-                    mimo_key_changed = true;
-                }
-            }
+            Ok(()) => {}
             Err(error) => errors.push(format!("{id}: {error}")),
+        }
+    }
+    if request.tts_clear_key {
+        match secret.clear("mimo-tts") {
+            Ok(()) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+    } else if !request.tts_key.trim().is_empty() {
+        match secret.save("mimo-tts", request.tts_key.trim()) {
+            Ok(()) => {}
+            Err(e) => errors.push(e.to_string()),
         }
     }
     let key_error = if errors.is_empty() {
@@ -704,8 +754,8 @@ pub fn apply_save(
     restore_model_catalogs(settings, paths, secret, None);
 
     // 只有"给当前启用的云端后端"写入了新 Key 才算凭据变化。
-    let key_changed_for_active_backend =
-        mimo_key_changed && settings.tts.active_backend() == TtsBackend::Mimo;
+    let key_changed_for_active_backend = previous_key != effective_key(&settings.tts)
+        && settings.tts.active_backend() == TtsBackend::Mimo;
     let tts_changed =
         tts_runtime_config_changed(&previous, settings, key_changed_for_active_backend);
     let speech_warning = if tts_changed {
@@ -772,10 +822,20 @@ mod tests {
             permission_overrides: vec![0; crate::permissions::capabilities().len()],
             search_api_key: String::new(),
             search_enabled: settings.search.enabled,
+            tts_key: String::new(),
+            tts_clear_key: false,
             tts_enabled: false,
             tts_backend_index: 0,
             tts_mimo_voice: String::new(),
             tts_mimo_style: String::new(),
+            tts_mimo_model: String::new(),
+            tts_mimo_tags: String::new(),
+            tts_mimo_streaming: true,
+            tts_mimo_reuse_key: true,
+            tts_mimo_speed: "1.0".into(),
+            tts_volume: "1.0".into(),
+            tts_output_device: String::new(),
+
             tts_local_dir: String::new(),
             tts_local_sid: settings.tts.local_sid.to_string(),
             tts_local_speed: format!("{:.1}", settings.tts.local_speed),
@@ -1198,6 +1258,52 @@ mod tests {
         assert_eq!(candidate.timeout_ms, 5_000);
         assert_eq!(candidate.context_window, 1_000_000);
         assert_eq!(candidate.context_compress_percent, 10);
+    }
+
+    #[test]
+    fn pr14_save_restart_and_secret_isolation() {
+        let root = std::env::temp_dir().join(format!("cuava-pr14-{}", crate::clock::now().unix_ms));
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        secret.save("mimo", "official-test").unwrap();
+        secret.save("deepseek", "deepseek-test").unwrap();
+        let mut settings = Settings::default();
+        let mut request = base_request(&settings);
+        request.tts_key = "tts-test".into();
+        request.tts_mimo_model = "mimo-v2.5-tts".into();
+        request.tts_mimo_tags =
+            crate::voice::tts::styles::encode(&["温柔".into(), "含|分隔符".into()]);
+        request.tts_mimo_style = "  自然\n 保留  ".into();
+        request.tts_mimo_streaming = false;
+        request.tts_mimo_speed = "1.5".into();
+        request.tts_volume = "0.4".into();
+        request.tts_output_device = "测试扬声器".into();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        let loaded = config::load_settings(&paths).unwrap();
+        assert_eq!(loaded.tts.mimo_tags, vec!["温柔", "含|分隔符"]);
+        assert_eq!(loaded.tts.mimo_style, request.tts_mimo_style);
+        assert_eq!(loaded.tts.volume, 0.4);
+        assert_eq!(loaded.tts.mimo_speed, 1.5);
+        assert!(!loaded.tts.mimo_streaming);
+        assert_eq!(loaded.tts.output_device, "测试扬声器");
+        assert_eq!(
+            secret.load("mimo-tts").unwrap().as_deref(),
+            Some("tts-test")
+        );
+        request.tts_key.clear();
+        request.tts_clear_key = true;
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        assert!(!secret.has("mimo-tts"));
+        assert_eq!(
+            secret.load("mimo").unwrap().as_deref(),
+            Some("official-test")
+        );
+        assert_eq!(
+            secret.load("deepseek").unwrap().as_deref(),
+            Some("deepseek-test")
+        );
     }
 
     /// 只改模型端点时，TTS 运行时配置不算变化 → 不重建引擎（不会中断播报）。

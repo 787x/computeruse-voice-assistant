@@ -730,6 +730,20 @@ fn build_output_stream(
     }
 }
 
+/// 当前可用的单路输出设备；空名称代表系统默认。
+pub fn output_device_names() -> Result<Vec<String>, String> {
+    let mut names = vec![String::new()];
+    for device in cpal::default_host()
+        .output_devices()
+        .map_err(|e| format!("枚举输出设备失败：{e}"))?
+    {
+        if let Ok(description) = device.description() {
+            names.push(description.name().to_string());
+        }
+    }
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

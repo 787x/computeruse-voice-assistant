@@ -15,6 +15,7 @@
 pub mod local;
 pub mod mimo;
 pub mod settings;
+pub mod styles;
 
 use crate::cancel::CancelToken;
 use crate::secret::SecretStore;
@@ -122,6 +123,10 @@ impl SpeechStream {
 ///  - 错误信息里**不出现** Key、原始 Authorization 或整段音频。
 pub trait TtsEngine: Send + Sync {
     /// 给界面看的后端描述（不含密钥）。
+    fn text_byte_budget(&self) -> usize {
+        usize::MAX
+    }
+
     fn label(&self) -> String;
 
     /// 启动一句合成。
@@ -363,7 +368,14 @@ pub fn build_engine(
         TtsBackend::Off => Err("语音播报未开启".to_string()),
         TtsBackend::Mimo => {
             let key = secret
-                .load(mimo::KEY_PROVIDER)
+                .load("mimo-tts")
+                .and_then(|key| {
+                    if key.is_some() || !settings.mimo_reuse_key {
+                        Ok(key)
+                    } else {
+                        secret.load(mimo::KEY_PROVIDER)
+                    }
+                })
                 .map_err(|error| format!("读取 MiMo 账户 Key 失败：{error}"))?
                 .unwrap_or_default();
             if key.trim().is_empty() {
@@ -372,7 +384,13 @@ pub fn build_engine(
                         .to_string(),
                 );
             }
-            Ok(Box::new(mimo::MimoTts::new(settings, key)?))
+            Ok(Box::new(
+                mimo::MimoTts::new(settings, key)?.with_key_source(if secret.has("mimo-tts") {
+                    "独立 TTS Key 已设置"
+                } else {
+                    "复用官方 mimo Key 已设置"
+                }),
+            ))
         }
         TtsBackend::Local => Ok(Box::new(local::LocalTts::new(settings)?)),
     }
