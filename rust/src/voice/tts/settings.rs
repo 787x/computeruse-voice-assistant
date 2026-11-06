@@ -94,6 +94,16 @@ pub struct TtsSettings {
     /// 简短风格指令（放进 `user` 消息）；空 = 不发送。
     #[serde(default)]
     pub mimo_style: String,
+    #[serde(default)]
+    pub mimo_tags: Vec<String>,
+    #[serde(default = "default_true")]
+    pub mimo_streaming: bool,
+    #[serde(default = "default_true")]
+    pub mimo_reuse_key: bool,
+    #[serde(default = "default_speed")]
+    pub mimo_speed: f32,
+    #[serde(default = "default_speed")]
+    pub volume: f32,
     /// 本地模型目录（含 model.onnx / voices.bin / tokens.txt 等）。
     #[serde(default)]
     pub local_model_dir: String,
@@ -124,6 +134,11 @@ impl Default for TtsSettings {
             mimo_model: default_mimo_model(),
             mimo_voice: String::new(),
             mimo_style: String::new(),
+            mimo_tags: Vec::new(),
+            mimo_streaming: true,
+            mimo_reuse_key: true,
+            mimo_speed: 1.0,
+            volume: 1.0,
             local_model_dir: String::new(),
             local_sid: 0,
             local_speed: default_speed(),
@@ -139,7 +154,16 @@ impl TtsSettings {
         self.output_device = self.output_device.trim().to_string();
         self.mimo_model = self.mimo_model.trim().to_string();
         self.mimo_voice = self.mimo_voice.trim().to_string();
-        self.mimo_style = self.mimo_style.trim().to_string();
+        if self.mimo_model.encode_utf16().count() > 200 {
+            return Err("MiMo 模型名最多200字符".into());
+        }
+        super::styles::validate(&self.mimo_tags)?;
+        if !self.mimo_speed.is_finite() || !(0.5..=2.0).contains(&self.mimo_speed) {
+            return Err("MiMo 语速必须为 0.5–2.0".into());
+        }
+        if !self.volume.is_finite() || !(0.0..=1.0).contains(&self.volume) {
+            return Err("音量必须为 0–1".into());
+        }
         self.local_model_dir = self.local_model_dir.trim().to_string();
         // 提供者只认 cuda/cpu；写错就按默认（cuda）处理，不因为一个拼写
         // 错误让整个设置无法保存。
@@ -163,9 +187,8 @@ impl TtsSettings {
             return Err(format!("音色编号超出合理范围：{}", self.local_sid));
         }
         self.timeout_ms = self.timeout_ms.clamp(5_000, 120_000);
-        // 风格指令只用于一句短语调性，过长会挤占正文预算。
-        if self.mimo_style.chars().count() > 120 {
-            self.mimo_style = self.mimo_style.chars().take(120).collect();
+        if self.mimo_style.encode_utf16().count() > 1000 {
+            return Err("自然语言说明最多 1000 字符".into());
         }
         Ok(self)
     }
@@ -254,7 +277,42 @@ mod tests {
         .unwrap();
         assert_eq!(ok.local_speed, 1.5);
         assert_eq!(ok.timeout_ms, 5_000);
-        assert_eq!(ok.mimo_style.chars().count(), 120);
+        assert_eq!(ok.mimo_style.chars().count(), 200);
+    }
+
+    #[test]
+    fn pr14_playback_ranges_roundtrip_and_reject_invalid_values() {
+        for speed in [0.5, 1.0, 2.0] {
+            for volume in [0.0, 0.5, 1.0] {
+                let settings = TtsSettings {
+                    mimo_speed: speed,
+                    volume,
+                    ..Default::default()
+                }
+                .normalized()
+                .unwrap();
+                let loaded: TtsSettings =
+                    serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+                assert_eq!(loaded.mimo_speed, speed);
+                assert_eq!(loaded.volume, volume);
+            }
+        }
+        for speed in [0.49, 2.01, f32::NAN, f32::INFINITY] {
+            assert!(TtsSettings {
+                mimo_speed: speed,
+                ..Default::default()
+            }
+            .normalized()
+            .is_err());
+        }
+        for volume in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+            assert!(TtsSettings {
+                volume,
+                ..Default::default()
+            }
+            .normalized()
+            .is_err());
+        }
     }
 
     #[test]

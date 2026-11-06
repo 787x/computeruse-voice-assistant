@@ -639,9 +639,112 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        let weak = window.as_weak();
+        window.on_tts_prefix(|tags| {
+            crate::voice::tts::styles::prefix(&crate::voice::tts::styles::decode(&tags)).into()
+        });
+        window.on_tts_matches(|value, query| {
+            value
+                .to_lowercase()
+                .contains(query.trim().to_lowercase().as_str())
+        });
+        window.on_tts_tag_action(move |value| {
+            if let Some(w) = weak.upgrade() {
+                let old = w.get_tts_mimo_tags().to_string();
+                let mut tags = crate::voice::tts::styles::decode(&old);
+                let value = value.to_string();
+                if value.is_empty() {
+                    tags.clear();
+                } else if tags.contains(&value) {
+                    tags.retain(|s| s != &value);
+                } else if let Err(e) = crate::voice::tts::styles::add(&mut tags, &value) {
+                    w.set_settings_error(e.into());
+                    return;
+                }
+                match crate::voice::tts::styles::validate(&tags) {
+                    Ok(()) => {
+                        w.set_tts_mimo_tags(crate::voice::tts::styles::encode(&tags).into());
+                        w.set_tts_selected_tags(
+                            std::rc::Rc::new(slint::VecModel::from(
+                                tags.into_iter()
+                                    .map(slint::SharedString::from)
+                                    .collect::<Vec<_>>(),
+                            ))
+                            .into(),
+                        );
+                        w.set_settings_dirty(true);
+                    }
+                    Err(e) => w.set_settings_error(e.into()),
+                }
+            }
+        });
+        let weak = window.as_weak();
+        window.on_tts_add_custom(move || {
+            if let Some(w) = weak.upgrade() {
+                let mut tags = crate::voice::tts::styles::decode(&w.get_tts_mimo_tags());
+                match crate::voice::tts::styles::add(&mut tags, &w.get_tts_custom()) {
+                    Ok(true) => {
+                        w.set_tts_mimo_tags(crate::voice::tts::styles::encode(&tags).into());
+                        w.set_tts_selected_tags(
+                            std::rc::Rc::new(slint::VecModel::from(
+                                tags.into_iter()
+                                    .map(slint::SharedString::from)
+                                    .collect::<Vec<_>>(),
+                            ))
+                            .into(),
+                        );
+                        w.set_tts_custom("".into());
+                        w.set_tts_tag_hint("".into());
+                        w.set_settings_dirty(true);
+                    }
+                    Ok(false) => w.set_tts_tag_hint("该风格已存在".into()),
+                    Err(e) => w.set_tts_tag_hint(e.into()),
+                }
+            }
+        });
+        window.on_tts_voice_index(|voice| settings_ui::mimo_voice_index(&voice));
+        window.on_tts_voice_for_index(|index| settings_ui::mimo_voice_for_index(index).into());
+        window.on_tts_format_number(|value| format!("{value:.2}").into());
+        window.on_tts_number(|value| value.parse::<f32>().unwrap_or(1.0));
+        window.on_tts_presets(|category, query| {
+            let query = query.trim().to_lowercase();
+            let tags = crate::voice::tts::styles::PRESETS
+                .iter()
+                .filter(|(name, _)| *name == category.as_str())
+                .flat_map(|(name, tags)| {
+                    tags.iter()
+                        .filter(|tag| name.contains(&query) || tag.to_lowercase().contains(&query))
+                        .map(|s| slint::SharedString::from(*s))
+                })
+                .collect::<Vec<_>>();
+            std::rc::Rc::new(slint::VecModel::from(tags)).into()
+        });
+        let weak = window.as_weak();
+        window.on_tts_refresh_devices(move || {
+            if let Some(w) = weak.upgrade() {
+                match crate::voice::playback::output_device_names() {
+                    Ok(names) => w.set_tts_devices(
+                        std::rc::Rc::new(slint::VecModel::from(
+                            names
+                                .into_iter()
+                                .map(slint::SharedString::from)
+                                .collect::<Vec<_>>(),
+                        ))
+                        .into(),
+                    ),
+                    Err(e) => w.set_settings_error(e.into()),
+                }
+            }
+        });
         // ---- 设置分类导航 ----
         let tx = command_tx.clone();
+        let weak = window.as_weak();
         window.on_settings_tab_picked(move |index| {
+            if index == 4 {
+                if let Some(w) = weak.upgrade() {
+                    w.invoke_tts_refresh_devices();
+                }
+            }
             let _ = tx.send(UiCommand::SettingsTab(index));
         });
     }
@@ -1687,6 +1790,7 @@ async fn run_worker(
      * 偏好只在用户点了开关之后才写回。
      */
     seed_voice_ui(&weak, &settings);
+    publish_tts_key_ui(&weak, &secret);
     seed_tts_ui(&weak, &settings, &speech);
 
     // 会话已由 `run_app` 在 `seed_ui` **之前**备好（含落盘），
@@ -1801,6 +1905,7 @@ async fn run_worker(
             UiCommand::CancelSettings { generation } => {
                 // 取消 = 丢弃界面上的未保存修改，按已保存配置重新回填并关闭面板。
                 if generation_is_current(&save_generation, generation) {
+                    publish_tts_key_ui(&weak, &secret);
                     publish_tts_ui(&weak, &settings.tts, &speech);
                     let has_key = secret.has(&settings.provider_id);
                     apply_settings_to_ui(&weak, &settings, has_key);
@@ -3224,11 +3329,34 @@ fn clear_model_key(
 ///  - `tts-active-*`：当前真正生效的那一份配置（试音据此启用/说明）。
 ///
 /// 两者在用户改动但未保存时会不一致，这正是这里要区分的地方。
+fn publish_tts_key_ui(weak: &slint::Weak<AppWindow>, secret: &SecretStore) {
+    let status = format!(
+        "独立 TTS Key：{}；官方 mimo Key：{}",
+        if secret.has("mimo-tts") {
+            "已设置"
+        } else {
+            "未设置"
+        },
+        if secret.has("mimo") {
+            "已设置"
+        } else {
+            "未设置"
+        }
+    );
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_tts_key_status(status.into());
+        }
+    });
+}
+
 fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &SpeechRuntime) {
     let backend_index = tts_backend_index(tts.backend);
     let enabled = tts.enabled;
     let mimo_voice = tts.mimo_voice.clone();
     let mimo_style = tts.mimo_style.clone();
+    let extra_tts = tts.clone();
     let local_dir = tts.local_model_dir.clone();
     let local_sid = tts.local_sid.to_string();
     let local_speed = format!("{:.1}", tts.local_speed);
@@ -3252,10 +3380,33 @@ fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &Spe
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            window.set_tts_key("".into());
+            window.set_tts_clear_key(false);
             window.set_tts_enabled(enabled);
             window.set_tts_backend_index(backend_index);
             window.set_tts_mimo_voice(mimo_voice.into());
+            window.set_tts_tag_hint("".into());
+            window.set_tts_custom("".into());
             window.set_tts_mimo_style(mimo_style.into());
+            window.set_tts_mimo_model(extra_tts.mimo_model.clone().into());
+            window
+                .set_tts_mimo_tags(crate::voice::tts::styles::encode(&extra_tts.mimo_tags).into());
+            window.set_tts_selected_tags(
+                std::rc::Rc::new(slint::VecModel::from(
+                    extra_tts
+                        .mimo_tags
+                        .iter()
+                        .map(|s| slint::SharedString::from(s.as_str()))
+                        .collect::<Vec<_>>(),
+                ))
+                .into(),
+            );
+            window.set_tts_mimo_streaming(extra_tts.mimo_streaming);
+            window.set_tts_mimo_reuse_key(extra_tts.mimo_reuse_key);
+            window.set_tts_mimo_speed(extra_tts.mimo_speed.to_string().into());
+            window.set_tts_volume(extra_tts.volume.to_string().into());
+            window.set_tts_output_device(extra_tts.output_device.clone().into());
+
             window.set_tts_local_dir(local_dir.into());
             window.set_tts_local_sid(local_sid.into());
             window.set_tts_local_speed(local_speed.into());
@@ -3610,10 +3761,20 @@ pub fn build_save_request(window: &AppWindow) -> SaveRequest {
         permission_overrides: window.get_override_indices().iter().collect(),
         search_api_key: window.get_search_key_input().to_string(),
         search_enabled: window.get_search_enabled(),
+        tts_key: window.get_tts_key().to_string(),
+        tts_clear_key: window.get_tts_clear_key(),
         tts_enabled: window.get_tts_enabled(),
         tts_backend_index: window.get_tts_backend_index(),
         tts_mimo_voice: window.get_tts_mimo_voice().to_string(),
         tts_mimo_style: window.get_tts_mimo_style().to_string(),
+        tts_mimo_model: window.get_tts_mimo_model().to_string(),
+        tts_mimo_tags: window.get_tts_mimo_tags().to_string(),
+        tts_mimo_streaming: window.get_tts_mimo_streaming(),
+        tts_mimo_reuse_key: window.get_tts_mimo_reuse_key(),
+        tts_mimo_speed: window.get_tts_mimo_speed().to_string(),
+        tts_volume: window.get_tts_volume().to_string(),
+        tts_output_device: window.get_tts_output_device().to_string(),
+
         tts_local_dir: window.get_tts_local_dir().to_string(),
         tts_local_sid: window.get_tts_local_sid().to_string(),
         tts_local_speed: window.get_tts_local_speed().to_string(),
@@ -3673,10 +3834,34 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
             window.set_timeout_ms(saved.timeout_ms.to_string().into());
             window.set_context_window(saved.context_window.to_string().into());
             window.set_compress_percent(saved.context_compress_percent.to_string().into());
+            window.set_tts_key("".into());
+            window.set_tts_clear_key(false);
             window.set_tts_enabled(saved.tts.enabled);
             window.set_tts_backend_index(tts_backend_index(saved.tts.backend));
             window.set_tts_mimo_voice(saved.tts.mimo_voice.into());
+            window.set_tts_tag_hint("".into());
+            window.set_tts_custom("".into());
             window.set_tts_mimo_style(saved.tts.mimo_style.into());
+            window.set_tts_mimo_model(saved.tts.mimo_model.clone().into());
+            window
+                .set_tts_mimo_tags(crate::voice::tts::styles::encode(&saved.tts.mimo_tags).into());
+            window.set_tts_selected_tags(
+                std::rc::Rc::new(slint::VecModel::from(
+                    saved
+                        .tts
+                        .mimo_tags
+                        .iter()
+                        .map(|s| slint::SharedString::from(s.as_str()))
+                        .collect::<Vec<_>>(),
+                ))
+                .into(),
+            );
+            window.set_tts_mimo_streaming(saved.tts.mimo_streaming);
+            window.set_tts_mimo_reuse_key(saved.tts.mimo_reuse_key);
+            window.set_tts_mimo_speed(saved.tts.mimo_speed.to_string().into());
+            window.set_tts_volume(saved.tts.volume.to_string().into());
+            window.set_tts_output_device(saved.tts.output_device.clone().into());
+
             window.set_tts_local_dir(saved.tts.local_model_dir.into());
             window.set_tts_local_sid(saved.tts.local_sid.to_string().into());
             window.set_tts_local_speed(saved.tts.local_speed.to_string().into());
@@ -3953,6 +4138,7 @@ async fn wait_turn(
                     }
                     Some(UiCommand::CancelSettings { generation }) => {
                         if generation_is_current(save_generation, generation) {
+                            publish_tts_key_ui(weak, secret);
                             publish_tts_ui(weak, &settings.tts, speech);
                             let has_key = secret.has(&settings.provider_id);
                             apply_settings_to_ui(weak, settings, has_key);
@@ -4341,6 +4527,7 @@ fn handle_save_all_ui(
             state.mode = settings.permission_mode;
             state.overrides = settings.permission_overrides.clone();
         }
+        publish_tts_key_ui(weak, secret);
         publish_tts_ui(weak, &settings.tts, speech);
         let has_key = secret.has(&settings.provider_id);
         let endpoint = config::describe_endpoint(settings, has_key);

@@ -506,6 +506,35 @@ pub struct PlayerHandle {
 }
 
 impl PlayerHandle {
+    /// Test-only stream owner: same stop/join lifecycle without opening hardware.
+    #[cfg(test)]
+    pub(crate) fn test_handle(name: &str) -> (Self, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let signal = released.clone();
+        let thread_stop = stop.clone();
+        let join = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            signal.store(true, Ordering::SeqCst);
+        });
+        (
+            Self {
+                shared: Arc::new(PlaybackShared::new(24000, 1)),
+                stop,
+                join: Some(join),
+                info: DeviceInfo {
+                    device_name: name.into(),
+                    sample_rate: 24000,
+                    channels: 1,
+                    sample_format: "f32".into(),
+                },
+            },
+            released,
+        )
+    }
+
     /// 打开输出设备（`device_name` 为空 = 系统默认输出）。
     ///
     /// 失败时返回可读原因：调用方据此**只禁用播报**，文本与 CUA 不受影响。
@@ -728,6 +757,20 @@ fn build_output_stream(
             "不支持的输出采样格式：{other:?}"
         ))),
     }
+}
+
+/// 当前可用的单路输出设备；空名称代表系统默认。
+pub fn output_device_names() -> Result<Vec<String>, String> {
+    let mut names = vec![String::new()];
+    for device in cpal::default_host()
+        .output_devices()
+        .map_err(|e| format!("枚举输出设备失败：{e}"))?
+    {
+        if let Ok(description) = device.description() {
+            names.push(description.name().to_string());
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(test)]

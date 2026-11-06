@@ -98,6 +98,11 @@ impl SpeechRuntime {
         secret: &SecretStore,
     ) -> Result<(), String> {
         self.stop();
+        if self.settings.output_device != settings.output_device
+            || settings.active_backend() == super::tts::TtsBackend::Off
+        {
+            self.release_playback();
+        }
         self.settings = settings.clone();
         self.engine = None;
         self.engine_error = None;
@@ -210,7 +215,26 @@ impl SpeechRuntime {
                 .clone()
                 .unwrap_or_else(|| "语音播报未开启".to_string())
         })?;
-        let plan = prepare_speech(text);
+        let mut plan = prepare_speech(text);
+        let budget = engine.text_byte_budget();
+        plan.sentences = plan
+            .sentences
+            .into_iter()
+            .flat_map(|sentence| {
+                let mut pieces = Vec::new();
+                let mut part = String::new();
+                for c in sentence.chars() {
+                    if part.len() + c.len_utf8() > budget && !part.is_empty() {
+                        pieces.push(std::mem::take(&mut part));
+                    }
+                    part.push(c);
+                }
+                if !part.is_empty() {
+                    pieces.push(part);
+                }
+                pieces
+            })
+            .collect();
         if plan.is_empty() {
             return Err("没有可播报的文本".to_string());
         }
@@ -238,6 +262,7 @@ impl SpeechRuntime {
         let events = self.events.clone();
         let sentences = plan.sentences.clone();
         let style = self.settings.mimo_style.clone();
+        let volume = self.settings.volume;
         let engine_for_task = engine.clone();
         let active = Arc::new(AtomicBool::new(true));
         // 字幕队列：合成端写入"哪一句从哪一帧开始"，监控端在设备真的播到
@@ -257,6 +282,7 @@ impl SpeechRuntime {
                 turn,
                 sentences,
                 style,
+                volume,
                 synth_cancel.clone(),
             )
             .await;
@@ -312,10 +338,7 @@ impl SpeechRuntime {
     /// 退出：停止播报、释放设备、丢弃引擎（本地模型随之释放）。
     pub fn shutdown(&mut self) {
         self.stop();
-        if let Some(mut player) = self.player.take() {
-            player.shutdown();
-        }
-        self.shared = None;
+        self.release_playback();
         self.engine = None;
         self.recent
             .lock()
@@ -323,16 +346,33 @@ impl SpeechRuntime {
             .clear();
     }
 
+    fn release_playback(&mut self) {
+        if let Some(mut player) = self.player.take() {
+            player.shutdown();
+        }
+        if let Some(shared) = self.shared.take() {
+            shared.stop();
+        }
+    }
+
     /// 懒打开输出设备（失败只影响播报）。
     fn ensure_playback(&mut self) -> Result<Arc<PlaybackShared>, String> {
+        self.ensure_playback_with(PlayerHandle::start)
+    }
+
+    fn ensure_playback_with(
+        &mut self,
+        open: impl FnOnce(&str) -> Result<PlayerHandle, super::playback::PlayerError>,
+    ) -> Result<Arc<PlaybackShared>, String> {
         if let Some(shared) = &self.shared {
             return Ok(shared.clone());
         }
-        let player = PlayerHandle::start(&self.settings.output_device).map_err(|error| {
+        let player = open(&self.settings.output_device).map_err(|error| {
             self.engine_error = Some(error.to_string());
             error.to_string()
         })?;
         let shared = player.shared();
+        self.engine_error = None;
         self.player = Some(player);
         self.shared = Some(shared.clone());
         Ok(shared)
@@ -367,6 +407,7 @@ async fn synthesize_all(
     turn: TurnId,
     sentences: Vec<String>,
     style: String,
+    volume: f32,
     cancel: CancelToken,
 ) -> Result<(), SynthFailure> {
     let mut feed = Feed::new(speech_id);
@@ -391,7 +432,12 @@ async fn synthesize_all(
             };
             let Some(event) = event else { break };
             match event {
-                TtsEvent::Chunk(chunk) => {
+                TtsEvent::Chunk(mut chunk) => {
+                    if volume != 1.0 {
+                        for sample in &mut chunk.samples {
+                            *sample *= volume;
+                        }
+                    }
                     if first_chunk {
                         /*
                          * 字幕与**实际播放**对齐：记下这一句的第一个样本会落在
@@ -746,6 +792,85 @@ mod tests {
             if shared.pull(&mut sink) == 0 {
                 break;
             }
+        }
+    }
+
+    #[test]
+    fn pr14_device_change_releases_old_stream_and_reopens_selected_device() {
+        let root = std::env::temp_dir().join(format!("cuava-device-review-{}", std::process::id()));
+        let secret = SecretStore::new(root.join("secret.bin"));
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = SpeechRuntime::new(tx);
+        runtime.settings = TtsSettings {
+            enabled: true,
+            backend: super::super::tts::TtsBackend::Mimo,
+            output_device: "A".into(),
+            ..Default::default()
+        };
+        let (player, released) = PlayerHandle::test_handle("A");
+        runtime.shared = Some(player.shared());
+        runtime.player = Some(player);
+        let old_shared = Arc::downgrade(runtime.shared.as_ref().unwrap());
+        let mut next = runtime.settings.clone();
+        next.output_device = "B".into();
+        // Missing cloud credentials can fail synthesis setup; playback disposal must still happen.
+        let _ = runtime.apply_settings(&next, &secret);
+        assert!(released.load(Ordering::SeqCst));
+        assert!(old_shared.upgrade().is_none());
+        assert!(runtime.player.is_none() && runtime.shared.is_none());
+        let error = runtime
+            .ensure_playback_with(|name| {
+                assert_eq!(name, "B");
+                Err(super::super::playback::PlayerError::NoDevice)
+            })
+            .err()
+            .expect("设备打开必须失败");
+        assert!(error.contains("设备"));
+        assert!(runtime.shared.is_none() && runtime.player.is_none());
+        runtime
+            .ensure_playback_with(|name| {
+                assert_eq!(name, "B");
+                Ok(PlayerHandle::test_handle(name).0)
+            })
+            .unwrap();
+        let same = runtime.shared.as_ref().unwrap().clone();
+        next.mimo_style = "温柔".into();
+        let _ = runtime.apply_settings(&next, &secret);
+        assert!(Arc::ptr_eq(&same, runtime.shared.as_ref().unwrap()));
+        next.output_device.clear();
+        let _ = runtime.apply_settings(&next, &secret);
+        runtime
+            .ensure_playback_with(|name| {
+                assert_eq!(name, "");
+                Ok(PlayerHandle::test_handle(name).0)
+            })
+            .unwrap();
+        let player_shared = Arc::downgrade(runtime.shared.as_ref().unwrap());
+        next.enabled = false;
+        runtime.apply_settings(&next, &secret).unwrap();
+        assert!(runtime.player.is_none() && runtime.shared.is_none());
+        assert!(player_shared.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn pr14_volume_changes_real_pcm_without_changing_text() {
+        for volume in [0.0, 0.5, 1.0] {
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let engine = Arc::new(FakeEngine {
+                chunks: vec![vec![0.8; 2400]],
+                sample_rate: 24_000,
+                fail: None,
+                started: started.clone(),
+            });
+            let (mut runtime, _rx, shared) = runtime_with(engine);
+            runtime.settings.volume = volume;
+            runtime.speak(1, "音量测试。").unwrap();
+            wait_until_end_marked(&shared).await;
+            let mut output = vec![0.0; 100];
+            assert!(shared.pull(&mut output) > 0);
+            assert!(output.iter().all(|v| (*v - 0.8 * volume).abs() < 0.0001));
+            assert_eq!(started.lock().unwrap().as_slice(), &["音量测试"]);
+            runtime.stop();
         }
     }
 
