@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -204,6 +204,16 @@ pub struct PwshBridge {
     /// 只统计"曾经就绪后意外死亡"的次数。
     restarts: AtomicU64,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /*
+     * 当前 CUA 子进程的 PID（0 = 没有）。
+     *
+     * 为什么单独用一个原子量而不是让调用方去锁 `runtime`：
+     * `kill_app` 需要在**同步**的候选筛选里判断"这个 powershell 是不是我们的"，
+     * 而 `runtime` 是 tokio 异步锁。这个值在 spawn / kill / 退出三处维护，
+     * 始终只反映**当前**那一个进程——不做历史累积，避免 PID 被系统复用后
+     * 永久保护一个无关程序。
+     */
+    child_pid: AtomicU32,
 }
 
 impl PwshBridge {
@@ -216,7 +226,34 @@ impl PwshBridge {
             id_counter: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            child_pid: AtomicU32::new(0),
         }
+    }
+
+    /// 当前 CUA 子进程的 PID；`None` = 当前没有受管理的子进程。
+    ///
+    /// 供 `kill_app` 判断"候选进程是不是助手自己的 CUA 后端"。
+    /// **只反映这一刻还活着的那个进程**：进程退出/被杀后立刻清零，
+    /// 所以 PID 被复用不会得到错误保护。
+    pub fn current_child_pid(&self) -> Option<u32> {
+        match self.child_pid.load(Ordering::SeqCst) {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+
+    fn set_child_pid(&self, pid: Option<u32>) {
+        self.child_pid.store(pid.unwrap_or(0), Ordering::SeqCst);
+    }
+
+    /// 测试用：直接登记受管理的子进程 PID（不真的起进程）。
+    ///
+    /// 生产路径只有 spawn / kill / 启动失败三处调用 `set_child_pid`；
+    /// 工具层与 bridge 自己的回归测试需要在不依赖真实 PowerShell 的情况下
+    /// 验证"保护跟随当前 PID"，所以留这一个入口。
+    #[cfg(test)]
+    pub fn set_child_pid_for_test(&self, pid: Option<u32>) {
+        self.set_child_pid(pid);
     }
 
     pub fn script_path(&self) -> &Path {
@@ -310,6 +347,9 @@ impl PwshBridge {
         let mut child = command.spawn().map_err(|error| {
             BridgeError::Unavailable(format!("无法启动 {}：{error}", self.options.executable))
         })?;
+        // 记下当前子进程身份：`kill_app` 据此拒绝结束它。
+        // 这是**唯一**登记新进程的地方（每次 spawn 都会覆盖旧值）。
+        self.set_child_pid(child.id());
 
         let stdin = child
             .stdin
@@ -352,10 +392,13 @@ impl PwshBridge {
             }
             Ok(Err(error)) => {
                 let _ = runtime.child.kill().await;
+                // 没能就绪 = 这个进程不再受我们管理，撤销保护。
+                self.set_child_pid(None);
                 Err(error)
             }
             Err(_) => {
                 let _ = runtime.child.kill().await;
+                self.set_child_pid(None);
                 Err(BridgeError::Unavailable(format!(
                     "后端在 {}ms 内没有报告就绪{}",
                     self.options.startup_timeout_ms,
@@ -373,6 +416,8 @@ impl PwshBridge {
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(2), runtime.child.wait()).await;
         }
+        // 进程已经不再受我们管理：立刻撤销保护，避免 PID 复用时误保护别的进程。
+        self.set_child_pid(None);
         *self.ready.lock().await = None;
     }
 
@@ -584,5 +629,42 @@ async fn wait_response(
                 return Err(BridgeError::Unavailable("后端进程已退出".to_string()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bridge() -> PwshBridge {
+        PwshBridge::new(BridgeOptions::new("nope.ps1"))
+    }
+
+    /// 未启动时没有受管理的子进程：工具层据此不做额外保护。
+    #[test]
+    fn no_child_pid_before_start() {
+        assert_eq!(bridge().current_child_pid(), None);
+    }
+
+    /// 登记的 PID 一改，对外暴露的就是新值（重启后保护随之转移）。
+    #[test]
+    fn child_pid_tracks_the_latest_value() {
+        let bridge = bridge();
+        bridge.set_child_pid(Some(1234));
+        assert_eq!(bridge.current_child_pid(), Some(1234));
+        // 模拟重启：新进程换 PID。
+        bridge.set_child_pid(Some(5678));
+        assert_eq!(bridge.current_child_pid(), Some(5678));
+        // 模拟退出/被杀：立刻清零，旧 PID 不再被保护。
+        bridge.set_child_pid(None);
+        assert_eq!(bridge.current_child_pid(), None);
+    }
+
+    /// PID 0 表示"没有子进程"，不会被当成一个真实 PID 暴露出去。
+    #[test]
+    fn zero_pid_is_reported_as_none() {
+        let bridge = bridge();
+        bridge.set_child_pid(Some(0));
+        assert_eq!(bridge.current_child_pid(), None);
     }
 }

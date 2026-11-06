@@ -142,10 +142,19 @@ fn parse_rows(raw: &str) -> Vec<ProcessRow> {
 
 /// 自己的进程与"不该被误杀"的助手子进程。
 ///
-/// 判定用**路径**而不是名字：`python.exe` 既是用户的也可能不是我们的，
-/// 但"可执行文件在自己的安装目录/数据目录下"这个条件足够精确。
-fn is_own_process(row: &ProcessRow, own_roots: &[String]) -> bool {
+/// 三层判定，按**精确性**从高到低：
+///  1. 就是本进程（PID 相等）；
+///  2. PID 等于当前受管理的 CUA 后端子进程（`managed_pids`）——
+///     `powershell.exe` 在 `C:\Windows\System32`，路径判定抓不到它；
+///  3. 可执行文件位于助手自己的安装目录/数据目录下（`own_roots`）。
+///
+/// 第 2 层只认 **当前** 那个 PID：bridge 在子进程退出/重启后立即更新，
+/// 不做历史累积，所以 PID 被系统复用不会错误保护无关程序。
+fn is_own_process(row: &ProcessRow, own_roots: &[String], managed_pids: &[u32]) -> bool {
     if row.pid == std::process::id() {
+        return true;
+    }
+    if managed_pids.contains(&row.pid) {
         return true;
     }
     let path = row.path.to_lowercase();
@@ -233,11 +242,12 @@ fn is_protected(name: &str) -> bool {
 /// 三道闸，任何一道不通过都不进 `taskkill`：
 ///  1. 实际 `ProcessName` 必须与请求名**完全一致**（不是前缀、不是包含）；
 ///  2. 不能是系统关键进程（按**实际**名字再查一次，不只是查输入）；
-///  3. 不能是助手自身或其必要子进程。
+///  3. 不能是助手自身、**当前管理的 CUA 子进程**或其必要子进程。
 fn kill_candidates(
     rows: &[ProcessRow],
     requested: &str,
     own_roots: &[String],
+    managed_pids: &[u32],
 ) -> (Vec<ProcessRow>, Vec<String>) {
     let wanted = requested.to_lowercase();
     let mut allowed = Vec::new();
@@ -253,7 +263,7 @@ fn kill_candidates(
             refused.push(format!("{}（系统关键进程）", actual));
             continue;
         }
-        if is_own_process(row, own_roots) {
+        if is_own_process(row, own_roots, managed_pids) {
             refused.push(format!("{}({})（助手自身或其必要进程）", actual, row.pid));
             continue;
         }
@@ -289,7 +299,11 @@ async fn query_windowed(cancel: &CancelToken) -> Result<Vec<ProcessRow>, ToolErr
 }
 
 /// 执行一次 `app_control`。
-pub async fn run_control(args: &Value, cancel: &CancelToken) -> Result<String, ToolError> {
+pub async fn run_control(
+    args: &Value,
+    cancel: &CancelToken,
+    managed_pids: &[u32],
+) -> Result<String, ToolError> {
     let object = as_args(args);
     let action = coerce_string(&object, "action")
         .unwrap_or_default()
@@ -331,7 +345,7 @@ pub async fn run_control(args: &Value, cancel: &CancelToken) -> Result<String, T
             let roots = own_roots();
             let mut rows = query_by_name(&name, cancel).await?;
             // 与旧版一致：自己的进程不列出来——否则用户会以为"助手自己还在跑"。
-            rows.retain(|row| !is_own_process(row, &roots));
+            rows.retain(|row| !is_own_process(row, &roots, managed_pids));
             if rows.is_empty() {
                 return Ok(format!(
                     "没有找到名为「{name}」的进程（已查全部进程，不只是有窗口的）。"
@@ -361,7 +375,15 @@ pub async fn run_control(args: &Value, cancel: &CancelToken) -> Result<String, T
 }
 
 /// 执行一次 `kill_app`。
-pub async fn run_kill(args: &Value, cancel: &CancelToken) -> Result<String, ToolError> {
+///
+/// `managed_pids` 是助手**当前**管理着的子进程（CUA 后端 PowerShell）。
+/// 它必须由调用方在执行前从 bridge 取一次——`powershell.exe` 位于系统目录，
+/// 路径判定抓不到它，只靠 `own_roots` 会把我们的后端一起结束掉。
+pub async fn run_kill(
+    args: &Value,
+    cancel: &CancelToken,
+    managed_pids: &[u32],
+) -> Result<String, ToolError> {
     let object = as_args(args);
     let raw = require_string(&object, "name", "kill_app")?;
     // **第一步就是拒绝通配符**：必须在任何查询之前，也不能靠"查到再筛"兜底——
@@ -381,8 +403,8 @@ pub async fn run_kill(args: &Value, cancel: &CancelToken) -> Result<String, Tool
             "没有找到正在运行的「{name}」（已查全部进程，不只是有窗口的）"
         )));
     }
-    // 执行前再按**实际** ProcessName 复核一次，逐 PID 排除关键进程与自身。
-    let (targets, refused) = kill_candidates(&all, &name, &roots);
+    // 执行前再按**实际** ProcessName 复核一次，逐 PID 排除关键进程、自身与 CUA 子进程。
+    let (targets, refused) = kill_candidates(&all, &name, &roots, managed_pids);
     if targets.is_empty() {
         return Err(ToolError::failed(format!(
             "「{name}」没有可结束的进程（{}）",
@@ -406,7 +428,7 @@ pub async fn run_kill(args: &Value, cancel: &CancelToken) -> Result<String, Tool
         killed.push(row.pid);
     }
 
-    let alive = wait_until_gone(&name, &roots, cancel).await?;
+    let alive = wait_until_gone(&name, &roots, managed_pids, cancel).await?;
     if alive.is_empty() {
         return Ok(format!(
             "「{name}」已结束（taskkill /F /T，{} 个进程树）。",
@@ -432,6 +454,7 @@ pub async fn run_kill(args: &Value, cancel: &CancelToken) -> Result<String, Tool
 async fn wait_until_gone(
     name: &str,
     roots: &[String],
+    managed_pids: &[u32],
     cancel: &CancelToken,
 ) -> Result<Vec<ProcessRow>, ToolError> {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(GONE_WAIT_MS);
@@ -439,7 +462,12 @@ async fn wait_until_gone(
         if cancel.is_cancelled() {
             return Err(ToolError::cancelled());
         }
-        let (rows, _) = kill_candidates(&query_by_name(name, cancel).await?, name, roots);
+        let (rows, _) = kill_candidates(
+            &query_by_name(name, cancel).await?,
+            name,
+            roots,
+            managed_pids,
+        );
         if rows.is_empty() {
             return Ok(rows);
         }
@@ -478,7 +506,7 @@ mod tests {
             title: String::new(),
             path: String::new(),
         };
-        assert!(is_own_process(&me, &[]));
+        assert!(is_own_process(&me, &[], &[]));
 
         let sibling = ProcessRow {
             pid: 999_999,
@@ -486,15 +514,21 @@ mod tests {
             title: String::new(),
             path: "D:\\apps\\cuava\\cuava.exe".into(),
         };
-        assert!(is_own_process(&sibling, &["d:\\apps\\cuava".to_string()]));
-        assert!(!is_own_process(&sibling, &["d:\\other".to_string()]));
+        assert!(is_own_process(
+            &sibling,
+            &["d:\\apps\\cuava".to_string()],
+            &[]
+        ));
+        assert!(!is_own_process(&sibling, &["d:\\other".to_string()], &[]));
     }
 
     #[tokio::test]
     async fn protected_system_processes_are_refused_before_any_kill() {
         let cancel = CancelToken::new();
         for name in ["explorer", "svchost", "lsass", "csrss"] {
-            let error = run_kill(&json!({"name": name}), &cancel).await.unwrap_err();
+            let error = run_kill(&json!({"name": name}), &cancel, &[])
+                .await
+                .unwrap_err();
             assert!(error.is_argument(), "{name} 必须在动作前被拒绝");
             assert!(error.user_message().contains("系统关键进程"));
         }
@@ -524,7 +558,7 @@ mod tests {
             "   ",
             "",
         ] {
-            let error = run_kill(&json!({"name": name}), &cancel).await;
+            let error = run_kill(&json!({"name": name}), &cancel, &[]).await;
             let error = match error {
                 Ok(text) => panic!("「{name}」必须被拒绝，却返回成功：{text}"),
                 Err(error) => error,
@@ -584,7 +618,8 @@ mod tests {
             },
         ];
 
-        let (allowed, refused) = kill_candidates(&rows, "chrome", &["d:\\apps\\cuava".to_string()]);
+        let (allowed, refused) =
+            kill_candidates(&rows, "chrome", &["d:\\apps\\cuava".to_string()], &[]);
         assert_eq!(allowed.len(), 1, "只允许精确匹配的 chrome");
         assert_eq!(allowed[0].pid, 100);
         assert!(
@@ -596,17 +631,123 @@ mod tests {
 
         // 请求 svchost 时一个都不许结束（保护名单按实际名字生效）。
         let (allowed, refused) =
-            kill_candidates(&rows, "svchost", &["d:\\apps\\cuava".to_string()]);
+            kill_candidates(&rows, "svchost", &["d:\\apps\\cuava".to_string()], &[]);
         assert!(allowed.is_empty(), "系统关键进程不能进 taskkill");
         assert!(refused.iter().any(|item| item.contains("系统关键进程")));
 
         // 请求助手自己的名字：同样一个都不许结束。
-        let (allowed, _) = kill_candidates(&rows, "cuava", &["d:\\apps\\cuava".to_string()]);
+        let (allowed, _) = kill_candidates(&rows, "cuava", &["d:\\apps\\cuava".to_string()], &[]);
         assert!(allowed.is_empty(), "助手自身不能被结束");
 
         // 大小写不敏感（Windows 语义），但仍然要求整名相等。
-        let (allowed, _) = kill_candidates(&rows, "CHROME", &[]);
+        let (allowed, _) = kill_candidates(&rows, "CHROME", &[], &[]);
         assert_eq!(allowed.len(), 1);
+    }
+
+    /// **CUA 后端 PowerShell 不能被 kill_app 结束**。
+    ///
+    /// `powershell.exe` 位于 `C:\Windows\System32`，不在助手安装目录下，
+    /// 所以只靠 `own_roots` 的路径判定抓不到它——这正是本次修的缺陷。
+    /// 同时必须保留"结束**普通** PowerShell"的能力，不能把名字一律加进保护名单。
+    #[test]
+    fn managed_cua_powershell_is_protected_but_user_powershell_is_not() {
+        let cua_pid = 4242;
+        let rows = vec![
+            // 助手的 CUA 后端：系统目录里的 powershell.exe。
+            ProcessRow {
+                pid: cua_pid,
+                name: "powershell".into(),
+                title: String::new(),
+                path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into(),
+            },
+            // 用户自己开的 PowerShell：同样路径，但 PID 不在受管理集合里。
+            ProcessRow {
+                pid: 4243,
+                name: "powershell".into(),
+                title: "Windows PowerShell".into(),
+                path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into(),
+            },
+            // 助手主进程。
+            ProcessRow {
+                pid: 4244,
+                name: "cuava".into(),
+                title: String::new(),
+                path: "D:\\apps\\cuava\\cuava.exe".into(),
+            },
+        ];
+
+        let (allowed, refused) = kill_candidates(&rows, "powershell", &[], &[cua_pid]);
+        assert_eq!(
+            allowed.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![4243],
+            "只允许结束用户自己的 powershell"
+        );
+        assert!(
+            refused.iter().any(|item| item.contains("4242")),
+            "CUA 子进程必须被记录为拒绝：{refused:?}"
+        );
+
+        // 没有受管理 PID 时（后端未启动），两个 powershell 都可以是目标——
+        // 证明保护来自"当前 PID"而不是"进程名一律拉黑"。
+        let (allowed, _) = kill_candidates(&rows, "powershell", &[], &[]);
+        assert_eq!(allowed.len(), 2, "没有 CUA 时不该按名字一刀切");
+    }
+
+    /// CUA 进程重启 / PID 变化后，保护关系必须跟着更新。
+    #[test]
+    fn protection_follows_the_current_cua_pid_only() {
+        let rows = vec![
+            ProcessRow {
+                pid: 5001,
+                name: "powershell".into(),
+                title: String::new(),
+                path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into(),
+            },
+            ProcessRow {
+                pid: 5002,
+                name: "powershell".into(),
+                title: String::new(),
+                path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into(),
+            },
+        ];
+
+        // 第一代 CUA 是 5001：它被保护，5002 可结束。
+        let (allowed, _) = kill_candidates(&rows, "powershell", &[], &[5001]);
+        assert_eq!(
+            allowed.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![5002]
+        );
+
+        // 重启后 CUA 变成 5002：保护随之转移，旧 PID 不再特殊。
+        let (allowed, refused) = kill_candidates(&rows, "powershell", &[], &[5002]);
+        assert_eq!(
+            allowed.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![5001],
+            "旧 PID 不能继续被保护"
+        );
+        assert!(refused.iter().any(|item| item.contains("5002")));
+    }
+
+    /// 旧 PID 被系统复用（新进程仍是 powershell）时，不会因为历史记录被保护。
+    ///
+    /// 保护集合只来自"当前管理的 PID"，不累积历史；所以只要 bridge 已清零，
+    /// 复用同一 PID 的无关进程就是普通目标。
+    #[test]
+    fn recycled_pid_is_not_protected_once_the_cua_process_is_gone() {
+        let rows = vec![ProcessRow {
+            pid: 6001,
+            name: "powershell".into(),
+            title: String::new(),
+            path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into(),
+        }];
+
+        // CUA 已经退出：bridge 清空 → 没有任何受管理 PID。
+        let (allowed, _) = kill_candidates(&rows, "powershell", &[], &[]);
+        assert_eq!(allowed.len(), 1, "复用 PID 的无关进程不该被保护");
+
+        // 反向确认：只要它仍是当前 CUA，就必须保护。
+        let (allowed, _) = kill_candidates(&rows, "powershell", &[], &[6001]);
+        assert!(allowed.is_empty());
     }
 
     /// 精确名字的合法目标仍然可以被选中（不会因为这次收紧而全都杀不掉）。
@@ -625,7 +766,7 @@ mod tests {
             .expect("测试进程必须有可执行文件名");
         let rows = query_by_name(&exe_name, &cancel).await.unwrap();
         assert!(!rows.is_empty(), "按名字应能查到当前测试进程");
-        let (allowed, refused) = kill_candidates(&rows, &exe_name, &own_roots());
+        let (allowed, refused) = kill_candidates(&rows, &exe_name, &own_roots(), &[]);
         assert!(allowed.is_empty(), "自己的进程必须被排除");
         assert!(!refused.is_empty(), "应记录为拒绝原因：{refused:?}");
     }
@@ -633,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_action_is_rejected() {
         let cancel = CancelToken::new();
-        let error = run_control(&json!({"action":"stop"}), &cancel)
+        let error = run_control(&json!({"action":"stop"}), &cancel, &[])
             .await
             .unwrap_err();
         assert!(error.is_argument());
@@ -655,6 +796,7 @@ mod tests {
         let text = run_control(
             &json!({"action":"find","name":"cuava-definitely-not-running"}),
             &cancel,
+            &[],
         )
         .await
         .unwrap();
@@ -665,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn list_returns_something_readable() {
         let cancel = CancelToken::new();
-        let text = run_control(&json!({"action":"list"}), &cancel)
+        let text = run_control(&json!({"action":"list"}), &cancel, &[])
             .await
             .unwrap();
         assert!(

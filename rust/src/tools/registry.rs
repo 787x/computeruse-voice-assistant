@@ -373,6 +373,21 @@ impl crate::agent::ToolInvoker for ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// 当前由 bridge 管理的 CUA 后端子进程 PID。
+    ///
+    /// 没有 CUA 后端（找不到 `cua.ps1`）或后端尚未启动时返回空：
+    /// 此时没有任何进程需要额外保护。
+    ///
+    /// **只返回此刻有效的那一个**：bridge 在 spawn 时写入、在 kill/崩溃/启动
+    /// 失败时清零，所以这里不会拿到已经退出的历史 PID（PID 复用不会误保护）。
+    pub fn managed_cua_pids(&self) -> Vec<u32> {
+        self.cua
+            .as_ref()
+            .and_then(|toolkit| toolkit.bridge().current_child_pid())
+            .into_iter()
+            .collect()
+    }
+
     /// 执行一次工具调用。
     ///
     /// 返回 `ToolExecution`（文本 + 可选图像）：截图必须走**真正的**
@@ -389,8 +404,21 @@ impl ToolRegistry {
                 shell::run(args, cancel, Some(self.home.as_path())).await?,
             )),
             "files" => Ok(text_of(files::run(args, cancel).await?)),
-            "app_control" => Ok(text_of(procs::run_control(args, cancel).await?)),
-            "kill_app" => Ok(text_of(procs::run_kill(args, cancel).await?)),
+            /*
+             * `app_control` / `kill_app` 都要知道"当前受管理的 CUA 子进程"。
+             *
+             * `powershell.exe` 位于 `C:\Windows\System32`，路径判定抓不到它：
+             * 只有 bridge 知道自己此刻管着哪个 PID，所以这里**每次执行前**
+             * 现取一次（不缓存、不留历史），进程重启后自然拿到新值。
+             */
+            "app_control" => {
+                let managed = self.managed_cua_pids();
+                Ok(text_of(procs::run_control(args, cancel, &managed).await?))
+            }
+            "kill_app" => {
+                let managed = self.managed_cua_pids();
+                Ok(text_of(procs::run_kill(args, cancel, &managed).await?))
+            }
             "launch_app" => {
                 let mut index = tokio::select! {
                     guard = self.app_index.lock() => guard,
@@ -585,6 +613,43 @@ mod tests {
             "{}",
             error.user_message()
         );
+    }
+
+    /// 没有 CUA 后端时没有需要额外保护的子进程。
+    #[test]
+    fn managed_cua_pids_is_empty_without_a_backend() {
+        let registry = registry();
+        assert!(registry.managed_cua_pids().is_empty());
+    }
+
+    /// 有后端但尚未启动时同样为空——不会凭空保护某个 PID。
+    #[test]
+    fn managed_cua_pids_is_empty_before_the_backend_starts() {
+        let bridge =
+            crate::cua::bridge::PwshBridge::new(crate::cua::bridge::BridgeOptions::new("nope.ps1"));
+        let toolkit = Arc::new(CuaToolkit::new(bridge, None));
+        let registry = ToolRegistry::new(Some(toolkit), Arc::new(WebSearch::new("")), true);
+        assert!(
+            registry.managed_cua_pids().is_empty(),
+            "后端没起来时不该报告任何 PID"
+        );
+    }
+
+    /// 后端登记了子进程后，registry 必须如实透出**那一个** PID；
+    /// 清零后立刻不再透出（PID 复用不会误保护）。
+    #[test]
+    fn managed_cua_pids_reflects_the_current_backend_child() {
+        let bridge =
+            crate::cua::bridge::PwshBridge::new(crate::cua::bridge::BridgeOptions::new("nope.ps1"));
+        let toolkit = Arc::new(CuaToolkit::new(bridge, None));
+        // 直接把这只 toolkit 的 bridge 当成"已启动"，登记一个假 PID。
+        toolkit.bridge().set_child_pid_for_test(Some(4321));
+        let registry = ToolRegistry::new(Some(toolkit.clone()), Arc::new(WebSearch::new("")), true);
+        assert_eq!(registry.managed_cua_pids(), vec![4321]);
+
+        // 进程退出（bridge 清零）：registry 不再报告它。
+        toolkit.bridge().set_child_pid_for_test(None);
+        assert!(registry.managed_cua_pids().is_empty());
     }
 
     #[test]

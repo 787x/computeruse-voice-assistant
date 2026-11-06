@@ -95,7 +95,14 @@ pub enum UiCommand {
     /// 测试联网搜索 Key 的可用性（真实打一次 `POST /search`）。
     ///
     /// `key` 为空 = 用已保存的 Key；非空 = 用界面上还没保存的草稿。
-    TestSearchKey(String),
+    ///
+    /// `generation` 是**点击测试那一刻**的测试代次。命令在通道里排队期间
+    /// 用户完全可能又改了输入（界面侧会推进代次），所以工作线程处理这条命令前
+    /// 必须先核对它是否仍然有效——否则 Key A 的旧命令会被当成 Key B 的测试。
+    TestSearchKey {
+        key: String,
+        generation: u64,
+    },
     /// 切换提供商（界面据此回填地址与模型）。
     ProviderChanged,
     /// 打开设置：按当前已保存的配置回填界面。
@@ -636,10 +643,19 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
          *
          * 测试**不在 Slint 线程上发请求**：一次真实搜索要 1~8 秒，
          * 在事件循环里等会把整个界面卡住（这正是 PR8 定下的规矩）。
+         *
+         * **代次在点击这一刻就确定**：命令进队列后、工作线程处理前，用户仍可能
+         * 改输入框（界面侧会推进代次）。把点击时的代次随命令带上，工作线程
+         * 处理前先核对；否则 Key A 的旧命令会被当成 Key B 的测试结果。
          */
         let test_tx = command_tx.clone();
+        let generation = search_test_generation.clone();
         window.on_test_search_key(move |key| {
-            let _ = test_tx.send(UiCommand::TestSearchKey(key.to_string()));
+            let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = test_tx.send(UiCommand::TestSearchKey {
+                key: key.to_string(),
+                generation,
+            });
         });
         let clear_tx = command_tx.clone();
         window.on_clear_search_key(move || {
@@ -1812,21 +1828,17 @@ async fn run_worker(
                 }
                 Err(error) => set_status(&weak, &format!("清除联网搜索 Key 失败：{error}")),
             },
-            UiCommand::TestSearchKey(draft_key) => {
-                /*
-                 * 可用性测试：真的打一次接口，但**只读不写**。
-                 *
-                 * 用**草稿优先**：用户刚填了 Key 想先试一下、还没保存，
-                 * 这时拿已保存的旧 Key 去测只会给出误导性的结论。
-                 * 测试结果只用于显示；不写盘、不改共享客户端。
-                 */
-                let key = if draft_key.trim().is_empty() {
-                    secret.load_search_key().ok().flatten().unwrap_or_default()
-                } else {
-                    draft_key.trim().to_string()
-                };
-                let generation = search_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
-                handle_test_search_key(&weak, key, generation, &search_test_generation);
+            UiCommand::TestSearchKey {
+                key: draft_key,
+                generation,
+            } => {
+                handle_queued_search_test(
+                    &weak,
+                    &secret,
+                    draft_key,
+                    generation,
+                    &search_test_generation,
+                );
             }
             // ---- 设置分类导航 ----
             UiCommand::SettingsTab(index) => {
@@ -3937,28 +3949,54 @@ async fn wait_turn(
                             }
                         }
                     }
-                    Some(UiCommand::TestSearchKey(key)) => {
-                        /*
-                         * 可用性测试：真的打一次接口，但**只读不写**。
-                         *
-                         * 用**草稿优先**：用户刚填了 Key 想先试一下、还没保存，
-                         * 这时拿已保存的旧 Key 去测只会给出误导性的结论。
-                         * 测试结果只用于显示；不写盘、不改共享客户端。
-                         */
-                        let key = if key.trim().is_empty() {
-                            secret.load_search_key().ok().flatten().unwrap_or_default()
-                        } else {
-                            key.trim().to_string()
-                        };
-                        let generation =
-                            search_test_generation.fetch_add(1, Ordering::SeqCst) + 1;
-                        handle_test_search_key(weak, key, generation, search_test_generation);
+                    Some(UiCommand::TestSearchKey { key, generation }) => {
+                        handle_queued_search_test(
+                            weak,
+                            secret,
+                            key,
+                            generation,
+                            search_test_generation,
+                        );
                     }
                     None => return TurnWait::Quit,
                 }
             }
         }
     }
+}
+
+/// 处理一条**已排队**的 Key 测试命令。
+///
+/// 关键：命令携带的是**点击那一刻**的代次。命令在通道里排队期间用户可能
+/// 已经改了输入框（界面侧推进代次），此时这条命令已经过期——必须丢弃，
+/// 否则 Key A 的测试会跑在 Key B 的输入旁边，结果被当成 B 的结论。
+///
+/// 这里**不**再推进代次：推进的责任在"点击测试"（界面侧）与
+/// "改草稿/保存/清除"（各自路径）。收到命令时只做核对。
+fn handle_queued_search_test(
+    weak: &slint::Weak<AppWindow>,
+    secret: &SecretStore,
+    draft_key: String,
+    generation: u64,
+    search_test_generation: &Arc<std::sync::atomic::AtomicU64>,
+) {
+    // 排队期间状态变了：丢掉这条命令，连"测试中"都不要点亮。
+    if search_test_generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    /*
+     * 可用性测试：真的打一次接口，但**只读不写**。
+     *
+     * 用**草稿优先**：用户刚填了 Key 想先试一下、还没保存，
+     * 这时拿已保存的旧 Key 去测只会给出误导性的结论。
+     * 测试结果只用于显示；不写盘、不改共享客户端。
+     */
+    let key = if draft_key.trim().is_empty() {
+        secret.load_search_key().ok().flatten().unwrap_or_default()
+    } else {
+        draft_key.trim().to_string()
+    };
+    handle_test_search_key(weak, key, generation, search_test_generation);
 }
 
 /// 联网搜索 Key 的可用性测试（后台执行，结果回填设置页）。
@@ -5694,6 +5732,61 @@ mod tests {
         let after = generation.load(Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(generation.load(Ordering::SeqCst), after);
+    }
+
+    /// **问题 2 的核心回归**：命令已入队、工作线程尚未处理时用户改了 Key。
+    ///
+    /// 修复前代次在工作线程收到命令后才推进，于是 Key A 的旧命令会把代次
+    /// 推到新值、然后正常执行 —— 结果被显示在 Key B 的输入框旁边。
+    /// 现在代次在**点击那一刻**就确定并随命令携带，处理前先核对。
+    #[tokio::test]
+    async fn queued_test_command_is_dropped_when_draft_changed_before_processing() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // 点击「测试可用性」（Key A）：界面侧立刻推进到第 1 代并带上它。
+        let clicked_with = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(clicked_with, 1);
+
+        // 命令还在队列里，用户已把输入改成 Key B（界面侧推进到第 2 代）。
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        // 工作线程这时才处理这条命令：必须丢弃，且不点亮"测试中"。
+        let before = generation.load(Ordering::SeqCst);
+        handle_queued_search_test(
+            &slint::Weak::default(),
+            &SecretStore::new(std::env::temp_dir().join("cuava-queued-test-unused")),
+            "tvly-key-A".to_string(),
+            clicked_with,
+            &generation,
+        );
+        // 丢弃时不再推进代次（推进只发生在点击/编辑/保存/清除）。
+        assert_eq!(
+            generation.load(Ordering::SeqCst),
+            before,
+            "被丢弃的命令不该改动代次"
+        );
+    }
+
+    /// 代次仍有效时，排队命令会正常执行（收紧不能把正常测试也拦掉）。
+    #[tokio::test]
+    async fn queued_test_command_runs_when_generation_is_still_current() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clicked_with = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let before = generation.load(Ordering::SeqCst);
+        handle_queued_search_test(
+            &slint::Weak::default(),
+            &SecretStore::new(std::env::temp_dir().join("cuava-queued-test-run")),
+            "tvly-current".to_string(),
+            clicked_with,
+            &generation,
+        );
+        // 正常路径：代次不变（测试本身只读），后台任务已经启动。
+        assert_eq!(generation.load(Ordering::SeqCst), before);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            generation.load(Ordering::SeqCst),
+            before,
+            "测试完成也不该推进代次"
+        );
     }
 
     /// 测试成功后**不保存**，实际运行凭据与工具集保持不变。
