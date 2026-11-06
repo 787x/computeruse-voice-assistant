@@ -190,6 +190,29 @@ pub fn provider_hint_index(hint: ProviderHint) -> i32 {
 }
 
 /// 播报后端下拉顺序（与界面数组一致）。
+pub const MIMO_VOICES: &[&str] = &[
+    "",
+    "mimo_default",
+    "冰糖",
+    "茉莉",
+    "苏打",
+    "白桦",
+    "Mia",
+    "Chloe",
+    "Milo",
+    "Dean",
+];
+pub fn mimo_voice_index(voice: &str) -> i32 {
+    MIMO_VOICES
+        .iter()
+        .position(|v| *v == voice)
+        .map(|i| i as i32)
+        .unwrap_or(10)
+}
+pub fn mimo_voice_for_index(index: i32) -> &'static str {
+    MIMO_VOICES.get(index as usize).copied().unwrap_or("")
+}
+
 pub const TTS_BACKENDS: &[TtsBackend] = &[TtsBackend::Off, TtsBackend::Mimo, TtsBackend::Local];
 
 /// 自动播报选项的界面标签（与 `speak_flags` 的顺序严格对应）。
@@ -1258,6 +1281,27 @@ mod tests {
         assert_eq!(candidate.timeout_ms, 5_000);
         assert_eq!(candidate.context_window, 1_000_000);
         assert_eq!(candidate.context_compress_percent, 10);
+    }
+
+    #[test]
+    fn pr14_voice_mapping_preserves_defaults_presets_and_custom() {
+        for (i, voice) in MIMO_VOICES.iter().enumerate() {
+            assert_eq!(mimo_voice_index(voice), i as i32);
+            assert_eq!(mimo_voice_for_index(i as i32), *voice);
+        }
+        assert_ne!(mimo_voice_index(""), mimo_voice_index("mimo_default"));
+        assert_eq!(mimo_voice_index("legacy-custom"), 10);
+        for voice in ["茉莉", "", "mimo_default", "legacy-custom"] {
+            let mut settings = Settings::default();
+            settings.tts.mimo_voice = voice.into();
+            let json = serde_json::to_string(&settings).unwrap();
+            let loaded: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded.tts.mimo_voice, voice);
+            assert_eq!(
+                mimo_voice_index(&loaded.tts.mimo_voice),
+                mimo_voice_index(voice)
+            );
+        }
     }
 
     #[test]

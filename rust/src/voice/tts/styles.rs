@@ -57,9 +57,46 @@ pub fn prefix(tags: &[String]) -> String {
     }
 }
 
+/// 只有添加操作；重复项不改变已有选择。先校验，再执行唱歌模式互斥。
+pub fn add(tags: &mut Vec<String>, name: &str) -> Result<bool, String> {
+    validate(&[name.to_string()])?;
+    if tags.iter().any(|s| s == name) {
+        return Ok(false);
+    }
+    let mut next = tags.clone();
+    if singing(name) || next.iter().any(|s| singing(s)) {
+        next.clear();
+    }
+    next.push(name.to_string());
+    validate(&next)?;
+    *tags = next;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_add_is_idempotent_and_failed_add_is_atomic() {
+        let mut tags = vec!["温柔".into()];
+        assert_eq!(add(&mut tags, "温柔"), Ok(false));
+        assert_eq!(tags, ["温柔"]);
+        assert!(add(&mut tags, "坏\n标签").is_err());
+        assert_eq!(tags, ["温柔"]);
+        assert_eq!(add(&mut tags, "清亮"), Ok(true));
+        assert_eq!(prefix(&tags), "(温柔 清亮)");
+        assert_eq!(add(&mut tags, "singing"), Ok(true));
+        assert_eq!(tags, ["singing"]);
+        assert_eq!(add(&mut tags, "温柔"), Ok(true));
+        assert_eq!(tags, ["温柔"]);
+        tags = (0..16).map(|i| format!("标签{i}")).collect();
+        let old = tags.clone();
+        assert!(add(&mut tags, "第17项").is_err());
+        assert_eq!(tags, old);
+        assert!(add(&mut tags, &"😀".repeat(33)).is_err());
+        assert_eq!(tags, old);
+    }
+
     #[test]
     fn preset_count_and_validation() {
         assert_eq!(PRESETS.len(), 8);

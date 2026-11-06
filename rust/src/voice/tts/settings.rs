@@ -281,6 +281,41 @@ mod tests {
     }
 
     #[test]
+    fn pr14_playback_ranges_roundtrip_and_reject_invalid_values() {
+        for speed in [0.5, 1.0, 2.0] {
+            for volume in [0.0, 0.5, 1.0] {
+                let settings = TtsSettings {
+                    mimo_speed: speed,
+                    volume,
+                    ..Default::default()
+                }
+                .normalized()
+                .unwrap();
+                let loaded: TtsSettings =
+                    serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+                assert_eq!(loaded.mimo_speed, speed);
+                assert_eq!(loaded.volume, volume);
+            }
+        }
+        for speed in [0.49, 2.01, f32::NAN, f32::INFINITY] {
+            assert!(TtsSettings {
+                mimo_speed: speed,
+                ..Default::default()
+            }
+            .normalized()
+            .is_err());
+        }
+        for volume in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+            assert!(TtsSettings {
+                volume,
+                ..Default::default()
+            }
+            .normalized()
+            .is_err());
+        }
+    }
+
+    #[test]
     fn roundtrip_keeps_selected_backend() {
         let settings = TtsSettings {
             enabled: true,

@@ -592,6 +592,45 @@ component EndpointEditor inherits Rectangle {
     }
 }
 
+// Native Slint geometry: compact adaptive cells, no renderer or backend changes.
+component TtsTagWrap inherits Rectangle {
+    in property <[string]> tags;
+    in property <bool> removable: false;
+    callback picked(string);
+    private property <int> columns: Math.max(1, Math.floor(self.width / 112px));
+    height: Math.ceil(tags.length / columns) * 36px;
+    for tag[i] in root.tags : AppButton {
+        x: Math.mod(i, root.columns) * (root.width / root.columns);
+        y: Math.floor(i / root.columns) * 36px;
+        width: root.width / root.columns - 6px;
+        label: tag + (root.removable ? " ×" : "");
+        clicked => { root.picked(tag); }
+    }
+}
+component TtsRange inherits Rectangle {
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in property <float> value: 1;
+    callback edited(float);
+    height: 32px;
+    forward-focus: keys;
+    function set-position(x: length) { root.edited(Math.round((root.minimum + Math.clamp(x / root.width, 0, 1) * (root.maximum - root.minimum)) * 100) / 100); }
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.LeftArrow || event.text == Key.RightArrow {
+                root.edited(Math.clamp(root.value + (event.text == Key.LeftArrow ? -0.01 : 0.01), root.minimum, root.maximum)); return accept;
+            }
+            return reject;
+        }
+    }
+    Rectangle { y: 14px; height: 4px; background: #c9c9d0; border-radius: 2px; }
+    Rectangle { x: Math.clamp((root.value - root.minimum) / (root.maximum - root.minimum), 0, 1) * (parent.width - 16px); y: 8px; width: 16px; height: 16px; border-radius: 8px; background: keys.has-focus ? #184e9a : #1f6feb; }
+    input := TouchArea {
+        clicked => { keys.focus(); root.set-position(self.mouse-x); }
+        moved => { if self.pressed { root.set-position(self.mouse-x); } }
+    }
+}
+
 export component AppWindow inherits Window {
     in-out property <[EndpointCard]> endpoint-cards;
     in-out property <string> settings-provider-id;
@@ -809,6 +848,13 @@ export component AppWindow inherits Window {
     pure callback tts-prefix(string) -> string;
     pure callback tts-matches(string, string) -> bool;
     callback tts-tag-action(string);
+    callback tts-add-custom();
+    in-out property <string> tts-tag-hint;
+    pure callback tts-voice-index(string) -> int;
+    pure callback tts-voice-for-index(int) -> string;
+    pure callback tts-number(string) -> float;
+    pure callback tts-format-number(float) -> string;
+    pure callback tts-presets(string, string) -> [string];
     callback tts-refresh-devices();
 
     in-out property <string> tts-local-dir: "";
@@ -1965,7 +2011,7 @@ export component AppWindow inherits Window {
                                 AppLineEdit { text <=> root.keywords-file; edited => { root.settings-dirty = true; root.local-model-check = "路径已更改，请检查"; } }
                                 AppButton { label: "选择…"; clicked => { root.choose-local-path(2); } }
                             }
-                            HorizontalLayout {
+                            if root.tts-backend-index == 2 : HorizontalLayout {
                                 spacing: 8px;
                                 Text { text: "ONNX TTS 目录"; width: 100px; color: #1f1f22; vertical-alignment: center; }
                                 AppLineEdit { text <=> root.tts-local-dir; edited => { root.settings-dirty = true; root.local-model-check = "路径已更改，请检查"; } }
@@ -2054,118 +2100,46 @@ export component AppWindow inherits Window {
                                 AppLineEdit { text <=> root.tts-mimo-model; edited => { root.settings-dirty = true; } }
                                 AppButton { label: root.tts-mimo-streaming ? "✓ 流式播放（推荐）" : "非流式 WAV 播放"; clicked => { root.tts-mimo-streaming = !root.tts-mimo-streaming; root.settings-dirty = true; } }
                                 Text { text: "预置音色（当前：" + root.tts-mimo-voice + "）"; color: Theme.text-color; }
-                                AppComboBox { options: ["服务端默认", "mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"]; picked(index) => { root.tts-mimo-voice = index == 0 ? "" : self.options[index]; root.settings-dirty = true; } }
+                                AppComboBox { options: ["服务端默认（未指定音色）", "mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean", "自定义音色"]; index: root.tts-voice-index(root.tts-mimo-voice); picked(index) => { if index != 10 { root.tts-mimo-voice = root.tts-voice-for-index(index); } root.settings-dirty = true; } }
+                                AppLineEdit { text <=> root.tts-mimo-voice; placeholder-text: "音色名称；留空表示服务端默认，支持旧自定义音色"; edited => { root.settings-dirty = true; } }
                                 Text { text: "整体风格 · 点击已选项移除"; color: Theme.text-color; }
-                                for tag in root.tts-selected-tags : AppButton { width: 180px; label: tag + " ×"; clicked => { root.tts-tag-action(tag); } }
+                                TtsTagWrap { tags: root.tts-selected-tags; removable: true; picked(tag) => { root.tts-tag-action(tag); } }
                                 Text { text: "请求前缀（按选择顺序）：" + root.tts-prefix(root.tts-mimo-tags); wrap: word-wrap; color: Theme.text-color; }
                                 AppButton { label: "清空整体风格"; clicked => { root.tts-tag-action(""); } }
                                 AppButton { label: root.tts-browse ? "收起预设" : "浏览 / 搜索预设与自定义风格"; clicked => { root.tts-browse = !root.tts-browse; } }
                                 if root.tts-browse : VerticalLayout {
                                     AppLineEdit { text <=> root.tts-search; placeholder-text: "搜索风格或类别"; }
-                                    if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("开心", root.tts-search) || root.tts-matches("悲伤", root.tts-search) || root.tts-matches("愤怒", root.tts-search) || root.tts-matches("恐惧", root.tts-search) || root.tts-matches("惊讶", root.tts-search) || root.tts-matches("兴奋", root.tts-search) || root.tts-matches("委屈", root.tts-search) || root.tts-matches("平静", root.tts-search) || root.tts-matches("冷漠", root.tts-search) : VerticalLayout {
-                                        Text { text: "基础情绪"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("开心", root.tts-search) : AppButton { label: "开心"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("悲伤", root.tts-search) : AppButton { label: "悲伤"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("愤怒", root.tts-search) : AppButton { label: "愤怒"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("恐惧", root.tts-search) : AppButton { label: "恐惧"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("惊讶", root.tts-search) : AppButton { label: "惊讶"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("兴奋", root.tts-search) : AppButton { label: "兴奋"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("委屈", root.tts-search) : AppButton { label: "委屈"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("平静", root.tts-search) : AppButton { label: "平静"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("基础情绪", root.tts-search) || root.tts-matches("冷漠", root.tts-search) : AppButton { label: "冷漠"; clicked => { root.tts-tag-action(self.label); } }
+                                    ScrollView {
+                                        height: 230px;
+                                        content-width: self.width;
+                                        content-height: preset-groups.preferred-height;
+                                        preset-groups := VerticalLayout {
+                                            alignment: start; spacing: 6px;
+                                            for category in ["基础情绪", "复合情绪", "整体语调", "音色定位", "人设腔调", "方言", "角色扮演", "特殊风格"] : VerticalLayout {
+                                                if root.tts-presets(category, root.tts-search).length > 0 : Text { text: category; color: Theme.text-color; }
+                                                TtsTagWrap { tags: root.tts-presets(category, root.tts-search); picked(tag) => { root.tts-tag-action(tag); } }
+                                            }
+                                            if root.tts-presets("基础情绪", root.tts-search).length + root.tts-presets("复合情绪", root.tts-search).length + root.tts-presets("整体语调", root.tts-search).length + root.tts-presets("音色定位", root.tts-search).length + root.tts-presets("人设腔调", root.tts-search).length + root.tts-presets("方言", root.tts-search).length + root.tts-presets("角色扮演", root.tts-search).length + root.tts-presets("特殊风格", root.tts-search).length == 0 : Text { text: "没有匹配的风格"; color: Theme.text-color; }
                                         }
                                     }
-                                    if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("怅然", root.tts-search) || root.tts-matches("欣慰", root.tts-search) || root.tts-matches("无奈", root.tts-search) || root.tts-matches("愧疚", root.tts-search) || root.tts-matches("释然", root.tts-search) || root.tts-matches("嫉妒", root.tts-search) || root.tts-matches("厌倦", root.tts-search) || root.tts-matches("忐忑", root.tts-search) || root.tts-matches("动情", root.tts-search) : VerticalLayout {
-                                        Text { text: "复合情绪"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("怅然", root.tts-search) : AppButton { label: "怅然"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("欣慰", root.tts-search) : AppButton { label: "欣慰"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("无奈", root.tts-search) : AppButton { label: "无奈"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("愧疚", root.tts-search) : AppButton { label: "愧疚"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("释然", root.tts-search) : AppButton { label: "释然"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("嫉妒", root.tts-search) : AppButton { label: "嫉妒"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("厌倦", root.tts-search) : AppButton { label: "厌倦"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("忐忑", root.tts-search) : AppButton { label: "忐忑"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("复合情绪", root.tts-search) || root.tts-matches("动情", root.tts-search) : AppButton { label: "动情"; clicked => { root.tts-tag-action(self.label); } }
-                                        }
-                                    }
-                                    if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("温柔", root.tts-search) || root.tts-matches("高冷", root.tts-search) || root.tts-matches("活泼", root.tts-search) || root.tts-matches("严肃", root.tts-search) || root.tts-matches("慵懒", root.tts-search) || root.tts-matches("俏皮", root.tts-search) || root.tts-matches("深沉", root.tts-search) || root.tts-matches("干练", root.tts-search) || root.tts-matches("凌厉", root.tts-search) : VerticalLayout {
-                                        Text { text: "整体语调"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("温柔", root.tts-search) : AppButton { label: "温柔"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("高冷", root.tts-search) : AppButton { label: "高冷"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("活泼", root.tts-search) : AppButton { label: "活泼"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("严肃", root.tts-search) : AppButton { label: "严肃"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("慵懒", root.tts-search) : AppButton { label: "慵懒"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("俏皮", root.tts-search) : AppButton { label: "俏皮"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("深沉", root.tts-search) : AppButton { label: "深沉"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("干练", root.tts-search) : AppButton { label: "干练"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("整体语调", root.tts-search) || root.tts-matches("凌厉", root.tts-search) : AppButton { label: "凌厉"; clicked => { root.tts-tag-action(self.label); } }
-                                        }
-                                    }
-                                    if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("磁性", root.tts-search) || root.tts-matches("醇厚", root.tts-search) || root.tts-matches("清亮", root.tts-search) || root.tts-matches("空灵", root.tts-search) || root.tts-matches("稚嫩", root.tts-search) || root.tts-matches("苍老", root.tts-search) || root.tts-matches("甜美", root.tts-search) || root.tts-matches("沙哑", root.tts-search) || root.tts-matches("醇雅", root.tts-search) : VerticalLayout {
-                                        Text { text: "音色定位"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("磁性", root.tts-search) : AppButton { label: "磁性"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("醇厚", root.tts-search) : AppButton { label: "醇厚"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("清亮", root.tts-search) : AppButton { label: "清亮"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("空灵", root.tts-search) : AppButton { label: "空灵"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("稚嫩", root.tts-search) : AppButton { label: "稚嫩"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("苍老", root.tts-search) : AppButton { label: "苍老"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("甜美", root.tts-search) : AppButton { label: "甜美"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("沙哑", root.tts-search) : AppButton { label: "沙哑"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("音色定位", root.tts-search) || root.tts-matches("醇雅", root.tts-search) : AppButton { label: "醇雅"; clicked => { root.tts-tag-action(self.label); } }
-                                        }
-                                    }
-                                    if root.tts-search == "" || root.tts-matches("人设腔调", root.tts-search) || root.tts-matches("夹子音", root.tts-search) || root.tts-matches("御姐音", root.tts-search) || root.tts-matches("正太音", root.tts-search) || root.tts-matches("大叔音", root.tts-search) || root.tts-matches("台湾腔", root.tts-search) : VerticalLayout {
-                                        Text { text: "人设腔调"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("人设腔调", root.tts-search) || root.tts-matches("夹子音", root.tts-search) : AppButton { label: "夹子音"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("人设腔调", root.tts-search) || root.tts-matches("御姐音", root.tts-search) : AppButton { label: "御姐音"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("人设腔调", root.tts-search) || root.tts-matches("正太音", root.tts-search) : AppButton { label: "正太音"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("人设腔调", root.tts-search) || root.tts-matches("大叔音", root.tts-search) : AppButton { label: "大叔音"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("人设腔调", root.tts-search) || root.tts-matches("台湾腔", root.tts-search) : AppButton { label: "台湾腔"; clicked => { root.tts-tag-action(self.label); } }
-                                        }
-                                    }
-                                    if root.tts-search == "" || root.tts-matches("方言", root.tts-search) || root.tts-matches("东北话", root.tts-search) || root.tts-matches("四川话", root.tts-search) || root.tts-matches("河南话", root.tts-search) || root.tts-matches("粤语", root.tts-search) : VerticalLayout {
-                                        Text { text: "方言"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("方言", root.tts-search) || root.tts-matches("东北话", root.tts-search) : AppButton { label: "东北话"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("方言", root.tts-search) || root.tts-matches("四川话", root.tts-search) : AppButton { label: "四川话"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("方言", root.tts-search) || root.tts-matches("河南话", root.tts-search) : AppButton { label: "河南话"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("方言", root.tts-search) || root.tts-matches("粤语", root.tts-search) : AppButton { label: "粤语"; clicked => { root.tts-tag-action(self.label); } }
-                                        }
-                                    }
-                                    if root.tts-search == "" || root.tts-matches("角色扮演", root.tts-search) || root.tts-matches("孙悟空", root.tts-search) || root.tts-matches("林黛玉", root.tts-search) : VerticalLayout {
-                                        Text { text: "角色扮演"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("角色扮演", root.tts-search) || root.tts-matches("孙悟空", root.tts-search) : AppButton { label: "孙悟空"; clicked => { root.tts-tag-action(self.label); } }
-                                            if root.tts-search == "" || root.tts-matches("角色扮演", root.tts-search) || root.tts-matches("林黛玉", root.tts-search) : AppButton { label: "林黛玉"; clicked => { root.tts-tag-action(self.label); } }
-                                        }
-                                    }
-                                    if root.tts-search == "" || root.tts-matches("特殊风格", root.tts-search) || root.tts-matches("唱歌", root.tts-search) : VerticalLayout {
-                                        Text { text: "特殊风格"; color: Theme.text-color; }
-                                        HorizontalLayout { spacing: 4px;
-                                            if root.tts-search == "" || root.tts-matches("特殊风格", root.tts-search) || root.tts-matches("唱歌", root.tts-search) : AppButton { label: "唱歌"; clicked => { root.tts-tag-action(self.label); } }
-                                        }
-                                    }
-
                                     AppLineEdit { text <=> root.tts-custom; placeholder-text: "自定义标签（1–64字符）"; }
-                                    AppButton { label: "添加自定义标签"; clicked => { root.tts-tag-action(root.tts-custom); } }
+                                    AppButton { label: "添加自定义标签"; clicked => { root.tts-add-custom(); } }
                                 }
+                                Text { text: root.tts-tag-hint; color: #a05a00; wrap: word-wrap; }
                                 Text { text: "自然语言说明（独立发送，最多1000字符）"; color: Theme.text-color; }
                                 AppTextEdit { text <=> root.tts-mimo-style; height: 80px; edited => { root.settings-dirty = true; } }
                                 Text { text: "MiMo 语速 0.5–2.0（近似指导，不保证精确倍率）"; color: Theme.text-color; }
-                                AppLineEdit { text <=> root.tts-mimo-speed; edited => { root.settings-dirty = true; } }
+                                Text { text: "当前语速：" + root.tts-mimo-speed; color: Theme.text-color; }
+                                TtsRange { minimum: 0.5; maximum: 2; value: root.tts-number(root.tts-mimo-speed); edited(v) => { root.tts-mimo-speed = root.tts-format-number(v); root.settings-dirty = true; } }
                             }
                             Text { text: "音量 0–1（默认1，实际输出生效）"; color: Theme.text-color; }
-                            AppLineEdit { text <=> root.tts-volume; edited => { root.settings-dirty = true; } }
+                            Text { text: "当前音量：" + root.tts-volume; color: Theme.text-color; }
+                            TtsRange { value: root.tts-number(root.tts-volume); edited(v) => { root.tts-volume = root.tts-format-number(v); root.settings-dirty = true; } }
                             Text { text: "输出设备：" + (root.tts-output-device == "" ? "系统默认" : root.tts-output-device); wrap: word-wrap; color: Theme.text-color; }
                             AppButton { label: "刷新 Windows 输出设备"; clicked => { root.tts-refresh-devices(); } }
                             for device in root.tts-devices : AppButton { label: device == "" ? "系统默认" : device; clicked => { root.tts-output-device = device; root.settings-dirty = true; } }
 
-                            HorizontalLayout {
+                            if root.tts-backend-index == 2 : HorizontalLayout {
                                 spacing: 10px;
                                 Text { text: "音色/语速"; width: 100px; vertical-alignment: center; color: Theme.text-color; }
                                 AppLineEdit {

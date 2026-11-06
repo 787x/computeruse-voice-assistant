@@ -657,13 +657,9 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     tags.clear();
                 } else if tags.contains(&value) {
                     tags.retain(|s| s != &value);
-                } else {
-                    if crate::voice::tts::styles::singing(&value)
-                        || tags.iter().any(|s| crate::voice::tts::styles::singing(s))
-                    {
-                        tags.clear();
-                    }
-                    tags.push(value);
+                } else if let Err(e) = crate::voice::tts::styles::add(&mut tags, &value) {
+                    w.set_settings_error(e.into());
+                    return;
                 }
                 match crate::voice::tts::styles::validate(&tags) {
                     Ok(()) => {
@@ -681,6 +677,47 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => w.set_settings_error(e.into()),
                 }
             }
+        });
+        let weak = window.as_weak();
+        window.on_tts_add_custom(move || {
+            if let Some(w) = weak.upgrade() {
+                let mut tags = crate::voice::tts::styles::decode(&w.get_tts_mimo_tags());
+                match crate::voice::tts::styles::add(&mut tags, &w.get_tts_custom()) {
+                    Ok(true) => {
+                        w.set_tts_mimo_tags(crate::voice::tts::styles::encode(&tags).into());
+                        w.set_tts_selected_tags(
+                            std::rc::Rc::new(slint::VecModel::from(
+                                tags.into_iter()
+                                    .map(slint::SharedString::from)
+                                    .collect::<Vec<_>>(),
+                            ))
+                            .into(),
+                        );
+                        w.set_tts_custom("".into());
+                        w.set_tts_tag_hint("".into());
+                        w.set_settings_dirty(true);
+                    }
+                    Ok(false) => w.set_tts_tag_hint("该风格已存在".into()),
+                    Err(e) => w.set_tts_tag_hint(e.into()),
+                }
+            }
+        });
+        window.on_tts_voice_index(|voice| settings_ui::mimo_voice_index(&voice));
+        window.on_tts_voice_for_index(|index| settings_ui::mimo_voice_for_index(index).into());
+        window.on_tts_format_number(|value| format!("{value:.2}").into());
+        window.on_tts_number(|value| value.parse::<f32>().unwrap_or(1.0));
+        window.on_tts_presets(|category, query| {
+            let query = query.trim().to_lowercase();
+            let tags = crate::voice::tts::styles::PRESETS
+                .iter()
+                .filter(|(name, _)| *name == category.as_str())
+                .flat_map(|(name, tags)| {
+                    tags.iter()
+                        .filter(|tag| name.contains(&query) || tag.to_lowercase().contains(&query))
+                        .map(|s| slint::SharedString::from(*s))
+                })
+                .collect::<Vec<_>>();
+            std::rc::Rc::new(slint::VecModel::from(tags)).into()
         });
         let weak = window.as_weak();
         window.on_tts_refresh_devices(move || {
@@ -3348,6 +3385,8 @@ fn publish_tts_ui(weak: &slint::Weak<AppWindow>, tts: &TtsSettings, speech: &Spe
             window.set_tts_enabled(enabled);
             window.set_tts_backend_index(backend_index);
             window.set_tts_mimo_voice(mimo_voice.into());
+            window.set_tts_tag_hint("".into());
+            window.set_tts_custom("".into());
             window.set_tts_mimo_style(mimo_style.into());
             window.set_tts_mimo_model(extra_tts.mimo_model.clone().into());
             window
@@ -3800,6 +3839,8 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
             window.set_tts_enabled(saved.tts.enabled);
             window.set_tts_backend_index(tts_backend_index(saved.tts.backend));
             window.set_tts_mimo_voice(saved.tts.mimo_voice.into());
+            window.set_tts_tag_hint("".into());
+            window.set_tts_custom("".into());
             window.set_tts_mimo_style(saved.tts.mimo_style.into());
             window.set_tts_mimo_model(saved.tts.mimo_model.clone().into());
             window
