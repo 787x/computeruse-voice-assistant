@@ -311,13 +311,17 @@ impl ModelSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub image_input: Option<bool>,
     pub id: String,
     #[serde(default)]
     pub source: ModelSource,
     /// 服务端元数据声明的上下文窗口（`None` = 未知，按配置值）。
     #[serde(default)]
     pub context_window: Option<u64>,
-    /// 服务端元数据声明的最大输出 tokens（仅展示）。
+    /// 服务端元数据声明的最大输出 tokens（运行时请求上限）。
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
 }
@@ -325,6 +329,8 @@ pub struct ModelOption {
 impl ModelOption {
     pub fn manual(id: impl Into<String>) -> Self {
         Self {
+            display_name: String::new(),
+            image_input: None,
             id: id.into(),
             source: ModelSource::Manual,
             context_window: None,
@@ -333,10 +339,22 @@ impl ModelOption {
     }
 }
 
+/// 协议族与凭据/会话使用的实例 ID 独立。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolKind {
+    Mimo,
+    DeepSeek,
+    OpenaiCompatible,
+}
+
 /// 一个提供商的持久配置（端点、首选模型、推理档位、已知模型）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
+    /// None 仅用于读取旧配置；normalized 后持久化明确协议。
+    #[serde(default)]
+    pub protocol_kind: Option<ProtocolKind>,
     pub id: String,
     /// 自定义端点显示名（内置提供商留空，用注册表名字）。
     #[serde(default)]
@@ -378,24 +396,30 @@ impl ProviderConfig {
     pub const MAX_MODELS: usize = 80;
 
     pub fn display_name(&self) -> String {
-        if let Some(info) = get_provider(&self.id) {
-            return info.name.to_string();
-        }
         if !self.name.trim().is_empty() {
             return self.name.trim().to_string();
         }
         self.id.clone()
     }
 
-    /// 该提供商的协议能力（注册表声明优先，其次用户提示）。
-    pub fn capability(&self) -> Capability {
-        match get_provider(&self.id) {
-            Some(info) if info.capability != Capability::Plain => info.capability,
+    /// 已保存的协议族优先；缺失时只按历史 ID / hint 迁移。
+    pub fn protocol_kind(&self) -> ProtocolKind {
+        self.protocol_kind.unwrap_or(match self.id.as_str() {
+            "mimo" => ProtocolKind::Mimo,
+            "deepseek" => ProtocolKind::DeepSeek,
             _ => match self.provider_hint {
-                ProviderHint::DeepSeek => Capability::DeepSeek,
-                ProviderHint::Mimo => Capability::Mimo,
-                ProviderHint::Auto => Capability::Plain,
+                ProviderHint::Mimo => ProtocolKind::Mimo,
+                ProviderHint::DeepSeek => ProtocolKind::DeepSeek,
+                ProviderHint::Auto => ProtocolKind::OpenaiCompatible,
             },
+        })
+    }
+
+    pub fn capability(&self) -> Capability {
+        match self.protocol_kind() {
+            ProtocolKind::Mimo => Capability::Mimo,
+            ProtocolKind::DeepSeek => Capability::DeepSeek,
+            ProtocolKind::OpenaiCompatible => Capability::Plain,
         }
     }
 
@@ -406,9 +430,13 @@ impl ProviderConfig {
 
     pub fn base_url_or_default(&self) -> String {
         if self.base_url.trim().is_empty() {
-            get_provider(&self.id)
-                .map(|info| info.base_url.to_string())
-                .unwrap_or_default()
+            get_provider(match self.protocol_kind() {
+                ProtocolKind::Mimo => "mimo",
+                ProtocolKind::DeepSeek => "deepseek",
+                ProtocolKind::OpenaiCompatible => "openai-compatible",
+            })
+            .map(|info| info.base_url.to_string())
+            .unwrap_or_default()
         } else {
             self.base_url.trim().trim_end_matches('/').to_string()
         }
@@ -416,7 +444,15 @@ impl ProviderConfig {
 
     /// 该提供商下某个模型的可信元数据（上下文窗口）。
     pub fn model_meta(&self, model: &str) -> Option<&ModelOption> {
-        self.models.iter().find(|option| option.id == model)
+        self.models
+            .iter()
+            .find(|option| option.id == model)
+            .filter(|option| {
+                option.source == ModelSource::Manual
+                    || self.models_origin_url.is_empty()
+                    || self.models_origin_url.trim().trim_end_matches('/')
+                        == self.base_url_or_default()
+            })
     }
 
     /// 记下/更新一个模型（保留手动添加的模型，清掉过期的目录缓存）。
@@ -430,27 +466,45 @@ impl ProviderConfig {
             }
             self.enabled_models = Some(enabled);
         }
-        let manual: Vec<ModelOption> = self
-            .models
-            .iter()
-            .filter(|option| option.source == ModelSource::Manual)
-            .cloned()
-            .collect();
-        let mut merged = Vec::with_capacity(manual.len() + discovered.len());
-        merged.extend(manual);
+        // 保留所有可编辑条目，服务端消失或地址变化的模型降级为未验证。
+        let mut merged = self.models.clone();
+        for existing in &mut merged {
+            if existing.source != ModelSource::Manual
+                && !discovered.iter().any(|m| m.id == existing.id)
+            {
+                existing.source = ModelSource::Unverified;
+                existing.context_window = None;
+                existing.max_output_tokens = None;
+                existing.image_input = None;
+            }
+        }
         for option in discovered {
-            if let Some(existing) = merged.iter_mut().find(|item| item.id == option.id) {
-                // 手动保存的模型不能因在线目录覆盖而失去手动来源。
-                existing.context_window = option.context_window;
-                existing.max_output_tokens = option.max_output_tokens;
-            } else {
+            if let Some(existing) = merged.iter_mut().find(|m| m.id == option.id) {
+                if existing.source != ModelSource::Manual {
+                    let label = existing.display_name.clone();
+                    *existing = option.clone();
+                    if !label.is_empty() {
+                        existing.display_name = label;
+                    }
+                }
+            } else if merged.len() < Self::MAX_MODELS {
                 merged.push(option.clone());
             }
         }
-        if merged.len() > Self::MAX_MODELS {
-            merged.truncate(Self::MAX_MODELS);
-        }
         self.models = merged;
+    }
+
+    pub fn invalidate_catalog_for_url(&mut self) {
+        if self.models_origin_url.trim().trim_end_matches('/') != self.base_url_or_default() {
+            for m in &mut self.models {
+                if m.source != ModelSource::Manual {
+                    m.source = ModelSource::Unverified;
+                    m.context_window = None;
+                    m.max_output_tokens = None;
+                    m.image_input = None;
+                }
+            }
+        }
     }
 
     /// 手填一个模型（已存在就原样保留其元数据）。
@@ -695,6 +749,8 @@ impl SessionModelChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    #[serde(default)]
+    pub removed_provider_ids: Vec<String>,
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     /// 当前生效的提供商（与旧版单提供商字段保持一致）。
@@ -775,6 +831,7 @@ impl Default for Settings {
     fn default() -> Self {
         let provider = get_provider(DEFAULT_PROVIDER_ID).expect("内置默认提供商必须存在");
         Self {
+            removed_provider_ids: Vec::new(),
             schema_version: CONFIG_SCHEMA_VERSION,
             provider_id: provider.id.to_string(),
             base_url: provider.base_url.to_string(),
@@ -844,6 +901,7 @@ impl Settings {
         // 多提供商条目：地址/模型合法化，非法条目**报错而不是静默删除**，
         // 否则用户会看到"我配的端点不见了"。
         for provider in &mut self.providers {
+            provider.protocol_kind = Some(provider.protocol_kind());
             provider.id = provider.id.trim().to_string();
             if provider.id.is_empty() {
                 return Err("提供商 id 不能为空".to_string());
@@ -859,6 +917,10 @@ impl Settings {
                 ));
             }
             provider.base_url = address;
+            if provider.models_origin_url.is_empty() {
+                provider.models_origin_url = provider.base_url.clone();
+            }
+            provider.invalidate_catalog_for_url();
             provider.model = provider.model.trim().to_string();
             let model = provider.model.clone();
             provider.remember_manual_model(&model);
@@ -929,6 +991,7 @@ impl Settings {
             return;
         }
         let entry = ProviderConfig {
+            protocol_kind: None,
             enabled_models: None,
             models_origin_url: String::new(),
             id: provider_id.clone(),
@@ -972,6 +1035,7 @@ impl Settings {
         let info = get_provider(provider_id);
         let is_active = provider_id == self.provider_id;
         ProviderConfig {
+            protocol_kind: None,
             enabled_models: None,
             models_origin_url: String::new(),
             id: provider_id.to_string(),
@@ -1056,6 +1120,9 @@ impl Settings {
     ) -> ProviderProfile {
         let provider = self.provider(provider_id);
         ProviderProfile {
+            request_output_tokens: None,
+            max_output_tokens: provider.model_meta(model).and_then(|m| m.max_output_tokens),
+            image_input: provider.model_meta(model).and_then(|m| m.image_input),
             provider_id: provider_id.to_string(),
             capability: provider.capability(),
             base_url: provider.base_url_or_default(),
@@ -1176,21 +1243,23 @@ impl Settings {
 
     /// 与 `resolve_selection` 对应的端点档案。
     pub fn profile_for_selection(&self, selection: &ModelSelection) -> ProviderProfile {
-        ProviderProfile {
-            provider_id: selection.provider_id.clone(),
-            capability: self.provider(&selection.provider_id).capability(),
-            base_url: selection.base_url.clone(),
-            model: selection.model.clone(),
-            thinking: selection.thinking,
-            reasoning_effort: selection.reasoning_effort,
-            model_context_window: self
-                .model_context_window(&selection.provider_id, &selection.model),
-        }
+        let mut profile = self.profile_of(
+            &selection.provider_id,
+            &selection.model,
+            selection.thinking,
+            selection.reasoning_effort,
+        );
+        profile.base_url = selection.base_url.clone();
+        profile
     }
 
     /// 所有可选提供商 id（内置在前，自定义按配置顺序）。
     pub fn provider_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = PROVIDERS.iter().map(|info| info.id.to_string()).collect();
+        let mut ids: Vec<String> = PROVIDERS
+            .iter()
+            .filter(|info| !self.removed_provider_ids.iter().any(|id| id == info.id))
+            .map(|info| info.id.to_string())
+            .collect();
         for provider in &self.providers {
             if !ids.contains(&provider.id) {
                 ids.push(provider.id.clone());
@@ -1599,6 +1668,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.context_window = 1_000_000;
         settings.providers = vec![ProviderConfig {
+            protocol_kind: None,
             enabled_models: None,
             models_origin_url: String::new(),
             id: "mimo".to_string(),
@@ -1609,6 +1679,8 @@ mod tests {
             thinking: ThinkingLevel::Default,
             reasoning_effort: ReasoningEffort::Default,
             models: vec![ModelOption {
+                display_name: String::new(),
+                image_input: None,
                 id: "mimo-v2.6-flash".to_string(),
                 source: ModelSource::Discovered,
                 context_window: Some(131_072),
@@ -1764,6 +1836,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.providers = vec![
             ProviderConfig {
+                protocol_kind: None,
                 enabled_models: None,
                 models_origin_url: String::new(),
                 id: "mimo".to_string(),
@@ -1776,6 +1849,7 @@ mod tests {
                 models: Vec::new(),
             },
             ProviderConfig {
+                protocol_kind: None,
                 enabled_models: None,
                 models_origin_url: String::new(),
                 id: "deepseek".to_string(),

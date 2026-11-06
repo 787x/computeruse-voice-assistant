@@ -458,13 +458,13 @@ fn upsert_provider(
         Some(existing) => {
             if existing.base_url_or_default().trim_end_matches('/')
                 != base_url.trim().trim_end_matches('/')
+                && existing.models_origin_url.is_empty()
             {
-                if existing.models_origin_url.is_empty() {
-                    existing.models_origin_url = existing.base_url_or_default();
-                }
-                existing.models.clear();
+                existing.models_origin_url = existing.base_url_or_default();
             }
+            // 目录保留；地址变化只让旧服务端元数据失效。
             existing.base_url = base_url.to_string();
+            existing.invalidate_catalog_for_url();
             existing.model = model_text.clone();
             existing.provider_hint = hint;
             existing.thinking = thinking;
@@ -473,6 +473,7 @@ fn upsert_provider(
         }
         None => {
             let mut entry = ProviderConfig {
+                protocol_kind: None,
                 enabled_models: None,
                 models_origin_url: String::new(),
                 id: id.to_string(),
@@ -518,7 +519,7 @@ pub fn tts_runtime_config_changed(
         || key_changed_for_active_backend
 }
 
-/// 仅恢复当前端点和账户的发现目录；手动模型始终保留。不会保存设置或密钥。
+/// 持久目录优先；仅为旧配置、缺失目录或更换端点补充匹配缓存，不覆盖已有条目。
 pub fn restore_model_catalogs(
     settings: &mut Settings,
     paths: &AppPaths,
@@ -532,17 +533,32 @@ pub fn restore_model_catalogs(
         if legacy {
             provider.enabled_models = Some(provider.selectable_models());
         }
-        provider
-            .models
-            .retain(|model| model.source == config::ModelSource::Manual);
+        let endpoint = provider.base_url_or_default();
+        let recover = legacy
+            || provider.models.is_empty()
+            || provider.models_origin_url.trim().trim_end_matches('/') != endpoint;
+        provider.invalidate_catalog_for_url();
+        if !recover {
+            continue;
+        }
         let saved_key = secret.load(&id).ok().flatten().unwrap_or_default();
         let key = pending_key
             .filter(|(target, _)| *target == id)
             .map(|(_, key)| key)
             .unwrap_or(&saved_key);
         if let Some(models) = cache.models_for(&id, &provider.base_url_or_default(), key) {
-            provider.remember_models(models);
-            provider.models_origin_url = provider.base_url_or_default();
+            // 缓存只补充缺失候选；用户删除/修改过的持久目录不重新由缓存主导。
+            for model in models {
+                if provider.models.len() < ProviderConfig::MAX_MODELS
+                    && !provider
+                        .models
+                        .iter()
+                        .any(|existing| existing.id == model.id)
+                {
+                    provider.models.push(model.clone());
+                }
+            }
+            provider.models_origin_url = endpoint;
             if legacy {
                 let enabled = provider
                     .enabled_models
@@ -768,6 +784,92 @@ mod tests {
     }
 
     #[test]
+    fn card_catalog_survives_unrelated_save_key_clear_and_restart_without_cache() {
+        let paths = AppPaths::with_root(std::env::temp_dir().join(format!(
+                "cuava-catalog-authority-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        for id in ["mimo", "deepseek"] {
+            let mut provider = settings.provider(id);
+            let mut remote = config::ModelOption::manual("server-model");
+            remote.source = config::ModelSource::Discovered;
+            remote.display_name = "用户显示名".into();
+            remote.context_window = Some(64000);
+            remote.max_output_tokens = Some(4000);
+            remote.image_input = Some(true);
+            let mut unknown = config::ModelOption::manual("unknown");
+            unknown.source = config::ModelSource::Unverified;
+            provider.model = remote.id.clone();
+            provider.models = vec![remote, unknown, config::ModelOption::manual("private")];
+            provider.enabled_models = Some(vec!["server-model".into(), "unknown".into()]);
+            provider.models_origin_url = provider.base_url_or_default();
+            settings = super::super::endpoint_cards::save_provider(
+                &paths,
+                &secret,
+                &settings,
+                &provider,
+                "dummy-key",
+                "",
+            )
+            .unwrap();
+        }
+        let before = settings.providers.clone();
+        assert!(!paths.model_cache_file().exists());
+        let mut request = base_request(&settings);
+        request.custom_prompt = true;
+        request.system_prompt = "保留模型目录的提示词".into();
+        request.temperature = "0.7".into();
+        request.context_window = "32000".into();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut speech = SpeechRuntime::new(tx);
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        assert_eq!(settings.providers, before);
+        secret.clear("deepseek").unwrap();
+        restore_model_catalogs(&mut settings, &paths, &secret, None);
+        assert_eq!(settings.providers, before);
+        let mut restarted = config::load_settings(&paths).unwrap();
+        restore_model_catalogs(&mut restarted, &paths, &secret, None);
+        assert_eq!(restarted.providers, before);
+        // 旧缓存即使含相同 ID 的过时元数据，也不能更新或复活用户的持久目录。
+        let p = restarted.provider("mimo");
+        let cache = serde_json::json!({"entries":{"old":{"atMs":1,"providerId":"mimo","baseUrl":p.base_url,"keyFingerprint":crate::model_catalog::fingerprint("dummy-key"),"models":[{"id":"server-model","displayName":"过时名称","source":"discovered","contextWindow":8},{"id":"deleted-cached-model","source":"discovered"}],"dropped":[],"raw":2}}});
+        std::fs::write(
+            paths.model_cache_file(),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+        restore_model_catalogs(&mut restarted, &paths, &secret, None);
+        assert_eq!(restarted.providers, before);
+        let new_url = "http://127.0.0.1:24999/v1";
+        restarted.base_url = new_url.into();
+        restarted
+            .providers
+            .iter_mut()
+            .find(|p| p.id == "mimo")
+            .unwrap()
+            .base_url = new_url.into();
+        restore_model_catalogs(&mut restarted, &paths, &secret, None);
+        let changed = restarted.provider("mimo");
+        let stale = changed
+            .models
+            .iter()
+            .find(|m| m.id == "server-model")
+            .unwrap();
+        assert_eq!(stale.source, config::ModelSource::Unverified);
+        assert_eq!(stale.context_window, None);
+        assert_eq!(stale.image_input, None);
+        assert_eq!(changed.enabled_models, p.enabled_models);
+        assert!(changed.models.iter().any(|m| m.id == "private"));
+        std::fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
     fn invalid_other_provider_draft_does_not_write_any_keys_or_settings() {
         let root = std::env::temp_dir().join(format!(
             "cuava-invalid-drafts-{}",
@@ -972,7 +1074,7 @@ mod tests {
         let provider = restored.provider("mimo");
         assert_eq!(provider.base_url, endpoint);
         assert!(provider.models.iter().any(|m| m.id == "new-model"));
-        assert!(!provider.models.iter().any(|m| m.id == "old-model"));
+        assert!(provider.models.iter().any(|m| m.id == "old-model"));
         let cached = crate::model_catalog::ModelCache::with_path(paths.model_cache_file());
         assert_eq!(
             cached.models_for("mimo", endpoint, "").unwrap()[0].id,

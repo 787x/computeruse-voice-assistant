@@ -37,6 +37,10 @@ impl Capability {
 /// 一次请求的端点档案（**回合快照**：一整轮用同一套）。
 #[derive(Debug, Clone)]
 pub struct ProviderProfile {
+    /// 当前请求的显式预算；None 保留服务端默认行为。模型能力只约束此预算。
+    pub request_output_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub image_input: Option<bool>,
     pub provider_id: String,
     pub capability: Capability,
     pub base_url: String,
@@ -217,6 +221,20 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    pub fn without_images(&self) -> Self {
+        let mut copy = self.clone();
+        if let Content::Parts(parts) = &mut copy.content {
+            let original_len = parts.len();
+            parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("image_url"));
+            if parts.len() != original_len {
+                parts.push(
+                    json!({"type":"text", "text":"（当前模型配置不接受图片，本次只发送文字。）"}),
+                );
+            }
+        }
+        copy
+    }
+
     /// 会话持久化用的有界副本：截图 base64 不进会话文件。
     ///
     /// 只处理 `Content::Parts`：保留说明文字，把每个 `image_url` 段换成一条
@@ -636,12 +654,26 @@ impl LlmClient {
         let built = build_request_fields(&self.profile, self.temperature);
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), json!(self.profile.model));
+        if let Some(limit) = self.profile.request_output_tokens {
+            let limit = self
+                .profile
+                .max_output_tokens
+                .map_or(limit, |cap| limit.min(cap));
+            body.insert("max_tokens".into(), json!(limit));
+        }
         body.insert(
             "messages".to_string(),
             Value::Array(
                 messages
                     .iter()
-                    .map(|m| m.to_request_value(echo, &self.profile.provider_id))
+                    .map(|m| {
+                        if self.profile.image_input == Some(false) && m.has_attachment() {
+                            m.without_images()
+                                .to_request_value(echo, &self.profile.provider_id)
+                        } else {
+                            m.to_request_value(echo, &self.profile.provider_id)
+                        }
+                    })
                     .collect(),
             ),
         );
@@ -900,7 +932,14 @@ impl LlmClient {
         let body = {
             let mut body = self.build_body(&messages, &[], true);
             if let Some(object) = body.as_object_mut() {
-                object.insert("max_tokens".to_string(), json!(16));
+                let budget = self.profile.request_output_tokens.unwrap_or(16).min(16);
+                object.insert(
+                    "max_tokens".to_string(),
+                    json!(self
+                        .profile
+                        .max_output_tokens
+                        .map_or(budget, |cap| budget.min(cap))),
+                );
             }
             body
         };
@@ -1087,6 +1126,9 @@ mod tests {
 
     fn profile(capability: Capability, model: &str) -> ProviderProfile {
         ProviderProfile {
+            request_output_tokens: None,
+            max_output_tokens: None,
+            image_input: None,
             provider_id: "test".to_string(),
             capability,
             base_url: "http://127.0.0.1:1/v1".to_string(),
@@ -1094,6 +1136,28 @@ mod tests {
             thinking: ThinkingLevel::Default,
             reasoning_effort: ReasoningEffort::Default,
             model_context_window: None,
+        }
+    }
+
+    #[test]
+    fn model_output_cap_is_not_an_unconditional_request_budget() {
+        for capability in [Capability::Mimo, Capability::DeepSeek, Capability::Plain] {
+            let mut p = profile(capability, "model");
+            p.max_output_tokens = Some(131072);
+            let body = LlmClient::new(p.clone(), "test", 0.3, 1000)
+                .unwrap()
+                .build_body(&[], &[], false);
+            assert!(body.get("max_tokens").is_none());
+            p.request_output_tokens = Some(4096);
+            let body = LlmClient::new(p.clone(), "test", 0.3, 1000)
+                .unwrap()
+                .build_body(&[], &[], false);
+            assert_eq!(body["max_tokens"], 4096);
+            p.max_output_tokens = Some(2048);
+            let body = LlmClient::new(p, "test", 0.3, 1000)
+                .unwrap()
+                .build_body(&[], &[], false);
+            assert_eq!(body["max_tokens"], 2048);
         }
     }
 

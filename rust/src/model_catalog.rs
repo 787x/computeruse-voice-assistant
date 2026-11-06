@@ -258,6 +258,8 @@ pub fn parse_model_response(json: &Value) -> ParsedModels {
             ModelSource::Discovered
         };
         parsed.chat.push(ModelOption {
+            display_name: String::new(),
+            image_input: None,
             id: verdict.id,
             source,
             context_window: read_u64(
@@ -573,6 +575,9 @@ pub async fn fetch_models(
     }
 
     let profile = ProviderProfile {
+        request_output_tokens: None,
+        max_output_tokens: None,
+        image_input: None,
         provider_id: provider.id.clone(),
         capability: provider.capability(),
         base_url: base_url.clone(),
@@ -779,6 +784,114 @@ mod tests {
 
     fn entry(id: &str) -> Value {
         serde_json::json!({ "id": id })
+    }
+
+    #[tokio::test]
+    async fn disk_cache_hit_forced_refresh_expiry_and_failure_are_credential_scoped() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for i in 1..=2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !data.windows(4).any(|s| s == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&buf[..n]);
+                }
+                let headers = String::from_utf8_lossy(&data).to_lowercase();
+                assert!(headers.starts_with("get /v1/models "));
+                assert!(headers.contains("authorization: bearer cache-test-secret"));
+                let body = format!(r#"{{"data":[{{"id":"chat-{i}","context_window":32000}}]}}"#);
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let root = unique_root("cache-round2");
+        let path = root.join("cache.json");
+        let mut p = crate::config::Settings::default().provider("mimo");
+        p.base_url = url;
+        let first = fetch_models(
+            &p,
+            "cache-test-secret",
+            &mut ModelCache::with_path(&path),
+            false,
+        )
+        .await;
+        assert!(first.ok);
+        assert!(!first.cached);
+        let hit = fetch_models(
+            &p,
+            "cache-test-secret",
+            &mut ModelCache::with_path(&path),
+            false,
+        )
+        .await;
+        assert!(hit.ok && hit.cached);
+        assert_eq!(hit.models[0].id, "chat-1");
+        let refresh = fetch_models(
+            &p,
+            "cache-test-secret",
+            &mut ModelCache::with_path(&path),
+            true,
+        )
+        .await;
+        assert!(refresh.ok && !refresh.cached);
+        assert_eq!(refresh.models[0].id, "chat-2");
+        server.join().unwrap();
+        let failed = fetch_models(
+            &p,
+            "cache-test-secret",
+            &mut ModelCache::with_path(&path),
+            true,
+        )
+        .await;
+        assert!(!failed.ok && failed.stale);
+        assert_eq!(failed.models, refresh.models);
+        let other_key =
+            fetch_models(&p, "other-key", &mut ModelCache::with_path(&path), false).await;
+        assert!(!other_key.ok && !other_key.cached && other_key.models.is_empty());
+        let mut other = p.clone();
+        other.id = "second-instance".into();
+        let isolated = fetch_models(
+            &other,
+            "cache-test-secret",
+            &mut ModelCache::with_path(&path),
+            false,
+        )
+        .await;
+        assert!(!isolated.cached && isolated.models.is_empty());
+        other = p.clone();
+        other.base_url.push_str("/other");
+        let isolated = fetch_models(
+            &other,
+            "cache-test-secret",
+            &mut ModelCache::with_path(&path),
+            false,
+        )
+        .await;
+        assert!(!isolated.cached && isolated.models.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("cache-test-secret"));
+        let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for entry in json["entries"].as_object_mut().unwrap().values_mut() {
+            entry["atMs"] = serde_json::json!(0);
+        }
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let expired = fetch_models(
+            &p,
+            "cache-test-secret",
+            &mut ModelCache::with_path(&path),
+            false,
+        )
+        .await;
+        assert!(!expired.ok && expired.stale);
+        assert_eq!(expired.models, refresh.models);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

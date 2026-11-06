@@ -124,7 +124,7 @@ async fn unsaved_probe_and_discovery_use_the_same_draft_without_saving_key() {
     assert!(!format!("{draft:?}").contains("fake-new-key"));
 }
 #[tokio::test]
-async fn restart_restores_only_current_endpoint_account_and_keeps_manual_models() {
+async fn legacy_cache_recovery_preserves_catalog_when_credentials_change() {
     let paths = paths("account-cache");
     let secrets = SecretStore::new(paths.secret_file());
     secrets.save("deepseek", "account-a").unwrap();
@@ -179,13 +179,10 @@ async fn restart_restores_only_current_endpoint_account_and_keeps_manual_models(
             .iter()
             .map(|m| m.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["manual"]
+        vec!["manual", "a-one", "a-two"]
     );
-    assert!(
-        fetch_models(&provider, "account-b", &mut cache, true)
-            .await
-            .ok
-    );
+    let fetched = fetch_models(&provider, "account-b", &mut cache, true).await;
+    assert!(fetched.ok);
     task.join().unwrap();
     assert_eq!(
         cache
@@ -195,12 +192,19 @@ async fn restart_restores_only_current_endpoint_account_and_keeps_manual_models(
         2
     );
     restore_model_catalogs(&mut restarted, &paths, &secrets, None);
+    // 更换 Key 不让缓存代替配置；新候选仅由明确获取后的目录合并进入。
+    assert!(!restarted
+        .provider("deepseek")
+        .models
+        .iter()
+        .any(|m| m.id == "b-only"));
+    assert!(restarted.remember_discovered_models("deepseek", &url, &fetched.models));
     assert!(restarted
         .provider("deepseek")
         .models
         .iter()
         .any(|m| m.id == "b-only"));
-    assert!(!restarted
+    assert!(restarted
         .provider("deepseek")
         .models
         .iter()
@@ -212,7 +216,16 @@ async fn restart_restores_only_current_endpoint_account_and_keeps_manual_models(
         .unwrap()
         .base_url = "http://127.0.0.1:1/v1".into();
     restore_model_catalogs(&mut restarted, &paths, &secrets, None);
-    assert_eq!(restarted.provider("deepseek").models.len(), 1);
+    let changed = restarted.provider("deepseek");
+    assert_eq!(changed.models.len(), 4);
+    assert!(changed
+        .models
+        .iter()
+        .filter(|m| m.source != cuava::config::ModelSource::Manual)
+        .all(|m| m.source == cuava::config::ModelSource::Unverified
+            && m.context_window.is_none()
+            && m.max_output_tokens.is_none()
+            && m.image_input.is_none()));
 }
 
 #[tokio::test]

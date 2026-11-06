@@ -305,6 +305,7 @@ component ModelPicker inherits Rectangle {
     in property <[string]> names;
     in property <[string]> providers;
     in property <[string]> groups;
+    in property <[string]> group-labels;
     in property <string> current-model;
     in property <[string]> reasoning-options;
     in property <int> reasoning-index;
@@ -380,9 +381,9 @@ component ModelPicker inherits Rectangle {
                         content-width: self.width; content-height: rows.preferred-height;
                         rows := VerticalLayout {
                             alignment: start; spacing: 4px;
-                            for group in root.groups : VerticalLayout {
+                            for group[gi] in root.groups : VerticalLayout {
                                 alignment: start; spacing: 4px;
-                                if root.group-matches(root.labels, root.providers, group, search.text) : Text { text: group; color: #777780; font-size: 11px; }
+                                if root.group-matches(root.labels, root.providers, group, search.text) : Text { text: root.group-labels[gi]; color: #777780; font-size: 11px; wrap: word-wrap; min-width: 0px; }
                                 for label[i] in root.labels : VerticalLayout {
                                     if root.providers[i] == group && (search.text == "" || root.matches(label, search.text)) : Rectangle {
                                         height: 38px; border-radius: 7px;
@@ -449,12 +450,20 @@ component AppButton inherits Rectangle {
     in property <bool> primary: false;
     in property <bool> enabled: true;
     callback clicked();
+    forward-focus: button-keys;
+    button-keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if root.enabled && (event.text == " " || event.text == "\n") { root.clicked(); return accept; }
+            return reject;
+        }
+    }
 
     width: Math.max(64px, button-label.preferred-width + 24px);
     height: 30px;
     border-radius: 5px;
     border-width: 1px;
-    border-color: !enabled ? #d8d8dd : (primary ? #1f6feb : #c9c9d0);
+    border-color: button-keys.has-focus ? #1f6feb : !enabled ? #d8d8dd : (primary ? #1f6feb : #c9c9d0);
     background: !enabled ? #f0f0f2 : (primary ? #1f6feb : (touch.has-hover ? #f0f0f4 : #ffffff));
 
     button-label := Text {
@@ -469,7 +478,7 @@ component AppButton inherits Rectangle {
 
     touch := TouchArea {
         enabled: root.enabled;
-        clicked => { if (root.enabled) { root.clicked(); } }
+        clicked => { if (root.enabled) { button-keys.focus(); root.clicked(); } }
     }
 }
 
@@ -481,7 +490,114 @@ export global Theme {
     out property <color> faint-color: #8a8a90;
 }
 
+export struct EndpointModel {
+    id: string, label: string, enabled: bool, expanded: bool,
+    context: string, output: string, image: bool, image-known: bool, source: string,
+}
+export struct EndpointCard {
+    id: string, name: string, url: string, key: string, default-model: string,
+    saved-url: string, credential-url: string, catalog-origin: string, error: string,
+    delete-pending: bool, revision: int, kind: int, thinking: int, effort: int, status: string, rows: [EndpointModel],
+}
+component EndpointEditor inherits Rectangle {
+    // 本地编辑会解除 card 的单向绑定；保留独立父快照，以接收异步结果与取消回填。
+    in property <EndpointCard> snapshot;
+    in-out property <EndpointCard> card: snapshot;
+    changed snapshot => { card = snapshot; }
+    callback action(string, EndpointCard);
+    background: #f5f5f6; border-radius: 12px;
+    VerticalLayout {
+        padding: 16px; spacing: 10px;
+        HorizontalLayout {
+            Text { text: card.name + " · " + (card.status == "" ? "未测" : card.status == "busy" ? "测试中" : card.status); font-weight: 600; color: Theme.text-color; }
+            if card.delete-pending : AppButton { label: "取消删除"; clicked => { action("cancel-delete", card); } }
+            AppButton { label: card.delete-pending ? "确认删除本实例" : "删除"; clicked => { action("delete", card); } }
+        }
+        Text { text: "实例 ID：" + card.id; color: #77777d; overflow: elide; }
+        HorizontalLayout {
+            Text { text: "名称"; width: 80px; color: Theme.text-color; }
+            AppLineEdit { text <=> card.name; edited => { card.status = ""; card.error = ""; action("draft", card); } }
+        }
+        HorizontalLayout {
+            Text { text: "API Key"; width: 80px; color: Theme.text-color; }
+            AppLineEdit { text <=> card.key; input-type-password: true; placeholder-text: "留空使用该实例已保存凭据"; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
+            AppButton {
+                label: card.status == "busy" ? "测试中…" : card.status == "成功" ? "测试成功" : card.status == "失败" ? "测试失败" : "测试连接";
+                text-color: card.status == "成功" ? #1f7a3a : card.status == "失败" ? #a02020 : #242428;
+                enabled: card.status != "busy";
+                clicked => { action("test", card); }
+            }
+        }
+        if card.error != "" : Text { text: card.error; color: #a02020; wrap: word-wrap; }
+        HorizontalLayout {
+            AppButton { label: "清除此实例 Key"; clicked => { action("clear-key", card); } }
+        }
+        HorizontalLayout {
+            Text { text: "API 地址"; width: 80px; color: Theme.text-color; }
+            AppLineEdit { text <=> card.url; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
+        }
+        if card.saved-url != card.url && card.credential-url != card.url && card.key == "" : AppButton {
+            label: "确认将本实例已存 Key 用于此地址";
+            clicked => { action("reuse-key", card); }
+        }
+        HorizontalLayout {
+            Text { text: "默认模型"; width: 80px; color: Theme.text-color; }
+            AppLineEdit { text <=> card.default-model; edited => { card.status = ""; card.error = ""; action("draft", card); } }
+        }
+        HorizontalLayout {
+            AppComboBox { options: ["默认思考", "开启思考", "关闭思考"]; index <=> card.thinking; picked(i) => { card.status = ""; card.error = ""; action("draft", card); } }
+            AppComboBox { options: ["默认推理", "不推理", "低", "高", "最大"]; index <=> card.effort; picked(i) => { card.status = ""; card.error = ""; action("draft", card); } }
+        }
+        HorizontalLayout {
+            Text { text: "模型目录"; color: Theme.text-color; }
+            AppButton { label: "恢复默认模型"; clicked => { action("restore", card); } }
+            AppButton { label: "获取可用模型"; enabled: card.status != "busy"; clicked => { action("fetch", card); } }
+        }
+        for row[i] in card.rows : Rectangle {
+            background: #ffffff; border-radius: 8px;
+            VerticalLayout {
+                padding: 8px; spacing: 8px;
+                HorizontalLayout {
+                    AppLineEdit { text <=> row.id; placeholder-text: "模型 ID"; edited => { row.source = "manual"; row.context = ""; row.output = ""; row.image-known = false; card.status = ""; card.error = ""; action("draft", card); } }
+                    AppLineEdit { text <=> row.label; placeholder-text: "显示名"; edited => { card.status = ""; card.error = ""; action("draft", card); } }
+                }
+                HorizontalLayout {
+                    AppButton { label: row.enabled ? "已启用" : "未启用"; clicked => { action("toggle:" + i, card); } }
+                    AppButton { label: row.expanded ? "收起" : "展开"; clicked => { action("expand:" + i, card); } }
+                    AppButton { label: "删除"; clicked => { action("remove:" + i, card); } }
+                }
+                if row.expanded : VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        Text { text: "上下文窗口"; color: Theme.text-color; }
+                        AppLineEdit { text <=> row.context; placeholder-text: "未知"; edited => { row.source = "manual"; card.status = ""; card.error = ""; action("draft", card); } }
+                        Text { text: "最大输出 tokens"; color: Theme.text-color; }
+                        AppLineEdit { text <=> row.output; placeholder-text: "未知"; edited => { row.source = "manual"; card.status = ""; card.error = ""; action("draft", card); } }
+                    }
+                    HorizontalLayout {
+                        Text { text: "输入：文本 · 图片："; color: Theme.text-color; }
+                        AppButton { label: !row.image-known ? "未知" : row.image ? "支持" : "不支持"; clicked => { row.image = !row.image-known || !row.image; row.image-known = true; row.source = "manual"; card.status = ""; card.error = ""; action("draft", card); } }
+                        Text { text: "元数据来源：" + row.source; color: Theme.text-color; }
+                    }
+                }
+            }
+        }
+        AppButton { label: "+ 添加模型"; clicked => { action("add-model", card); } }
+        Text { text: "删除或禁用默认模型前，请先填写并启用另一默认模型。恢复默认仅替换本卡草稿目录和默认模型，保存后生效。"; wrap: word-wrap; color: #66666b; }
+        HorizontalLayout {
+            Rectangle { horizontal-stretch: 1; }
+            AppButton { label: "取消"; clicked => { action("cancel", card); } }
+            AppButton { label: "保存"; clicked => { action("save", card); } }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
+    in-out property <[EndpointCard]> endpoint-cards;
+    in-out property <string> settings-provider-id;
+    in-out property <int> new-endpoint-kind: 0;
+    callback endpoint-action(string, EndpointCard);
+    callback add-endpoint(int);
     in-out property <int> probe-revision;
     pure callback model-matches(string, string) -> bool;
     pure callback model-match-count([string], string) -> int;
@@ -526,6 +642,7 @@ export component AppWindow inherits Window {
     // `model-option-labels` 与 `model-choices` 一一对应；下拉只接受 [string]。
     in-out property <[string]> model-option-providers;
     in-out property <[string]> model-provider-groups;
+    in-out property <[string]> model-provider-group-labels;
     in-out property <float> context-usage: 0;
     in-out property <bool> context-known: false;
     in-out property <bool> voice-manual: false;
@@ -1203,6 +1320,7 @@ export component AppWindow inherits Window {
                         names: root.model-option-names;
                         providers: root.model-option-providers;
                         groups: root.model-provider-groups;
+                        group-labels: root.model-provider-group-labels;
                         selected: root.model-choice-index;
                         current-model: root.model-choice-label;
                         reasoning-options: root.reasoning-options;
@@ -1348,7 +1466,7 @@ export component AppWindow inherits Window {
         TouchArea { }
 
         panel := Rectangle {
-            width: min(600px, parent.width - 48px);
+            width: min(1000px, parent.width - 48px);
             // 高度用**固定上限**而不是"内容首选高度"：`ScrollView` 不会把内部
             // 内容的 preferred-height 传播出来（它只报自己的最小值），
             // 用内容高度算会把面板压扁、把下面的字段裁掉。
@@ -1456,6 +1574,15 @@ export component AppWindow inherits Window {
 
                         // ===== 0. 模型 / 方案 =====
                         if root.settings-tab-index == 0 : VerticalLayout {
+                            HorizontalLayout {
+                                Text { text: "模型端点"; color: Theme.text-color; font-weight: 600; }
+                                AppComboBox { options: ["Xiaomi MiMo", "DeepSeek", "OpenAI-compatible"]; index <=> root.new-endpoint-kind; }
+                                AppButton { label: "+ 添加供应商"; clicked => { root.add-endpoint(root.new-endpoint-kind); } }
+                            }
+                            for card[i] in root.endpoint-cards : EndpointEditor {
+                                snapshot: card;
+                                action(op, draft) => { root.endpoint-action(op, draft); }
+                            }
                             Text { text: "模型方案"; color: Theme.text-color; }
                             HorizontalLayout {
                                 AppComboBox { options: root.plan-edit-labels; index: root.plan-edit-index; picked(i) => { root.edit-plan(i); } }
@@ -1466,7 +1593,7 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 AppLineEdit { text <=> root.plan-edit-id; placeholder-text: "方案 ID"; }
                                 AppLineEdit { text <=> root.plan-edit-name; placeholder-text: "名称"; }
-                                AppLineEdit { text <=> root.plan-edit-provider; placeholder-text: "mimo / deepseek / openai-compatible"; }
+                                AppLineEdit { text <=> root.plan-edit-provider; placeholder-text: "供应商实例 ID（卡片标题下方）"; }
                                 AppLineEdit { text <=> root.plan-edit-model; placeholder-text: "模型名称"; }
                             }
                             HorizontalLayout {
@@ -1490,149 +1617,6 @@ export component AppWindow inherits Window {
 
                             spacing: 10px;
 
-                            Text {
-                                color: Theme.text-color;
-                                text: "模型端点";
-                                font-size: 14px;
-                                font-weight: 600;
-                            }
-
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Text { text: "提供商"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
-                                AppComboBox {
-                                    enabled: !root.settings-saving;
-                                    options: ["mimo", "deepseek", "openai-compatible"];
-                                    // 注意 `index:` 是**单向**绑定：下拉自己会先改内部的
-                                    // `index`，这里必须同时把值写回 `root.provider-index`，
-                                    // 否则界面显示的提供商与保存出去的 provider_id 会不一致
-                                    // （选 DeepSeek 却存成 MiMo，Key 也会写到错误的那家名下）。
-                                    index <=> root.provider-index;
-                                    picked(index) => {
-                                    root.settings-dirty = true;
-                                    root.settings-error = "";
-                                    root.clear-probe-results();
-                                    root.provider-changed(index);
-                                }
-                            }
-                        }
-
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Text { text: "地址"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
-                            AppLineEdit {
-                                enabled: !root.settings-saving;
-                                text <=> root.base-url;
-                                placeholder-text: "https://…";
-                                edited => { root.settings-dirty = true; root.settings-error = "";  root.clear-probe-results(); root.model-list-hint = "端点已更改：保留启用选择，但旧目录模型尚未在新端点验证，请重新获取或测试";}
-                            }
-                        }
-
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Text { text: "模型"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
-                            AppLineEdit {
-                                enabled: !root.settings-saving;
-                                text <=> root.model-name;
-                                placeholder-text: "模型名";
-                                edited => { root.settings-dirty = true; root.settings-error = "";  root.clear-probe-results();}
-                            }
-                            AppComboBox {
-                                enabled: !root.settings-saving;
-                                options: root.discovered-models;
-                                index <=> root.discovered-model-index;
-                                picked(index) => {
-                                    // 选中就填进模型输入框（用户随后保存；
-                                    // 不会偷偷改掉已生效配置）。
-                                    if index >= 0 && index < root.discovered-models.length {
-                                        root.model-name = root.discovered-models[index];
-                                        root.settings-dirty = true;
-                                        root.settings-error = ""; root.clear-probe-results();
-                                    }
-                                }
-                            }
-
-                        }
-
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Text { text: "API Key"; width: 88px; vertical-alignment: center; color: Theme.text-color; }
-                            AppLineEdit {
-                                enabled: !root.settings-saving;
-                                text <=> root.api-key-input;
-                                placeholder-text: root.has-key ? "已保存（留空则不修改）" : "未保存";
-                                input-type-password: true;
-                                edited => { root.settings-dirty = true; root.settings-error = "";  root.clear-probe-results();}
-                            }
-                            AppButton {
-                                label: root.connection-code == "busy" ? "测试中…" : root.connection-code == "ok" ? "测试成功" : root.connection-code != "" ? "测试失败" : "测试连接";
-                                text-color: root.connection-code == "ok" ? #1f7a3a : root.connection-code != "" && root.connection-code != "busy" ? #a02020 : #1f1f22;
-                                enabled: !root.busy && !root.settings-saving && root.connection-code != "busy";
-                                clicked => { root.connection-code = "busy"; root.test-connection(); }
-                            }
-
-                        }
-
-
-                        Rectangle { height: 1px; background: #e3e3e6; }
-
-                        Text {
-                            color: Theme.text-color;
-                            text: "语音播报";
-                            font-size: 14px;
-                            font-weight: 600;
-                        }
-
-                        Text { text: "播报后端、音色与本地 TTS 在「语音」页统一编辑，一次保存生效。"; color: #55555c; wrap: word-wrap; }
-                        Text { text: "聊天区启用模型（默认模型始终可选；目录项尚未经过聊天验证）"; color: #55555c; wrap: word-wrap; }
-                        for name[i] in root.enabled-model-names : AppButton {
-                            label: (name == root.model-name ? "默认模型（始终可选） · " : root.enabled-model-flags[i] ? "已启用 · " : "未启用 · ") + root.enabled-model-labels[i];
-                            enabled: !root.settings-saving && name != root.model-name;
-                            width: 100%;
-                            clicked => {
-                                root.enabled-model-flags[i] = !root.enabled-model-flags[i];
-                                root.settings-dirty = true;
-                            }
-                        }
-                        // ---- 模型发现与连通性 ----
-                        Text {
-                            color: Theme.text-color;
-                            text: "连通性与模型发现";
-                            font-size: 13px;
-                            font-weight: 600;
-                        }
-
-                        HorizontalLayout {
-                            spacing: 8px;
-                            AppButton {
-                                label: root.models-busy ? "获取中…" : "获取模型";
-                                enabled: !root.settings-saving && !root.models-busy;
-                                clicked => { root.fetch-models(); }
-                            }
-                            Rectangle { horizontal-stretch: 1; }
-                        }
-
-                        if root.connection-hint != "" : Text {
-                            text: root.connection-hint;
-                            font-size: 11px;
-                            color: root.connection-code == "ok" ? #1f7a3a : (root.connection-code == "auth" ? #a02020 : #a05a00);
-                            wrap: word-wrap;
-                        }
-
-                        if root.model-list-hint != "" : Text {
-                            text: root.model-list-hint;
-                            font-size: 11px;
-                            color: #55555c;
-                            wrap: word-wrap;
-                        }
-
-
-                        Text {
-                            text: "「获取模型」只查询 /models 目录：成功不等于模型能聊天，失败也不妨碍手填模型名。「测试连接」会真的发一次最小对话请求，据此区分授权 / 模型 / 网络问题。";
-                            font-size: 11px;
-                            color: #8a8a90;
-                            wrap: word-wrap;
-                        }
                         }
 
                         // ===== 1. Agent 与上下文 =====
@@ -2307,11 +2291,7 @@ export component AppWindow inherits Window {
                             clicked => { root.stop-speaking(); }
                         }
 
-                        AppButton {
-                            label: "清除已保存的 Key";
-                            enabled: root.has-key && !root.settings-saving;
-                            clicked => { root.clear-api-key(root.provider-index); }
-                        }
+
 
                         Rectangle { horizontal-stretch: 1; }
                     }
