@@ -187,6 +187,8 @@ impl StepRecord {
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutcome {
     pub text: String,
+    /// 经协议成功终结的最终正文；不包含工具决策步骤的临时文字。
+    pub speech_text: String,
     pub steps: Vec<StepRecord>,
     pub limited: bool,
     pub reasoning_chars: usize,
@@ -543,6 +545,7 @@ impl Agent {
                     emit(AgentEvent::Failed { turn, reason });
                     return outcome;
                 }
+                outcome.speech_text = result.text.clone();
                 messages.push(assistant_message_from(
                     &result,
                     self.config.echo_reasoning,
@@ -959,6 +962,9 @@ impl Agent {
                 .await
             {
                 Ok(closing) => {
+                    if !closing.tool_calls_incomplete && closing.finish_reason == "stop" {
+                        outcome.speech_text = closing.text.clone();
+                    }
                     // 这条内部提示不属于对话内容，拿到回复后就撤掉。
                     messages.remove(note_index);
                     if !closing.text.is_empty() {

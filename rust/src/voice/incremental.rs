@@ -9,7 +9,8 @@ pub struct Sentences {
     code: usize,
     link_url: usize,
     after_label: bool,
-    tag: bool,
+    tag: String,
+    tag_quote: Option<char>,
     line_start: bool,
 }
 impl Sentences {
@@ -36,11 +37,33 @@ impl Sentences {
                     continue;
                 }
             }
-            if self.tag {
-                if c == '>' || c == '\n' {
-                    self.tag = false;
+            if !self.tag.is_empty() {
+                if c == '>' && self.tag_quote.is_none() {
+                    let candidate = std::mem::take(&mut self.tag);
+                    if !is_html_tag(&candidate[1..]) {
+                        self.token.push_str(&candidate);
+                        self.token.push('>');
+                    }
+                    continue;
                 }
-                continue;
+                // 不确定结构最多保留 512 字节；遇到普通比较式立即按正文恢复。
+                if c == '\n'
+                    || self.tag.len() >= 512
+                    || (self.tag == "<" && !(c.is_ascii_alphabetic() || c == '/'))
+                {
+                    self.token.push_str(&std::mem::take(&mut self.tag));
+                    self.tag_quote = None;
+                } else {
+                    if matches!(c, '\'' | '"') {
+                        if self.tag_quote == Some(c) {
+                            self.tag_quote = None;
+                        } else if self.tag_quote.is_none() {
+                            self.tag_quote = Some(c);
+                        }
+                    }
+                    self.tag.push(c);
+                    continue;
+                }
             }
             if self.link_url > 0 {
                 if c == '\n' {
@@ -67,7 +90,7 @@ impl Sentences {
             match c {
                 '<' => {
                     self.flush_token();
-                    self.tag = true;
+                    self.tag.push('<');
                 }
                 '[' => {}
                 ']' => self.after_label = true,
@@ -172,12 +195,105 @@ impl Sentences {
         }
     }
     pub fn finish(&mut self) -> Vec<String> {
-        if self.code == 0 && self.ticks == 0 && !self.tag && self.link_url == 0 {
+        if !self.tag.is_empty() {
+            self.token.push_str(&std::mem::take(&mut self.tag));
+        }
+        if self.code == 0 && self.ticks == 0 && self.link_url == 0 {
             self.flush_token();
         }
         let mut out = Vec::new();
         self.drain(&mut out, true);
         out
+    }
+}
+// 只跳过明确的常见 HTML 元素；未知/未闭合结构保留为正文，避免吞掉数学表达式。
+fn is_html_tag(body: &str) -> bool {
+    let closing = body.starts_with('/');
+    let body = body.strip_prefix('/').unwrap_or(body);
+    let end = body
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(body.len());
+    let name = body[..end].to_ascii_lowercase();
+    if ![
+        "a",
+        "abbr",
+        "b",
+        "br",
+        "blockquote",
+        "code",
+        "div",
+        "em",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "i",
+        "img",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "s",
+        "small",
+        "span",
+        "strong",
+        "sub",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "thead",
+        "tr",
+        "u",
+        "ul",
+    ]
+    .contains(&name.as_str())
+    {
+        return false;
+    }
+    let mut tail = &body[end..];
+    if closing {
+        return tail.trim().is_empty();
+    }
+    if !tail.is_empty() && tail != "/" && !tail.starts_with(char::is_whitespace) {
+        return false;
+    }
+    loop {
+        tail = tail.trim_start();
+        if tail.is_empty() || tail == "/" {
+            return true;
+        }
+        let size = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+            .count();
+        if size == 0 {
+            return false;
+        }
+        tail = &tail[size..]; // 属性名仅 ASCII，字符数就是字节数。
+        tail = tail.trim_start();
+        if let Some(value) = tail.strip_prefix('=') {
+            tail = value.trim_start();
+            if let Some(quote) = tail.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+                let Some(end) = tail[1..].find(quote) else {
+                    return false;
+                };
+                tail = &tail[end + 2..];
+            } else {
+                let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+                if end == 0 || tail[..end].contains(['<', '>', '\'', '"', '`', '=']) {
+                    return false;
+                }
+                tail = &tail[end..];
+            }
+            if !tail.is_empty() && tail != "/" && !tail.starts_with(char::is_whitespace) {
+                return false;
+            }
+        }
     }
 }
 #[cfg(test)]
@@ -191,6 +307,41 @@ mod tests {
         }
         out.extend(s.finish());
         out
+    }
+    #[test]
+    fn comparisons_and_html_preserve_text_at_every_split() {
+        for (input, expected) in [
+            (
+                "如果温度 < 20°C，就打开空调。",
+                "如果温度 < 20°C，就打开空调。",
+            ),
+            ("当 x < 10 时，继续执行。", "当 x < 10 时，继续执行。"),
+            (
+                "p < 0.05 表示存在统计学显著性。",
+                "p < 0.05 表示存在统计学显著性。",
+            ),
+            (r#"<b>保留</b><span class="x">文字。</span>"#, "保留文字。"),
+            (
+                "普通 <not-a-tag 后面仍有正文。",
+                "普通 <not-a-tag 后面仍有正文。",
+            ),
+            ("未闭合 <span 后面文字", "未闭合 <span 后面文字"),
+            (
+                "x<y>z。[文字](https://example.com)。`代码`结束。",
+                "x<y>z。文字。结束。",
+            ),
+        ] {
+            let expected_parts = collect(&[input]);
+            assert_eq!(expected_parts.join(""), expected);
+            for i in input.char_indices().map(|(i, _)| i) {
+                assert_eq!(collect(&[&input[..i], &input[i..]]), expected_parts);
+            }
+            let parts: Vec<_> = input
+                .char_indices()
+                .map(|(i, c)| &input[i..i + c.len_utf8()])
+                .collect();
+            assert_eq!(collect(&parts), expected_parts);
+        }
     }
     #[test]
     fn markdown_arbitrary_chunks() {

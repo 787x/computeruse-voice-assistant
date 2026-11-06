@@ -3284,6 +3284,8 @@ fn settle_voice_confirmation(
 pub(crate) struct IncrementalSpeech {
     step: Option<usize>,
     pending: std::collections::VecDeque<String>,
+    truncated: bool,
+    omitted_chars: usize,
     turn: u64,
     sentences: crate::voice::incremental::Sentences,
     id: Option<SpeechId>,
@@ -3348,14 +3350,21 @@ impl IncrementalSpeech {
             return;
         }
         for sentence in sentences {
+            self.pump(turn, speech, weak);
+            if self.truncated
+                || self.pending.iter().map(String::len).sum::<usize>() + sentence.len() > 32_768
+            {
+                self.omitted_chars = self.omitted_chars.saturating_add(sentence.chars().count());
+                if !self.truncated {
+                    self.truncated = true;
+                    if let Some(id) = self.id {
+                        speech.notice(id, "待播正文达到 32KB 预算，本轮只播已接收前缀；其后文字保留在对话中，结束时显示未播字符数".into());
+                    }
+                }
+                continue;
+            }
             self.pending.push_back(sentence);
             self.pump(turn, speech, weak);
-            if self.pending.iter().map(String::len).sum::<usize>() > 32_768 {
-                self.suppress();
-                speech.stop();
-                set_speech_unavailable(weak, "待播文字超过 32KB，请缩短回答后重试");
-                break;
-            }
         }
     }
     fn pump(&mut self, turn: u64, speech: &mut SpeechRuntime, weak: &slint::Weak<AppWindow>) {
@@ -3396,6 +3405,9 @@ impl IncrementalSpeech {
         // id is allocated only once; the caller supplies the originating turn before any tail.
         self.send(sentences, self.turn, speech, weak);
         if let Some(id) = self.id {
+            if self.truncated {
+                speech.notice(id, format!("本轮有 {} 个可读字符因待播预算未播报；已接收部分继续正常播放，完整回复仍在对话中", self.omitted_chars));
+            }
             speech.finish_pending(id, std::mem::take(&mut self.pending));
         }
     }
@@ -3403,9 +3415,9 @@ impl IncrementalSpeech {
 
 /// 回合正常完成后播报可见回复。
 ///
-/// 只播 `TurnOutcome::text`（经过 Agent 汇总的**用户可见**文本）：
+/// 只播 `TurnOutcome::speech_text`（协议终结后确定的最终用户正文）：
 /// 思考内容、工具 JSON、内部提示都不在这里，也不可能从这里漏出去。
-fn maybe_speak(
+pub(crate) fn maybe_speak(
     weak: &slint::Weak<AppWindow>,
     speech: &mut SpeechRuntime,
     settings: &Settings,
@@ -3420,7 +3432,7 @@ fn maybe_speak(
     if !settings.tts.speaks(source.is_voice()) {
         return;
     }
-    let text = outcome.text.trim();
+    let text = outcome.speech_text.trim();
     if text.is_empty() {
         return;
     }
@@ -3450,6 +3462,7 @@ fn set_speech_unavailable(weak: &slint::Weak<AppWindow>, reason: &str) {
 struct SpeechView {
     /// 当前（或最近一次）播报的身份；`None` = 还没有播报。
     current: Option<SpeechId>,
+    notice: Option<String>,
 }
 
 impl SpeechView {
@@ -3460,6 +3473,7 @@ impl SpeechView {
             Some(current) if speech_id == current => true,
             _ => {
                 self.current = Some(speech_id);
+                self.notice = None;
                 true
             }
         }
@@ -3485,7 +3499,13 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
     match event {
         SpeechEvent::State { state, .. } => {
             let code = state.code().to_string();
-            let label = state.label();
+            if matches!(state, PlaybackState::Stopped | PlaybackState::Failed(_)) {
+                view.notice = None;
+            }
+            let label = match &view.notice {
+                Some(notice) => format!("{}；{notice}", state.label()),
+                None => state.label(),
+            };
             let label_for_loop = label.clone();
             let active = state.is_active();
             let failed = matches!(state, PlaybackState::Failed(_));
@@ -3514,6 +3534,7 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
             });
         }
         SpeechEvent::Notice { text, .. } => {
+            view.notice = Some(text.clone());
             set_status(weak, text);
             let detail = text.clone();
             let weak = weak.clone();

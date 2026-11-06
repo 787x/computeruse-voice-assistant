@@ -22,8 +22,7 @@ use super::playback::{
     DeviceInfo, Feed, PlaybackShared, PlaybackState, PlayerHandle, LOW_WATER_SECONDS,
 };
 use super::tts::{
-    build_engine, prepare_speech, SpeechChunk, SpeechId, SynthRequest, TtsEngine, TtsEvent,
-    TtsSettings, TurnId,
+    build_engine, SpeechChunk, SpeechId, SynthRequest, TtsEngine, TtsEvent, TtsSettings, TurnId,
 };
 
 /// 播报层发给界面的事件。
@@ -216,51 +215,31 @@ impl SpeechRuntime {
     ///
     /// 调用方必须传入**已确认的用户可见文本**；空文本直接拒绝（不发请求）。
     pub fn speak(&mut self, turn: TurnId, text: &str) -> Result<SpeechId, String> {
-        let engine = self.engine.clone().ok_or_else(|| {
-            self.engine_error
-                .clone()
-                .unwrap_or_else(|| "语音播报未开启".to_string())
-        })?;
-        let mut plan = prepare_speech(text);
-        let budget = engine.text_byte_budget();
-        plan.sentences = plan
-            .sentences
-            .into_iter()
-            .flat_map(|sentence| {
-                let mut pieces = Vec::new();
-                let mut part = String::new();
-                for c in sentence.chars() {
-                    if part.len() + c.len_utf8() > budget && !part.is_empty() {
-                        pieces.push(std::mem::take(&mut part));
-                    }
-                    part.push(c);
-                }
-                if !part.is_empty() {
-                    pieces.push(part);
-                }
-                pieces
-            })
-            .collect();
-        if plan.is_empty() {
-            return Err("没有可播报的文本".to_string());
+        // 完整回复也使用同一个有界合成通道；不再走历史 400 字预览预算。
+        const MAX_COMPLETED_BYTES: usize = 256 * 1024;
+        let mut end = text.len().min(MAX_COMPLETED_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
         }
-        let (tx, rx) = tokio::sync::mpsc::channel(plan.sentences.len().max(1));
-        for sentence in plan.sentences {
-            let _ = tx.try_send(sentence);
+        let mut parser = super::incremental::Sentences::default();
+        let mut sentences: std::collections::VecDeque<_> = parser.push(&text[..end])?.into();
+        sentences.extend(parser.finish());
+        if sentences.is_empty() {
+            return Err("没有可播报的文本".into());
         }
-        drop(tx);
-        let id = self.start_input(turn, rx, None)?;
-        if plan.dropped_chars > 0 {
-            let _ = self.events.send(SpeechEvent::Notice {
-                speech_id: id,
-                text: format!(
-                    "回复较长，只播报前 {} 字（另有 {} 字未播报）",
-                    super::tts::MAX_SPEECH_CHARS,
-                    plan.dropped_chars
-                ),
-            });
+        let id = self.begin(turn)?;
+        self.finish_pending(id, sentences);
+        if end < text.len() {
+            self.notice(id, format!("完整回复播报输入上限为 256KB，原始回复末尾 {} 个字符未送入播报；已接收部分继续播放，完整文本仍在对话中", text[end..].chars().count()));
         }
         Ok(id)
+    }
+
+    pub(crate) fn notice(&self, id: SpeechId, text: String) {
+        let _ = self.events.send(SpeechEvent::Notice {
+            speech_id: id,
+            text,
+        });
     }
 
     /// 单个播放器、单个身份，生产者关闭后才允许设备排空完成。
@@ -271,22 +250,20 @@ impl SpeechRuntime {
 
     pub fn append(&mut self, id: SpeechId, text: String) -> Result<(), String> {
         let parts = self.sentence_parts(&text);
+        let input = self
+            .speaking
+            .as_ref()
+            .filter(|s| s.speech_id == id && s.active.load(Ordering::SeqCst))
+            .and_then(|s| s.input.as_ref())
+            .ok_or_else(|| "播报输入已关闭".to_string())?;
+        // 全句预检；暂满既不修改播放终态，也不先塞入半句导致重试重复。
+        if input.capacity() < parts.len() {
+            return Err("播报队列暂满，请稍后重试".into());
+        }
         for part in parts {
-            let result = self
-                .speaking
-                .as_ref()
-                .filter(|s| s.speech_id == id && s.active.load(Ordering::SeqCst))
-                .and_then(|s| s.input.as_ref())
-                .ok_or_else(|| "播报输入已关闭".to_string())?
-                .try_send(part);
-            if result.is_err() {
-                self.settle(
-                    id,
-                    PlaybackState::Failed("播报句子队列已满，请停止后重试".into()),
-                    true,
-                );
-                return Err("播报句子队列已满，请停止后重试".into());
-            }
+            input
+                .try_send(part)
+                .map_err(|_| "播报输入已关闭".to_string())?;
         }
         Ok(())
     }
@@ -357,10 +334,11 @@ impl SpeechRuntime {
         sentences: tokio::sync::mpsc::Receiver<String>,
         input: Option<tokio::sync::mpsc::Sender<String>>,
     ) -> Result<SpeechId, String> {
-        let engine = self
-            .engine
-            .clone()
-            .ok_or_else(|| "语音播报不可用".to_string())?;
+        let engine = self.engine.clone().ok_or_else(|| {
+            self.engine_error
+                .clone()
+                .unwrap_or_else(|| "语音播报未开启".into())
+        })?;
         self.stop();
         let shared = self.ensure_playback()?;
         self.next_speech_id += 1;
@@ -924,24 +902,77 @@ mod tests {
         }
     }
 
+    struct TestWindowTool;
+    impl crate::agent::ToolInvoker for TestWindowTool {
+        fn tool_definitions(&self) -> Vec<serde_json::Value> {
+            vec![
+                serde_json::json!({"type":"function","function":{"name":"list_windows","description":"list windows","parameters":{"type":"object","properties":{}}}}),
+            ]
+        }
+        fn invoke<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a CancelToken,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::agent::ToolExecution, crate::cua::ToolError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::agent::ToolExecution {
+                    text: "已列出窗口".into(),
+                    image: None,
+                })
+            })
+        }
+    }
+    struct Deny;
+    impl crate::permissions::Confirmer for Deny {
+        fn confirm<'a>(
+            &'a self,
+            _: crate::permissions::ConfirmRequest,
+            _: &'a CancelToken,
+        ) -> crate::permissions::ConfirmFuture<'a> {
+            Box::pin(async { crate::permissions::ConfirmAnswer::deny_click() })
+        }
+    }
     #[tokio::test]
-    async fn bounded_sentence_queue_fails_without_blocking_or_restarting() {
+    async fn bounded_sentence_queue_reports_backpressure_without_failing_playback() {
         let engine = Arc::new(FakeEngine {
             chunks: vec![vec![0.25; 2400]],
             sample_rate: 24_000,
             fail: None,
             started: Arc::new(Mutex::new(Vec::new())),
         });
-        let (mut runtime, mut events, _) = runtime_with(engine);
+        let (mut runtime, mut events, shared) = runtime_with(engine);
         let id = runtime.begin(15).unwrap();
         for _ in 0..32 {
             runtime.append(id, "句子".into()).unwrap();
         }
         assert!(runtime.append(id, "超出队列".into()).is_err());
-        assert!(!runtime.is_speaking());
-        assert!(runtime.append(id, "迟到片段".into()).is_err());
+        assert!(runtime.is_speaking());
+        for _ in 0..100 {
+            if runtime.can_append(id, "恢复后句子") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        runtime.append(id, "恢复后句子".into()).unwrap();
+        runtime.finish(id);
+        for _ in 0..1000 {
+            shared.pull(&mut vec![0.0; 2400]);
+            if !runtime.is_speaking() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(shared.progress().drained());
         assert!(
-            std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(
+            !std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(
                 e,
                 SpeechEvent::State {
                     state: PlaybackState::Failed(_),
@@ -1001,6 +1032,201 @@ mod tests {
             *started.lock().unwrap(),
             (0..100).map(|i| format!("第{i}句")).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn tool_enabled_plain_long_answer_waits_for_protocol_then_reads_all() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::new(FakeEngine {
+            chunks: vec![vec![0.25; 240]],
+            sample_rate: 24_000,
+            fail: None,
+            started: started.clone(),
+        });
+        let (mut runtime, _, shared) = runtime_with(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let playback = shared.clone();
+        let answer = "完整长回答。".repeat(150); // 900 字，显著超过旧 400 字预算。
+        let body = answer.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]);
+                    let len = head
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + len {
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&request[end + 4..end + 4 + len]).unwrap();
+                        assert!(!value["tools"].as_array().unwrap().is_empty());
+                        break;
+                    }
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            let delta = serde_json::json!({"choices":[{"delta":{"content":body}}]});
+            socket
+                .write_all(format!("data: {delta}\n\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert_eq!(
+                playback.progress().pushed_frames,
+                0,
+                "工具可用的未终结流不能提前判为最终回答"
+            );
+            socket.write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").await.unwrap();
+        });
+        let mut settings = crate::config::Settings {
+            provider_id: "openai-compatible".into(),
+            base_url: url,
+            model: "mock".into(),
+            ..Default::default()
+        };
+        settings.tts.enabled = true;
+        settings.tts.backend = crate::voice::tts::TtsBackend::Mimo;
+        let client = crate::llm::LlmClient::new(settings.profile(), "", 0.0, 5000).unwrap();
+        let mut agent = crate::agent::Agent::new(
+            client,
+            Arc::new(TestWindowTool),
+            crate::agent::AgentConfig {
+                turn_id: 15,
+                use_tools: true,
+                ..Default::default()
+            },
+            crate::permissions::PermissionState::new(crate::config::PermissionMode::Standard),
+        );
+        let pipeline = Mutex::new((
+            crate::ui::worker::IncrementalSpeech::default(),
+            &mut runtime,
+        ));
+        let emit = |event| {
+            let mut g = pipeline.lock().unwrap();
+            let (inc, rt) = &mut *g;
+            inc.event(
+                &event,
+                15,
+                &settings,
+                crate::ui::worker::TurnSource::Voice,
+                rt,
+                &slint::Weak::default(),
+            );
+        };
+        let result = agent
+            .run("test", &mut Vec::new(), &CancelToken::new(), &Deny, &emit)
+            .await;
+        drop(pipeline);
+        server.await.unwrap();
+        assert!(!result.failed);
+        assert_eq!(result.text, answer);
+        crate::ui::worker::maybe_speak(
+            &slint::Weak::default(),
+            &mut runtime,
+            &settings,
+            &result,
+            15,
+            crate::ui::worker::TurnSource::Voice,
+        );
+        for _ in 0..2000 {
+            shared.pull(&mut vec![0.0; 2400]);
+            if !runtime.is_speaking() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(shared.progress().drained());
+        assert_eq!(*started.lock().unwrap(), vec!["完整长回答"; 150]);
+    }
+
+    #[tokio::test]
+    async fn sustained_backlog_keeps_prefix_and_reports_exact_omission_without_failure() {
+        for stopped in [false, true] {
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let engine = Arc::new(FakeEngine {
+                chunks: vec![vec![0.25; 240]],
+                sample_rate: 24000,
+                fail: None,
+                started: started.clone(),
+            });
+            let (mut runtime, mut events, shared) = runtime_with(engine);
+            let mut settings = crate::config::Settings::default();
+            settings.tts.enabled = true;
+            settings.tts.backend = crate::voice::tts::TtsBackend::Mimo;
+            let mut inc = crate::ui::worker::IncrementalSpeech::default();
+            let weak = slint::Weak::default();
+            inc.event(
+                &crate::agent::AgentEvent::SpeechEligible { turn: 15, step: 0 },
+                15,
+                &settings,
+                crate::ui::worker::TurnSource::Voice,
+                &mut runtime,
+                &weak,
+            );
+            for i in 0..5000 {
+                inc.event(
+                    &crate::agent::AgentEvent::TextDelta {
+                        turn: 15,
+                        step: 0,
+                        text: format!("第{i}句。"),
+                    },
+                    15,
+                    &settings,
+                    crate::ui::worker::TurnSource::Voice,
+                    &mut runtime,
+                    &weak,
+                );
+            }
+            assert!(runtime.is_speaking(), "预算降级不得停止已接收声音");
+            inc.finish(&mut runtime, &weak);
+            if stopped {
+                runtime.stop();
+            }
+            for _ in 0..3000 {
+                shared.pull(&mut vec![0.0; 2400]);
+                if !runtime.is_speaking() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let accepted = started.lock().unwrap().clone();
+            let messages: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+            assert!(!messages.iter().any(|e| matches!(
+                e,
+                SpeechEvent::State {
+                    state: PlaybackState::Failed(_),
+                    ..
+                }
+            )));
+            if stopped {
+                assert!(accepted.is_empty());
+                continue;
+            }
+            assert!(shared.progress().drained());
+            assert!(!accepted.is_empty() && accepted.len() < 5000);
+            assert_eq!(
+                accepted,
+                (0..accepted.len())
+                    .map(|i| format!("第{i}句"))
+                    .collect::<Vec<_>>()
+            );
+            let omitted: usize = (accepted.len()..5000)
+                .map(|i| format!("第{i}句。").chars().count())
+                .sum();
+            assert!(messages.iter().any(|e| matches!(e,SpeechEvent::Notice {text,..} if text.contains(&format!("{omitted} 个可读字符")))));
+        }
     }
 
     #[tokio::test]
@@ -1127,44 +1353,6 @@ mod tests {
             ..Default::default()
         };
         let client = crate::llm::LlmClient::new(settings.profile(), "", 0.0, 5000).unwrap();
-        struct TestWindowTool;
-        impl crate::agent::ToolInvoker for TestWindowTool {
-            fn tool_definitions(&self) -> Vec<serde_json::Value> {
-                vec![
-                    serde_json::json!({"type":"function","function":{"name":"list_windows","description":"list windows","parameters":{"type":"object","properties":{}}}}),
-                ]
-            }
-            fn invoke<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a serde_json::Value,
-                _: &'a CancelToken,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<crate::agent::ToolExecution, crate::cua::ToolError>,
-                        > + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async {
-                    Ok(crate::agent::ToolExecution {
-                        text: "已列出窗口".into(),
-                        image: None,
-                    })
-                })
-            }
-        }
-        struct Deny;
-        impl crate::permissions::Confirmer for Deny {
-            fn confirm<'a>(
-                &'a self,
-                _: crate::permissions::ConfirmRequest,
-                _: &'a CancelToken,
-            ) -> crate::permissions::ConfirmFuture<'a> {
-                Box::pin(async { crate::permissions::ConfirmAnswer::deny_click() })
-            }
-        }
         let mut settings = settings;
         settings.tts.enabled = true;
         settings.tts.backend = crate::voice::tts::TtsBackend::Mimo;
@@ -1197,6 +1385,7 @@ mod tests {
             .run("test", &mut Vec::new(), &CancelToken::new(), &Deny, &emit)
             .await;
         assert!(result.text.ends_with("第一句。第二句。"));
+        assert_eq!(result.speech_text, "第一句。第二句。");
         assert_eq!(result.steps.len(), 1);
         assert!(result.steps[0].ok());
         assert!(!result.failed);
@@ -1489,7 +1678,7 @@ mod tests {
             started: Arc::new(Mutex::new(Vec::new())),
         });
         let (mut runtime, mut rx, _shared) = runtime_with(engine);
-        let text = "这是一段很长的回复。".repeat(200);
+        let text = "这是一段很长的回复。".repeat(30_000);
         runtime.speak(1, &text).unwrap();
         let mut notice = None;
         for _ in 0..20 {
@@ -1503,7 +1692,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(notice.unwrap().contains("只播报前"));
+        assert!(notice.unwrap().contains("256KB"));
     }
 
     /// **P1 回归**：自然播完后 `is_speaking()` 必须变成 `false`。
@@ -1636,12 +1825,10 @@ mod tests {
             "音频还没开始播就不该显示字幕：{subtitles:?}"
         );
 
-        // 播掉第一句（设备侧 2400 帧 @24k，句 1 的 cue 在 0）。
-        let mut sink = vec![0.0f32; 1200];
-        for _ in 0..3 {
-            shared.pull(&mut sink);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // 只消费首句前 600 帧，不能先消费超过 2400 帧再断言第二句尚未播放。
+        let mut sink = vec![0.0f32; 600];
+        shared.pull(&mut sink);
+        tokio::time::sleep(Duration::from_millis(40)).await;
         let (_, subtitles) = collect_all(&mut rx);
         assert!(
             subtitles.iter().any(|text| text == "第一句"),
