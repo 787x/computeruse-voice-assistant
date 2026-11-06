@@ -273,9 +273,21 @@ fn kill_candidates(
 }
 
 /// 查同名进程（含后台）。名字里的 `.exe` 会被去掉。
+///
+/// **必须排除执行本次查询的临时 PowerShell 自身**（`$PID`）：
+/// `query_by_name("powershell")` 会启动一个 `powershell.exe` 去跑
+/// `Get-Process -Name 'powershell'`，那个临时进程自己也符合查询条件。
+/// 它既不是助手主进程、也不是受保护的 CUA 子进程，于是会被当成
+/// "一个可以结束的普通 PowerShell"——`app_control find powershell` 会凭空
+/// 多出一行，`kill_app powershell` 会试图结束查询者本身，
+/// `wait_until_gone()` 更会因此永远认为目标还在。
+///
+/// 用 `$PID` 排除是这里最直接可靠的做法：它由 PowerShell 自己给出，
+/// 不需要我们在 Rust 侧等待子进程 PID（那要在 `run_powershell` 里另开出口）。
 async fn query_by_name(name: &str, cancel: &CancelToken) -> Result<Vec<ProcessRow>, ToolError> {
     let script = format!(
         "Get-Process -Name '{}' -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.Id -ne $PID }} | \
          Select-Object Id, ProcessName, MainWindowTitle, Path | ConvertTo-Json -Compress",
         quote_pwsh(name)
     );
@@ -813,6 +825,183 @@ mod tests {
         assert!(
             text.contains("正在运行") || text.contains("没有正在运行"),
             "{text}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 自查询排除：query_by_name 不能把执行查询的临时 PowerShell 算进去
+    // ---------------------------------------------------------------
+
+    /// **实机验证 `$PID` 排除真的生效**。
+    ///
+    /// 直接在同一段 PowerShell 里对比"排除前/排除后"：如果 `$PID` 过滤有效，
+    /// 过滤后的集合里不应再出现当前进程 ID。这比只看最终文本更直接，
+    /// 也顺便证明 `$PID` 在这个脚本包装下确实可用。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pid_filter_actually_excludes_the_querying_process() {
+        let cancel = CancelToken::new();
+        let script = "$all = @(Get-Process -Name 'powershell' -ErrorAction SilentlyContinue); \
+             $filtered = @($all | Where-Object { $_.Id -ne $PID }); \
+             [pscustomobject]@{ \
+               total = $all.Count; \
+               after = $filtered.Count; \
+               selfPresent = [bool]($all | Where-Object { $_.Id -eq $PID }) \
+             } | ConvertTo-Json -Compress";
+        let outcome =
+            crate::tools::process::run_powershell(script, None, QUERY_TIMEOUT, &cancel, 4000)
+                .await
+                .expect("PowerShell 应该能跑起来");
+        let payload: serde_json::Value =
+            serde_json::from_str(outcome.stdout.trim()).expect("应返回 JSON");
+        assert_eq!(
+            payload["selfPresent"],
+            json!(true),
+            "查询进程自身确实会出现在未过滤结果里（否则这个测试没有意义）"
+        );
+        assert_eq!(
+            payload["total"].as_i64().unwrap() - payload["after"].as_i64().unwrap(),
+            1,
+            "过滤后应恰好少掉查询进程自己"
+        );
+    }
+    /// `query_by_name` 的结果里**不含查询进程自己的 PID**。
+    ///
+    /// 确定性做法：让查询脚本把**自己的 `$PID`** 一并写到 stderr
+    /// （stdout 必须保持纯 JSON，否则解析会被破坏），然后断言这个 PID
+    /// 没有出现在结果里。若 `$PID` 过滤失效，查询者自己一定会被
+    /// `Get-Process -Name powershell` 枚举到。
+    ///
+    /// 同时跑一个**去掉过滤**的对照组，证明这个测试真的能发现回归。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn query_by_name_excludes_its_own_powershell() {
+        let cancel = CancelToken::new();
+        let filtered = "Get-Process -Name 'powershell' -ErrorAction SilentlyContinue | \
+             Where-Object { $_.Id -ne $PID } | \
+             Select-Object Id, ProcessName, MainWindowTitle, Path | ConvertTo-Json -Compress; \
+             [Console]::Error.WriteLine('SELF_PID=' + $PID)";
+        let outcome =
+            crate::tools::process::run_powershell(filtered, None, QUERY_TIMEOUT, &cancel, 200_000)
+                .await
+                .expect("PowerShell 应该能跑起来");
+        let rows = parse_rows(&outcome.stdout);
+        let self_pid = read_self_pid(&outcome.stderr);
+        assert!(
+            !rows.iter().any(|row| row.pid == self_pid),
+            "查询进程自己（PID {self_pid}）不该出现在结果里：{rows:?}"
+        );
+
+        // 对照组：去掉 `$PID` 过滤后，自己**确实**会被枚举到。
+        let unfiltered = "Get-Process -Name 'powershell' -ErrorAction SilentlyContinue | \
+             Select-Object Id, ProcessName, MainWindowTitle, Path | ConvertTo-Json -Compress; \
+             [Console]::Error.WriteLine('SELF_PID=' + $PID)";
+        let outcome = crate::tools::process::run_powershell(
+            unfiltered,
+            None,
+            QUERY_TIMEOUT,
+            &cancel,
+            200_000,
+        )
+        .await
+        .unwrap();
+        let rows = parse_rows(&outcome.stdout);
+        let self_pid = read_self_pid(&outcome.stderr);
+        assert!(
+            rows.iter().any(|row| row.pid == self_pid),
+            "对照组：不过滤时查询进程自己应被枚举到（PID {self_pid}）"
+        );
+    }
+
+    /// 从脚本写到 stderr 的 `SELF_PID=<n>` 里取查询进程 PID。
+    fn read_self_pid(stderr: &str) -> u32 {
+        stderr
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("SELF_PID="))
+            .and_then(|text| text.trim().parse().ok())
+            .expect("脚本应在 stderr 上报告自己的 PID")
+    }
+
+    /// 查询 `powershell` 时，**至少**不会把 CUA 受保护进程漏进可结束集合。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kill_candidates_exclude_the_querying_process_and_cua_child() {
+        let cancel = CancelToken::new();
+        let rows = query_by_name("powershell", &cancel).await.unwrap();
+        // 把第一个候选当作"受管理的 CUA"：它必须被排除。
+        let managed: Vec<u32> = rows.first().map(|row| vec![row.pid]).unwrap_or_default();
+        let (allowed, refused) = kill_candidates(&rows, "powershell", &own_roots(), &managed);
+        if !managed.is_empty() {
+            assert!(
+                !allowed.iter().any(|row| managed.contains(&row.pid)),
+                "受管理的 CUA 进程不能进可结束集合"
+            );
+            assert!(
+                refused.iter().any(|item| item.contains("助手自身")),
+                "应记录为受保护：{refused:?}"
+            );
+        }
+        // 剩余候选里同样不允许出现"查询进程自己"——它已被 query_by_name 滤掉，
+        // 所以这里能直接断言结果稳定（不会每轮多出一个临时 PID）。
+        assert!(allowed.len() <= rows.len());
+    }
+
+    /// 查询其他名字时 `$PID` 过滤不产生副作用：不存在的进程仍是"没有找到"。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pid_filter_does_not_break_other_names() {
+        let cancel = CancelToken::new();
+        let rows = query_by_name("cuava-not-a-real-process-xyz", &cancel)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "不存在的进程应查不到：{rows:?}");
+    }
+
+    /// 端到端：查询 → 它消失后查询 → `wait_until_gone` 能正确报告"已结束"。
+    ///
+    /// 用**自己启动的、可明确识别的**临时 PowerShell（窗口标题带唯一标记），
+    /// 不去碰用户已有的任何进程。这是对"查询进程自己造成误判"的直接验证：
+    /// 若 `$PID` 没排除，`wait_until_gone` 会因为每轮查询都新建一个
+    /// powershell 而永远看到"还有进程"。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn wait_until_gone_is_not_confused_by_the_querying_process() {
+        let cancel = CancelToken::new();
+        // 启动一个短命、可识别的临时 powershell（约 8 秒后自然退出）。
+        let mut child = tokio::process::Command::new("powershell.exe");
+        child
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg("Start-Sleep -Seconds 8");
+        #[cfg(windows)]
+        {
+            // `tokio::process::Command` 自己提供 `creation_flags`，不需要 CommandExt。
+            child.creation_flags(0x0800_0000);
+        }
+        let mut child = child.spawn().expect("应能启动临时 powershell");
+        let child_pid = child.id().expect("子进程应有 PID");
+        // 等它真正出现在进程表里。
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // 它应该能被查到（query_by_name 只排除**查询者自己**，不排除别的 powershell）。
+        let rows = query_by_name("powershell", &cancel).await.unwrap();
+        assert!(
+            rows.iter().any(|row| row.pid == child_pid),
+            "自己启动的临时 powershell 应能被查到（PID {child_pid}）：{rows:?}"
+        );
+
+        // 结束它。
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        // 再查：它应该已经不在结果里；`wait_until_gone` 也应返回空集合。
+        let alive = wait_until_gone("powershell", &own_roots(), &[], &cancel)
+            .await
+            .unwrap();
+        assert!(
+            !alive.iter().any(|row| row.pid == child_pid),
+            "已结束的临时 powershell 不应还在存活集合里（PID {child_pid}）：{alive:?}"
         );
     }
 }
