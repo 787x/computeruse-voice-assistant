@@ -242,6 +242,15 @@ pub fn normalize_for_speech(text: &str) -> String {
 ///  4. 单句超 [`MAX_SENTENCE_CHARS`] 硬切；
 ///  5. 总长超 [`MAX_SPEECH_CHARS`] 在句子边界截断，并如实记录丢了多少字。
 pub fn prepare_speech(text: &str) -> SpeechPlan {
+    prepare_with_limit(text, MAX_SPEECH_CHARS)
+}
+
+/// 增量生产者已有有界输入，不再按完整回复的 400 字预算静默截断。
+pub fn prepare_incremental(text: &str) -> SpeechPlan {
+    prepare_with_limit(text, usize::MAX)
+}
+
+fn prepare_with_limit(text: &str, limit: usize) -> SpeechPlan {
     let normalized = normalize_for_speech(text);
     if normalized.is_empty() {
         return SpeechPlan {
@@ -338,7 +347,7 @@ pub fn prepare_speech(text: &str) -> SpeechPlan {
     let mut dropped = 0usize;
     for (index, sentence) in merged.iter().enumerate() {
         let length = sentence.chars().count();
-        if used + length > MAX_SPEECH_CHARS && !sentences.is_empty() {
+        if used + length > limit && !sentences.is_empty() {
             dropped += length;
             // 剩下的句子全都不播，一并计入丢弃字数。
             for rest in merged.iter().skip(index + 1) {

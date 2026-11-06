@@ -46,6 +46,8 @@ impl std::fmt::Debug for ProviderDraft {
 /// 界面「保存」提交的全部内容。
 #[derive(Debug, Clone)]
 pub struct SaveRequest {
+    pub continuous_conversation: bool,
+    pub followup_seconds: String,
     pub kws_dir: String,
     pub whisper_file: String,
     pub keywords_file: String,
@@ -456,6 +458,12 @@ pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Sett
     }
     next.providers = providers;
 
+    next.voice.continuous_conversation = request.continuous_conversation;
+    next.voice.followup_seconds = request
+        .followup_seconds
+        .parse::<u32>()
+        .map_err(|_| "追问窗口应为 1–30 秒".to_string())?
+        .clamp(1, 30);
     next.voice.kws_model_dir = request.kws_dir.clone();
     next.voice.whisper_model = request.whisper_file.clone();
     next.voice.keywords_file = request.keywords_file.clone();
@@ -819,6 +827,8 @@ mod tests {
 
     fn base_request(settings: &Settings) -> SaveRequest {
         SaveRequest {
+            continuous_conversation: settings.voice.continuous_conversation,
+            followup_seconds: settings.voice.followup_seconds.to_string(),
             kws_dir: settings.voice.kws_model_dir.clone(),
             whisper_file: settings.voice.whisper_model.clone(),
             keywords_file: settings.voice.keywords_file.clone(),

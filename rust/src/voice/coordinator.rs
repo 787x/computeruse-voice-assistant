@@ -97,6 +97,7 @@ pub enum ListenPurpose {
     Wake,
     /// 用户点击麦克风后的一次直通指令。
     Manual,
+    Followup,
     /// 播报期间听打断短语。
     BargeIn,
     /// 权限确认期间听「允许 / 拒绝」。
@@ -108,6 +109,7 @@ impl ListenPurpose {
         match self {
             Self::Wake => "wake",
             Self::Manual => "manual",
+            Self::Followup => "followup",
             Self::BargeIn => "barge-in",
             Self::Confirm => "confirm",
         }
@@ -117,6 +119,7 @@ impl ListenPurpose {
         match self {
             Self::Wake => "唤醒词",
             Self::Manual => "点击识别",
+            Self::Followup => "可以继续说",
             Self::BargeIn => "打断聆听",
             Self::Confirm => "语音确认",
         }

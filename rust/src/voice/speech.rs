@@ -72,6 +72,7 @@ struct Speaking {
     /// "这一段已经结束"，`is_speaking()` 与 `sync_listen_mode()` 才能立刻
     /// 反映真实运行状态，而不是等下一次 `speak()` / `stop()` 才收敛。
     active: Arc<AtomicBool>,
+    input: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl SpeechRuntime {
@@ -238,18 +239,15 @@ impl SpeechRuntime {
         if plan.is_empty() {
             return Err("没有可播报的文本".to_string());
         }
-        // 上一段还没结束：直接停掉（新回合绝不接在旧音频后面）。
-        self.stop();
-
-        let shared = self.ensure_playback()?;
-        self.next_speech_id += 1;
-        let speech_id = self.next_speech_id;
-        shared.begin(speech_id);
-        *self.recent.lock().unwrap_or_else(|e| e.into_inner()) = plan.sentences.clone();
-
+        let (tx, rx) = tokio::sync::mpsc::channel(plan.sentences.len().max(1));
+        for sentence in plan.sentences {
+            let _ = tx.try_send(sentence);
+        }
+        drop(tx);
+        let id = self.start_input(turn, rx, None)?;
         if plan.dropped_chars > 0 {
             let _ = self.events.send(SpeechEvent::Notice {
-                speech_id,
+                speech_id: id,
                 text: format!(
                     "回复较长，只播报前 {} 字（另有 {} 字未播报）",
                     super::tts::MAX_SPEECH_CHARS,
@@ -257,10 +255,82 @@ impl SpeechRuntime {
                 ),
             });
         }
+        Ok(id)
+    }
 
+    /// 单个播放器、单个身份，生产者关闭后才允许设备排空完成。
+    pub fn begin(&mut self, turn: TurnId) -> Result<SpeechId, String> {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        self.start_input(turn, rx, Some(tx))
+    }
+
+    pub fn append(&mut self, id: SpeechId, text: String) -> Result<(), String> {
+        let budget = self
+            .engine
+            .as_ref()
+            .map(|e| e.text_byte_budget())
+            .unwrap_or(1024)
+            .max(4);
+        let mut parts = Vec::new();
+        for sentence in super::tts::prepare_incremental(&text).sentences {
+            let mut part = String::new();
+            for c in sentence.chars() {
+                if part.len() + c.len_utf8() > budget {
+                    parts.push(std::mem::take(&mut part));
+                }
+                part.push(c);
+            }
+            if !part.is_empty() {
+                parts.push(part);
+            }
+        }
+        for part in parts {
+            let result = self
+                .speaking
+                .as_ref()
+                .filter(|s| s.speech_id == id && s.active.load(Ordering::SeqCst))
+                .and_then(|s| s.input.as_ref())
+                .ok_or_else(|| "播报输入已关闭".to_string())?
+                .try_send(part);
+            if result.is_err() {
+                self.settle(
+                    id,
+                    PlaybackState::Failed("播报句子队列已满，请停止后重试".into()),
+                    true,
+                );
+                return Err("播报句子队列已满，请停止后重试".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(&mut self, id: SpeechId) {
+        if let Some(s) = self.speaking.as_mut().filter(|s| s.speech_id == id) {
+            s.input.take();
+        }
+    }
+
+    fn start_input(
+        &mut self,
+        turn: TurnId,
+        sentences: tokio::sync::mpsc::Receiver<String>,
+        input: Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<SpeechId, String> {
+        let engine = self
+            .engine
+            .clone()
+            .ok_or_else(|| "语音播报不可用".to_string())?;
+        self.stop();
+        let shared = self.ensure_playback()?;
+        self.next_speech_id += 1;
+        let speech_id = self.next_speech_id;
+        shared.begin(speech_id);
+        self.recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let cancel = CancelToken::new();
         let events = self.events.clone();
-        let sentences = plan.sentences.clone();
         let style = self.settings.mimo_style.clone();
         let volume = self.settings.volume;
         let engine_for_task = engine.clone();
@@ -300,6 +370,7 @@ impl SpeechRuntime {
         let monitor_cancel = cancel.clone();
         let monitor_active = active.clone();
         let monitor_cues = cues.clone();
+        let recent = self.recent.clone();
         tokio::spawn(async move {
             monitor(
                 monitor_shared,
@@ -309,6 +380,7 @@ impl SpeechRuntime {
                 turn,
                 monitor_cancel,
                 monitor_active,
+                recent,
             )
             .await;
         });
@@ -319,6 +391,7 @@ impl SpeechRuntime {
             cancel,
             task,
             active,
+            input,
         });
         Ok(speech_id)
     }
@@ -405,13 +478,18 @@ async fn synthesize_all(
     cues: Arc<Mutex<SubtitleCues>>,
     speech_id: SpeechId,
     turn: TurnId,
-    sentences: Vec<String>,
+    mut sentences: tokio::sync::mpsc::Receiver<String>,
     style: String,
     volume: f32,
     cancel: CancelToken,
 ) -> Result<(), SynthFailure> {
     let mut feed = Feed::new(speech_id);
-    for (index, sentence) in sentences.iter().enumerate() {
+    let mut index = 0;
+    loop {
+        let sentence = tokio::select! {
+            _ = cancel.cancelled() => return Err(SynthFailure::Cancelled),
+            sentence = sentences.recv() => match sentence { Some(s) => s, None => break },
+        };
         if cancel.is_cancelled() {
             return Err(SynthFailure::Cancelled);
         }
@@ -461,6 +539,7 @@ async fn synthesize_all(
         }
         // 一句话没有任何音频（后端静默失败）：仍要保证会有字幕/无字幕一致，
         // 不补发字幕——没有声音就不该显示"正在读这句"。
+        index += 1;
         if first_chunk && !cancel.is_cancelled() {
             eprintln!("[tts] 第 {index} 句没有产出音频，跳过字幕");
         }
@@ -605,6 +684,7 @@ async fn monitor(
     turn: TurnId,
     cancel: CancelToken,
     active: Arc<AtomicBool>,
+    recent: Arc<Mutex<Vec<String>>>,
 ) {
     let mut last: Option<PlaybackState> = None;
     loop {
@@ -640,6 +720,7 @@ async fn monitor(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take_ready(speech_id, progress.consumed_frames);
         if let Some(text) = ready {
+            *recent.lock().unwrap_or_else(|e| e.into_inner()) = vec![text.clone()];
             let _ = events.send(SpeechEvent::Subtitle { speech_id, text });
         }
         let state = if let Some(error) = progress.failed.clone() {
@@ -793,6 +874,169 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_sentence_queue_fails_without_blocking_or_restarting() {
+        let engine = Arc::new(FakeEngine {
+            chunks: vec![vec![0.25; 2400]],
+            sample_rate: 24_000,
+            fail: None,
+            started: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (mut runtime, mut events, _) = runtime_with(engine);
+        let id = runtime.begin(15).unwrap();
+        for _ in 0..32 {
+            runtime.append(id, "句子".into()).unwrap();
+        }
+        assert!(runtime.append(id, "超出队列".into()).is_err());
+        assert!(!runtime.is_speaking());
+        assert!(runtime.append(id, "迟到片段".into()).is_err());
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(
+                e,
+                SpeechEvent::State {
+                    state: PlaybackState::Failed(_),
+                    ..
+                }
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_sse_first_audio_precedes_final_text() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::new(FakeEngine {
+            chunks: vec![vec![0.25; 2400]],
+            sample_rate: 24_000,
+            fail: None,
+            started,
+        });
+        let (mut runtime, _, shared) = runtime_with(engine);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let playback = shared.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 65536];
+            let mut received = Vec::new();
+            loop {
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(count > 0);
+                received.extend_from_slice(&request[..count]);
+                if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&received[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if received.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket
+                .write_all(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"第一句。\"}}]}\n\n".as_bytes(),
+                )
+                .await
+                .unwrap();
+            let limit = std::time::Instant::now() + Duration::from_secs(2);
+            while playback.progress().pushed_frames == 0 {
+                assert!(
+                    std::time::Instant::now() < limit,
+                    "必须在末批 SSE 发送前播放首句"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let first_audio = std::time::Instant::now();
+            let mut output = vec![0.0; 2400];
+            playback.pull(&mut output);
+            assert!(output.iter().any(|v| *v != 0.0));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let last_text = std::time::Instant::now();
+            socket.write_all("data: {\"choices\":[{\"delta\":{\"content\":\"第二句。\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_bytes()).await.unwrap();
+            assert!(first_audio < last_text);
+        });
+        let settings = crate::config::Settings {
+            provider_id: "openai-compatible".into(),
+            base_url: url,
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        let client = crate::llm::LlmClient::new(settings.profile(), "", 0.0, 5000).unwrap();
+        let id = runtime.begin(15).unwrap();
+        let mut sentences = super::super::incremental::Sentences::default();
+        let result = client
+            .chat(
+                &[crate::llm::ChatMessage::user("test")],
+                &[],
+                &CancelToken::new(),
+                |text| {
+                    for sentence in sentences.push(text).unwrap() {
+                        runtime.append(id, sentence).unwrap();
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.text, "第一句。第二句。");
+        runtime.finish(id);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incremental_plays_before_producer_closes_and_stop_is_permanent() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::new(FakeEngine {
+            chunks: vec![vec![0.25; 2400]],
+            sample_rate: 24_000,
+            fail: None,
+            started: started.clone(),
+        });
+        let (mut runtime, mut events, shared) = runtime_with(engine);
+        let id = runtime.begin(15).unwrap();
+        runtime.append(id, "第一句。".into()).unwrap();
+        for _ in 0..100 {
+            if shared.progress().pushed_frames > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            shared.progress().pushed_frames > 0,
+            "首句必须在生产者结束前进入真实播放缓冲"
+        );
+        assert!(!shared.progress().end_marked);
+        let mut samples = vec![0.0; 2400];
+        shared.pull(&mut samples);
+        assert!(samples.iter().any(|x| *x != 0.0));
+        assert!(!shared.progress().drained());
+        runtime.append(id, "第二句。".into()).unwrap();
+        runtime.finish(id);
+        wait_until_end_marked(&shared).await;
+        drain_device(&shared, 2400);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(*started.lock().unwrap(), vec!["第一句", "第二句"]);
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(
+                e,
+                SpeechEvent::State {
+                    state: PlaybackState::Finished,
+                    ..
+                }
+            ))
+        );
+        let id = runtime.begin(16).unwrap();
+        runtime.stop();
+        assert!(runtime.append(id, "不得重新出声".into()).is_err());
     }
 
     #[test]

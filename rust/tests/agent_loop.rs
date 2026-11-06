@@ -376,6 +376,7 @@ async fn run_turn(
     let sink = events.clone();
     let emit = move |event: AgentEvent| {
         let label = match &event {
+            AgentEvent::SpeechEligible { .. } => return,
             AgentEvent::TextDelta { text, .. } => format!("text:{text}"),
             AgentEvent::ReasoningDone { chars, .. } => format!("reasoning:{chars}"),
             AgentEvent::ReasoningDelta { .. } => "reasoning_delta".to_string(),

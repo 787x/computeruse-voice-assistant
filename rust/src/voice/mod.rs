@@ -40,3 +40,5 @@ pub use coordinator::{
 pub use settings::{AsrLanguage, VoicePaths, VoiceSettings};
 pub use speech::{SpeechEvent, SpeechRuntime};
 pub use tts::{TtsBackend, TtsSettings};
+
+pub mod incremental;

@@ -69,6 +69,8 @@ pub struct ToolCallId(pub u64);
 ///  - 参数摘要（`args_summary`）用于折叠展示，不含截图 base64。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// 请求未提供工具，允许提前播报；不代表流一定成功。
+    SpeechEligible { turn: u64, step: usize },
     /// 可见回复的增量文本。
     TextDelta {
         turn: u64,
@@ -366,6 +368,12 @@ impl Agent {
 
             let step_no = step as usize;
             let request_messages = strip_local_markers(&messages);
+            if tools.is_empty() {
+                emit(AgentEvent::SpeechEligible {
+                    turn,
+                    step: step_no,
+                });
+            }
             /*
              * 思考内容走独立的回调：与可见正文/工具 JSON/系统提示词分离，
              * 绝不进 `outcome.text`，因此也不可能被 TTS 读到。
@@ -928,9 +936,26 @@ impl Agent {
                 self.config.max_steps
             )));
             let request_messages = strip_local_markers(&messages);
+            let closing_step = self.config.max_steps as usize + 1;
+            emit(AgentEvent::SpeechEligible {
+                turn,
+                step: closing_step,
+            });
             match self
                 .llm
-                .chat(&request_messages, &[], cancel, |_| {}, |_| {})
+                .chat(
+                    &request_messages,
+                    &[],
+                    cancel,
+                    |text| {
+                        emit(AgentEvent::TextDelta {
+                            turn,
+                            step: closing_step,
+                            text: text.to_string(),
+                        })
+                    },
+                    |_| {},
+                )
                 .await
             {
                 Ok(closing) => {
