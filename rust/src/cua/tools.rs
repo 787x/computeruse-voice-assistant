@@ -8,6 +8,10 @@
 //!  - `frame_id` 与截图栅格坐标：坐标是**返回图像内的像素**，不是物理屏幕像素；
 //!  - 截图按真实 media type（`image/png` / `image/jpeg`）交给多模态模型；
 //!  - 参数错误一律在执行前拦下（`.invalid arguments: …`），绝不拿半截参数动作。
+//!
+//! PR12：工具定义与参数宽化挪到 [`crate::tools::spec`]、错误类型挪到
+//! [`crate::tools::error`]，CUA 与本地工具共用同一套形态。本文件重新导出它们，
+//! 所以既有调用点（`cua::ToolError` 等）不需要改动。
 
 use std::path::PathBuf;
 
@@ -16,6 +20,12 @@ use serde_json::{json, Map, Value};
 
 use crate::cancel::CancelToken;
 use crate::cua::bridge::{BridgeError, PwshBridge};
+use crate::tools::spec::{
+    as_args, coerce_bool, coerce_int, coerce_number, coerce_string, merge_objects, object_schema,
+};
+
+pub use crate::tools::error::{ArgError, ToolError};
+pub use crate::tools::spec::ToolSpec;
 
 /// 语音场景默认工具白名单（与 `packages/cua/adapter.mjs` 的 `DEFAULT_TOOL_NAMES` 一致）。
 pub const DEFAULT_TOOL_NAMES: &[&str] = &[
@@ -57,41 +67,8 @@ pub struct ImageAttachment {
     pub height: Option<i64>,
 }
 
-/// 工具定义（OpenAI function calling 形态）。
-#[derive(Debug, Clone)]
-pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub parameters: Value,
-    pub read_only: bool,
-    /// 长耗时命令用更长的超时（`get_app_state` / `screenshot` / `wait`）。
-    pub long_timeout: bool,
-}
-
-impl ToolSpec {
-    /// 转成请求体里的 tool 对象。
-    pub fn to_request_value(&self) -> Value {
-        json!({
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            }
-        })
-    }
-}
-
-fn object_schema(properties: Value, required: &[&str]) -> Value {
-    let mut schema = Map::new();
-    schema.insert("type".to_string(), json!("object"));
-    schema.insert("properties".to_string(), properties);
-    schema.insert("additionalProperties".to_string(), json!(false));
-    if !required.is_empty() {
-        schema.insert("required".to_string(), json!(required));
-    }
-    Value::Object(schema)
-}
+// 工具定义与参数宽化在 `crate::tools::spec`（CUA 与本地工具共用），
+// 本模块重新导出它们，所以既有调用点（`cua::ToolSpec` 等）不需要改动。
 
 fn app_selector() -> Value {
     json!({
@@ -150,18 +127,6 @@ fn coord_props() -> Value {
             "description": "raster (default) = pixels inside the returned screenshot; screen = absolute physical pixels."
         }
     })
-}
-
-fn merge_objects(parts: &[Value]) -> Value {
-    let mut merged = Map::new();
-    for part in parts {
-        if let Some(object) = part.as_object() {
-            for (key, value) in object {
-                merged.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    Value::Object(merged)
 }
 
 /// 构造 12 个工具的定义。
@@ -376,60 +341,8 @@ pub fn tools_for_request(names: &[&str]) -> Vec<Value> {
         .collect()
 }
 
-/// 参数错误（与旧版 `invalid arguments: …` 文案同形）。
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("invalid arguments: {0}")]
-pub struct ArgError(pub String);
-
-impl ArgError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-/// 模型常把数字写成字符串、把布尔写成 `"true"`，也可能把对象写成 JSON 字符串。
-/// 先做一次无损宽化，再校验——一次误报就要重跑一整轮，宽化收益远大于风险。
-fn coerce_number(args: &Map<String, Value>, key: &str) -> Option<f64> {
-    match args.get(key) {
-        Some(Value::Number(number)) => number.as_f64(),
-        Some(Value::String(text)) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            trimmed.parse::<f64>().ok()
-        }
-        _ => None,
-    }
-}
-
-fn coerce_int(args: &Map<String, Value>, key: &str) -> Option<i64> {
-    coerce_number(args, key).map(|value| value.round() as i64)
-}
-
-fn coerce_bool(args: &Map<String, Value>, key: &str) -> Option<bool> {
-    match args.get(key) {
-        Some(Value::Bool(value)) => Some(*value),
-        Some(Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn coerce_string(args: &Map<String, Value>, key: &str) -> Option<String> {
-    match args.get(key) {
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(Value::Number(number)) => Some(number.to_string()),
-        _ => None,
-    }
-}
-
-fn as_args(raw: &Value) -> Map<String, Value> {
-    raw.as_object().cloned().unwrap_or_default()
-}
+// 参数错误与参数宽化都在 `crate::tools::{error,spec}` 里（CUA 与本地工具共用）。
+// 本模块只保留 CUA 特有的 selector → 协议参数转换。
 
 /// app 选择器 → 协议参数。
 fn app_selector_to_args(selector: Option<&Value>) -> Result<Value, ArgError> {
@@ -1504,34 +1417,8 @@ impl CuaToolkit {
     }
 }
 
-/// 工具执行错误。
-#[derive(Debug, thiserror::Error)]
-pub enum ToolError {
-    #[error("{0}")]
-    Arg(#[from] ArgError),
-    #[error("{0}")]
-    Bridge(#[from] BridgeError),
-}
-
-impl ToolError {
-    /// 交给模型/界面的说明：带上"怎么修"的提示，避免裸错误码。
-    pub fn user_message(&self) -> String {
-        match self {
-            Self::Arg(error) => error.to_string(),
-            Self::Bridge(error) => match error {
-                BridgeError::Backend { code, message, .. } => {
-                    format!("{message}\nHint: {}", action_error_hint(code))
-                }
-                other => other.user_message(),
-            },
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Bridge(BridgeError::Cancelled))
-    }
-}
-
+/// 工具执行错误见 [`crate::tools::error::ToolError`]（已在上方重新导出）。
+///
 /// 把 `Option<&Value>` 便捷地读成对象。
 pub fn args_object(value: &Value) -> Map<String, Value> {
     as_args(value)
