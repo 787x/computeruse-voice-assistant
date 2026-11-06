@@ -473,6 +473,7 @@ fn upsert_provider(
         }
         None => {
             let mut entry = ProviderConfig {
+                protocol_kind: None,
                 enabled_models: None,
                 models_origin_url: String::new(),
                 id: id.to_string(),

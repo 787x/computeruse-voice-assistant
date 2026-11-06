@@ -31,3 +31,5 @@ mod hud_window;
 mod autostart;
 
 mod local_models;
+
+mod endpoint_cards;

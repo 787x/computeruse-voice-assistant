@@ -61,6 +61,8 @@ use crate::AppWindow;
 /// 界面发给工作线程的命令。
 #[derive(Debug)]
 pub enum UiCommand {
+    SaveEndpoint(config::ProviderConfig, settings_ui::ProviderDraft, i32),
+    DeleteEndpoint(String),
     /// 用户发出一条指令。
     Send(String),
     /// 取消当前回合（同时停止这一回合的播报）。
@@ -304,6 +306,7 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
+    super::endpoint_cards::install(&window, paths.clone(), command_tx.clone());
 
     // 确认器由界面持有：设置页/确认框/退出都要和它交互。
     let confirmer = Arc::new(UiConfirmer::new(window.as_weak()));
@@ -1110,10 +1113,15 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
             {
                 selected_index = labels.len() as i32;
             }
+            let display = provider
+                .model_meta(&model)
+                .map(|m| m.display_name.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&model);
             let label = if has_key {
-                format!("{provider_label} · {model}")
+                format!("{provider_label} · {display}")
             } else {
-                format!("{provider_label} · {model}（还没 Key）")
+                format!("{provider_label} · {display}（还没 Key）")
             };
             providers.push(provider_label.clone().into());
             model_names.push(model.clone().into());
@@ -1775,6 +1783,131 @@ async fn run_worker(
                 apply_settings_to_ui(&weak, &settings, has_key);
                 // 工具总览与实际公布清单同源，每次打开都按**此刻**的能力刷新。
                 publish_tool_overview(&weak, &tools_registry);
+            }
+            UiCommand::SaveEndpoint(provider, draft, revision) => {
+                let key = draft.api_key;
+                let saved_id = provider.id.clone();
+                let result = (|| -> Result<(), String> {
+                    let mut next = settings.clone();
+                    if provider.id == next.provider_id {
+                        next.base_url = provider.base_url.clone();
+                        next.model = provider.model.clone();
+                        next.thinking = provider.thinking;
+                        next.reasoning_effort = provider.reasoning_effort;
+                    }
+                    if let Some(existing) = next.providers.iter_mut().find(|p| p.id == provider.id)
+                    {
+                        *existing = provider.clone();
+                    } else {
+                        next.providers.push(provider.clone());
+                    }
+                    let next = next.normalized()?;
+                    let old_key = if key.trim().is_empty() {
+                        None
+                    } else {
+                        secret.load(&provider.id).map_err(|e| e.to_string())?
+                    };
+                    if !key.trim().is_empty() {
+                        secret.save(&provider.id, &key).map_err(|e| e.to_string())?;
+                    }
+                    if let Err(error) = config::save_settings(&paths, &next) {
+                        if !key.trim().is_empty() {
+                            secret
+                                .save(&provider.id, old_key.as_deref().unwrap_or_default())
+                                .map_err(|rollback| {
+                                    format!("配置保存失败：{error}；Key 恢复失败：{rollback}")
+                                })?;
+                        }
+                        return Err(error);
+                    }
+                    settings = next;
+                    if provider.id == MIMO_PROVIDER_ID
+                        && !key.trim().is_empty()
+                        && settings.tts.backend == crate::voice::tts::TtsBackend::Mimo
+                    {
+                        speech
+                            .apply_settings(&settings.tts, &secret)
+                            .map_err(|error| {
+                                format!("端点和 Key 已保存，但播报暂不可用：{error}")
+                            })?;
+                    }
+                    Ok(())
+                })();
+                let snapshot = settings.clone();
+                let picker_sessions = sessions.clone();
+                with_window(&weak, move |w| {
+                    if let Err(e) = result {
+                        w.set_settings_error(e.into());
+                    } else {
+                        let cards = w.get_endpoint_cards();
+                        if let Some(i) = cards
+                            .iter()
+                            .position(|c| c.id == saved_id && c.revision == revision)
+                        {
+                            cards.set_row_data(
+                                i,
+                                super::endpoint_cards::card(&snapshot.provider(&saved_id)),
+                            );
+                        }
+                        if saved_id == snapshot.provider_id {
+                            w.set_base_url(snapshot.base_url.clone().into());
+                            w.set_model_name(snapshot.model.clone().into());
+                            w.set_thinking_index(thinking_index(snapshot.thinking));
+                            w.set_effort_index(reasoning_effort_index(snapshot.reasoning_effort));
+                            fill_model_settings(w, &snapshot.provider(&saved_id));
+                        }
+                        refresh_model_picker(w, &snapshot, &picker_sessions);
+                    }
+                });
+            }
+            UiCommand::DeleteEndpoint(id) => {
+                // 明确拒绝带引用的删除，不隐式重绑任何凭据。
+                let result = (|| -> Result<(), String> {
+                    if settings.provider_id == id
+                        || settings
+                            .model_plans
+                            .iter()
+                            .any(|p| serde_json::to_string(p).unwrap_or_default().contains(&id))
+                    {
+                        return Err("该实例被当前默认配置或模型方案引用，请先更换引用".into());
+                    }
+                    for entry in
+                        std::fs::read_dir(paths.sessions_dir()).map_err(|e| e.to_string())?
+                    {
+                        let path = entry.map_err(|e| e.to_string())?.path();
+                        if path.extension().is_some_and(|v| v == "json")
+                            && std::fs::read_to_string(&path)
+                                .map_err(|e| e.to_string())?
+                                .contains(&id)
+                        {
+                            return Err("该实例被已保存 Session 引用，请先修改会话模型选择".into());
+                        }
+                    }
+                    let mut next = settings.clone();
+                    next.providers.retain(|p| p.id != id);
+                    if !next.removed_provider_ids.contains(&id) {
+                        next.removed_provider_ids.push(id.clone());
+                    }
+                    config::save_settings(&paths, &next)?;
+                    settings = next;
+                    secret.clear(&id).map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
+                let snapshot = settings.clone();
+                let picker_sessions = sessions.clone();
+                with_window(&weak, move |w| {
+                    if let Err(e) = result {
+                        w.set_settings_error(e.into());
+                    } else {
+                        let cards = w
+                            .get_endpoint_cards()
+                            .iter()
+                            .filter(|c| c.id != id)
+                            .collect::<Vec<_>>();
+                        w.set_endpoint_cards(ModelRc::new(VecModel::from(cards)));
+                        refresh_model_picker(w, &snapshot, &picker_sessions);
+                    }
+                });
             }
             UiCommand::ProviderChanged => {
                 model_request += 1;
@@ -3407,11 +3540,7 @@ pub fn build_save_request(window: &AppWindow) -> SaveRequest {
         keywords_file: window.get_keywords_file().to_string(),
         model_plans_json: window.get_model_plans_json().to_string(),
         model_schedule_json: window.get_model_schedule_json().to_string(),
-        provider_id: PROVIDER_IDS
-            .get(usize::try_from(window.get_provider_index()).unwrap_or(usize::MAX))
-            .copied()
-            .unwrap_or("openai-compatible")
-            .to_string(),
+        provider_id: window.get_settings_provider_id().to_string(),
         base_url: window.get_base_url().to_string(),
         model: window.get_model_name().to_string(),
         enabled_models: window
@@ -3493,6 +3622,8 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            window.set_settings_provider_id(saved.provider_id.clone().into());
+            super::endpoint_cards::fill(&window, &saved);
             window.set_probe_revision(window.get_probe_revision().wrapping_add(1));
             window.set_prompt_mode(prompt::preset_index(saved.system_prompt.as_deref()));
             window.set_silver_wolf_prompt(prompt::SILVER_WOLF_SYSTEM_PROMPT.into());
@@ -3898,6 +4029,7 @@ async fn wait_turn(
                         let has_key = secret.has(&settings.provider_id);
                         apply_settings_to_ui(weak, settings, has_key);
                     }
+                    Some(UiCommand::SaveEndpoint(_, _, _)) | Some(UiCommand::DeleteEndpoint(_)) => { with_window(weak, |w| w.set_settings_error("请先结束当前回合再保存或删除供应商".into())); }
                     Some(UiCommand::ProviderChanged) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
                     Some(UiCommand::ClearApiKey(provider_id)) => {
                         /*
@@ -4093,6 +4225,20 @@ fn handle_save_all_ui(
     let reload_voice = voice_running
         && (settings.voice.kws_model_dir != request.kws_dir
             || settings.voice.whisper_model != request.whisper_file);
+    // PR13：端点由卡片独立提交。全局表单只更新其他设置，不能用隐藏旧字段
+    // 覆盖刚刚保存的卡片、会话生效实例或其启用集合。
+    let mut request = request.clone();
+    request.provider_id = settings.provider_id.clone();
+    request.base_url = settings.base_url.clone();
+    request.model = settings.model.clone();
+    request.provider_hint = settings_ui::provider_hint_index(settings.provider_hint);
+    request.thinking = thinking_index(settings.thinking);
+    request.reasoning_effort = reasoning_effort_index(settings.reasoning_effort);
+    request.enabled_models = settings.provider(&settings.provider_id).selectable_models();
+    request.provider_enabled_models.clear();
+    request.provider_drafts.clear();
+    request.api_key.clear();
+    let request = &request;
     let outcome = apply_save(paths, secret, settings, speech, request);
     let status = if outcome.config_written() && reload_voice {
         format!("{}；请重新开启麦克风以加载新的语音模型", outcome.message())

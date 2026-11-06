@@ -37,6 +37,8 @@ impl Capability {
 /// 一次请求的端点档案（**回合快照**：一整轮用同一套）。
 #[derive(Debug, Clone)]
 pub struct ProviderProfile {
+    pub max_output_tokens: Option<u64>,
+    pub image_input: Option<bool>,
     pub provider_id: String,
     pub capability: Capability,
     pub base_url: String,
@@ -217,6 +219,20 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    pub fn without_images(&self) -> Self {
+        let mut copy = self.clone();
+        if let Content::Parts(parts) = &mut copy.content {
+            let original_len = parts.len();
+            parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("image_url"));
+            if parts.len() != original_len {
+                parts.push(
+                    json!({"type":"text", "text":"（当前模型配置不接受图片，本次只发送文字。）"}),
+                );
+            }
+        }
+        copy
+    }
+
     /// 会话持久化用的有界副本：截图 base64 不进会话文件。
     ///
     /// 只处理 `Content::Parts`：保留说明文字，把每个 `image_url` 段换成一条
@@ -636,12 +652,22 @@ impl LlmClient {
         let built = build_request_fields(&self.profile, self.temperature);
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), json!(self.profile.model));
+        if let Some(limit) = self.profile.max_output_tokens {
+            body.insert("max_tokens".into(), json!(limit));
+        }
         body.insert(
             "messages".to_string(),
             Value::Array(
                 messages
                     .iter()
-                    .map(|m| m.to_request_value(echo, &self.profile.provider_id))
+                    .map(|m| {
+                        if self.profile.image_input == Some(false) && m.has_attachment() {
+                            m.without_images()
+                                .to_request_value(echo, &self.profile.provider_id)
+                        } else {
+                            m.to_request_value(echo, &self.profile.provider_id)
+                        }
+                    })
                     .collect(),
             ),
         );
@@ -1087,6 +1113,8 @@ mod tests {
 
     fn profile(capability: Capability, model: &str) -> ProviderProfile {
         ProviderProfile {
+            max_output_tokens: None,
+            image_input: None,
             provider_id: "test".to_string(),
             capability,
             base_url: "http://127.0.0.1:1/v1".to_string(),

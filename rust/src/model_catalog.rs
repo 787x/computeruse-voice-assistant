@@ -258,6 +258,8 @@ pub fn parse_model_response(json: &Value) -> ParsedModels {
             ModelSource::Discovered
         };
         parsed.chat.push(ModelOption {
+            display_name: String::new(),
+            image_input: None,
             id: verdict.id,
             source,
             context_window: read_u64(
@@ -573,6 +575,8 @@ pub async fn fetch_models(
     }
 
     let profile = ProviderProfile {
+        max_output_tokens: None,
+        image_input: None,
         provider_id: provider.id.clone(),
         capability: provider.capability(),
         base_url: base_url.clone(),
