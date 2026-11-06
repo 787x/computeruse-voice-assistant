@@ -575,6 +575,7 @@ pub async fn fetch_models(
     }
 
     let profile = ProviderProfile {
+        request_output_tokens: None,
         max_output_tokens: None,
         image_input: None,
         provider_id: provider.id.clone(),

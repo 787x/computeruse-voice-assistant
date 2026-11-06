@@ -444,7 +444,15 @@ impl ProviderConfig {
 
     /// 该提供商下某个模型的可信元数据（上下文窗口）。
     pub fn model_meta(&self, model: &str) -> Option<&ModelOption> {
-        self.models.iter().find(|option| option.id == model)
+        self.models
+            .iter()
+            .find(|option| option.id == model)
+            .filter(|option| {
+                option.source == ModelSource::Manual
+                    || self.models_origin_url.is_empty()
+                    || self.models_origin_url.trim().trim_end_matches('/')
+                        == self.base_url_or_default()
+            })
     }
 
     /// 记下/更新一个模型（保留手动添加的模型，清掉过期的目录缓存）。
@@ -458,29 +466,45 @@ impl ProviderConfig {
             }
             self.enabled_models = Some(enabled);
         }
-        let manual: Vec<ModelOption> = self
-            .models
-            .iter()
-            .filter(|option| option.source == ModelSource::Manual)
-            .cloned()
-            .collect();
-        let mut merged = Vec::with_capacity(manual.len() + discovered.len());
-        merged.extend(manual);
+        // 保留所有可编辑条目，服务端消失或地址变化的模型降级为未验证。
+        let mut merged = self.models.clone();
+        for existing in &mut merged {
+            if existing.source != ModelSource::Manual
+                && !discovered.iter().any(|m| m.id == existing.id)
+            {
+                existing.source = ModelSource::Unverified;
+                existing.context_window = None;
+                existing.max_output_tokens = None;
+                existing.image_input = None;
+            }
+        }
         for option in discovered {
-            if let Some(existing) = merged.iter_mut().find(|item| item.id == option.id) {
-                // 手动保存的模型不能因在线目录覆盖而失去手动来源。
-                // 用户手动元数据优先；目录刷新不能覆盖用户值。
+            if let Some(existing) = merged.iter_mut().find(|m| m.id == option.id) {
                 if existing.source != ModelSource::Manual {
+                    let label = existing.display_name.clone();
                     *existing = option.clone();
+                    if !label.is_empty() {
+                        existing.display_name = label;
+                    }
                 }
-            } else {
+            } else if merged.len() < Self::MAX_MODELS {
                 merged.push(option.clone());
             }
         }
-        if merged.len() > Self::MAX_MODELS {
-            merged.truncate(Self::MAX_MODELS);
-        }
         self.models = merged;
+    }
+
+    pub fn invalidate_catalog_for_url(&mut self) {
+        if self.models_origin_url.trim().trim_end_matches('/') != self.base_url_or_default() {
+            for m in &mut self.models {
+                if m.source != ModelSource::Manual {
+                    m.source = ModelSource::Unverified;
+                    m.context_window = None;
+                    m.max_output_tokens = None;
+                    m.image_input = None;
+                }
+            }
+        }
     }
 
     /// 手填一个模型（已存在就原样保留其元数据）。
@@ -893,6 +917,10 @@ impl Settings {
                 ));
             }
             provider.base_url = address;
+            if provider.models_origin_url.is_empty() {
+                provider.models_origin_url = provider.base_url.clone();
+            }
+            provider.invalidate_catalog_for_url();
             provider.model = provider.model.trim().to_string();
             let model = provider.model.clone();
             provider.remember_manual_model(&model);
@@ -1092,6 +1120,7 @@ impl Settings {
     ) -> ProviderProfile {
         let provider = self.provider(provider_id);
         ProviderProfile {
+            request_output_tokens: None,
             max_output_tokens: provider.model_meta(model).and_then(|m| m.max_output_tokens),
             image_input: provider.model_meta(model).and_then(|m| m.image_input),
             provider_id: provider_id.to_string(),

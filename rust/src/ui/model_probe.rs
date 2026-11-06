@@ -68,6 +68,7 @@ impl ProbeDraft {
     }
     pub fn profile(provider: &ProviderConfig) -> ProviderProfile {
         ProviderProfile {
+            request_output_tokens: None,
             max_output_tokens: None,
             image_input: None,
             provider_id: provider.id.clone(),

@@ -305,6 +305,7 @@ component ModelPicker inherits Rectangle {
     in property <[string]> names;
     in property <[string]> providers;
     in property <[string]> groups;
+    in property <[string]> group-labels;
     in property <string> current-model;
     in property <[string]> reasoning-options;
     in property <int> reasoning-index;
@@ -380,9 +381,9 @@ component ModelPicker inherits Rectangle {
                         content-width: self.width; content-height: rows.preferred-height;
                         rows := VerticalLayout {
                             alignment: start; spacing: 4px;
-                            for group in root.groups : VerticalLayout {
+                            for group[gi] in root.groups : VerticalLayout {
                                 alignment: start; spacing: 4px;
-                                if root.group-matches(root.labels, root.providers, group, search.text) : Text { text: group; color: #777780; font-size: 11px; }
+                                if root.group-matches(root.labels, root.providers, group, search.text) : Text { text: root.group-labels[gi]; color: #777780; font-size: 11px; wrap: word-wrap; min-width: 0px; }
                                 for label[i] in root.labels : VerticalLayout {
                                     if root.providers[i] == group && (search.text == "" || root.matches(label, search.text)) : Rectangle {
                                         height: 38px; border-radius: 7px;
@@ -449,12 +450,20 @@ component AppButton inherits Rectangle {
     in property <bool> primary: false;
     in property <bool> enabled: true;
     callback clicked();
+    forward-focus: button-keys;
+    button-keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if root.enabled && (event.text == " " || event.text == "\n") { root.clicked(); return accept; }
+            return reject;
+        }
+    }
 
     width: Math.max(64px, button-label.preferred-width + 24px);
     height: 30px;
     border-radius: 5px;
     border-width: 1px;
-    border-color: !enabled ? #d8d8dd : (primary ? #1f6feb : #c9c9d0);
+    border-color: button-keys.has-focus ? #1f6feb : !enabled ? #d8d8dd : (primary ? #1f6feb : #c9c9d0);
     background: !enabled ? #f0f0f2 : (primary ? #1f6feb : (touch.has-hover ? #f0f0f4 : #ffffff));
 
     button-label := Text {
@@ -469,7 +478,7 @@ component AppButton inherits Rectangle {
 
     touch := TouchArea {
         enabled: root.enabled;
-        clicked => { if (root.enabled) { root.clicked(); } }
+        clicked => { if (root.enabled) { button-keys.focus(); root.clicked(); } }
     }
 }
 
@@ -487,69 +496,87 @@ export struct EndpointModel {
 }
 export struct EndpointCard {
     id: string, name: string, url: string, key: string, default-model: string,
+    saved-url: string, credential-url: string, catalog-origin: string, error: string,
     delete-pending: bool, revision: int, kind: int, thinking: int, effort: int, status: string, rows: [EndpointModel],
 }
 component EndpointEditor inherits Rectangle {
-    in-out property <EndpointCard> card;
+    // 本地编辑会解除 card 的单向绑定；保留独立父快照，以接收异步结果与取消回填。
+    in property <EndpointCard> snapshot;
+    in-out property <EndpointCard> card: snapshot;
+    changed snapshot => { card = snapshot; }
     callback action(string, EndpointCard);
     background: #f5f5f6; border-radius: 12px;
     VerticalLayout {
         padding: 16px; spacing: 10px;
         HorizontalLayout {
-            Text { text: card.name + " · " + (card.status == "" ? "未测" : card.status); font-weight: 600; color: Theme.text-color; }
+            Text { text: card.name + " · " + (card.status == "" ? "未测" : card.status == "busy" ? "测试中" : card.status); font-weight: 600; color: Theme.text-color; }
+            if card.delete-pending : AppButton { label: "取消删除"; clicked => { action("cancel-delete", card); } }
             AppButton { label: card.delete-pending ? "确认删除本实例" : "删除"; clicked => { action("delete", card); } }
         }
         Text { text: "实例 ID：" + card.id; color: #77777d; overflow: elide; }
         HorizontalLayout {
             Text { text: "名称"; width: 80px; color: Theme.text-color; }
-            AppLineEdit { text <=> card.name; edited => { card.status = ""; action("draft", card); } }
+            AppLineEdit { text <=> card.name; edited => { card.status = ""; card.error = ""; action("draft", card); } }
         }
         HorizontalLayout {
             Text { text: "API Key"; width: 80px; color: Theme.text-color; }
-            AppLineEdit { text <=> card.key; input-type-password: true; placeholder-text: "留空使用该实例已保存凭据"; edited => { card.status = ""; action("draft", card); } }
+            AppLineEdit { text <=> card.key; input-type-password: true; placeholder-text: "留空使用该实例已保存凭据"; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
+            AppButton {
+                label: card.status == "busy" ? "测试中…" : card.status == "成功" ? "测试成功" : card.status == "失败" ? "测试失败" : "测试连接";
+                text-color: card.status == "成功" ? #1f7a3a : card.status == "失败" ? #a02020 : #242428;
+                enabled: card.status != "busy";
+                clicked => { action("test", card); }
+            }
+        }
+        if card.error != "" : Text { text: card.error; color: #a02020; wrap: word-wrap; }
+        HorizontalLayout {
             AppButton { label: "清除此实例 Key"; clicked => { action("clear-key", card); } }
         }
         HorizontalLayout {
             Text { text: "API 地址"; width: 80px; color: Theme.text-color; }
-            AppLineEdit { text <=> card.url; edited => { card.status = ""; action("draft", card); } }
+            AppLineEdit { text <=> card.url; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
+        }
+        if card.saved-url != card.url && card.credential-url != card.url && card.key == "" : AppButton {
+            label: "确认将本实例已存 Key 用于此地址";
+            clicked => { action("reuse-key", card); }
         }
         HorizontalLayout {
             Text { text: "默认模型"; width: 80px; color: Theme.text-color; }
-            AppLineEdit { text <=> card.default-model; edited => { card.status = ""; action("draft", card); } }
+            AppLineEdit { text <=> card.default-model; edited => { card.status = ""; card.error = ""; action("draft", card); } }
         }
         HorizontalLayout {
-            AppComboBox { options: ["默认思考", "开启思考", "关闭思考"]; index <=> card.thinking; picked(i) => { card.status = ""; action("draft", card); } }
-            AppComboBox { options: ["默认推理", "不推理", "低", "高", "最大"]; index <=> card.effort; picked(i) => { card.status = ""; action("draft", card); } }
+            AppComboBox { options: ["默认思考", "开启思考", "关闭思考"]; index <=> card.thinking; picked(i) => { card.status = ""; card.error = ""; action("draft", card); } }
+            AppComboBox { options: ["默认推理", "不推理", "低", "高", "最大"]; index <=> card.effort; picked(i) => { card.status = ""; card.error = ""; action("draft", card); } }
         }
         HorizontalLayout {
             Text { text: "模型目录"; color: Theme.text-color; }
             AppButton { label: "恢复默认模型"; clicked => { action("restore", card); } }
-            AppButton { label: "获取可用模型"; clicked => { action("fetch", card); } }
+            AppButton { label: "获取可用模型"; enabled: card.status != "busy"; clicked => { action("fetch", card); } }
         }
         for row[i] in card.rows : Rectangle {
             background: #ffffff; border-radius: 8px;
             VerticalLayout {
                 padding: 8px; spacing: 8px;
                 HorizontalLayout {
-                    AppLineEdit { text <=> row.id; placeholder-text: "模型 ID"; edited => { card.status = ""; action("draft", card); } }
-                    AppLineEdit { text <=> row.label; placeholder-text: "显示名"; edited => { row.source = "manual"; card.status = ""; action("draft", card); } }
+                    AppLineEdit { text <=> row.id; placeholder-text: "模型 ID"; edited => { row.source = "manual"; row.context = ""; row.output = ""; row.image-known = false; card.status = ""; card.error = ""; action("draft", card); } }
+                    AppLineEdit { text <=> row.label; placeholder-text: "显示名"; edited => { card.status = ""; card.error = ""; action("draft", card); } }
                 }
                 HorizontalLayout {
-                    AppButton { label: row.enabled ? "已启用" : "未启用"; clicked => { row.enabled = !row.enabled; card.status = ""; action("draft", card); } }
-                    AppButton { label: row.expanded ? "收起" : "展开"; clicked => { row.expanded = !row.expanded; } }
+                    AppButton { label: row.enabled ? "已启用" : "未启用"; clicked => { action("toggle:" + i, card); } }
+                    AppButton { label: row.expanded ? "收起" : "展开"; clicked => { action("expand:" + i, card); } }
                     AppButton { label: "删除"; clicked => { action("remove:" + i, card); } }
                 }
                 if row.expanded : VerticalLayout {
                     spacing: 8px;
                     HorizontalLayout {
                         Text { text: "上下文窗口"; color: Theme.text-color; }
-                        AppLineEdit { text <=> row.context; placeholder-text: "未知"; edited => { row.source = "manual"; card.status = ""; action("draft", card); } }
+                        AppLineEdit { text <=> row.context; placeholder-text: "未知"; edited => { row.source = "manual"; card.status = ""; card.error = ""; action("draft", card); } }
                         Text { text: "最大输出 tokens"; color: Theme.text-color; }
-                        AppLineEdit { text <=> row.output; placeholder-text: "未知"; edited => { row.source = "manual"; card.status = ""; action("draft", card); } }
+                        AppLineEdit { text <=> row.output; placeholder-text: "未知"; edited => { row.source = "manual"; card.status = ""; card.error = ""; action("draft", card); } }
                     }
                     HorizontalLayout {
                         Text { text: "输入：文本 · 图片："; color: Theme.text-color; }
-                        AppButton { label: !row.image-known ? "未知" : row.image ? "支持" : "不支持"; clicked => { row.image = !row.image-known || !row.image; row.image-known = true; row.source = "manual"; card.status = ""; action("draft", card); } }
+                        AppButton { label: !row.image-known ? "未知" : row.image ? "支持" : "不支持"; clicked => { row.image = !row.image-known || !row.image; row.image-known = true; row.source = "manual"; card.status = ""; card.error = ""; action("draft", card); } }
                         Text { text: "元数据来源：" + row.source; color: Theme.text-color; }
                     }
                 }
@@ -558,7 +585,6 @@ component EndpointEditor inherits Rectangle {
         AppButton { label: "+ 添加模型"; clicked => { action("add-model", card); } }
         Text { text: "删除或禁用默认模型前，请先填写并启用另一默认模型。恢复默认仅替换本卡草稿目录和默认模型，保存后生效。"; wrap: word-wrap; color: #66666b; }
         HorizontalLayout {
-            AppButton { label: "测试连接"; clicked => { action("test", card); } }
             Rectangle { horizontal-stretch: 1; }
             AppButton { label: "取消"; clicked => { action("cancel", card); } }
             AppButton { label: "保存"; clicked => { action("save", card); } }
@@ -616,6 +642,7 @@ export component AppWindow inherits Window {
     // `model-option-labels` 与 `model-choices` 一一对应；下拉只接受 [string]。
     in-out property <[string]> model-option-providers;
     in-out property <[string]> model-provider-groups;
+    in-out property <[string]> model-provider-group-labels;
     in-out property <float> context-usage: 0;
     in-out property <bool> context-known: false;
     in-out property <bool> voice-manual: false;
@@ -1293,6 +1320,7 @@ export component AppWindow inherits Window {
                         names: root.model-option-names;
                         providers: root.model-option-providers;
                         groups: root.model-provider-groups;
+                        group-labels: root.model-provider-group-labels;
                         selected: root.model-choice-index;
                         current-model: root.model-choice-label;
                         reasoning-options: root.reasoning-options;
@@ -1552,7 +1580,7 @@ export component AppWindow inherits Window {
                                 AppButton { label: "+ 添加供应商"; clicked => { root.add-endpoint(root.new-endpoint-kind); } }
                             }
                             for card[i] in root.endpoint-cards : EndpointEditor {
-                                card: card;
+                                snapshot: card;
                                 action(op, draft) => { root.endpoint-action(op, draft); }
                             }
                             Text { text: "模型方案"; color: Theme.text-color; }

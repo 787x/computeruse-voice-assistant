@@ -61,7 +61,12 @@ use crate::AppWindow;
 /// 界面发给工作线程的命令。
 #[derive(Debug)]
 pub enum UiCommand {
-    SaveEndpoint(config::ProviderConfig, settings_ui::ProviderDraft, i32),
+    SaveEndpoint(
+        config::ProviderConfig,
+        settings_ui::ProviderDraft,
+        i32,
+        String,
+    ),
     DeleteEndpoint(String),
     /// 用户发出一条指令。
     Send(String),
@@ -1074,6 +1079,31 @@ fn apply_permission_options(window: &AppWindow) {
 ///
 /// 会话级手动选择优先；没有手选时按"时段方案 → 默认方案 → 全局"解析一次，
 /// 下拉的选中项如实反映当前会用的那一个。
+fn picker_groups(settings: &Settings) -> Vec<(String, String)> {
+    let ids = settings.provider_ids();
+    ids.iter()
+        .map(|id| {
+            let p = settings.provider(id);
+            let label = if ids
+                .iter()
+                .filter(|other| settings.provider(other).display_name() == p.display_name())
+                .count()
+                > 1
+            {
+                format!(
+                    "{} · {}\n{}",
+                    p.display_name(),
+                    p.id,
+                    p.base_url_or_default()
+                )
+            } else {
+                p.display_name()
+            };
+            (id.clone(), label)
+        })
+        .collect()
+}
+
 fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &SessionRuntime) {
     let now = crate::clock::now();
     let choice = sessions.model_choice();
@@ -1088,9 +1118,10 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
     let mut labels: Vec<slint::SharedString> = Vec::new();
     let mut selected_index: i32 = -1;
     let mut groups = Vec::<slint::SharedString>::new();
+    let mut group_labels = Vec::<slint::SharedString>::new();
     let mut providers = Vec::<slint::SharedString>::new();
     let mut model_names = Vec::<slint::SharedString>::new();
-    for provider_id in settings.provider_ids() {
+    for (provider_id, provider_label) in picker_groups(settings) {
         let provider = settings.provider(&provider_id);
         let mut models = provider.selectable_models();
         if !provider.model.trim().is_empty() && !models.contains(&provider.model) {
@@ -1099,8 +1130,8 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
         if models.is_empty() {
             continue;
         }
-        let provider_label = provider.display_name();
-        groups.push(provider_label.clone().into());
+        groups.push(provider_id.clone().into());
+        group_labels.push(provider_label.clone().into());
         let requires_key = config::get_provider(&provider_id)
             .map(|info| info.api_key_required)
             .unwrap_or(true);
@@ -1118,17 +1149,23 @@ fn refresh_model_picker(window: &AppWindow, settings: &Settings, sessions: &Sess
                 .map(|m| m.display_name.trim())
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&model);
-            let label = if has_key {
-                format!("{provider_label} · {display}")
+            let model_label = if display == model {
+                model.clone()
             } else {
-                format!("{provider_label} · {display}（还没 Key）")
+                format!("{display} · {model}")
             };
-            providers.push(provider_label.clone().into());
-            model_names.push(model.clone().into());
+            let label = if has_key {
+                format!("{provider_label} · {model_label}")
+            } else {
+                format!("{provider_label} · {model_label}（还没 Key）")
+            };
+            providers.push(provider_id.clone().into());
+            model_names.push(model_label.into());
             labels.push(label.into());
         }
     }
     window.set_model_provider_groups(ModelRc::new(VecModel::from(groups)));
+    window.set_model_provider_group_labels(ModelRc::new(VecModel::from(group_labels)));
     window.set_model_option_providers(ModelRc::new(VecModel::from(providers)));
     window.set_model_option_names(ModelRc::new(VecModel::from(model_names)));
     window.set_model_option_labels(ModelRc::new(VecModel::from(labels)));
@@ -1660,11 +1697,7 @@ async fn run_worker(
     // 记住"哪些提供商已有 Key"：输入区的模型下拉据此提示"还没 Key"，
     // 且**只**看该提供商自己的 Key。
     {
-        let presence: Vec<String> = config::PROVIDERS
-            .iter()
-            .filter(|info| secret.has(info.id))
-            .map(|info| info.id.to_string())
-            .collect();
+        let presence = super::endpoint_cards::key_presence(&settings, &secret);
         sessions.set_key_presence(presence);
     }
     {
@@ -1784,43 +1817,18 @@ async fn run_worker(
                 // 工具总览与实际公布清单同源，每次打开都按**此刻**的能力刷新。
                 publish_tool_overview(&weak, &tools_registry);
             }
-            UiCommand::SaveEndpoint(provider, draft, revision) => {
+            UiCommand::SaveEndpoint(provider, draft, revision, confirmed_url) => {
                 let key = draft.api_key;
                 let saved_id = provider.id.clone();
                 let result = (|| -> Result<(), String> {
-                    let mut next = settings.clone();
-                    if provider.id == next.provider_id {
-                        next.base_url = provider.base_url.clone();
-                        next.model = provider.model.clone();
-                        next.thinking = provider.thinking;
-                        next.reasoning_effort = provider.reasoning_effort;
-                    }
-                    if let Some(existing) = next.providers.iter_mut().find(|p| p.id == provider.id)
-                    {
-                        *existing = provider.clone();
-                    } else {
-                        next.providers.push(provider.clone());
-                    }
-                    let next = next.normalized()?;
-                    let old_key = if key.trim().is_empty() {
-                        None
-                    } else {
-                        secret.load(&provider.id).map_err(|e| e.to_string())?
-                    };
-                    if !key.trim().is_empty() {
-                        secret.save(&provider.id, &key).map_err(|e| e.to_string())?;
-                    }
-                    if let Err(error) = config::save_settings(&paths, &next) {
-                        if !key.trim().is_empty() {
-                            secret
-                                .save(&provider.id, old_key.as_deref().unwrap_or_default())
-                                .map_err(|rollback| {
-                                    format!("配置保存失败：{error}；Key 恢复失败：{rollback}")
-                                })?;
-                        }
-                        return Err(error);
-                    }
-                    settings = next;
+                    settings = super::endpoint_cards::save_provider(
+                        &paths,
+                        &secret,
+                        &settings,
+                        &provider,
+                        &key,
+                        &confirmed_url,
+                    )?;
                     if provider.id == MIMO_PROVIDER_ID
                         && !key.trim().is_empty()
                         && settings.tts.backend == crate::voice::tts::TtsBackend::Mimo
@@ -1834,9 +1842,21 @@ async fn run_worker(
                     Ok(())
                 })();
                 let snapshot = settings.clone();
+                sessions.set_key_presence(super::endpoint_cards::key_presence(&settings, &secret));
                 let picker_sessions = sessions.clone();
                 with_window(&weak, move |w| {
                     if let Err(e) = result {
+                        let cards = w.get_endpoint_cards();
+                        if let Some(i) = cards
+                            .iter()
+                            .position(|c| c.id == saved_id && c.revision == revision)
+                        {
+                            let mut c = cards.row_data(i).unwrap();
+                            c.saved_url = snapshot.provider(&saved_id).base_url_or_default().into();
+                            c.error = e.clone().into();
+                            c.delete_pending = false;
+                            cards.set_row_data(i, c);
+                        }
                         w.set_settings_error(e.into());
                     } else {
                         let cards = w.get_endpoint_cards();
@@ -1863,37 +1883,15 @@ async fn run_worker(
             UiCommand::DeleteEndpoint(id) => {
                 // 明确拒绝带引用的删除，不隐式重绑任何凭据。
                 let result = (|| -> Result<(), String> {
-                    if settings.provider_id == id
-                        || settings
-                            .model_plans
-                            .iter()
-                            .any(|p| serde_json::to_string(p).unwrap_or_default().contains(&id))
-                    {
-                        return Err("该实例被当前默认配置或模型方案引用，请先更换引用".into());
+                    if sessions.model_choice().provider_id == id {
+                        return Err("该实例被当前 Session 引用，请先更换会话选择".into());
                     }
-                    for entry in
-                        std::fs::read_dir(paths.sessions_dir()).map_err(|e| e.to_string())?
-                    {
-                        let path = entry.map_err(|e| e.to_string())?.path();
-                        if path.extension().is_some_and(|v| v == "json")
-                            && std::fs::read_to_string(&path)
-                                .map_err(|e| e.to_string())?
-                                .contains(&id)
-                        {
-                            return Err("该实例被已保存 Session 引用，请先修改会话模型选择".into());
-                        }
-                    }
-                    let mut next = settings.clone();
-                    next.providers.retain(|p| p.id != id);
-                    if !next.removed_provider_ids.contains(&id) {
-                        next.removed_provider_ids.push(id.clone());
-                    }
-                    config::save_settings(&paths, &next)?;
-                    settings = next;
-                    secret.clear(&id).map_err(|e| e.to_string())?;
+                    settings =
+                        super::endpoint_cards::delete_provider(&paths, &secret, &settings, &id)?;
                     Ok(())
                 })();
                 let snapshot = settings.clone();
+                sessions.set_key_presence(super::endpoint_cards::key_presence(&settings, &secret));
                 let picker_sessions = sessions.clone();
                 with_window(&weak, move |w| {
                     if let Err(e) = result {
@@ -1917,6 +1915,9 @@ async fn run_worker(
                     Ok(()) => {
                         settings_ui::restore_model_catalogs(&mut settings, &paths, &secret, None);
                         let picker_settings = settings.clone();
+                        sessions.set_key_presence(super::endpoint_cards::key_presence(
+                            &settings, &secret,
+                        ));
                         let picker_sessions = sessions.clone();
                         with_window(&weak, move |window| {
                             refresh_model_picker(window, &picker_settings, &picker_sessions)
@@ -4029,7 +4030,7 @@ async fn wait_turn(
                         let has_key = secret.has(&settings.provider_id);
                         apply_settings_to_ui(weak, settings, has_key);
                     }
-                    Some(UiCommand::SaveEndpoint(_, _, _)) | Some(UiCommand::DeleteEndpoint(_)) => { with_window(weak, |w| w.set_settings_error("请先结束当前回合再保存或删除供应商".into())); }
+                    Some(UiCommand::SaveEndpoint(_, _, _, _)) | Some(UiCommand::DeleteEndpoint(_)) => { with_window(weak, |w| w.set_settings_error("请先结束当前回合再保存或删除供应商".into())); }
                     Some(UiCommand::ProviderChanged) => { *model_request += 1; with_window(weak, |window| window.set_models_busy(false)); }
                     Some(UiCommand::ClearApiKey(provider_id)) => {
                         /*
@@ -4043,7 +4044,8 @@ async fn wait_turn(
                         match secret.clear(&provider_id) {
                             Ok(()) => {
                                 settings_ui::restore_model_catalogs(settings, paths, secret, None);
-                                let picker_settings = settings.clone(); let picker_sessions = sessions.clone();
+                                let picker_settings = settings.clone(); sessions.set_key_presence(super::endpoint_cards::key_presence(settings, secret));
+                let picker_sessions = sessions.clone();
                                 with_window(weak, move |window| refresh_model_picker(window, &picker_settings, &picker_sessions));
                                 let view = view_after_clear(secret, settings, &provider_id);
                                 let weak_ui = weak.clone();
@@ -5170,6 +5172,58 @@ mod tests {
     fn speech_without_engine() -> SpeechRuntime {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         SpeechRuntime::new(tx)
+    }
+
+    #[test]
+    fn same_name_groups_keep_distinct_ids_and_pick_exact_session_endpoint() {
+        let mut settings = Settings::default();
+        for i in 0..2 {
+            let mut p = settings.provider("mimo");
+            p.id = format!("same-name-{i}");
+            p.name = "同名 MiMo".into();
+            p.base_url = format!("http://127.0.0.1:{}/v1", 24000 + i);
+            p.model = format!("private-{i}");
+            settings.providers.push(p);
+        }
+        let groups = picker_groups(&settings);
+        let pair = groups
+            .iter()
+            .filter(|(id, _)| id.starts_with("same-name"))
+            .collect::<Vec<_>>();
+        assert_eq!(pair.len(), 2);
+        assert_ne!(pair[0].0, pair[1].0);
+        assert_ne!(pair[0].1, pair[1].1);
+        let paths = AppPaths {
+            root: std::env::temp_dir().join(format!(
+                "cuava-same-name-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )),
+        };
+        let mut sessions = SessionRuntime::open(&paths);
+        sessions.ensure_one(1);
+        let index = settings
+            .provider_ids()
+            .iter()
+            .take_while(|id| id.as_str() != "same-name-1")
+            .map(|id| settings.provider(id).selectable_models().len())
+            .sum::<usize>();
+        handle_model_pick(
+            &slint::Weak::default(),
+            &settings,
+            &mut sessions,
+            index as i32,
+        );
+        let choice = sessions.model_choice();
+        assert_eq!(choice.provider_id, "same-name-1");
+        assert_eq!(choice.model, "private-1");
+        let selection = settings.resolve_selection(Some(&choice), &crate::clock::now());
+        assert_eq!(selection.base_url, "http://127.0.0.1:24001/v1");
+        assert_eq!(SessionRuntime::open(&paths).model_choice(), choice);
+        std::fs::remove_dir_all(paths.root).unwrap();
     }
 
     #[test]
