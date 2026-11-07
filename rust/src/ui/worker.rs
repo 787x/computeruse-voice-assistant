@@ -70,6 +70,13 @@ pub enum UiCommand {
     DeleteEndpoint(String),
     /// 用户发出一条指令。
     Send(String),
+    ContinueVoice {
+        session: String,
+        text: String,
+        instance: Option<VoiceInstance>,
+        generation: u64,
+        deadline: std::time::Instant,
+    },
     /// 取消当前回合（同时停止这一回合的播报）。
     Cancel,
     /// 只停止播报：不取消 Agent 回合，不结算任何权限请求。
@@ -1821,10 +1828,49 @@ async fn run_worker(
         // 每一轮都按"当前是否在播报 / 是否有挂起的确认"重新决定聆听模式：
         // 只有播报期间与等待确认期间才允许不喊唤醒词。
         sync_listen_mode(&mut voice, &speech, &confirmer);
-        let Some(command) = commands.recv().await else {
-            break;
+        if let Some(end) = voice
+            .followup
+            .filter(|_| !voice.mode.followup_started(voice.followup_generation))
+        {
+            set_status(
+                &weak,
+                &format!(
+                    "可以继续说（剩余 {} 秒）",
+                    end.saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                        + 1
+                ),
+            );
+        }
+        let command = tokio::select! {
+            command = commands.recv() => match command { Some(c) => c, None => break },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => continue,
+        };
+        let mut command_source = TurnSource::Text;
+        let command = match command {
+            UiCommand::ContinueVoice {
+                session,
+                text,
+                instance,
+                generation,
+                deadline,
+            } => {
+                if sessions.current_id() != session
+                    || voice.followup_generation != generation
+                    || voice.route.instance != instance
+                    || instance.is_none()
+                    || std::time::Instant::now() >= deadline
+                {
+                    set_status(&weak, "替代语音指令已过期，请重新说");
+                    continue;
+                }
+                command_source = TurnSource::Voice;
+                UiCommand::Send(text)
+            }
+            other => other,
         };
         match command {
+            UiCommand::ContinueVoice { .. } => unreachable!(),
             UiCommand::Quit => {
                 // 取消当前回合，让它在下一个检查点结束；子进程由 break 之后的
                 // dispose 负责清理。主循环不会再接受任何新命令。
@@ -1849,6 +1895,7 @@ async fn run_worker(
                 voice.cancel_pending();
             }
             UiCommand::StopSpeaking => {
+                voice.clear_followup();
                 // **只停声音**：不取消回合、不结算权限请求、不关麦克风。
                 if speech.is_speaking() {
                     speech.stop();
@@ -2202,6 +2249,7 @@ async fn run_worker(
             }
             // ---- 会话 ----
             UiCommand::NewSession => {
+                voice.clear_followup();
                 speech.stop();
                 let now = crate::clock::now().unix_ms;
                 let id = sessions.create(now, "新会话");
@@ -2224,6 +2272,7 @@ async fn run_worker(
                 set_status(&weak, "已新建会话");
             }
             UiCommand::SelectSession(id) => {
+                voice.clear_followup();
                 if id.trim().is_empty() {
                     // 空 id = 界面没指定：保持当前选中，不做事。
                 } else {
@@ -2402,7 +2451,7 @@ async fn run_worker(
                         next_turn_id,
                         &input,
                         &answer,
-                        TurnSource::Text,
+                        command_source,
                     );
                     continue;
                 }
@@ -2450,7 +2499,7 @@ async fn run_worker(
                             &save_generation,
                             &search_test_generation,
                             &mut model_request,
-                            TurnSource::Text,
+                            command_source,
                         )
                         .await
                         {
@@ -2566,6 +2615,11 @@ async fn run_worker(
                             &answer,
                             TurnSource::Voice,
                         );
+                        voice.followup_seconds = settings.voice.followup_seconds.clamp(1, 30);
+                        voice.followup_pending = settings.voice.enabled
+                            && settings.voice.continuous_conversation
+                            && voice.route.instance.is_some()
+                            && !voice.manual_temporary;
                         continue;
                     }
                     set_busy(&weak, true);
@@ -2774,6 +2828,11 @@ struct VoiceRuntime {
     manual_armed: bool,
     manual_temporary: bool,
     manual_request: u64,
+    followup: Option<std::time::Instant>,
+    followup_pending: bool,
+    followup_generation: u64,
+    followup_seconds: u32,
+    followup_allowed: bool,
 }
 
 impl VoiceRuntime {
@@ -2785,6 +2844,11 @@ impl VoiceRuntime {
             manual_armed: false,
             manual_temporary: false,
             manual_request: 0,
+            followup: None,
+            followup_pending: false,
+            followup_generation: 0,
+            followup_seconds: 8,
+            followup_allowed: true,
         }
     }
 
@@ -2856,6 +2920,7 @@ impl VoiceRuntime {
     ///
     /// 与「偏好保存」无关：即使 `settings.json` 写失败，这里也必须真的关掉。
     fn disable(&mut self, weak: &slint::Weak<AppWindow>) {
+        self.clear_followup();
         with_window(weak, |w| w.set_voice_manual(false));
         self.manual_armed = false;
         self.manual_temporary = false;
@@ -2869,7 +2934,15 @@ impl VoiceRuntime {
     }
 
     /// 取消当前这一句（不关麦）：之后返回的识别结果不再提交。
+    fn clear_followup(&mut self) {
+        self.mode.clear_followup();
+        self.followup = None;
+        self.followup_allowed = false;
+        self.followup_pending = false;
+        self.followup_generation = self.followup_generation.wrapping_add(1);
+    }
     fn cancel_pending(&mut self) {
+        self.clear_followup();
         self.route.cancel();
         self.route.clear_active();
     }
@@ -2893,6 +2966,7 @@ impl VoiceRuntime {
                 set_voice_state(weak, &state);
                 set_status(weak, &state.label());
                 if !state.is_active() {
+                    self.clear_followup();
                     with_window(weak, |w| w.set_voice_manual(false));
                     self.manual_armed = false;
                     self.manual_temporary = false;
@@ -2929,6 +3003,12 @@ impl VoiceRuntime {
                 {
                     return VoiceOutcome::None;
                 }
+                if purpose == ListenPurpose::Followup
+                    && (request_id != self.followup_generation
+                        || !self.mode.followup_started(request_id))
+                {
+                    return VoiceOutcome::None;
+                }
                 self.route.bind(event.instance, turn);
                 set_voice_state(weak, &VoiceState::Capturing);
                 match purpose {
@@ -2943,6 +3023,7 @@ impl VoiceRuntime {
                         self.manual_armed = false;
                         set_status(weak, "正在听，请说指令");
                     }
+                    ListenPurpose::Followup => set_status(weak, "可以继续说，无需唤醒词"),
                     ListenPurpose::Wake => {}
                 }
                 VoiceOutcome::None
@@ -2963,9 +3044,15 @@ impl VoiceRuntime {
                     self.manual_armed = false;
                 }
                 self.route.release(event.instance, turn);
+                if self.mode.followup_started(self.followup_generation) {
+                    self.clear_followup();
+                }
                 // 空转录/太短属于「没听清」，给一句可读的提示；
                 // 不需要弹窗，也不能触发工具。直通聆听时保持安静更合适。
                 if self.mode.purpose().is_direct() {
+                    if self.mode.purpose() == ListenPurpose::Confirm {
+                        set_status(weak, "没听清，请说可以/不可以，也可点按钮");
+                    }
                     return VoiceOutcome::None;
                 }
                 if matches!(
@@ -3007,7 +3094,14 @@ impl VoiceRuntime {
                 }
                 set_transcript(weak, &text);
                 match purpose {
-                    ListenPurpose::Wake | ListenPurpose::Manual => {
+                    ListenPurpose::Wake | ListenPurpose::Manual | ListenPurpose::Followup => {
+                        if purpose == ListenPurpose::Followup
+                            && (request_id != self.followup_generation
+                                || !self.mode.followup_started(request_id))
+                        {
+                            return VoiceOutcome::None;
+                        }
+                        self.clear_followup();
                         if agent_busy {
                             set_status(weak, "上一轮还在跑；这句话没有执行");
                             return VoiceOutcome::None;
@@ -3035,7 +3129,7 @@ const TEST_SPEECH_TEXT: &str = "语音播报已就绪。这是一次试音，数
 
 /// 一次回合的输入来源：决定这条回复要不要自动播报。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnSource {
+pub(crate) enum TurnSource {
     Text,
     Voice,
 }
@@ -3053,12 +3147,32 @@ impl TurnSource {
 ///  - 正在播报 → 听打断词；
 ///  - 其它时候 → 必须唤醒词（与 PR6 一致）。
 fn sync_listen_mode(voice: &mut VoiceRuntime, speech: &SpeechRuntime, confirmer: &UiConfirmer) {
+    if voice
+        .followup
+        .is_some_and(|end| std::time::Instant::now() >= end)
+        && !voice.mode.followup_started(voice.followup_generation)
+    {
+        voice.clear_followup();
+    }
+    if voice.followup_pending && !speech.is_speaking() {
+        voice.followup_pending = false;
+        voice.followup = Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(voice.followup_seconds as u64),
+        );
+        voice.followup_generation = voice.followup_generation.wrapping_add(1);
+    }
+    if let Some(end) = voice.followup {
+        voice.mode.followup_deadline(voice.followup_generation, end);
+    }
     let desired = if let Some(request_id) = confirmer.pending_request() {
         (ListenPurpose::Confirm, request_id)
     } else if speech.is_speaking() {
         (ListenPurpose::BargeIn, 0)
     } else if voice.manual_armed {
         (ListenPurpose::Manual, voice.manual_request)
+    } else if voice.followup.is_some() {
+        (ListenPurpose::Followup, voice.followup_generation)
     } else {
         (ListenPurpose::Wake, 0)
     };
@@ -3093,6 +3207,15 @@ fn handle_voice_event(
             match verdict.reason {
                 bargein::BargeReason::Matched => {
                     speech.stop();
+                    voice.clear_followup();
+                    let next = bargein::strip_barge_words(&heard);
+                    if !next.trim().is_empty() {
+                        return Some(VoicePrompt {
+                            text: next,
+                            audio_seconds: 0.0,
+                            decode_ms: 0,
+                        });
+                    }
                     set_status(
                         weak,
                         &format!("已停止播报（听到「{}」）", verdict.word.unwrap_or_default()),
@@ -3111,6 +3234,9 @@ fn handle_voice_event(
             None
         }
         VoiceOutcome::Confirm { request_id, text } => {
+            if bargein::is_probably_echo(&text, &speech.recent_sentences()) {
+                return None;
+            }
             settle_voice_confirmation(weak, confirmer, request_id, &text);
             None
         }
@@ -3154,11 +3280,144 @@ fn settle_voice_confirmation(
     }
 }
 
+#[derive(Default)]
+pub(crate) struct IncrementalSpeech {
+    step: Option<usize>,
+    pending: std::collections::VecDeque<String>,
+    truncated: bool,
+    omitted_chars: usize,
+    turn: u64,
+    sentences: crate::voice::incremental::Sentences,
+    id: Option<SpeechId>,
+    attempted: bool,
+    disabled: bool,
+}
+impl IncrementalSpeech {
+    fn suppress(&mut self) {
+        self.disabled = true;
+        self.attempted = true;
+        self.sentences = Default::default();
+        self.pending.clear();
+    }
+    pub(crate) fn event(
+        &mut self,
+        event: &AgentEvent,
+        turn_id: u64,
+        settings: &Settings,
+        source: TurnSource,
+        speech: &mut SpeechRuntime,
+        weak: &slint::Weak<AppWindow>,
+    ) {
+        if self.disabled || !settings.tts.speaks(source.is_voice()) {
+            return;
+        }
+        match event {
+            AgentEvent::SpeechEligible { turn, step } if *turn == turn_id => {
+                self.step = Some(*step)
+            }
+            AgentEvent::TextDelta { turn, step, text }
+                if *turn == turn_id && self.step == Some(*step) =>
+            {
+                self.attempted = true;
+                self.turn = turn_id;
+                match self.sentences.push(text) {
+                    Ok(sentences) => self.send(sentences, turn_id, speech, weak),
+                    Err(error) => {
+                        self.disabled = true;
+                        speech.stop();
+                        set_speech_unavailable(weak, &error);
+                    }
+                }
+            }
+            AgentEvent::Failed { .. } => {
+                self.pending.clear();
+                self.disabled = true;
+                if self.attempted {
+                    speech.stop();
+                }
+            }
+            _ => {}
+        }
+    }
+    fn send(
+        &mut self,
+        sentences: Vec<String>,
+        turn: u64,
+        speech: &mut SpeechRuntime,
+        weak: &slint::Weak<AppWindow>,
+    ) {
+        if self.disabled {
+            return;
+        }
+        for sentence in sentences {
+            self.pump(turn, speech, weak);
+            if self.truncated
+                || self.pending.iter().map(String::len).sum::<usize>() + sentence.len() > 32_768
+            {
+                self.omitted_chars = self.omitted_chars.saturating_add(sentence.chars().count());
+                if !self.truncated {
+                    self.truncated = true;
+                    if let Some(id) = self.id {
+                        speech.notice(id, "待播正文达到 32KB 预算，本轮只播已接收前缀；其后文字保留在对话中，结束时显示未播字符数".into());
+                    }
+                }
+                continue;
+            }
+            self.pending.push_back(sentence);
+            self.pump(turn, speech, weak);
+        }
+    }
+    fn pump(&mut self, turn: u64, speech: &mut SpeechRuntime, weak: &slint::Weak<AppWindow>) {
+        if self.disabled {
+            return;
+        }
+        while let Some(sentence) = self.pending.front() {
+            let id = match self.id {
+                Some(id) => id,
+                None => match speech.begin(turn) {
+                    Ok(id) => {
+                        self.id = Some(id);
+                        id
+                    }
+                    Err(error) => {
+                        self.suppress();
+                        set_speech_unavailable(weak, &error);
+                        return;
+                    }
+                },
+            };
+            if !speech.can_append(id, sentence) {
+                break;
+            }
+            let sentence = self.pending.pop_front().unwrap();
+            if let Err(error) = speech.append(id, sentence) {
+                self.suppress();
+                set_speech_unavailable(weak, &error);
+                return;
+            }
+        }
+    }
+    pub(crate) fn finish(&mut self, speech: &mut SpeechRuntime, weak: &slint::Weak<AppWindow>) {
+        if self.disabled {
+            return;
+        }
+        let sentences = self.sentences.finish();
+        // id is allocated only once; the caller supplies the originating turn before any tail.
+        self.send(sentences, self.turn, speech, weak);
+        if let Some(id) = self.id {
+            if self.truncated {
+                speech.notice(id, format!("本轮有 {} 个可读字符因待播预算未播报；已接收部分继续正常播放，完整回复仍在对话中", self.omitted_chars));
+            }
+            speech.finish_pending(id, std::mem::take(&mut self.pending));
+        }
+    }
+}
+
 /// 回合正常完成后播报可见回复。
 ///
-/// 只播 `TurnOutcome::text`（经过 Agent 汇总的**用户可见**文本）：
+/// 只播 `TurnOutcome::speech_text`（协议终结后确定的最终用户正文）：
 /// 思考内容、工具 JSON、内部提示都不在这里，也不可能从这里漏出去。
-fn maybe_speak(
+pub(crate) fn maybe_speak(
     weak: &slint::Weak<AppWindow>,
     speech: &mut SpeechRuntime,
     settings: &Settings,
@@ -3173,7 +3432,7 @@ fn maybe_speak(
     if !settings.tts.speaks(source.is_voice()) {
         return;
     }
-    let text = outcome.text.trim();
+    let text = outcome.speech_text.trim();
     if text.is_empty() {
         return;
     }
@@ -3203,6 +3462,7 @@ fn set_speech_unavailable(weak: &slint::Weak<AppWindow>, reason: &str) {
 struct SpeechView {
     /// 当前（或最近一次）播报的身份；`None` = 还没有播报。
     current: Option<SpeechId>,
+    notice: Option<String>,
 }
 
 impl SpeechView {
@@ -3213,6 +3473,7 @@ impl SpeechView {
             Some(current) if speech_id == current => true,
             _ => {
                 self.current = Some(speech_id);
+                self.notice = None;
                 true
             }
         }
@@ -3238,7 +3499,13 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
     match event {
         SpeechEvent::State { state, .. } => {
             let code = state.code().to_string();
-            let label = state.label();
+            if matches!(state, PlaybackState::Stopped | PlaybackState::Failed(_)) {
+                view.notice = None;
+            }
+            let label = match &view.notice {
+                Some(notice) => format!("{}；{notice}", state.label()),
+                None => state.label(),
+            };
             let label_for_loop = label.clone();
             let active = state.is_active();
             let failed = matches!(state, PlaybackState::Failed(_));
@@ -3267,6 +3534,7 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
             });
         }
         SpeechEvent::Notice { text, .. } => {
+            view.notice = Some(text.clone());
             set_status(weak, text);
             let detail = text.clone();
             let weak = weak.clone();
@@ -3722,6 +3990,8 @@ fn view_after_clear(
 /// 从当前配置里原样保留。
 pub fn build_save_request(window: &AppWindow) -> SaveRequest {
     SaveRequest {
+        continuous_conversation: window.get_continuous_conversation(),
+        followup_seconds: window.get_followup_seconds().to_string(),
         kws_dir: window.get_kws_dir().to_string(),
         whisper_file: window.get_whisper_file().to_string(),
         keywords_file: window.get_keywords_file().to_string(),
@@ -3869,6 +4139,8 @@ fn apply_settings_to_ui(weak: &slint::Weak<AppWindow>, settings: &Settings, has_
                 saved.tts.speak_voice_turns,
                 saved.tts.speak_text_turns,
             ));
+            window.set_continuous_conversation(voice.continuous_conversation);
+            window.set_followup_seconds(voice.followup_seconds as i32);
             window.set_kws_dir(voice.kws_model_dir.into());
             window.set_whisper_file(voice.whisper_model.into());
             window.set_keywords_file(voice.keywords_file.into());
@@ -4056,18 +4328,36 @@ async fn wait_turn(
      * 否则回合卡在"等点击"的这段时间里，语音确认永远进不去（没有人按按钮，
      * 也没有命令进来唤醒这个 select）。
      */
+    voice.clear_followup();
+    voice.followup_allowed = true;
+    let mut replacement: Option<(String, std::time::Instant, Option<VoiceInstance>, u64)> = None;
+    let speech_settings_snapshot = settings.clone();
+    let mut incremental = IncrementalSpeech::default();
     let pending_changes = confirmer.changes();
     loop {
         // 每一轮重新决定聆听模式（播报中 = 听打断词，等待确认 = 听允许/拒绝）。
         sync_listen_mode(voice, speech, confirmer);
         tokio::select! {
-            Some(event) = events.recv() => { record_event(weak, sessions, turn_id, event); }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(40)), if !incremental.pending.is_empty() => { incremental.pump(turn_id, speech, weak); }
+            Some(event) = events.recv() => { incremental.event(&event, turn_id, &speech_settings_snapshot, source, speech, weak); record_event(weak, sessions, turn_id, event); }
             joined = &mut task => {
-                while let Ok(event) = events.try_recv() { record_event(weak, sessions, turn_id, event); }
+                while let Ok(event) = events.try_recv() { incremental.event(&event, turn_id, &speech_settings_snapshot, source, speech, weak); record_event(weak, sessions, turn_id, event); }
                 *turn_cancel = None;
+                if let Some((text, deadline, instance, generation)) = replacement.take() {
+                    let _ = command_tx.send(UiCommand::ContinueVoice { session: sessions.current_id().to_string(), text, deadline, instance, generation });
+                }
                 match joined {
                     Ok((outcome, history, settings_snapshot)) => {
-                        maybe_speak(weak, speech, &settings_snapshot, &outcome, turn_id, source);
+                        if incremental.attempted {
+                            if outcome.failed || outcome.cancelled { speech.stop(); }
+                            else { incremental.finish(speech, weak); }
+                        } else {
+                            maybe_speak(weak, speech, &settings_snapshot, &outcome, turn_id, source);
+                        }
+                        voice.followup_seconds = settings.voice.followup_seconds.clamp(1, 30);
+                        voice.followup_pending = voice.followup_allowed && source.is_voice() && !outcome.failed && !outcome.cancelled
+                            && settings.voice.enabled && settings.voice.continuous_conversation && !voice.manual_temporary
+                            && voice.route.instance.is_some();
                         return TurnWait::Finished(TurnFinished {
                             history,
                             outcome,
@@ -4092,9 +4382,17 @@ async fn wait_turn(
             _ = pending_changes.notified() => {
                 // 只是唤醒一次循环：下一轮一开头会重新同步聆听模式。
             }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)), if replacement.is_some() => {
+                if replacement.as_ref().is_some_and(|(_, end, _, _)| std::time::Instant::now() >= *end) {
+                    replacement = None;
+                    set_status(weak, "旧任务未及时结束，替代指令已丢弃，请稍后重说");
+                }
+            }
             command = commands.recv() => {
                 match command {
                     Some(UiCommand::Cancel) => {
+                        incremental.suppress();
+                        replacement = None;
                         if let Some(token) = turn_cancel.as_ref() {
                             token.cancel();
                             set_status(weak, "正在中断…");
@@ -4105,6 +4403,9 @@ async fn wait_turn(
                         voice.cancel_pending();
                     }
                     Some(UiCommand::StopSpeaking) => {
+                        voice.clear_followup();
+                        incremental.attempted = true;
+                        incremental.disabled = true;
                         if speech.is_speaking() {
                             speech.stop();
                             set_status(weak, "已停止播报（任务继续）");
@@ -4120,6 +4421,7 @@ async fn wait_turn(
                         // 过期请求丢弃（用户已取消或又提交了新的保存）。
                         // 同样**不**清 `settings-saving`：那是更年轻那一代的职责。
                         if generation_is_current(save_generation, generation) {
+                            let revision = speech.settings_revision();
                             let _ = handle_save_all_ui(
                                 weak,
                                 paths,
@@ -4134,6 +4436,7 @@ async fn wait_turn(
                                 save_generation,
                                 search_test_generation,
                             );
+                            if speech.settings_revision() != revision { incremental.suppress(); voice.clear_followup(); }
                         }
                     }
                     Some(UiCommand::CancelSettings { generation }) => {
@@ -4156,6 +4459,7 @@ async fn wait_turn(
                         apply_speech_event(speech_view, weak, &event);
                     }
                     Some(UiCommand::Quit) => {
+                        incremental.disabled = true;
                         if let Some(token) = turn_cancel.as_ref() {
                             token.cancel();
                         }
@@ -4175,12 +4479,12 @@ async fn wait_turn(
                             &mut task,
                         )
                         .await;
-                        while let Ok(event) = events.try_recv() { record_event(weak, sessions, turn_id, event); }
+                        while let Ok(event) = events.try_recv() { incremental.event(&event, turn_id, &speech_settings_snapshot, source, speech, weak); record_event(weak, sessions, turn_id, event); }
                         let _ = sessions.save_current();
                         *turn_cancel = None;
                         return TurnWait::Quit;
                     }
-                    Some(UiCommand::Send(_)) => {
+                    Some(UiCommand::Send(_)) | Some(UiCommand::ContinueVoice { .. }) => {
                         set_status(weak, "上一轮还在跑，先取消再发新指令");
                     }
                     /*
@@ -4244,7 +4548,15 @@ async fn wait_turn(
                         apply_voice_enabled(weak, paths, settings, voice, command_tx, enabled);
                     }
                     Some(UiCommand::Voice(event)) => {
-                        let _ = handle_voice_event(weak, voice, confirmer, speech, event, true);
+                        let stop_revision = speech.stop_revision();
+                        let prompt = handle_voice_event(weak, voice, confirmer, speech, event, true);
+                        if speech.stop_revision() != stop_revision { incremental.suppress(); }
+                        if let Some(prompt) = prompt {
+                            if let Some(token) = turn_cancel.as_ref() { token.cancel(); }
+                            incremental.disabled = true;
+                            replacement = Some((prompt.text, std::time::Instant::now() + std::time::Duration::from_secs(8), voice.route.instance, voice.followup_generation));
+                            set_status(weak, "已停止播报，正在取消旧任务后执行新指令（最多等待 8 秒）");
+                        }
                     }
                     Some(UiCommand::OpenSettings) => {
                         // 执行中也能查看当前（已保存的）配置。
@@ -4798,6 +5110,7 @@ fn apply_event(weak: &slint::Weak<AppWindow>, event: AgentEvent) {
             });
         }
         AgentEvent::ConfirmationRequired(prompt) => {
+            set_status(weak, "请说可以/不可以，也可点按钮");
             let weak = weak.clone();
             let args_text = serde_json::to_string(&prompt.args_summary).unwrap_or_default();
             let _ = slint::invoke_from_event_loop(move || {
@@ -4810,7 +5123,7 @@ fn apply_event(weak: &slint::Weak<AppWindow>, event: AgentEvent) {
                 }
             });
         }
-        AgentEvent::Done(_) | AgentEvent::Failed { .. } => {
+        AgentEvent::SpeechEligible { .. } | AgentEvent::Done(_) | AgentEvent::Failed { .. } => {
             // 收尾统一在 `finish_turn` 里做，避免两处各写一半状态。
         }
     }
@@ -5832,6 +6145,187 @@ mod tests {
         let answer = wait.try_recv().expect("中止必须让等待方立刻拿到答复");
         assert!(!answer.allow, "中止 = 拒绝，不能放行");
         assert!(confirmer.pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn followup_admission_survives_late_final_but_not_cancel_or_instance_change() {
+        for invalidate in 0..4 {
+            let mut voice = VoiceRuntime::new();
+            let instance = voice.route.open();
+            let turn = VoiceTurn {
+                instance,
+                session: 1,
+            };
+            let base = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            let end = base + std::time::Duration::from_secs(8);
+            voice.followup = Some(end);
+            voice.followup_generation = 9;
+            voice.mode.followup_deadline(9, end);
+            assert!(!voice.mode.admit_followup(9, end));
+            assert!(voice
+                .mode
+                .admit_followup(9, base + std::time::Duration::from_secs(7)));
+            voice.set_listen_mode(ListenPurpose::Followup, 9);
+            let weak = slint::Weak::default();
+            voice.on_event(
+                &weak,
+                VoiceEvent {
+                    instance,
+                    kind: VoiceEventKind::DirectStarted {
+                        turn,
+                        purpose: ListenPurpose::Followup,
+                        request_id: 9,
+                    },
+                },
+                false,
+            );
+            sync_listen_mode(
+                &mut voice,
+                &speech_without_engine(),
+                &confirmer_without_ui(),
+            );
+            assert_eq!(voice.mode.purpose(), ListenPurpose::Followup);
+            match invalidate {
+                1 => voice.cancel_pending(), // 同样用于取消和切 Session
+                2 => {
+                    voice.route.close();
+                    voice.route.open();
+                }
+                3 => {
+                    voice.on_event(
+                        &weak,
+                        VoiceEvent {
+                            instance,
+                            kind: VoiceEventKind::Rejected {
+                                turn,
+                                reason: RejectReason::Failed("识别超时".into()),
+                            },
+                        },
+                        false,
+                    );
+                }
+                _ => {}
+            }
+            let event = VoiceEvent {
+                instance,
+                kind: VoiceEventKind::Final {
+                    turn,
+                    text: "下一句".into(),
+                    audio_seconds: 2.0,
+                    decode_ms: 100,
+                    purpose: ListenPurpose::Followup,
+                    request_id: 9,
+                },
+            };
+            assert_eq!(
+                voice
+                    .on_event(&weak, event.clone(), false)
+                    .into_prompt()
+                    .is_some(),
+                invalidate == 0
+            );
+            assert!(voice.on_event(&weak, event, false).into_prompt().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_stop_suppresses_pending_deltas_and_fallback_without_failure() {
+        let mut voice = VoiceRuntime::new();
+        let instance = voice.route.open();
+        let turn = VoiceTurn {
+            instance,
+            session: 1,
+        };
+        voice.route.bind(instance, turn);
+        let mut speech = speech_without_engine();
+        speech.attach_playback_for_test(Arc::new(crate::voice::playback::PlaybackShared::new(
+            24000, 1,
+        )));
+        speech.attach_engine_for_test(Arc::new(KeyClearEngine));
+        let mut settings = Settings::default();
+        settings.tts.enabled = true;
+        settings.tts.backend = crate::voice::tts::TtsBackend::Mimo;
+        let mut incremental = IncrementalSpeech::default();
+        let weak = slint::Weak::default();
+        incremental.event(
+            &AgentEvent::SpeechEligible { turn: 1, step: 0 },
+            1,
+            &settings,
+            TurnSource::Voice,
+            &mut speech,
+            &weak,
+        );
+        incremental.event(
+            &AgentEvent::TextDelta {
+                turn: 1,
+                step: 0,
+                text: "正在播报。".into(),
+            },
+            1,
+            &settings,
+            TurnSource::Voice,
+            &mut speech,
+            &weak,
+        );
+        assert!(speech.is_speaking());
+        let before = speech.stop_revision();
+        assert!(handle_voice_event(
+            &weak,
+            &mut voice,
+            &Arc::new(confirmer_without_ui()),
+            &mut speech,
+            VoiceEvent {
+                instance,
+                kind: VoiceEventKind::Final {
+                    turn,
+                    text: "等一下".into(),
+                    audio_seconds: 1.0,
+                    decode_ms: 1,
+                    purpose: ListenPurpose::BargeIn,
+                    request_id: 0
+                }
+            },
+            true
+        )
+        .is_none());
+        if speech.stop_revision() != before {
+            incremental.suppress();
+        }
+        incremental.event(
+            &AgentEvent::TextDelta {
+                turn: 1,
+                step: 0,
+                text: "后续仍继续显示。".into(),
+            },
+            1,
+            &settings,
+            TurnSource::Voice,
+            &mut speech,
+            &weak,
+        );
+        incremental.finish(&mut speech, &weak);
+        assert!(incremental.attempted && incremental.disabled && incremental.pending.is_empty());
+        assert!(!speech.is_speaking());
+    }
+
+    #[test]
+    fn followup_expiry_and_listen_priority() {
+        let mut voice = VoiceRuntime::new();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let speech = SpeechRuntime::new(tx);
+        let confirmer = confirmer_without_ui();
+        voice.followup = Some(std::time::Instant::now() + std::time::Duration::from_secs(8));
+        voice.followup_generation = 7;
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.get(), (ListenPurpose::Followup, 7));
+        voice.manual_armed = true;
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Manual);
+        voice.manual_armed = false;
+        voice.followup = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        sync_listen_mode(&mut voice, &speech, &confirmer);
+        assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
+        assert_ne!(voice.followup_generation, 7);
     }
 
     #[test]

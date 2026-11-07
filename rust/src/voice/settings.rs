@@ -83,6 +83,10 @@ pub struct VoiceSettings {
     /// 程序启动时是否真的开始采集，由界面上的开关决定（见 worker）。
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_use_gpu")]
+    pub continuous_conversation: bool,
+    #[serde(default = "default_followup_seconds")]
+    pub followup_seconds: u32,
     /// 麦克风设备名；空 = 系统默认输入设备。
     #[serde(default)]
     pub input_device: String,
@@ -126,6 +130,10 @@ pub struct VoiceSettings {
     pub no_speech_timeout_ms: u32,
 }
 
+fn default_followup_seconds() -> u32 {
+    8
+}
+
 fn default_use_gpu() -> bool {
     true
 }
@@ -152,6 +160,8 @@ impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            continuous_conversation: true,
+            followup_seconds: 8,
             input_device: String::new(),
             kws_model_dir: String::new(),
             keywords_file: String::new(),
@@ -175,6 +185,7 @@ impl VoiceSettings {
     /// 不做「猜用户想说什么」的修正：只把**无效值**夹到能工作的范围，
     /// 并在 `warnings()` 里如实说明改了哪里。
     pub fn normalized(mut self) -> Result<Self, String> {
+        self.followup_seconds = self.followup_seconds.clamp(1, 30);
         self.input_device = self.input_device.trim().to_string();
         self.kws_model_dir = self.kws_model_dir.trim().to_string();
         self.keywords_file = self.keywords_file.trim().to_string();

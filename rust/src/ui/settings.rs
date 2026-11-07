@@ -46,6 +46,8 @@ impl std::fmt::Debug for ProviderDraft {
 /// 界面「保存」提交的全部内容。
 #[derive(Debug, Clone)]
 pub struct SaveRequest {
+    pub continuous_conversation: bool,
+    pub followup_seconds: String,
     pub kws_dir: String,
     pub whisper_file: String,
     pub keywords_file: String,
@@ -456,6 +458,12 @@ pub fn build_candidate(current: &Settings, request: &SaveRequest) -> Result<Sett
     }
     next.providers = providers;
 
+    next.voice.continuous_conversation = request.continuous_conversation;
+    next.voice.followup_seconds = request
+        .followup_seconds
+        .parse::<u32>()
+        .map_err(|_| "追问窗口应为 1–30 秒".to_string())?
+        .clamp(1, 30);
     next.voice.kws_model_dir = request.kws_dir.clone();
     next.voice.whisper_model = request.whisper_file.clone();
     next.voice.keywords_file = request.keywords_file.clone();
@@ -817,8 +825,72 @@ pub fn default_tts() -> TtsSettings {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn unrelated_or_invalid_save_preserves_playback_but_device_change_stops_it() {
+        struct Waiting;
+        impl crate::voice::tts::TtsEngine for Waiting {
+            fn label(&self) -> String {
+                "waiting".into()
+            }
+            fn start(
+                &self,
+                request: crate::voice::tts::SynthRequest,
+            ) -> Result<crate::voice::tts::SpeechStream, String> {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    request.cancel.cancelled().await;
+                    drop(tx);
+                });
+                Ok(crate::voice::tts::SpeechStream::new(rx))
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "cuava-pr15-save-{}-{}",
+            std::process::id(),
+            crate::clock::now().unix_ms
+        ));
+        let paths = AppPaths::with_root(root);
+        let secret = SecretStore::new(paths.secret_file());
+        let mut settings = Settings::default();
+        settings.tts.enabled = true;
+        settings.tts.backend = TtsBackend::Mimo;
+        let mut speech = SpeechRuntime::new(tokio::sync::mpsc::unbounded_channel().0);
+        speech.attach_playback_for_test(std::sync::Arc::new(
+            crate::voice::playback::PlaybackShared::new(24000, 1),
+        ));
+        speech.attach_engine_for_test(std::sync::Arc::new(Waiting));
+        speech.begin(1).unwrap();
+        let revision = speech.settings_revision();
+        let make_request = |settings: &Settings| {
+            let mut r = base_request(settings);
+            r.tts_enabled = true;
+            r.tts_backend_index = 1;
+            r
+        };
+        let mut request = make_request(&settings);
+        request.temperature = "invalid".into();
+        assert!(
+            !apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written()
+        );
+        assert!(speech.is_speaking());
+        assert_eq!(speech.settings_revision(), revision);
+        request = make_request(&settings);
+        request.context_window = "900000".into();
+        request.compress_percent = "85".into();
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        assert!(speech.is_speaking());
+        assert_eq!(speech.settings_revision(), revision);
+        request = make_request(&settings);
+        request.tts_output_device = "another-output".into();
+        assert!(apply_save(&paths, &secret, &mut settings, &mut speech, &request).config_written());
+        assert!(!speech.is_speaking());
+        assert_ne!(speech.settings_revision(), revision);
+    }
+
     fn base_request(settings: &Settings) -> SaveRequest {
         SaveRequest {
+            continuous_conversation: settings.voice.continuous_conversation,
+            followup_seconds: settings.voice.followup_seconds.to_string(),
             kws_dir: settings.voice.kws_model_dir.clone(),
             whisper_file: settings.voice.whisper_model.clone(),
             keywords_file: settings.voice.keywords_file.clone(),

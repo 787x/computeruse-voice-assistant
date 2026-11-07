@@ -632,6 +632,8 @@ component TtsRange inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
+    in-out property <bool> continuous-conversation: true;
+    in-out property <int> followup-seconds: 8;
     in-out property <[EndpointCard]> endpoint-cards;
     in-out property <string> settings-provider-id;
     in-out property <int> new-endpoint-kind: 0;
@@ -2026,6 +2028,10 @@ export component AppWindow inherits Window {
                                 font-weight: 600;
                             }
 
+                            HorizontalLayout {
+                                AppButton { label: root.continuous-conversation ? "连续对话：开" : "连续对话：关"; clicked => { root.continuous-conversation = !root.continuous-conversation; root.settings-dirty = true; } }
+                                AppComboBox { options: ["4 秒追问", "8 秒追问", "15 秒追问", "30 秒追问"]; index: root.followup-seconds <= 4 ? 0 : root.followup-seconds <= 8 ? 1 : root.followup-seconds <= 15 ? 2 : 3; picked(i) => { root.followup-seconds = i == 0 ? 4 : i == 1 ? 8 : i == 2 ? 15 : 30; root.settings-dirty = true; } }
+                            }
                             Text {
                                 text: "语音输入走本机 Whisper 与唤醒词模型，完全离线；设备与模型状态显示在主界面状态条。这里不提供尚未实现的开关。";
                                 font-size: 11px;

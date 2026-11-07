@@ -97,6 +97,7 @@ pub enum ListenPurpose {
     Wake,
     /// 用户点击麦克风后的一次直通指令。
     Manual,
+    Followup,
     /// 播报期间听打断短语。
     BargeIn,
     /// 权限确认期间听「允许 / 拒绝」。
@@ -108,6 +109,7 @@ impl ListenPurpose {
         match self {
             Self::Wake => "wake",
             Self::Manual => "manual",
+            Self::Followup => "followup",
             Self::BargeIn => "barge-in",
             Self::Confirm => "confirm",
         }
@@ -117,6 +119,7 @@ impl ListenPurpose {
         match self {
             Self::Wake => "唤醒词",
             Self::Manual => "点击识别",
+            Self::Followup => "可以继续说",
             Self::BargeIn => "打断聆听",
             Self::Confirm => "语音确认",
         }
@@ -137,7 +140,16 @@ impl ListenPurpose {
 /// **绑定到具体的确认请求**上：请求结束后迟到的识别结果不能被当成
 /// 下一个请求的答复。
 #[derive(Clone, Debug, Default)]
-pub struct ListenMode(Arc<Mutex<(ListenPurpose, u64)>>);
+pub struct ListenMode(
+    Arc<Mutex<(ListenPurpose, u64)>>,
+    Arc<Mutex<Option<FollowupAdmission>>>,
+);
+#[derive(Clone, Debug)]
+struct FollowupAdmission {
+    generation: u64,
+    deadline: Instant,
+    started: Option<Instant>,
+}
 
 impl ListenMode {
     pub fn new() -> Self {
@@ -159,6 +171,39 @@ impl ListenMode {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    pub fn followup_deadline(&self, generation: u64, deadline: Instant) {
+        let mut state = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        if state.as_ref().is_none_or(|s| s.generation != generation) {
+            *state = Some(FollowupAdmission {
+                generation,
+                deadline,
+                started: None,
+            });
+        }
+    }
+    pub fn admit_followup(&self, generation: u64, now: Instant) -> bool {
+        let mut state = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = state
+            .as_mut()
+            .filter(|s| s.generation == generation && now < s.deadline && s.started.is_none())
+        else {
+            return false;
+        };
+        s.started = Some(now);
+        true
+    }
+    pub fn followup_started(&self, generation: u64) -> bool {
+        self.1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|s| {
+                s.generation == generation && s.started.is_some_and(|start| start < s.deadline)
+            })
+    }
+    pub fn clear_followup(&self) {
+        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     pub fn purpose(&self) -> ListenPurpose {
         self.get().0
     }
@@ -565,11 +610,7 @@ impl SessionMachine {
         };
         self.session = Some(turn);
         self.purpose = purpose;
-        self.request_id = if purpose == ListenPurpose::Confirm {
-            request_id
-        } else {
-            0
-        };
+        self.request_id = if purpose.is_direct() { request_id } else { 0 };
         self.active.begin(turn);
         self.set_state(VoiceState::Capturing);
         Some(turn)
@@ -906,7 +947,12 @@ impl Coordinator {
             if !self.machine.has_session() {
                 let (purpose, request_id) = self.mode.get();
                 if purpose.is_direct() {
-                    if speech_started && self.machine.begin_direct(purpose, request_id) {
+                    if speech_started
+                        && self.machine.state() == &VoiceState::Listening
+                        && (purpose != ListenPurpose::Followup
+                            || self.mode.admit_followup(request_id, Instant::now()))
+                        && self.machine.begin_direct(purpose, request_id)
+                    {
                         // 从说话起点重新计一句：起点之前那段静音/回声不算进这一句。
                         self.detector.start_utterance();
                         self.kws.reset();
@@ -1426,6 +1472,29 @@ mod tests {
             kind,
             VoiceEventKind::DirectStarted {
                 purpose: ListenPurpose::BargeIn,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn followup_session_carries_generation_through_asr() {
+        let recorder = Recorder::default();
+        let active = ActiveSession::new();
+        let asr = FakeAsr {
+            immediate: Some(Ok("继续".into())),
+            ..FakeAsr::new()
+        };
+        let mut machine = machine_with(11, &recorder, &active, asr);
+        machine.start_listening();
+        assert!(machine.begin_direct(ListenPurpose::Followup, 73));
+        machine.finish(1.0, AUDIO.to_vec());
+        assert!(machine.poll());
+        assert!(recorder.kinds().iter().any(|e| matches!(
+            e,
+            VoiceEventKind::Final {
+                purpose: ListenPurpose::Followup,
+                request_id: 73,
                 ..
             }
         )));

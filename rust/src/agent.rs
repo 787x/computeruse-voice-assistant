@@ -69,6 +69,8 @@ pub struct ToolCallId(pub u64);
 ///  - 参数摘要（`args_summary`）用于折叠展示，不含截图 base64。
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// 请求未提供工具，允许提前播报；不代表流一定成功。
+    SpeechEligible { turn: u64, step: usize },
     /// 可见回复的增量文本。
     TextDelta {
         turn: u64,
@@ -185,6 +187,8 @@ impl StepRecord {
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutcome {
     pub text: String,
+    /// 经协议成功终结的最终正文；不包含工具决策步骤的临时文字。
+    pub speech_text: String,
     pub steps: Vec<StepRecord>,
     pub limited: bool,
     pub reasoning_chars: usize,
@@ -366,6 +370,12 @@ impl Agent {
 
             let step_no = step as usize;
             let request_messages = strip_local_markers(&messages);
+            if tools.is_empty() {
+                emit(AgentEvent::SpeechEligible {
+                    turn,
+                    step: step_no,
+                });
+            }
             /*
              * 思考内容走独立的回调：与可见正文/工具 JSON/系统提示词分离，
              * 绝不进 `outcome.text`，因此也不可能被 TTS 读到。
@@ -535,6 +545,7 @@ impl Agent {
                     emit(AgentEvent::Failed { turn, reason });
                     return outcome;
                 }
+                outcome.speech_text = result.text.clone();
                 messages.push(assistant_message_from(
                     &result,
                     self.config.echo_reasoning,
@@ -928,12 +939,32 @@ impl Agent {
                 self.config.max_steps
             )));
             let request_messages = strip_local_markers(&messages);
+            let closing_step = self.config.max_steps as usize + 1;
+            emit(AgentEvent::SpeechEligible {
+                turn,
+                step: closing_step,
+            });
             match self
                 .llm
-                .chat(&request_messages, &[], cancel, |_| {}, |_| {})
+                .chat(
+                    &request_messages,
+                    &[],
+                    cancel,
+                    |text| {
+                        emit(AgentEvent::TextDelta {
+                            turn,
+                            step: closing_step,
+                            text: text.to_string(),
+                        })
+                    },
+                    |_| {},
+                )
                 .await
             {
                 Ok(closing) => {
+                    if !closing.tool_calls_incomplete && closing.finish_reason == "stop" {
+                        outcome.speech_text = closing.text.clone();
+                    }
                     // 这条内部提示不属于对话内容，拿到回复后就撤掉。
                     messages.remove(note_index);
                     if !closing.text.is_empty() {
