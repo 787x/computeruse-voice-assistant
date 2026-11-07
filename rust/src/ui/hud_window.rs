@@ -245,7 +245,28 @@ mod pr16_layout_tests {
         hud.set_reply("这是增量回复测试内容。\n".repeat(40).into());
         hud.set_prompt("允许读取当前窗口标题吗？此操作会列出当前桌面窗口。".into());
         hud.set_asking(true);
+        hud.set_tools(slint::ModelRc::new(slint::VecModel::from(
+            (1..=12)
+                .map(|id| crate::ToolCard {
+                    name: format!("#{id} click").into(),
+                    state: "成功".into(),
+                    detail: "已点击目标控件 · 20 ms".into(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )));
         hud.set_request_id(1);
+        let h = hud.as_weak();
+        hud.on_answer(move |id, _| {
+            let h = h.upgrade().unwrap();
+            assert_eq!(id, h.get_request_id());
+            if id == 1 {
+                h.set_request_id(2);
+                h.set_prompt("第二个请求：允许读取剪贴板吗？这是与第一个请求不同的操作。".into());
+            } else {
+                slint::quit_event_loop().unwrap();
+            }
+        });
         hud.set_followup("可以继续说，无需唤醒词 · 8 秒".into());
         let placement = Placement::default();
         placement.show(&hud);

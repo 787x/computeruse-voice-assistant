@@ -693,6 +693,9 @@ export component AppWindow inherits Window {
     in-out property <string> hud-session;
     in-out property <string> hud-reasoning;
     in-out property <string> hud-reply;
+    in-out property <string> hud-process;
+    in-out property <bool> hud-saved-listening;
+    in-out property <bool> hud-temporary;
     in-out property <[ToolCard]> hud-tools;
     in-out property <string> hud-followup;
     callback quick-permission-picked(int);
@@ -2537,7 +2540,7 @@ export component BackgroundTray inherits SystemTrayIcon {
 export component VoiceHud inherits Window {
     title: "CUAVA Voice HUD";
     out property <length> content-width: 440px;
-    out property <length> content-height: min(680px, body.preferred-height + 190px);
+    out property <length> content-height: min(680px, body.preferred-height + (root.asking ? 360px : 190px));
     width: root.content-width;
     height: root.content-height;
     no-frame: true;
@@ -2551,6 +2554,8 @@ export component VoiceHud inherits Window {
     in property <string> prompt;
     in property <string> reasoning;
     in property <string> reply;
+    in property <string> process;
+    in property <bool> can-cancel-recognition;
     in property <string> summary;
     in property <string> listening;
     in property <string> playback;
@@ -2567,13 +2572,15 @@ export component VoiceHud inherits Window {
     VerticalLayout {
         padding: 16px;
         spacing: 8px;
-        Text { color: #333333; text: root.status; height: min(self.preferred-height, 44px); overflow: elide; wrap: word-wrap; }
+        Flickable {
+            height: min(status-text.preferred-height, 64px);
+            content-height: status-text.preferred-height;
+            status-text := Text { width: parent.width; color: #333333; text: root.status; wrap: word-wrap; }
+        }
         ScrollView {
             vertical-stretch: 1;
             body := VerticalLayout {
                 spacing: 6px;
-                if root.asking : Text { color: #333333; text: root.prompt + "\n可直接语音回答：可以 / 不可以"; wrap: word-wrap; }
-                Text { color: #333333; text: root.status; wrap: word-wrap; }
                 Text { color: #333333; text: root.summary; wrap: word-wrap; }
                 Text { color: #333333; text: root.listening; wrap: word-wrap; }
                 if root.followup != "" : Text { color: #333333; text: root.followup; wrap: word-wrap; }
@@ -2591,21 +2598,32 @@ export component VoiceHud inherits Window {
                     Text { color: #333333; text: tool.name + " · " + tool.state; wrap: word-wrap; }
                     if tool.detail != "" : Text { color: #333333; text: tool.detail; wrap: word-wrap; }
                 }
+                if root.process != "" : Text { color: #666; text: "生成过程（尚未确认为最终答复）\n" + root.process; wrap: word-wrap; }
                 if root.reply != "" : Text { color: #333333; text: "助手回复\n" + root.reply; wrap: word-wrap; }
-                Text { color: #333333; text: "播放 · " + root.playback + "\n" + root.subtitle; wrap: word-wrap; }
+                if root.subtitle != "" || root.playback != "" : Text { color: #333333; text: "播放 · " + root.playback + "\n" + root.subtitle; wrap: word-wrap; }
 
             }
         }
-        if root.asking : HorizontalLayout {
-            AppButton { label: "允许"; primary: true; clicked => { root.answer(root.request-id, true); } }
-            AppButton { label: "拒绝"; clicked => { root.answer(root.request-id, false); } }
+        if root.asking : VerticalLayout {
+            spacing: 6px;
+            approval := Flickable {
+                property <int> live-request: root.request-id;
+                changed live-request => { self.content-y = 0px; }
+                height: min(approval-text.preferred-height, 140px);
+                content-height: approval-text.preferred-height;
+                approval-text := Text { width: parent.width; color: #234560; text: root.prompt + "\n可直接语音回答：可以 / 不可以"; wrap: word-wrap; }
+            }
+            HorizontalLayout {
+                AppButton { label: "允许"; primary: true; clicked => { root.answer(root.request-id, true); } }
+                AppButton { label: "拒绝"; clicked => { root.answer(root.request-id, false); } }
+            }
         }
         HorizontalLayout {
             AppButton { label: "停止播报"; clicked => { root.stop-speech(); } }
             AppButton { label: "取消任务"; clicked => { root.cancel-task(); } }
         }
         HorizontalLayout {
-            AppButton { label: "取消识别"; clicked => { root.cancel-recognition(); } }
+            AppButton { label: "取消识别"; enabled: root.can-cancel-recognition; clicked => { root.cancel-recognition(); } }
             AppButton { label: "设置"; clicked => { root.settings(); } }
             AppButton { label: "主窗口"; clicked => { root.open-main(); } }
             AppButton { label: "隐藏"; enabled: !root.asking; clicked => { root.hide-hud(); } }

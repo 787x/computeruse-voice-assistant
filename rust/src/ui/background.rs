@@ -160,12 +160,35 @@ impl BackgroundUi {
                         );
                         h.set_reasoning(w.get_hud_reasoning());
                         h.set_reply(w.get_hud_reply());
+                        h.set_process(w.get_hud_process());
+                        h.set_can_cancel_recognition(
+                            w.get_voice_manual() && !w.get_busy() && !w.get_confirm_open(),
+                        );
                         h.set_tools(w.get_hud_tools());
                         h.set_listening(
                             format!(
-                                "麦克风偏好：{} · 设备：{}",
-                                if w.get_voice_enabled() { "开" } else { "关" },
-                                w.get_voice_state()
+                                "常驻监听（已保存）：{} · {} · 当前状态：{}",
+                                if w.get_hud_saved_listening() {
+                                    "开"
+                                } else {
+                                    "关"
+                                },
+                                if w.get_hud_temporary() {
+                                    "临时手动识别"
+                                } else if w.get_voice_manual() {
+                                    "手动识别"
+                                } else {
+                                    "常规模式"
+                                },
+                                if w.get_voice_state() == "listening" && w.get_voice_manual() {
+                                    "正在听取指令"
+                                } else if w.get_voice_state() == "listening"
+                                    && w.get_hud_followup().is_empty()
+                                {
+                                    "等待唤醒"
+                                } else {
+                                    voice_label(w.get_voice_state().as_str())
+                                }
                             )
                             .into(),
                         );
@@ -378,5 +401,17 @@ mod navigation_tests {
             },
         );
         slint::run_event_loop_until_quit().unwrap();
+    }
+}
+
+fn voice_label(state: &str) -> &'static str {
+    match state {
+        "off" => "已关闭",
+        "loading" => "加载模型中",
+        "listening" => "监听就绪",
+        "capturing" => "正在采集",
+        "transcribing" => "正在转录",
+        "error" => "出错（见状态说明）",
+        _ => "未就绪",
     }
 }
