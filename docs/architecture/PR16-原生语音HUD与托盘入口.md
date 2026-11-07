@@ -59,3 +59,21 @@ Followup 显示原 VoiceRuntime 截止时间，每 250ms 更新；不增加另�
 - 开发过程中实际失败：Slint 条件子组件 ID 作用域编译失败、状态标签借用临时字符串的 Rust 编译失败，均已修复并复验；新增 HTTP 测试最初未同时覆盖全局端点字段而失败，已将端点明确改为本机 Mock 后通过。未使用真实用户 Key。
 
 仍未执行：真实通知区单双击、麦克风/KWS 到实体扬声器和语音审批的完整声学回合、多屏负坐标与 150%/200% DPI。保持 PR16 Draft，不合并、不发布；本次不增加其他功能。
+
+
+## 第二轮针对性修复（2026-11-07）
+
+- worker 的 SelectSession/DeleteSession 共用 apply_session_navigation 实际业务入口。空选择和重选当前会话直接返回；其他切换先执行 SessionRuntime.select 的读取及索引保存，成功后才取消旧识别、作废 SpeechId、停止声音、清 HUD 和临时权限。失败只反馈原因，当前内存会话保持原样。
+- 删除非当前会话只删除目标并更新列表，不动当前识别、声音、Followup、HUD 或权限；等待 Agent/审批期间同样允许删除历史会话，仍拒绝删除当前正在执行的会话。仅成功删除当前会话才清理交互；选择后继时跳过无法读取的历史文件。
+- HUD 使用原 ScrollView 的实际 content-y 变化区分阅读上文与回到底部；内容/尺寸变化只在自动跟随启用时贴近末尾。复用现有 HUD 发布代次，在新交互开始时恢复默认跟随。审批区域保持独立固定布局，没有新滚动引擎、动画或 Session 数据格式。
+
+实际验证：
+
+- 新增共享业务入口回归覆盖删除历史会话、删除失败、空选择、重选当前、目标缺失、目标损坏、成功切换和删除当前。直接断言 VoiceInstance/在途 VoiceTurn、manual_armed、Followup 截止时间、SpeechRuntime.stop_revision/is_speaking、SpeechView 退休上界、HUD 发布版本、当前未保存内存历史及 allowed_once；无关操作后原审批 request_id 仍可正常拒绝结算。成功导航后的旧 Final 在正式 Session 识别准入处被拒绝。
+- cargo test --lib ui::：94 通过，4 GUI 项忽略；cargo test --lib voice:: -- --skip missing_model_message_is_actionable：155 通过（沿用本机已存在模型的环境前提筛除）；cargo test --test agent_loop：29 通过。PR16 针对性测试 9 通过、1 GUI 夹具忽略。
+- 默认 CUDA Windows cargo build --bin cuava、cargo clippy --tests、cargo fmt --check 通过，保留既有警告。没有构建 CPU-only。
+- Windows GUI 动态夹具使用长思考、12 条工具、每秒新增正文和字幕：默认展示最新段落和字幕；实际上滚后 following=false 且更新不抢位置；实际滚回末尾后 following=true，持续展示新字幕；再次上滚后通过新交互代次恢复 following=true。说明与按钮始终可见，夹具正常退出。
+- 原生无焦点测试再次执行：首显、重复 show、hide 后再显示三轮前台 HWND 保持不变。
+- 本轮真实失败记录：第一版 scrolled 回调没有可靠保留用户上滚位置，GUI 实测失败后改用实际 content-y 变化复验通过；一次测试重新链接因旧 GUI 夹具仍占用 EXE 而 LNK1104，关闭夹具后重新构建通过。
+
+未执行与合并边界：真实托盘单双击、麦克风到实体扬声器的完整链路、多显示器负坐标与高 DPI 仍未验收；动态 GUI 夹具和假音频设备测试不算这些项目通过。本轮未发现其他已知阻断代码问题，原 PR16 的实机验收缺口仍需在合并前完成。保持 Draft，不合并、不发布，到此停止。

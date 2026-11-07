@@ -77,6 +77,11 @@ impl SessionRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn hud_version(&self) -> u64 {
+        self.hud_revision_id
+    }
+
     pub fn reset_hud(&mut self, weak: &slint::Weak<AppWindow>) {
         self.hud_revision_id = self
             .hud_revision
@@ -260,14 +265,13 @@ impl SessionRuntime {
 
     /// 选中列表里的下一个（最近更新的那个）。
     fn select_next(&mut self) {
-        let Some(first) = self.summaries.first() else {
-            return;
-        };
-        let id = first.id.clone();
-        if let Ok(mut session) = self.store.read_session(&id) {
-            session.repair_after_restore();
-            self.current = Some(session);
-            self.current_id = id;
+        for summary in &self.summaries {
+            if let Ok(mut session) = self.store.read_session(&summary.id) {
+                session.repair_after_restore();
+                self.current = Some(session);
+                self.current_id = summary.id.clone();
+                break;
+            }
         }
     }
 
@@ -722,6 +726,7 @@ pub fn publish_timeline(weak: &slint::Weak<AppWindow>, runtime: &SessionRuntime)
                 window.set_voice_transcript("".into());
                 window.set_speech_subtitle("".into());
             }
+            window.set_hud_interaction(revision as i32);
             window.set_hud_process(process.into());
             window.set_hud_reasoning(reasoning.into());
             window.set_hud_reply(reply.into());

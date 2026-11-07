@@ -239,7 +239,7 @@ mod pr16_layout_tests {
             .unwrap();
         let hud = create().unwrap();
         hud.set_status("等待审批".into());
-        hud.set_listening("麦克风偏好：开 · 设备：capturing".into());
+        hud.set_listening("常驻监听（已保存）：开 · 当前状态：正在采集".into());
         hud.set_transcript("请列出窗口并检查当前文档".into());
         hud.set_reasoning("这是测试夹具中的模型事件文本。\n".repeat(60).into());
         hud.set_reply("这是增量回复测试内容。\n".repeat(40).into());
@@ -261,6 +261,7 @@ mod pr16_layout_tests {
             let h = h.upgrade().unwrap();
             assert_eq!(id, h.get_request_id());
             if id == 1 {
+                h.set_interaction_generation(h.get_interaction_generation() + 1);
                 h.set_request_id(2);
                 h.set_prompt("第二个请求：允许读取剪贴板吗？这是与第一个请求不同的操作。".into());
             } else {
@@ -270,10 +271,33 @@ mod pr16_layout_tests {
         hud.set_followup("可以继续说，无需唤醒词 · 8 秒".into());
         let placement = Placement::default();
         placement.show(&hud);
+        let updates = slint::Timer::default();
+        let h = hud.as_weak();
+        let tick = std::cell::Cell::new(0);
+        updates.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || {
+                let h = h.upgrade().unwrap();
+                let n = tick.get() + 1;
+                tick.set(n);
+                h.set_reply(format!("{}\n第 {n} 段新生成回复", h.get_reply()).into());
+                h.set_subtitle(format!("第 {n} 句实际播放字幕（测试夹具）").into());
+                h.set_status(
+                    if h.get_following_latest() {
+                        "跟随最新内容"
+                    } else {
+                        "阅读上文，暂停跟随"
+                    }
+                    .into(),
+                );
+                eprintln!("HUD tick={n} following={}", h.get_following_latest());
+            },
+        );
         let timer = slint::Timer::default();
         timer.start(
             slint::TimerMode::SingleShot,
-            std::time::Duration::from_secs(45),
+            std::time::Duration::from_secs(90),
             || {
                 slint::quit_event_loop().unwrap();
             },

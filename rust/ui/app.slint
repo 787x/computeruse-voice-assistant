@@ -691,6 +691,7 @@ export component AppWindow inherits Window {
     callback start-manual-from-tray();
     callback cancel-recognition();
     in-out property <string> hud-session;
+    in-out property <int> hud-interaction;
     in-out property <string> hud-reasoning;
     in-out property <string> hud-reply;
     in-out property <string> hud-process;
@@ -2562,6 +2563,12 @@ export component VoiceHud inherits Window {
     in property <string> followup;
     in property <[ToolCard]> tools;
     property <bool> expanded: false;
+    in property <int> interaction-generation;
+    out property <bool> following-latest: true;
+    changed interaction-generation => {
+        root.following-latest = true;
+        live-scroll.content-y = min(0px, live-scroll.height - live-scroll.content-height);
+    }
     callback settings();
     callback cancel-recognition();
     callback answer(int, bool);
@@ -2577,8 +2584,11 @@ export component VoiceHud inherits Window {
             content-height: status-text.preferred-height;
             status-text := Text { width: parent.width; color: #333333; text: root.status; wrap: word-wrap; }
         }
-        ScrollView {
+        live-scroll := ScrollView {
             vertical-stretch: 1;
+            changed content-y => { root.following-latest = self.content-y <= min(0px, self.height - self.content-height) + 24px; }
+            changed content-height => { if root.following-latest { self.content-y = min(0px, self.height - self.content-height); } }
+            changed height => { if root.following-latest { self.content-y = min(0px, self.height - self.content-height); } }
             body := VerticalLayout {
                 spacing: 6px;
                 Text { color: #333333; text: root.summary; wrap: word-wrap; }

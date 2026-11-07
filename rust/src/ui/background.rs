@@ -153,6 +153,7 @@ impl BackgroundUi {
                     if let Some(h) = h.upgrade() {
                         let woke =
                             last_wake.replace(w.get_wake_generation()) != w.get_wake_generation();
+                        h.set_interaction_generation(w.get_hud_interaction());
                         h.set_status(w.get_status());
                         h.set_summary(
                             format!("{} · {}", w.get_session_title(), w.get_model_choice_label())
