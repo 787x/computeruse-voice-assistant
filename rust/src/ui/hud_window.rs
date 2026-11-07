@@ -23,7 +23,7 @@ pub fn create() -> Result<VoiceHud, slint::PlatformError> {
 }
 
 type Geometry = (i32, i32, i32, i32, u64);
-type Viewport = ([i32; 4], u64);
+type Viewport = ([i32; 4], u64, u32, u32);
 #[derive(Default)]
 pub struct Placement {
     geometry: std::cell::Cell<Option<Geometry>>,
@@ -114,6 +114,8 @@ impl Placement {
                         let viewport = (
                             [area.left, area.top, area.right, area.bottom],
                             scale.to_bits(),
+                            hud.get_content_width().to_bits(),
+                            hud.get_content_height().to_bits(),
                         );
                         if self.viewport.replace(Some(viewport)) != Some(viewport) {
                             resize_to = Some(slint::LogicalSize::new(
@@ -219,6 +221,40 @@ mod native_tests {
                 if step.get() == 3 {
                     slint::quit_event_loop().unwrap();
                 }
+            },
+        );
+        slint::run_event_loop_until_quit().unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod pr16_layout_tests {
+    use super::*;
+    #[test]
+    #[ignore = "interactive Windows HUD layout fixture"]
+    fn long_content_hud_fixture() {
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .select()
+            .unwrap();
+        let hud = create().unwrap();
+        hud.set_status("等待审批".into());
+        hud.set_listening("麦克风偏好：开 · 设备：capturing".into());
+        hud.set_transcript("请列出窗口并检查当前文档".into());
+        hud.set_reasoning("这是测试夹具中的模型事件文本。\n".repeat(60).into());
+        hud.set_reply("这是增量回复测试内容。\n".repeat(40).into());
+        hud.set_prompt("允许读取当前窗口标题吗？此操作会列出当前桌面窗口。".into());
+        hud.set_asking(true);
+        hud.set_request_id(1);
+        hud.set_followup("可以继续说，无需唤醒词 · 8 秒".into());
+        let placement = Placement::default();
+        placement.show(&hud);
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_secs(45),
+            || {
+                slint::quit_event_loop().unwrap();
             },
         );
         slint::run_event_loop_until_quit().unwrap();

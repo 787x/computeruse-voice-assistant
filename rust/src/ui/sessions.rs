@@ -541,14 +541,57 @@ pub fn publish_session_list(weak: &slint::Weak<AppWindow>, runtime: &SessionRunt
     });
 }
 
+/// 仅投影当前回合；参数不进入 HUD，字幕仍由 SpeechView 独立提供。
+fn hud_content(items: &[crate::session::TimelineItem]) -> (String, String, Vec<crate::ToolCard>) {
+    let turn = items.last().map(|i| i.turn_id);
+    let mut reasoning = String::new();
+    let mut reply = String::new();
+    let mut hud_tools = Vec::new();
+    for item in items.iter().filter(|i| Some(i.turn_id) == turn) {
+        use crate::session::TimelineKind;
+        match item.kind {
+            TimelineKind::Reasoning => reasoning.push_str(&item.text),
+            TimelineKind::Assistant => reply.push_str(&item.text),
+            TimelineKind::Tool => hud_tools.push(crate::ToolCard {
+                name: format!("#{} {}", item.call_id, item.tool).into(),
+                state: item.status.label().into(),
+                detail: format!(
+                    "{} · {} ms",
+                    if item.text.is_empty() {
+                        "暂无结果".to_string()
+                    } else {
+                        format!("返回 {} 字符，详情见主窗口", item.text.chars().count())
+                    },
+                    item.ms
+                )
+                .into(),
+                ..Default::default()
+            }),
+            _ => {}
+        }
+    }
+    (reasoning, reply, hud_tools)
+}
+
 /// 把当前会话的时间线推给界面（对话气泡 + 工具卡片）。
 pub fn publish_timeline(weak: &slint::Weak<AppWindow>, runtime: &SessionRuntime) {
-    let view = TimelineView::from_items(runtime.timeline());
+    let items = runtime.timeline();
+    let (reasoning, reply, hud_tools) = hud_content(&items);
+    let session_id = runtime.current_id().to_string();
+    let view = TimelineView::from_items(items);
     let entries: Vec<crate::ChatEntry> = view.entries().to_vec();
     let tools: Vec<crate::ToolCard> = view.tools().to_vec();
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            if window.get_hud_session() != session_id {
+                window.set_voice_transcript("".into());
+                window.set_speech_subtitle("".into());
+                window.set_hud_session(session_id.into());
+            }
+            window.set_hud_reasoning(reasoning.into());
+            window.set_hud_reply(reply.into());
+            window.set_hud_tools(ModelRc::new(VecModel::from(hud_tools)));
             window.set_entries(ModelRc::new(VecModel::from(entries)));
             window.set_tools(ModelRc::new(VecModel::from(tools)));
         }
@@ -835,5 +878,48 @@ mod tests {
         assert_eq!(items[1].status, TimelineToolStatus::Ok);
         assert_eq!(items[1].ms, 12);
         let _ = std::fs::remove_dir_all(&paths.root);
+    }
+}
+
+#[cfg(test)]
+mod pr16_projection_tests {
+    use super::*;
+    use crate::session::{TimelineItem, TimelineKind, TimelineToolStatus};
+    #[test]
+    fn latest_turn_layers_and_same_name_instances_remain_independent() {
+        let item = |turn_id, kind, text: &str| TimelineItem {
+            turn_id,
+            kind,
+            text: text.into(),
+            ..Default::default()
+        };
+        let mut items = vec![
+            item(1, TimelineKind::Assistant, "旧答案"),
+            item(2, TimelineKind::Reasoning, "真实推理"),
+            item(2, TimelineKind::Assistant, "正文"),
+        ];
+        for call_id in [1, 2] {
+            items.push(TimelineItem {
+                turn_id: 2,
+                kind: TimelineKind::Tool,
+                call_id,
+                tool: "read_file".into(),
+                args_summary: "secret".into(),
+                text: "x".repeat(500),
+                status: TimelineToolStatus::Ok,
+                ms: 12,
+                ..Default::default()
+            });
+        }
+        let (reasoning, reply, tools) = hud_content(&items);
+        assert_eq!(reasoning, "真实推理");
+        assert_eq!(reply, "正文");
+        assert_eq!(tools.len(), 2);
+        assert_ne!(tools[0].name, tools[1].name);
+        assert!(!tools[0].detail.contains("secret"));
+        assert!(tools[0].detail.len() < 200);
+        assert!(tools[0].detail.contains("12 ms"));
+        let (r, a, t) = hud_content(&[]);
+        assert!(r.is_empty() && a.is_empty() && t.is_empty());
     }
 }

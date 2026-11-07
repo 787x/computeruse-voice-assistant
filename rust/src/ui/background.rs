@@ -75,6 +75,35 @@ impl BackgroundUi {
                 }
             }
         });
+        let idle_since = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+        let click_time = idle_since.clone();
+        let weak = window.as_weak();
+        let h = hud.as_weak();
+        let place = placement.clone();
+        tray.on_start_manual(move || {
+            click_time.set(std::time::Instant::now());
+            if let Some(h) = h.upgrade() {
+                place.show(&h);
+            }
+            if let Some(w) = weak.upgrade() {
+                w.invoke_start_manual_from_tray();
+            }
+        });
+        let weak = window.as_weak();
+        hud.on_cancel_recognition(move || {
+            if let Some(w) = weak.upgrade() {
+                if w.get_voice_manual() {
+                    w.invoke_cancel_recognition();
+                }
+            }
+        });
+        let weak = window.as_weak();
+        hud.on_settings(move || {
+            if let Some(w) = weak.upgrade() {
+                activate_main(&w);
+                w.invoke_open_settings();
+            }
+        });
         let weak = window.as_weak();
         tray.on_open_main(move || {
             if let Some(w) = weak.upgrade() {
@@ -114,7 +143,7 @@ impl BackgroundUi {
         let tray_weak = tray.as_weak();
         let h = hud.as_weak();
         let last_wake = std::cell::Cell::new(0);
-        let idle_since = std::cell::Cell::new(std::time::Instant::now());
+
         timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_millis(100),
@@ -125,6 +154,23 @@ impl BackgroundUi {
                         let woke =
                             last_wake.replace(w.get_wake_generation()) != w.get_wake_generation();
                         h.set_status(w.get_status());
+                        h.set_summary(
+                            format!("{} · {}", w.get_session_title(), w.get_model_choice_label())
+                                .into(),
+                        );
+                        h.set_reasoning(w.get_hud_reasoning());
+                        h.set_reply(w.get_hud_reply());
+                        h.set_tools(w.get_hud_tools());
+                        h.set_listening(
+                            format!(
+                                "麦克风偏好：{} · 设备：{}",
+                                if w.get_voice_enabled() { "开" } else { "关" },
+                                w.get_voice_state()
+                            )
+                            .into(),
+                        );
+                        h.set_playback(w.get_speech_detail());
+                        h.set_followup(w.get_hud_followup());
                         h.set_transcript(w.get_voice_transcript());
                         h.set_subtitle(w.get_speech_subtitle());
                         h.set_asking(w.get_confirm_open());
@@ -137,19 +183,23 @@ impl BackgroundUi {
                         {
                             placement.show(&h);
                         }
-                        if keeps_auto_hud_active(
-                            woke,
-                            w.get_voice_enabled(),
-                            w.get_voice_state().as_str(),
-                            w.get_busy(),
-                            w.get_speech_active(),
-                            w.get_confirm_open(),
-                        ) {
+                        if w.get_voice_manual()
+                            || w.get_busy()
+                            || w.get_speech_active()
+                            || keeps_auto_hud_active(
+                                woke || !w.get_hud_followup().is_empty(),
+                                w.get_voice_enabled() || w.get_voice_manual(),
+                                w.get_voice_state().as_str(),
+                                w.get_busy(),
+                                w.get_speech_active(),
+                                w.get_confirm_open(),
+                            )
+                        {
                             idle_since.set(std::time::Instant::now());
                         } else if should_hide(
                             manual.get(),
                             w.get_confirm_open(),
-                            w.get_voice_enabled(),
+                            true,
                             idle_since.get().elapsed().as_secs(),
                         ) {
                             let _ = h.hide();

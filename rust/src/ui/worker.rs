@@ -169,6 +169,8 @@ pub enum UiCommand {
     /// 启用/关闭麦克风监听（界面开关）。
     SetVoiceEnabled(bool),
     DictateNow,
+    StartManualFromTray,
+    CancelRecognition,
     QuickPermissionPicked(i32),
     /// 语音线程发回的事件（内部消息，不是用户动作）。
     Voice(VoiceEvent),
@@ -353,6 +355,9 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 立刻把用户这句话放进对话区（不必等工作线程回报）。
             if let Some(window) = weak.upgrade() {
                 push_entry(&window, "你", &value, "", "#e8f0fe");
+                window.set_hud_reasoning("".into());
+                window.set_hud_reply("".into());
+                window.set_hud_tools(ModelRc::new(VecModel::from(Vec::<ToolCard>::new())));
                 window.set_busy(true);
                 window.set_status("正在思考…".into());
                 window.set_draft("".into());
@@ -814,6 +819,14 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let direct_tx = command_tx.clone();
         window.on_dictate_now(move || {
             let _ = direct_tx.send(UiCommand::DictateNow);
+        });
+        let cancel_tx = command_tx.clone();
+        window.on_cancel_recognition(move || {
+            let _ = cancel_tx.send(UiCommand::CancelRecognition);
+        });
+        let tray_tx = command_tx.clone();
+        window.on_start_manual_from_tray(move || {
+            let _ = tray_tx.send(UiCommand::StartManualFromTray);
         });
         let permission_tx = command_tx.clone();
         window.on_quick_permission_picked(move |index| {
@@ -1828,6 +1841,17 @@ async fn run_worker(
         // 每一轮都按"当前是否在播报 / 是否有挂起的确认"重新决定聆听模式：
         // 只有播报期间与等待确认期间才允许不喊唤醒词。
         sync_listen_mode(&mut voice, &speech, &confirmer);
+        let followup = voice
+            .followup
+            .map(|end| {
+                format!(
+                    "可以继续说，无需唤醒词 · {} 秒",
+                    end.saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                )
+            })
+            .unwrap_or_default();
+        with_window(&weak, move |w| w.set_hud_followup(followup.into()));
         if let Some(end) = voice
             .followup
             .filter(|_| !voice.mode.followup_started(voice.followup_generation))
@@ -1893,6 +1917,12 @@ async fn run_worker(
                 // 取消也作用于「正在录/正在识别的那一句」：之后返回的结果不提交。
                 // 已经开始的 Agent 回合仍按原有取消语义处理。
                 voice.cancel_pending();
+                if voice.manual_temporary {
+                    voice.disable(&weak);
+                } else {
+                    voice.manual_armed = false;
+                    with_window(&weak, |w| w.set_voice_manual(false));
+                }
             }
             UiCommand::StopSpeaking => {
                 voice.clear_followup();
@@ -2521,7 +2551,23 @@ async fn run_worker(
                     }
                 }
             }
-            UiCommand::DictateNow => {
+            UiCommand::CancelRecognition => {
+                voice.cancel_pending();
+                if voice.manual_temporary {
+                    voice.disable(&weak);
+                } else {
+                    voice.manual_armed = false;
+                    voice.set_listen_mode(ListenPurpose::Wake, 0);
+                    with_window(&weak, |w| w.set_voice_manual(false));
+                }
+                set_status(&weak, "已取消识别");
+            }
+            UiCommand::DictateNow | UiCommand::StartManualFromTray => {
+                if matches!(command, UiCommand::StartManualFromTray)
+                    && !voice.can_start_manual_from_tray(confirmer.pending_request().is_some())
+                {
+                    continue;
+                }
                 if voice.manual_armed
                     || voice.route.pending.is_some()
                     || voice.route.active_session().current().is_some()
@@ -2537,6 +2583,7 @@ async fn run_worker(
                     }
                 } else {
                     speech.stop();
+                    with_window(&weak, |w| w.set_voice_transcript("".into()));
                     voice.manual_temporary = !voice
                         .handle
                         .as_ref()
@@ -2852,6 +2899,14 @@ impl VoiceRuntime {
         }
     }
 
+    fn can_start_manual_from_tray(&self, asking: bool) -> bool {
+        !asking
+            && !self.manual_armed
+            && self.route.pending.is_none()
+            && self.route.active_session().current().is_none()
+            && self.followup.is_none()
+    }
+
     /// 设置聆听模式（关麦时也会记下来，重开麦后沿用当前值）。
     fn set_listen_mode(&self, purpose: ListenPurpose, request_id: u64) {
         self.mode.set(purpose, request_id);
@@ -2890,7 +2945,7 @@ impl VoiceRuntime {
                 let message = errors.join("\n\n");
                 set_voice_state(weak, &VoiceState::Error("缺少语音模型".to_string()));
                 push_entry_via_weak(weak, "系统", &message, "", "#fdeeee");
-                set_status(weak, "语音模型不完整；文本模式仍然可用");
+                set_status(weak, &format!("语音模型不完整：{message}；请打开设置"));
                 return;
             }
         };
@@ -2964,7 +3019,14 @@ impl VoiceRuntime {
         match event.kind {
             VoiceEventKind::StateChanged(state) => {
                 set_voice_state(weak, &state);
-                set_status(weak, &state.label());
+                set_status(
+                    weak,
+                    &if state == VoiceState::Listening && self.manual_armed {
+                        "请直接说指令，无需唤醒词".to_string()
+                    } else {
+                        state.label()
+                    },
+                );
                 if !state.is_active() {
                     self.clear_followup();
                     with_window(weak, |w| w.set_voice_manual(false));
@@ -3010,6 +3072,9 @@ impl VoiceRuntime {
                     return VoiceOutcome::None;
                 }
                 self.route.bind(event.instance, turn);
+                if matches!(purpose, ListenPurpose::Manual | ListenPurpose::Followup) {
+                    with_window(weak, |w| w.set_voice_transcript("".into()));
+                }
                 set_voice_state(weak, &VoiceState::Capturing);
                 match purpose {
                     ListenPurpose::BargeIn => {
@@ -3492,9 +3557,13 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
         | SpeechEvent::Subtitle { speech_id, .. }
         | SpeechEvent::Notice { speech_id, .. } => *speech_id,
     };
+    let previous_speech = view.current;
     if !view.accepts(speech_id) {
         // 旧播报的迟到事件：不改状态、不改字幕、也不弹提示。
         return;
+    }
+    if previous_speech != view.current {
+        with_window(weak, |w| w.set_speech_subtitle("".into()));
     }
     match event {
         SpeechEvent::State { state, .. } => {
@@ -3870,6 +3939,11 @@ fn start_turn(
      * 优先级：会话手选 > 时段规则 → 方案 > 全局默认。**只在这里解析一次**，
      * 所以时段跨过边界、别的会话改模型都不会影响这一轮。
      */
+    with_window(weak, |w| {
+        w.set_hud_reasoning("".into());
+        w.set_hud_reply("".into());
+        w.set_hud_tools(ModelRc::new(VecModel::from(Vec::<ToolCard>::new())));
+    });
     let now = crate::clock::now();
     let selection = settings.resolve_selection(choice, &now);
     let profile = settings.profile_for_selection(&selection);
@@ -4543,7 +4617,8 @@ async fn wait_turn(
                      *  - 打断词与语音确认**照常生效**：它们不启动回合。
                      *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
                      */
-                    Some(UiCommand::DictateNow) | Some(UiCommand::QuickPermissionPicked(_)) => { set_status(weak, "请先结束当前回合再切换"); }
+                    Some(UiCommand::CancelRecognition) => { /* Agent/审批继续，托盘不能取消审批。 */ }
+                    Some(UiCommand::StartManualFromTray) | Some(UiCommand::DictateNow) | Some(UiCommand::QuickPermissionPicked(_)) => { set_status(weak, "请先结束当前回合再切换"); }
                     Some(UiCommand::SetVoiceEnabled(enabled)) => {
                         apply_voice_enabled(weak, paths, settings, voice, command_tx, enabled);
                     }
@@ -6858,5 +6933,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+}
+
+#[cfg(test)]
+mod pr16_tests {
+    use super::*;
+    #[test]
+    fn manual_final_is_consumed_once_and_temporary_capture_closes() {
+        for temporary in [false, true] {
+            let mut voice = VoiceRuntime::new();
+            let instance = voice.route.open();
+            let turn = VoiceTurn {
+                instance,
+                session: 1,
+            };
+            voice.route.bind(instance, turn);
+            voice.manual_temporary = temporary;
+            voice.manual_request = 1;
+            voice.set_listen_mode(ListenPurpose::Manual, 1);
+            let event = || VoiceEvent {
+                instance,
+                kind: VoiceEventKind::Final {
+                    turn,
+                    text: "测试".into(),
+                    audio_seconds: 1.0,
+                    decode_ms: 1,
+                    purpose: ListenPurpose::Manual,
+                    request_id: 1,
+                },
+            };
+            let weak = slint::Weak::default();
+            assert!(voice
+                .on_event(&weak, event(), false)
+                .into_prompt()
+                .is_some());
+            assert!(voice
+                .on_event(&weak, event(), false)
+                .into_prompt()
+                .is_none());
+            assert_eq!(voice.route.is_current(instance), !temporary);
+            assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
+        }
+    }
+    #[test]
+    fn tray_start_is_idempotent_and_preserves_confirmation_and_followup() {
+        let mut voice = VoiceRuntime::new();
+        assert!(voice.can_start_manual_from_tray(false));
+        assert!(!voice.can_start_manual_from_tray(true));
+        voice.manual_armed = true;
+        assert!(!voice.can_start_manual_from_tray(false));
+        voice.manual_armed = false;
+        voice.followup = Some(std::time::Instant::now());
+        assert!(!voice.can_start_manual_from_tray(false));
+        voice.followup = None;
+        let instance = voice.route.open();
+        voice.route.bind(
+            instance,
+            VoiceTurn {
+                instance,
+                session: 1,
+            },
+        );
+        assert!(!voice.can_start_manual_from_tray(false));
     }
 }
