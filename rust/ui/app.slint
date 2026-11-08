@@ -496,6 +496,7 @@ export struct EndpointModel {
 }
 export struct EndpointCard {
     id: string, name: string, url: string, key: string, default-model: string,
+    model-options: [string], default-index: int,
     saved-url: string, credential-url: string, catalog-origin: string, error: string,
     delete-pending: bool, revision: int, kind: int, thinking: int, effort: int, status: string, rows: [EndpointModel],
 }
@@ -517,15 +518,19 @@ component EndpointEditor inherits Rectangle {
         HorizontalLayout {
             Text { text: "名称"; width: 80px; color: Theme.text-color; }
             AppLineEdit { text <=> card.name; edited => { card.status = ""; card.error = ""; action("draft", card); } }
+            AppButton {
+                label: card.status == "busy" ? "测试中…" : card.status == "成功" ? "测试成功" : card.status == "失败" ? "测试失败" : "测试模型";
+                text-color: card.status == "成功" ? #1f7a3a : card.status == "失败" ? #a02020 : #242428;
+                enabled: card.status != "busy";
+                clicked => { action("test", card); }
+            }
         }
         HorizontalLayout {
             Text { text: "API Key"; width: 80px; color: Theme.text-color; }
             AppLineEdit { text <=> card.key; input-type-password: true; placeholder-text: "留空使用该实例已保存凭据"; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
-            AppButton {
-                label: card.status == "busy" ? "测试中…" : card.status == "成功" ? "测试成功" : card.status == "失败" ? "测试失败" : "测试连接";
-                text-color: card.status == "成功" ? #1f7a3a : card.status == "失败" ? #a02020 : #242428;
-                enabled: card.status != "busy";
-                clicked => { action("test", card); }
+            if card.kind == 0 || card.kind == 1 : AppButton {
+                label: "获取 API Key";
+                clicked => { action("api-keys", card); }
             }
         }
         if card.error != "" : Text { text: card.error; color: #a02020; wrap: word-wrap; }
@@ -535,6 +540,7 @@ component EndpointEditor inherits Rectangle {
         HorizontalLayout {
             Text { text: "API 地址"; width: 80px; color: Theme.text-color; }
             AppLineEdit { text <=> card.url; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
+            if card.kind == 0 || card.kind == 1 : AppButton { label: "填入官方地址"; clicked => { action("official-url", card); } }
         }
         if card.saved-url != card.url && card.credential-url != card.url && card.key == "" : AppButton {
             label: "确认将本实例已存 Key 用于此地址";
@@ -542,7 +548,11 @@ component EndpointEditor inherits Rectangle {
         }
         HorizontalLayout {
             Text { text: "默认模型"; width: 80px; color: Theme.text-color; }
-            AppLineEdit { text <=> card.default-model; edited => { card.status = ""; card.error = ""; action("draft", card); } }
+            AppComboBox {
+                options: card.model-options;
+                index: card.default-index;
+                picked(i) => { card.default-model = card.model-options[i]; card.status = ""; card.error = ""; action("draft", card); }
+            }
         }
         HorizontalLayout {
             AppComboBox { options: ["默认思考", "开启思考", "关闭思考"]; index <=> card.thinking; picked(i) => { card.status = ""; card.error = ""; action("draft", card); } }

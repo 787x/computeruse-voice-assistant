@@ -32,6 +32,42 @@ fn row(m: &ModelOption, enabled: bool) -> EndpointModel {
         expanded: false,
     }
 }
+fn refresh_model_choices(c: &mut EndpointCard) {
+    let options: Vec<slint::SharedString> = c
+        .rows
+        .iter()
+        .filter(|r| r.enabled && !r.id.trim().is_empty())
+        .map(|r| r.id)
+        .collect();
+    c.default_index = options
+        .iter()
+        .position(|id| id == &c.default_model)
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    c.model_options = ModelRc::new(VecModel::from(options));
+}
+fn official_url(kind: i32) -> Option<&'static str> {
+    match kind {
+        0 => Some("https://api.xiaomimimo.com/v1"),
+        1 => Some("https://api.deepseek.com/v1"),
+        _ => None,
+    }
+}
+fn api_keys_url(kind: i32) -> Option<&'static str> {
+    match kind {
+        0 => Some("https://platform.xiaomimimo.com/console/api-keys"),
+        1 => Some("https://platform.deepseek.com/api_keys"),
+        _ => None,
+    }
+}
+fn open_api_keys(kind: i32) -> Result<(), String> {
+    let url = api_keys_url(kind).ok_or("该端点没有预置密钥页面")?;
+    std::process::Command::new("explorer.exe")
+        .arg(url)
+        .spawn()
+        .map_err(|e| format!("无法打开密钥页面：{e}"))?;
+    Ok(())
+}
 pub(super) fn card(p: &ProviderConfig) -> EndpointCard {
     let mut p = p.clone();
     p.remember_manual_model(&p.model.clone());
@@ -43,7 +79,7 @@ pub(super) fn card(p: &ProviderConfig) -> EndpointCard {
             p.models.push(m);
         }
     }
-    EndpointCard {
+    let mut c = EndpointCard {
         id: p.id.clone().into(),
         name: p.display_name().into(),
         url: p.base_url_or_default().into(),
@@ -64,7 +100,9 @@ pub(super) fn card(p: &ProviderConfig) -> EndpointCard {
                 .collect::<Vec<_>>(),
         )),
         ..Default::default()
-    }
+    };
+    refresh_model_choices(&mut c);
+    c
 }
 pub fn fill(w: &AppWindow, s: &Settings) {
     let mut ids = vec!["mimo".to_string(), "deepseek".to_string()];
@@ -399,6 +437,12 @@ pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedS
         let Some(w) = weak.upgrade() else {
             return;
         };
+        if op == "api-keys" {
+            if let Err(error) = open_api_keys(c.kind) {
+                w.set_settings_error(error.into());
+            }
+            return;
+        }
         // 展开行和删除确认只改变 UI；不能作废正在进行的连接测试。
         if !op.starts_with("expand:") && op != "cancel-delete" && op != "delete" {
             revision.set(revision.get().wrapping_add(1));
@@ -413,6 +457,11 @@ pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedS
         };
         let result = (|| -> Result<(), String> {
             match op.as_str() {
+                "official-url" => {
+                    c.url = official_url(c.kind).ok_or("该端点没有预置地址")?.into();
+                    c.credential_url = "".into();
+                    invalidate_draft(&mut c);
+                }
                 "save" => {
                     let p = provider(&c)?;
                     validate_default(&p)?;
@@ -554,6 +603,7 @@ pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedS
                                     c.status = if ok { "成功" } else { "失败" }.into();
                                 } else if result.1.is_empty() {
                                     merge_catalog(&mut c, &result.2);
+                                    refresh_model_choices(&mut c);
                                 }
                                 if !result.1.is_empty() && result.0 != Some(true) {
                                     c.error = result.1.into();
@@ -592,6 +642,7 @@ pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedS
                     }
                 }
             }
+            refresh_model_choices(&mut c);
             cards.set_row_data(i, c);
             Ok(())
         })();
@@ -612,6 +663,32 @@ pub fn install(w: &AppWindow, paths: AppPaths, tx: tokio::sync::mpsc::UnboundedS
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn default_choices_follow_enabled_catalog_without_silent_reselection() {
+        let p = Settings::default().provider("mimo");
+        let mut c = card(&p);
+        let rows = vec![
+            row(&ModelOption::manual("first"), true),
+            row(&ModelOption::manual("disabled"), false),
+            row(&ModelOption::manual("second"), true),
+        ];
+        c.rows = ModelRc::new(VecModel::from(rows));
+        c.default_model = "second".into();
+        refresh_model_choices(&mut c);
+        assert_eq!(
+            c.model_options
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(c.default_index, 1);
+        c.default_model = "disabled".into();
+        refresh_model_choices(&mut c);
+        assert_eq!(c.default_index, -1);
+        assert_eq!(c.default_model, "disabled");
+    }
 
     fn isolated() -> (AppPaths, crate::secret::SecretStore) {
         let root = std::env::temp_dir().join(format!(
