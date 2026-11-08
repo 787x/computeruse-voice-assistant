@@ -1900,7 +1900,7 @@ async fn pr17_agent_real_errors_preserve_classification_and_safe_description() {
             PermissionState::new(PermissionMode::Standard),
         );
         let mut history = Vec::new();
-        let (outcome, _) = run_turn(
+        let (outcome, events) = run_turn(
             &mut agent,
             "test",
             &mut history,
@@ -1919,6 +1919,9 @@ async fn pr17_agent_real_errors_preserve_classification_and_safe_description() {
             })
         );
         let message = outcome.failure_message.unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event == &format!("failed:{message}")));
         assert!(message.contains("quota") && message.contains("try later"));
         if status == 200 {
             assert!(!message.contains("HTTP"));

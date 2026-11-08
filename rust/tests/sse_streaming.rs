@@ -385,3 +385,48 @@ async fn provider_field_rules_are_unchanged_after_stream_rewrite() {
     assert_eq!(body["reasoning_effort"], json!("low"));
     assert!(body.get("thinking").is_none());
 }
+
+#[tokio::test]
+async fn pr17_null_error_and_error_text_are_normal_data() {
+    let visible = r#"error {"error":"example"} and code: obj["error"]"#;
+    let payload = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"error":null, "choices":[{"delta":{"content":visible}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+    );
+    let chunks = split_every_byte(payload.as_bytes());
+    let server = RawServer::start(Box::new(move |_| chunks.clone())).await;
+    let result = chat(&client(&server.base_url, 2000)).await.unwrap();
+    assert_eq!(result.text, visible);
+    assert!(!result.incomplete && !result.tool_calls_incomplete);
+}
+
+#[tokio::test]
+async fn pr17_real_sse_error_formats_are_shared_and_prompt() {
+    for payload in [
+        "event:error\ndata: {\"error\":{\"code\":\"rate_limit_exceeded\",\"type\":\"quota\",\"message\":\"try later\"}}\n\n",
+        "event: error\ndata: {\"code\":\"rate_limit_exceeded\",\"message\":\"try later\"}\n\n",
+        "data: {\"error\":\"quota_exceeded\"}\n\n",
+        "event:error\ndata: quota_exceeded\n\n",
+    ] {
+        let chunks = split_every_byte(payload.as_bytes());
+        let server = RawServer::start(Box::new(move |_| chunks.clone())).await;
+        let client = client(&server.base_url, 2000);
+        let error = chat(&client).await.unwrap_err();
+        let message = client.user_error(&error);
+        assert!(matches!(error, cuava::llm::LlmError::Stream(_)));
+        assert!(message.contains("exceeded"), "{message}");
+        assert!(!message.contains("HTTP"));
+    }
+}
+
+#[tokio::test]
+async fn pr17_invalid_json_with_error_text_does_not_abort_valid_following_events() {
+    let payload = b"data: {\"error\":\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let chunks = split_every_byte(payload);
+    let server = RawServer::start(Box::new(move |_| chunks.clone())).await;
+    assert_eq!(
+        chat(&client(&server.base_url, 2000)).await.unwrap().text,
+        "ok"
+    );
+}

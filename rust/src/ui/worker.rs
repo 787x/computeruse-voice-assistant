@@ -835,17 +835,22 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let finish_weak = window.as_weak();
         window.on_finish_recognition(move || {
             if let Some(w) = finish_weak.upgrade() {
-                if w.get_voice_state() != "capturing" {
+                if !w.get_can_finish_recording() {
                     return;
                 }
                 let token = w.get_voice_submit_token().to_string();
                 if let Some((instance, session)) = token.split_once(':') {
                     if let (Ok(instance), Ok(session)) = (instance.parse(), session.parse()) {
-                        let _ = finish_tx.send(UiCommand::FinishRecognition(VoiceTurn {
-                            instance,
-                            session,
-                        }));
-                        w.set_voice_submit_token("".into());
+                        if finish_tx
+                            .send(UiCommand::FinishRecognition(VoiceTurn {
+                                instance,
+                                session,
+                            }))
+                            .is_ok()
+                        {
+                            w.set_voice_finishing(true);
+                            w.set_status("正在结束录音…".into());
+                        }
                     }
                 }
             }
@@ -2563,7 +2568,11 @@ async fn run_worker(
                 }
             }
             UiCommand::FinishRecognition(turn) => {
-                voice.route.active.request_finish(turn);
+                if voice.route.pending == Some(turn) && voice.route.active.is_current(turn) {
+                    voice.route.active.request_finish(turn);
+                } else {
+                    with_window(&weak, |w| w.set_voice_finishing(false));
+                }
             }
             UiCommand::CancelRecognition => {
                 if voice.route.pending.is_some() || voice.manual_session.is_some() {
@@ -2971,6 +2980,10 @@ impl VoiceRuntime {
     }
 
     fn cancel_recognition(&mut self, weak: &slint::Weak<AppWindow>) {
+        with_window(weak, |w| {
+            w.set_voice_submit_token("".into());
+            w.set_voice_finishing(false);
+        });
         if self.manual_temporary {
             self.disable(weak);
         } else {
@@ -3142,6 +3155,7 @@ impl VoiceRuntime {
             VoiceEventKind::Woke { turn, keyword } => {
                 self.route.bind(event.instance, turn);
                 with_window(weak, move |w| {
+                    w.set_voice_finishing(false);
                     w.set_voice_submit_token(format!("{}:{}", turn.instance, turn.session).into())
                 });
                 with_window(weak, |w| {
@@ -3171,6 +3185,7 @@ impl VoiceRuntime {
                 }
                 self.route.bind(event.instance, turn);
                 with_window(weak, move |w| {
+                    w.set_voice_finishing(false);
                     w.set_voice_submit_token(format!("{}:{}", turn.instance, turn.session).into())
                 });
                 if matches!(purpose, ListenPurpose::Manual | ListenPurpose::Followup) {
@@ -3203,7 +3218,11 @@ impl VoiceRuntime {
                     return VoiceOutcome::None;
                 }
                 self.manual_session = None;
-                with_window(weak, |w| w.set_voice_manual(false));
+                with_window(weak, |w| {
+                    w.set_voice_submit_token("".into());
+                    w.set_voice_finishing(false);
+                    w.set_voice_manual(false);
+                });
                 if self.manual_temporary {
                     self.disable(weak);
                 } else if self.mode.purpose() == ListenPurpose::Manual {
@@ -3251,6 +3270,10 @@ impl VoiceRuntime {
                     }
                     return VoiceOutcome::None;
                 }
+                with_window(weak, |w| {
+                    w.set_voice_submit_token("".into());
+                    w.set_voice_finishing(false);
+                });
                 if purpose == ListenPurpose::Manual {
                     self.manual_session = None;
                     with_window(weak, |w| w.set_voice_manual(false));
@@ -3953,6 +3976,10 @@ fn set_voice_state(weak: &slint::Weak<AppWindow>, state: &VoiceState) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            if code != "capturing" {
+                window.set_voice_submit_token("".into());
+                window.set_voice_finishing(false);
+            }
             window.set_voice_state(code.into());
             window.set_voice_enabled(enabled);
         }
@@ -4763,7 +4790,9 @@ async fn wait_turn(
                      *  - 打断词与语音确认**照常生效**：它们不启动回合。
                      *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
                      */
-                    Some(UiCommand::FinishRecognition(turn)) => { voice.route.active.request_finish(turn); }
+                    Some(UiCommand::FinishRecognition(_)) => {
+                        with_window(weak, |w| w.set_voice_finishing(false));
+                    }
                     Some(UiCommand::CancelRecognition) => { /* Agent/审批继续，托盘不能取消审批。 */ }
                     Some(UiCommand::StartManualFromTray) | Some(UiCommand::DictateNow) | Some(UiCommand::QuickPermissionPicked(_)) => { set_status(weak, "请先结束当前回合再切换"); }
                     Some(UiCommand::SetVoiceEnabled(enabled)) => {

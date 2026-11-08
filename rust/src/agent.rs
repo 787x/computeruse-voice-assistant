@@ -551,7 +551,7 @@ impl Agent {
                     outcome.failure_reason = Some("stream_error".to_string());
                     outcome.failure_message = Some("流式响应异常".to_string());
                     sync_history(history, &messages);
-                    let reason = format!("模型响应异常（finish_reason={}）", result.finish_reason);
+                    let reason = outcome.failure_message.clone().unwrap();
                     emit(AgentEvent::Failed { turn, reason });
                     return outcome;
                 }

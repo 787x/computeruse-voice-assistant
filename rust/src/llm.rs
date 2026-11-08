@@ -457,9 +457,15 @@ fn error_detail(body: &str, key: &str) -> String {
     };
     let error = value
         .get("error")
-        .filter(|v| v.is_object())
+        .filter(|v| !v.is_null())
         .unwrap_or(&value);
-    ["code", "message"]
+    let value = if error.is_string() {
+        json!({"message":error})
+    } else {
+        error.clone()
+    };
+    let error = &value;
+    ["code", "type", "message"]
         .iter()
         .filter_map(|field| {
             let value = error.get(*field)?;
@@ -484,6 +490,10 @@ fn error_detail(body: &str, key: &str) -> String {
                     "prompt",
                     "messages",
                     "request body",
+                    "https://",
+                    "http://",
+                    "password",
+                    "credential",
                 ]
                 .iter()
                 .any(|x| lower.contains(x))
@@ -793,13 +803,17 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = tokio::select! {
+                body = response.text() => body.unwrap_or_default(),
+                _ = signal.cancelled() => return Err(LlmError::Aborted),
+                _ = tokio::time::sleep(timeout) => String::new(),
+            };
+            if signal.is_cancelled() {
+                return Err(LlmError::Aborted);
+            }
             return Err(LlmError::Status {
                 status,
-                body: serde_json::to_string(
-                    &json!({"error":{"message":error_detail(&body, &self.api_key)}}),
-                )
-                .unwrap_or_default(),
+                body: truncate(&body, 16_384),
             });
         }
 
@@ -863,7 +877,11 @@ impl LlmClient {
                         interrupted = true;
                         break 'outer;
                     }
-                    return Err(LlmError::Other(error.to_string()));
+                    return Err(if error.is_timeout() {
+                        LlmError::Timeout(self.timeout_ms)
+                    } else {
+                        LlmError::Stream(r#"{"message":"连接中断"}"#.to_string())
+                    });
                 }
             };
             buffer.extend_from_slice(&bytes);
@@ -874,13 +892,10 @@ impl LlmClient {
                 // boundary.1 是分隔符长度（`\n\n` 或 `\r\n\r\n`），一并丢弃。
                 buffer.drain(..boundary.1);
                 if let Ok(raw) = String::from_utf8(raw) {
-                    if raw.lines().any(|l| l.trim() == "event: error") || raw.contains("\"error\"")
-                    {
-                        let payload = raw
-                            .lines()
-                            .filter_map(|l| l.strip_prefix("data:"))
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                    if let Some(payload) = sse_error(&raw) {
+                        if signal.is_cancelled() {
+                            return Err(LlmError::Aborted);
+                        }
                         return Err(LlmError::Stream(payload));
                     }
                     if pump_event(
@@ -912,12 +927,10 @@ impl LlmClient {
         if !buffer.is_empty() && !interrupted {
             let raw: Vec<u8> = std::mem::take(&mut buffer);
             if let Ok(raw) = String::from_utf8(raw) {
-                if raw.lines().any(|l| l.trim() == "event: error") || raw.contains("\"error\"") {
-                    let payload = raw
-                        .lines()
-                        .filter_map(|l| l.strip_prefix("data:"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                if let Some(payload) = sse_error(&raw) {
+                    if signal.is_cancelled() {
+                        return Err(LlmError::Aborted);
+                    }
                     return Err(LlmError::Stream(payload));
                 }
                 let _ = pump_event(
@@ -1108,21 +1121,7 @@ pub(crate) fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// 解析单个 SSE 事件。返回 `true` 表示收到 `[DONE]`。
-#[allow(clippy::too_many_arguments)]
-fn pump_event(
-    raw_event: &str,
-    assembler: &mut ToolCallAssembler,
-    text: &mut String,
-    reasoning: &mut String,
-    finish_reason: &mut String,
-    usage: &mut Option<Value>,
-    saw_finish: &mut bool,
-    saw_done: &mut bool,
-    saw_error: &mut bool,
-    on_delta: &mut impl FnMut(&str),
-    on_reasoning: &mut impl FnMut(&str),
-) -> bool {
+fn parse_sse_event(raw_event: &str) -> (String, String) {
     let mut event_name = String::new();
     let mut data_lines: Vec<&str> = Vec::new();
     // 事件内部也可能用 CRLF 换行（`\r\n\r\n` 分隔时，事件体里就是 `\r\n`）。
@@ -1147,30 +1146,65 @@ fn pump_event(
             data_lines.push(value);
         }
     }
-    let event_is_error = event_name == "error";
-    let payload = data_lines.join("\n").trim().to_string();
-    if payload.is_empty() {
-        if event_is_error {
-            *saw_error = true;
+    (event_name, data_lines.join("\n").trim().to_string())
+}
+
+/// 显式 error 事件，或已解析 JSON 中非空的协议错误字段。
+fn sse_error(raw_event: &str) -> Option<String> {
+    let (event, payload) = parse_sse_event(raw_event);
+    let json = serde_json::from_str::<Value>(&payload).ok();
+    let protocol_error = json.as_ref().is_some_and(|v| {
+        v.get("error").is_some_and(|e| !e.is_null())
+            || v.pointer("/choices/0/delta/error")
+                .is_some_and(|e| !e.is_null())
+            || v.pointer("/choices/0/message/error")
+                .is_some_and(|e| !e.is_null())
+    });
+    if event != "error" && !protocol_error {
+        return None;
+    }
+    Some(match json {
+        Some(value) => {
+            if let Some(error) = value
+                .pointer("/choices/0/delta/error")
+                .or_else(|| value.pointer("/choices/0/message/error"))
+            {
+                json!({"error":error}).to_string()
+            } else {
+                value.to_string()
+            }
         }
+        None => json!({"error": payload}).to_string(),
+    })
+}
+
+/// 解析单个 SSE 事件。返回 `true` 表示收到 `[DONE]`。
+#[allow(clippy::too_many_arguments)]
+fn pump_event(
+    raw_event: &str,
+    assembler: &mut ToolCallAssembler,
+    text: &mut String,
+    reasoning: &mut String,
+    finish_reason: &mut String,
+    usage: &mut Option<Value>,
+    saw_finish: &mut bool,
+    saw_done: &mut bool,
+    saw_error: &mut bool,
+    on_delta: &mut impl FnMut(&str),
+    on_reasoning: &mut impl FnMut(&str),
+) -> bool {
+    if sse_error(raw_event).is_some() {
+        *saw_error = true;
         return false;
     }
+    let (_, payload) = parse_sse_event(raw_event);
     if payload == "[DONE]" {
         *saw_done = true;
         return true;
     }
-    // 服务端错误事件：`event: error` 不管负载长什么样；负载里带 error 字段也算。
-    if event_is_error || (payload.starts_with('{') && payload.contains("\"error\"")) {
-        *saw_error = true;
-        return false;
-    }
     let Ok(json) = serde_json::from_str::<Value>(&payload) else {
         return false;
     };
-    if json.get("error").map(|e| !e.is_null()).unwrap_or(false) {
-        *saw_error = true;
-        return false;
-    }
     if let Some(value) = json.get("usage") {
         if !value.is_null() {
             *usage = Some(value.clone());
@@ -1283,6 +1317,35 @@ mod tests {
             assert!(message.contains("try later"));
             server.await.unwrap();
         }
+    }
+
+    #[test]
+    fn pr17_error_formats_and_redaction() {
+        assert_eq!(
+            error_detail(r#"{"error":"quota_exceeded"}"#, ""),
+            "quota_exceeded"
+        );
+        assert_eq!(
+            error_detail(
+                r#"{"error":{"code":429,"type":"rate_limit","message":"ordinary error"}}"#,
+                ""
+            ),
+            "429 — rate_limit — ordinary error"
+        );
+        assert_eq!(error_detail(r#"{"error":null}"#, ""), "");
+        assert_eq!(
+            error_detail(r#"{"error":{"message":"secret-key\nnext"}}"#, "secret-key"),
+            "[已隐藏] next"
+        );
+        assert!(error_detail(
+            r#"{"error":{"message":"see https://example.test/?key=secret"}}"#,
+            ""
+        )
+        .contains("隐藏"));
+        assert!(sse_error("event:error\ndata: invalid").is_some());
+        assert!(sse_error(r#"data: {"error":null}"#).is_none());
+        assert!(sse_error(r#"data: {"error":"#).is_none());
+        assert!(sse_error(r#"data: {"choices":[{"delta":{"content":"error"}}]}"#).is_none());
     }
 
     #[test]

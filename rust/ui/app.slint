@@ -407,8 +407,7 @@ component ModelPicker inherits Rectangle {
                         }
                         effort-entry := TouchArea {
                             enabled: root.enabled && root.reasoning-applicable;
-                            changed has-hover => { if self.has-hover { root.show-effort = true; } }
-                            clicked => { root.show-effort = true; }
+                            clicked => { root.show-effort = !root.show-effort; }
                         }
                     }
                 }
@@ -847,6 +846,9 @@ export component AppWindow inherits Window {
     in-out property <bool> voice-enabled: false;
     // off | loading | listening | capturing | transcribing | error
     in-out property <string> voice-submit-token;
+    in-out property <bool> voice-finishing: false;
+    out property <bool> can-finish-recording: voice-state == "capturing" && voice-submit-token != "" && !voice-finishing && !busy && !confirm-open;
+    out property <bool> can-cancel-recording: (voice-state == "capturing" || voice-state == "transcribing" || voice-manual) && !busy && !confirm-open;
     in-out property <string> voice-state: "off";
     in-out property <string> voice-device: "";
     in-out property <string> voice-level: "";
@@ -1268,7 +1270,7 @@ export component AppWindow inherits Window {
                 }
 
                 // 语音状态条（不加 HUD：只显示状态与识别出的最终文字）
-                if root.voice-enabled : Rectangle {
+                if root.voice-enabled || root.voice-manual || root.voice-state == "loading" || root.voice-state == "capturing" || root.voice-state == "transcribing" : Rectangle {
                     height: voice-row.preferred-height + 12px;
                     border-radius: 6px;
                     background: root.voice-state == "error" ? #fdeeee : #ffffff;
@@ -1283,7 +1285,7 @@ export component AppWindow inherits Window {
                         spacing: 10px;
 
                         Text {
-                            text: root.voice-manual && root.voice-state != "transcribing" ? "请直接说指令，无需唤醒词" : voice-label(root.voice-state);
+                            text: root.voice-finishing ? "正在结束录音…" : root.voice-manual && root.voice-state != "transcribing" ? "请直接说指令，无需唤醒词" : voice-label(root.voice-state);
                             font-size: 12px;
                             color: root.voice-state == "error" ? #a02020 : #1f1f22;
                             vertical-alignment: center;
@@ -1294,8 +1296,8 @@ export component AppWindow inherits Window {
                             color: #8a8a90;
                             vertical-alignment: center;
                         }
-                        AppButton { label: "结束录音并识别"; enabled: root.voice-state == "capturing" && root.voice-submit-token != ""; clicked => { root.finish-recognition(); } }
-                        AppButton { label: "取消识别"; enabled: root.voice-state == "capturing" || root.voice-state == "transcribing" || root.voice-manual; clicked => { root.cancel-recognition(); } }
+                        AppButton { label: "结束录音并识别"; enabled: root.can-finish-recording; clicked => { root.finish-recognition(); } }
+                        AppButton { label: "取消识别"; enabled: root.can-cancel-recording; clicked => { root.cancel-recognition(); } }
                         Rectangle { horizontal-stretch: 1; }
                         if root.voice-transcript != "" : Text {
                             text: "识别：" + root.voice-transcript;
@@ -1398,14 +1400,9 @@ export component AppWindow inherits Window {
                                         ArcTo { x: 9 + 8 * Math.sin(root.context-usage * 360deg); y: 9 - 8 * Math.cos(root.context-usage * 360deg); radius-x: 8; radius-y: 8; large-arc: root.context-usage > 0.5; sweep: true; }
                                     }
                                 }
-                                context-hit := TouchArea {
-                                    changed has-hover => {
-                                        if self.has-hover { context-popup.show(); }
-                                        else { context-popup.close(); }
-                                    }
-                                }
+                                context-hit := TouchArea { clicked => { context-popup.show(); } }
                                 context-popup := PopupWindow {
-                                    x: -120px; y: -90px; width: 280px; height: 80px; close-policy: no-auto-close;
+                                    x: -120px; y: -90px; width: 280px; height: 80px; close-policy: close-on-click-outside;
                                     Rectangle {
                                         background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #dedee3;
                                         Text { x: 12px; y: 10px; width: parent.width - 24px; height: parent.height - 20px; text: (root.context-known ? root.context-text : "上下文用量尚未统计，首轮请求后更新") + "\n" + root.model-hint; color: #44444b; wrap: word-wrap; }
