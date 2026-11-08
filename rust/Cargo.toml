@@ -1,6 +1,6 @@
 [package]
 name = "cuava"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Computer Use 语音助手 —— Rust + Slint 原生桌面程序（PR6：语音输入 + 文本 Agent / CUA 闭环）"
 publish = false

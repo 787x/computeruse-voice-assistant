@@ -92,8 +92,8 @@ SetErrorLevel 1
 Abort "无法生成可用卸载程序，安装尚未完成，不登记安装信息。请检查安装目录写入权限后重试。"
 uninstaller_ready:
 ClearErrors
-WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayName" "CUAVA Rust (unsigned CUDA candidate)"
-WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayVersion" "0.1.0"
+WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayName" "CUAVA Rust (unsigned CUDA)"
+WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayVersion" "0.1.1"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "InstallLocation" "$INSTDIR"
 WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CUAVA-Rust" "DisplayIcon" "$INSTDIR\cuava.exe"
