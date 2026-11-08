@@ -51,6 +51,10 @@ struct MockServer {
 impl MockServer {
     /// 启动一个流式 mock 端点。
     async fn start(plan: Plan) -> MockServer {
+        Self::start_status(plan, 200).await
+    }
+
+    async fn start_status(plan: Plan, status: u16) -> MockServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -108,9 +112,7 @@ impl MockServer {
                     //
                     // 用 chunked 编码、一个事件一个 chunk：真实端点也是分块推送，
                     // 客户端不该依赖"一次读完整个响应"。
-                    let mut response = String::from(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
-                    );
+                    let mut response = format!("HTTP/1.1 {status} Test\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
                     for event in events {
                         let chunk = format!("{event}\n\n");
                         response.push_str(&format!("{:x}\r\n{}\r\n", chunk.len(), chunk));
@@ -1872,4 +1874,60 @@ async fn switching_provider_drops_foreign_reasoning_only() {
                 && message["tool_call_id"] == json!("c1")),
         "工具调用链不能丢"
     );
+}
+
+#[tokio::test]
+async fn pr17_agent_real_errors_preserve_classification_and_safe_description() {
+    for status in [400, 401, 404, 429, 500, 200] {
+        let server = MockServer::start_status(
+            Box::new(move |_, _| {
+                let json = r#"{"error":{"code":"quota","message":"try later"}}"#;
+                vec![if status == 200 {
+                    format!("event: error\ndata: {json}")
+                } else {
+                    json.into()
+                }]
+            }),
+            status,
+        )
+        .await;
+        let tools = FakeTools::new();
+        let settings = settings_for("openai-compatible", &server.base_url);
+        let mut agent = Agent::new(
+            client(&settings),
+            tools.clone(),
+            agent_config(),
+            PermissionState::new(PermissionMode::Standard),
+        );
+        let mut history = Vec::new();
+        let (outcome, events) = run_turn(
+            &mut agent,
+            "test",
+            &mut history,
+            &FixedConfirmer::new(true),
+            &CancelToken::new(),
+        )
+        .await;
+        assert!(outcome.failed);
+        assert!(!outcome.cancelled);
+        assert_eq!(
+            outcome.failure_reason.as_deref(),
+            Some(if status == 200 {
+                "stream_error"
+            } else {
+                "llm_error"
+            })
+        );
+        let message = outcome.failure_message.unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event == &format!("failed:{message}")));
+        assert!(message.contains("quota") && message.contains("try later"));
+        if status == 200 {
+            assert!(!message.contains("HTTP"));
+        } else {
+            assert!(message.contains(&format!("HTTP {status}")));
+        }
+        assert_eq!(server.count(), 1);
+    }
 }

@@ -429,3 +429,50 @@ fn asr_worker_delivers_final_and_keeps_session_until_consumed() {
     assert!(!active.is_current(turn));
     worker.shutdown();
 }
+
+#[test]
+fn pr17_manual_finish_real_wav_before_natural_endpoint() {
+    let _serial = whisper_model_guard();
+    let (Some(model), Some(wav)) = (
+        require(whisper_model(), "Whisper model"),
+        require(sample("asr-zh.wav"), "asr-zh.wav"),
+    ) else {
+        return;
+    };
+    let mut detector = EndpointDetector::new(
+        EndpointConfig {
+            end_silence: std::time::Duration::from_secs(30),
+            ..Default::default()
+        },
+        16000,
+    );
+    detector.push(&vec![0.0; 16000]);
+    detector.start_utterance();
+    let samples = read_wav_16k(&wav).unwrap();
+    let mut started = false;
+    for chunk in samples.chunks(997) {
+        for event in detector.push(chunk) {
+            assert!(!matches!(event, VadEvent::UtteranceEnded { .. }));
+            started |= matches!(event, VadEvent::SpeechStarted);
+        }
+    }
+    assert!(started);
+    detector.finish_now();
+    assert!(detector.last_voiced_seconds() > 0.25);
+    let captured = detector.take_utterance();
+    let settings = cuava::voice::settings::VoiceSettings {
+        language: AsrLanguage::Chinese,
+        threads: 8,
+        ..Default::default()
+    };
+    let config = AsrConfig::from_settings(&settings, model.clone());
+    let mut params = whisper_rs::WhisperContextParameters::default();
+    params.use_gpu(std::env::var("CUAVA_WHISPER_GPU").is_ok());
+    let context = whisper_rs::WhisperContext::new_with_params(&model, params).unwrap();
+    let transcript = transcribe(&context, &config, 17, &captured).unwrap();
+    eprintln!(
+        "manual finish: {:?}, {} ms",
+        transcript.text, transcript.decode_ms
+    );
+    assert!(transcript.is_submittable());
+}

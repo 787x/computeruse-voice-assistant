@@ -171,6 +171,7 @@ pub enum UiCommand {
     DictateNow,
     StartManualFromTray,
     CancelRecognition,
+    FinishRecognition(VoiceTurn),
     QuickPermissionPicked(i32),
     /// 语音线程发回的事件（内部消息，不是用户动作）。
     Voice(VoiceEvent),
@@ -829,6 +830,30 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let direct_tx = command_tx.clone();
         window.on_dictate_now(move || {
             let _ = direct_tx.send(UiCommand::DictateNow);
+        });
+        let finish_tx = command_tx.clone();
+        let finish_weak = window.as_weak();
+        window.on_finish_recognition(move || {
+            if let Some(w) = finish_weak.upgrade() {
+                if !w.get_can_finish_recording() {
+                    return;
+                }
+                let token = w.get_voice_submit_token().to_string();
+                if let Some((instance, session)) = token.split_once(':') {
+                    if let (Ok(instance), Ok(session)) = (instance.parse(), session.parse()) {
+                        if finish_tx
+                            .send(UiCommand::FinishRecognition(VoiceTurn {
+                                instance,
+                                session,
+                            }))
+                            .is_ok()
+                        {
+                            w.set_voice_finishing(true);
+                            w.set_status("正在结束录音…".into());
+                        }
+                    }
+                }
+            }
         });
         let cancel_tx = command_tx.clone();
         window.on_cancel_recognition(move || {
@@ -2542,8 +2567,15 @@ async fn run_worker(
                     }
                 }
             }
+            UiCommand::FinishRecognition(turn) => {
+                if voice.route.pending == Some(turn) && voice.route.active.is_current(turn) {
+                    voice.route.active.request_finish(turn);
+                } else {
+                    with_window(&weak, |w| w.set_voice_finishing(false));
+                }
+            }
             UiCommand::CancelRecognition => {
-                if voice.manual_session.is_some() {
+                if voice.route.pending.is_some() || voice.manual_session.is_some() {
                     voice.cancel_recognition(&weak);
                     sessions.reset_hud(&weak);
                     set_status(&weak, "已取消识别");
@@ -2948,6 +2980,10 @@ impl VoiceRuntime {
     }
 
     fn cancel_recognition(&mut self, weak: &slint::Weak<AppWindow>) {
+        with_window(weak, |w| {
+            w.set_voice_submit_token("".into());
+            w.set_voice_finishing(false);
+        });
         if self.manual_temporary {
             self.disable(weak);
         } else {
@@ -3118,6 +3154,10 @@ impl VoiceRuntime {
             }
             VoiceEventKind::Woke { turn, keyword } => {
                 self.route.bind(event.instance, turn);
+                with_window(weak, move |w| {
+                    w.set_voice_finishing(false);
+                    w.set_voice_submit_token(format!("{}:{}", turn.instance, turn.session).into())
+                });
                 with_window(weak, |w| {
                     w.set_voice_transcript("".into());
                     w.set_wake_generation(w.get_wake_generation().wrapping_add(1));
@@ -3144,6 +3184,10 @@ impl VoiceRuntime {
                     return VoiceOutcome::None;
                 }
                 self.route.bind(event.instance, turn);
+                with_window(weak, move |w| {
+                    w.set_voice_finishing(false);
+                    w.set_voice_submit_token(format!("{}:{}", turn.instance, turn.session).into())
+                });
                 if matches!(purpose, ListenPurpose::Manual | ListenPurpose::Followup) {
                     with_window(weak, |w| w.set_voice_transcript("".into()));
                 }
@@ -3174,7 +3218,11 @@ impl VoiceRuntime {
                     return VoiceOutcome::None;
                 }
                 self.manual_session = None;
-                with_window(weak, |w| w.set_voice_manual(false));
+                with_window(weak, |w| {
+                    w.set_voice_submit_token("".into());
+                    w.set_voice_finishing(false);
+                    w.set_voice_manual(false);
+                });
                 if self.manual_temporary {
                     self.disable(weak);
                 } else if self.mode.purpose() == ListenPurpose::Manual {
@@ -3222,6 +3270,10 @@ impl VoiceRuntime {
                     }
                     return VoiceOutcome::None;
                 }
+                with_window(weak, |w| {
+                    w.set_voice_submit_token("".into());
+                    w.set_voice_finishing(false);
+                });
                 if purpose == ListenPurpose::Manual {
                     self.manual_session = None;
                     with_window(weak, |w| w.set_voice_manual(false));
@@ -3924,6 +3976,10 @@ fn set_voice_state(weak: &slint::Weak<AppWindow>, state: &VoiceState) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            if code != "capturing" {
+                window.set_voice_submit_token("".into());
+                window.set_voice_finishing(false);
+            }
             window.set_voice_state(code.into());
             window.set_voice_enabled(enabled);
         }
@@ -4734,6 +4790,9 @@ async fn wait_turn(
                      *  - 打断词与语音确认**照常生效**：它们不启动回合。
                      *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
                      */
+                    Some(UiCommand::FinishRecognition(_)) => {
+                        with_window(weak, |w| w.set_voice_finishing(false));
+                    }
                     Some(UiCommand::CancelRecognition) => { /* Agent/审批继续，托盘不能取消审批。 */ }
                     Some(UiCommand::StartManualFromTray) | Some(UiCommand::DictateNow) | Some(UiCommand::QuickPermissionPicked(_)) => { set_status(weak, "请先结束当前回合再切换"); }
                     Some(UiCommand::SetVoiceEnabled(enabled)) => {
@@ -5448,8 +5507,9 @@ fn finish_session_turn(
             TimelineItem::system(format!(
                 "这一轮没能完成：{}",
                 outcome
-                    .failure_reason
+                    .failure_message
                     .clone()
+                    .or_else(|| outcome.failure_reason.clone())
                     .unwrap_or_else(|| "未知原因".to_string())
             )),
         );
@@ -5479,7 +5539,10 @@ fn finish_session_turn(
     let steps = outcome.steps.len();
     let failed = outcome.failed;
     let cancelled = outcome.cancelled;
-    let reason = outcome.failure_reason.clone();
+    let reason = outcome
+        .failure_message
+        .clone()
+        .or_else(|| outcome.failure_reason.clone());
     let context_ratio = (outcome.context_tokens as f64 / turn_settings.context_window.max(1) as f64)
         .clamp(0.0, 0.99999) as f32;
     let context_text = format!(

@@ -195,6 +195,7 @@ pub struct TurnOutcome {
     /// 本回合因流式异常/错误/取消而未正常完成。
     pub failed: bool,
     pub failure_reason: Option<String>,
+    pub failure_message: Option<String>,
     pub context_tokens: u64,
     pub context_window: u64,
     pub cancelled: bool,
@@ -423,9 +424,17 @@ impl Agent {
                     );
                 }
                 Err(error) => {
-                    let reason = error.to_string();
+                    let reason = self.llm.user_error(&error);
+                    outcome.failure_message = Some(reason.clone());
                     outcome.failed = true;
-                    outcome.failure_reason = Some("llm_error".to_string());
+                    outcome.failure_reason = Some(
+                        if matches!(error, LlmError::Stream(_)) {
+                            "stream_error"
+                        } else {
+                            "llm_error"
+                        }
+                        .to_string(),
+                    );
                     sync_history(history, &messages);
                     emit(AgentEvent::Failed { turn, reason });
                     return outcome;
@@ -540,8 +549,9 @@ impl Agent {
                     }
                     outcome.failed = true;
                     outcome.failure_reason = Some("stream_error".to_string());
+                    outcome.failure_message = Some("流式响应异常".to_string());
                     sync_history(history, &messages);
-                    let reason = format!("模型响应异常（finish_reason={}）", result.finish_reason);
+                    let reason = outcome.failure_message.clone().unwrap();
                     emit(AgentEvent::Failed { turn, reason });
                     return outcome;
                 }
@@ -978,6 +988,7 @@ impl Agent {
                     if closing.tool_calls_incomplete && closing.text.is_empty() {
                         outcome.failed = true;
                         outcome.failure_reason = Some("stream_error".to_string());
+                        outcome.failure_message = Some("流式响应异常".to_string());
                     }
                 }
                 Err(LlmError::Aborted) => {
@@ -996,7 +1007,9 @@ impl Agent {
                 }
                 Err(error) => {
                     messages.remove(note_index);
-                    let fallback = format!("（步数用完了，没能收尾：{error}）");
+                    let reason = self.llm.user_error(&error);
+                    outcome.failure_message = Some(reason.clone());
+                    let fallback = format!("（步数用完了，没能收尾：{reason}）");
                     messages.push(ChatMessage::text(Role::Assistant, fallback.clone()));
                     outcome.text.push_str(&fallback);
                     outcome.failed = true;

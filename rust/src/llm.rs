@@ -444,8 +444,70 @@ pub enum LlmError {
     Timeout(u64),
     #[error("已中断")]
     Aborted,
+    #[error("流式响应异常：{0}")]
+    Stream(String),
     #[error("请求失败：{0}")]
     Other(String),
+}
+
+/// 仅提取错误字段；不展示任意响应正文或网络库携带的 URL。
+fn error_detail(body: &str, key: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return String::new();
+    };
+    let error = value
+        .get("error")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&value);
+    let value = if error.is_string() {
+        json!({"message":error})
+    } else {
+        error.clone()
+    };
+    let error = &value;
+    ["code", "type", "message"]
+        .iter()
+        .filter_map(|field| {
+            let value = error.get(*field)?;
+            let text = value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_i64().map(|n| n.to_string()))?;
+            let text = if key.is_empty() {
+                text
+            } else {
+                text.replace(key, "[已隐藏]")
+            };
+            // 反射认证/请求内容的响应不保存；超长消息也不截取敏感请求前缀。
+            let lower = text.to_ascii_lowercase();
+            if text.chars().count() > 180
+                || [
+                    "authorization",
+                    "bearer ",
+                    "api_key",
+                    "api key",
+                    "sk-",
+                    "prompt",
+                    "messages",
+                    "request body",
+                    "https://",
+                    "http://",
+                    "password",
+                    "credential",
+                ]
+                .iter()
+                .any(|x| lower.contains(x))
+            {
+                return Some("[错误详情已隐藏]".to_string());
+            }
+            Some(
+                text.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" — ")
 }
 
 /// 流式工具调用归并器。
@@ -741,10 +803,17 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = tokio::select! {
+                body = response.text() => body.unwrap_or_default(),
+                _ = signal.cancelled() => return Err(LlmError::Aborted),
+                _ = tokio::time::sleep(timeout) => String::new(),
+            };
+            if signal.is_cancelled() {
+                return Err(LlmError::Aborted);
+            }
             return Err(LlmError::Status {
                 status,
-                body: truncate(&body, 400),
+                body: truncate(&body, 16_384),
             });
         }
 
@@ -808,7 +877,11 @@ impl LlmClient {
                         interrupted = true;
                         break 'outer;
                     }
-                    return Err(LlmError::Other(error.to_string()));
+                    return Err(if error.is_timeout() {
+                        LlmError::Timeout(self.timeout_ms)
+                    } else {
+                        LlmError::Stream(r#"{"message":"连接中断"}"#.to_string())
+                    });
                 }
             };
             buffer.extend_from_slice(&bytes);
@@ -819,6 +892,12 @@ impl LlmClient {
                 // boundary.1 是分隔符长度（`\n\n` 或 `\r\n\r\n`），一并丢弃。
                 buffer.drain(..boundary.1);
                 if let Ok(raw) = String::from_utf8(raw) {
+                    if let Some(payload) = sse_error(&raw) {
+                        if signal.is_cancelled() {
+                            return Err(LlmError::Aborted);
+                        }
+                        return Err(LlmError::Stream(payload));
+                    }
                     if pump_event(
                         &raw,
                         &mut assembler,
@@ -848,6 +927,12 @@ impl LlmClient {
         if !buffer.is_empty() && !interrupted {
             let raw: Vec<u8> = std::mem::take(&mut buffer);
             if let Ok(raw) = String::from_utf8(raw) {
+                if let Some(payload) = sse_error(&raw) {
+                    if signal.is_cancelled() {
+                        return Err(LlmError::Aborted);
+                    }
+                    return Err(LlmError::Stream(payload));
+                }
                 let _ = pump_event(
                     &raw,
                     &mut assembler,
@@ -877,6 +962,37 @@ impl LlmClient {
     }
 
     /// 拉取可用模型列表（只要 id，保留给既有测试与简单场景）。
+    pub fn user_error(&self, error: &LlmError) -> String {
+        match error {
+            LlmError::Status { status, body } => {
+                let detail = error_detail(body, &self.api_key);
+                format!(
+                    "模型请求失败：HTTP {status}{}",
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {detail}")
+                    }
+                )
+            }
+            LlmError::Connect(_) => "模型连接失败".to_string(),
+            LlmError::Timeout(_) => "模型请求超时".to_string(),
+            LlmError::Aborted => "已取消".to_string(),
+            LlmError::Stream(body) => {
+                let detail = error_detail(body, &self.api_key);
+                format!(
+                    "流式响应异常{}",
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {detail}")
+                    }
+                )
+            }
+            LlmError::Other(_) => "模型响应协议异常或连接中断".to_string(),
+        }
+    }
+
     pub async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         let json = self.list_models_json().await?;
         Ok(json
@@ -1005,21 +1121,7 @@ pub(crate) fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// 解析单个 SSE 事件。返回 `true` 表示收到 `[DONE]`。
-#[allow(clippy::too_many_arguments)]
-fn pump_event(
-    raw_event: &str,
-    assembler: &mut ToolCallAssembler,
-    text: &mut String,
-    reasoning: &mut String,
-    finish_reason: &mut String,
-    usage: &mut Option<Value>,
-    saw_finish: &mut bool,
-    saw_done: &mut bool,
-    saw_error: &mut bool,
-    on_delta: &mut impl FnMut(&str),
-    on_reasoning: &mut impl FnMut(&str),
-) -> bool {
+fn parse_sse_event(raw_event: &str) -> (String, String) {
     let mut event_name = String::new();
     let mut data_lines: Vec<&str> = Vec::new();
     // 事件内部也可能用 CRLF 换行（`\r\n\r\n` 分隔时，事件体里就是 `\r\n`）。
@@ -1044,30 +1146,65 @@ fn pump_event(
             data_lines.push(value);
         }
     }
-    let event_is_error = event_name == "error";
-    let payload = data_lines.join("\n").trim().to_string();
-    if payload.is_empty() {
-        if event_is_error {
-            *saw_error = true;
+    (event_name, data_lines.join("\n").trim().to_string())
+}
+
+/// 显式 error 事件，或已解析 JSON 中非空的协议错误字段。
+fn sse_error(raw_event: &str) -> Option<String> {
+    let (event, payload) = parse_sse_event(raw_event);
+    let json = serde_json::from_str::<Value>(&payload).ok();
+    let protocol_error = json.as_ref().is_some_and(|v| {
+        v.get("error").is_some_and(|e| !e.is_null())
+            || v.pointer("/choices/0/delta/error")
+                .is_some_and(|e| !e.is_null())
+            || v.pointer("/choices/0/message/error")
+                .is_some_and(|e| !e.is_null())
+    });
+    if event != "error" && !protocol_error {
+        return None;
+    }
+    Some(match json {
+        Some(value) => {
+            if let Some(error) = value
+                .pointer("/choices/0/delta/error")
+                .or_else(|| value.pointer("/choices/0/message/error"))
+            {
+                json!({"error":error}).to_string()
+            } else {
+                value.to_string()
+            }
         }
+        None => json!({"error": payload}).to_string(),
+    })
+}
+
+/// 解析单个 SSE 事件。返回 `true` 表示收到 `[DONE]`。
+#[allow(clippy::too_many_arguments)]
+fn pump_event(
+    raw_event: &str,
+    assembler: &mut ToolCallAssembler,
+    text: &mut String,
+    reasoning: &mut String,
+    finish_reason: &mut String,
+    usage: &mut Option<Value>,
+    saw_finish: &mut bool,
+    saw_done: &mut bool,
+    saw_error: &mut bool,
+    on_delta: &mut impl FnMut(&str),
+    on_reasoning: &mut impl FnMut(&str),
+) -> bool {
+    if sse_error(raw_event).is_some() {
+        *saw_error = true;
         return false;
     }
+    let (_, payload) = parse_sse_event(raw_event);
     if payload == "[DONE]" {
         *saw_done = true;
         return true;
     }
-    // 服务端错误事件：`event: error` 不管负载长什么样；负载里带 error 字段也算。
-    if event_is_error || (payload.starts_with('{') && payload.contains("\"error\"")) {
-        *saw_error = true;
-        return false;
-    }
     let Ok(json) = serde_json::from_str::<Value>(&payload) else {
         return false;
     };
-    if json.get("error").map(|e| !e.is_null()).unwrap_or(false) {
-        *saw_error = true;
-        return false;
-    }
     if let Some(value) = json.get("usage") {
         if !value.is_null() {
             *usage = Some(value.clone());
@@ -1137,6 +1274,116 @@ mod tests {
             reasoning_effort: ReasoningEffort::Default,
             model_context_window: None,
         }
+    }
+
+    #[tokio::test]
+    async fn real_http_errors_and_sse_keep_their_type() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [400, 401, 404, 429, 500, 200] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut p = profile(Capability::Plain, "m");
+            p.base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 8192];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                let body = if status == 200 {
+                    "event: error\ndata: {\"error\":{\"code\":\"quota\",\"message\":\"try later\"}}\n\n"
+                } else {
+                    r#"{"error":{"code":"quota","message":"try later"}}"#
+                };
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let client = LlmClient::new(p, "dummy-test-key", 0.3, 1000).unwrap();
+            let error = client
+                .chat(
+                    &[ChatMessage::text(Role::User, "test")],
+                    &[],
+                    &crate::cancel::CancelToken::new(),
+                    |_| {},
+                    |_| {},
+                )
+                .await
+                .unwrap_err();
+            let message = client.user_error(&error);
+            if status == 200 {
+                assert!(message.starts_with("流式响应异常"));
+                assert!(!message.contains("HTTP"));
+            } else {
+                assert!(message.contains(&format!("HTTP {status}")));
+            }
+            assert!(message.contains("quota"));
+            assert!(message.contains("try later"));
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn pr17_error_formats_and_redaction() {
+        assert_eq!(
+            error_detail(r#"{"error":"quota_exceeded"}"#, ""),
+            "quota_exceeded"
+        );
+        assert_eq!(
+            error_detail(
+                r#"{"error":{"code":429,"type":"rate_limit","message":"ordinary error"}}"#,
+                ""
+            ),
+            "429 — rate_limit — ordinary error"
+        );
+        assert_eq!(error_detail(r#"{"error":null}"#, ""), "");
+        assert_eq!(
+            error_detail(r#"{"error":{"message":"secret-key\nnext"}}"#, "secret-key"),
+            "[已隐藏] next"
+        );
+        assert!(error_detail(
+            r#"{"error":{"message":"see https://example.test/?key=secret"}}"#,
+            ""
+        )
+        .contains("隐藏"));
+        assert!(sse_error("event:error\ndata: invalid").is_some());
+        assert!(sse_error(r#"data: {"error":null}"#).is_none());
+        assert!(sse_error(r#"data: {"error":"#).is_none());
+        assert!(sse_error(r#"data: {"choices":[{"delta":{"content":"error"}}]}"#).is_none());
+    }
+
+    #[test]
+    fn visible_errors_keep_status_and_hide_credentials() {
+        let client = LlmClient::new(
+            profile(Capability::Plain, "m"),
+            "secret-test-token",
+            0.3,
+            1000,
+        )
+        .unwrap();
+        for status in [400, 401, 404, 429, 500] {
+            let message = client.user_error(&LlmError::Status {
+                status,
+                body: r#"{"error":{"code":"quota","message":"try later"}}"#.into(),
+            });
+            assert_eq!(
+                message,
+                format!("模型请求失败：HTTP {status} — quota — try later")
+            );
+        }
+        let body = r#"{"error":{"message":"secret-test-token"}} "#;
+        assert!(!client
+            .user_error(&LlmError::Status {
+                status: 401,
+                body: body.into()
+            })
+            .contains("secret-test-token"));
+        assert!(!client
+            .user_error(&LlmError::Connect("private URL".into()))
+            .contains("HTTP"));
+        assert!(!client.user_error(&LlmError::Timeout(1)).contains("HTTP"));
+        assert_eq!(error_detail("arbitrary secret body", ""), "");
+        assert!(error_detail(
+            r#"{"error":{"message":"Authorization: Bearer sk-secret"}}"#,
+            ""
+        )
+        .contains("隐藏"));
     }
 
     #[test]
