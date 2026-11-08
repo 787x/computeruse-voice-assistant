@@ -90,9 +90,18 @@ impl BackgroundUi {
             }
         });
         let weak = window.as_weak();
+        hud.on_finish_recognition(move || {
+            if let Some(w) = weak.upgrade() {
+                w.invoke_finish_recognition();
+            }
+        });
+        let weak = window.as_weak();
         hud.on_cancel_recognition(move || {
             if let Some(w) = weak.upgrade() {
-                if w.get_voice_manual() {
+                if w.get_voice_manual()
+                    || w.get_voice_state() == "capturing"
+                    || w.get_voice_state() == "transcribing"
+                {
                     w.invoke_cancel_recognition();
                 }
             }
@@ -162,8 +171,16 @@ impl BackgroundUi {
                         h.set_reasoning(w.get_hud_reasoning());
                         h.set_reply(w.get_hud_reply());
                         h.set_process(w.get_hud_process());
+                        h.set_can_finish_recognition(
+                            w.get_voice_state() == "capturing"
+                                && !w.get_voice_submit_token().is_empty(),
+                        );
                         h.set_can_cancel_recognition(
-                            w.get_voice_manual() && !w.get_busy() && !w.get_confirm_open(),
+                            (w.get_voice_manual()
+                                || w.get_voice_state() == "capturing"
+                                || w.get_voice_state() == "transcribing")
+                                && !w.get_busy()
+                                && !w.get_confirm_open(),
                         );
                         h.set_tools(w.get_hud_tools());
                         h.set_listening(

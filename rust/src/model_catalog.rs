@@ -657,6 +657,7 @@ pub fn describe_llm_error(error: &LlmError) -> String {
         LlmError::Connect(detail) => format!("连接失败：{detail}"),
         LlmError::Timeout(ms) => format!("请求超时（{ms} ms）"),
         LlmError::Aborted => "已中断".to_string(),
+        LlmError::Stream(_) => "流式响应异常".to_string(),
         LlmError::Other(detail) => detail.clone(),
     }
 }

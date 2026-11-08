@@ -467,6 +467,24 @@ impl EndpointDetector {
         self.finished_voiced as f32 / self.sample_rate as f32
     }
 
+    /// 手动结束保留未满一帧的 PCM，按实际样本计时。
+    pub fn finish_now(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        if self.state == State::Speaking {
+            let active =
+                crate::voice::pcm::rms_db(&pending) > self.last_floor_db + self.config.off_db;
+            self.utterance.extend_from_slice(&pending);
+            self.speech_samples += pending.len();
+            if active {
+                self.quiet_samples = 0;
+            } else {
+                self.quiet_samples += pending.len();
+            }
+        }
+        if self.finished.is_none() {
+            self.reset_utterance();
+        }
+    }
     pub fn take_utterance(&mut self) -> Vec<f32> {
         let mut out = self
             .finished
@@ -556,6 +574,31 @@ mod tests {
                     * amplitude
             })
             .collect()
+    }
+
+    #[test]
+    fn manual_finish_preserves_partial_frame_and_voiced_duration() {
+        let mut detector = EndpointDetector::new(cfg(), TARGET_SAMPLE_RATE);
+        detector.push(&silence(1000));
+        detector.start_utterance();
+        let audio = tone(517, 0.4);
+        detector.push(&audio);
+        detector.finish_now();
+        assert!((detector.last_voiced_seconds() - 0.517).abs() < 0.001);
+        let pcm = detector.take_utterance();
+        assert_eq!(&pcm[..audio.len()], audio.as_slice());
+        assert_eq!(pcm.len(), audio.len() + 800);
+        detector.finish_now();
+        assert!(detector.take_utterance().is_empty());
+    }
+
+    #[test]
+    fn manual_silence_is_empty() {
+        let mut detector = EndpointDetector::new(cfg(), TARGET_SAMPLE_RATE);
+        detector.push(&silence(1000));
+        detector.finish_now();
+        assert_eq!(detector.last_voiced_seconds(), 0.0);
+        assert!(detector.take_utterance().is_empty());
     }
 
     /// 恒定的底噪被跟随后，安静信号不应被判成语音。

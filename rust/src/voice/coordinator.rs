@@ -232,7 +232,7 @@ pub struct VoiceTurn {
 /// 新实例正在识别的那一句抹掉（表现为新实例的 Final 被当成过期丢弃）。
 /// 调用方每次 `spawn()` 必须传一份新的；见 `ui::worker::VoiceRoute::open`。
 #[derive(Clone, Debug, Default)]
-pub struct ActiveSession(Arc<Mutex<Option<VoiceTurn>>>);
+pub struct ActiveSession(Arc<Mutex<Option<VoiceTurn>>>, Arc<Mutex<Option<VoiceTurn>>>);
 
 impl ActiveSession {
     pub fn new() -> Self {
@@ -256,6 +256,14 @@ impl ActiveSession {
         *self.lock() = None;
     }
 
+    pub fn request_finish(&self, turn: VoiceTurn) {
+        if self.is_current(turn) {
+            *self.1.lock().unwrap_or_else(|e| e.into_inner()) = Some(turn);
+        }
+    }
+    fn take_finish(&self) -> Option<VoiceTurn> {
+        self.1.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
     pub fn current(&self) -> Option<VoiceTurn> {
         *self.lock()
     }
@@ -882,6 +890,35 @@ impl Coordinator {
                 self.kws.reset();
             }
 
+            if let Some(turn) = self.machine.active.take_finish() {
+                if self.machine.session == Some(turn)
+                    && self.machine.active.is_current(turn)
+                    && self.machine.is_capturing()
+                    && !self.handle_overflow()
+                {
+                    // 只取本次观察到的队列快照，不等待未来音频。
+                    let queued: Vec<_> = self.receiver.try_iter().collect();
+                    for chunk in queued {
+                        let samples = self.frontend.process(&chunk.samples)?;
+                        let events = self.detector.push(&samples);
+                        for event in events {
+                            self.handle_vad_event(event);
+                        }
+                        if !self.machine.is_capturing() {
+                            break;
+                        }
+                    }
+                    if self.machine.is_capturing() {
+                        let tail = self.frontend.resampler.flush()?;
+                        let events = self.detector.push(&tail);
+                        for event in events {
+                            self.handle_vad_event(event);
+                        }
+                    }
+                    self.detector.finish_now();
+                    self.finish_session();
+                }
+            }
             let chunk = match self.receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok(chunk) => chunk,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1308,6 +1345,33 @@ mod tests {
             Box::new(asr),
             250,
         )
+    }
+
+    #[test]
+    fn manual_request_is_bound_to_turn_and_submission_is_once() {
+        let recorder = Recorder::default();
+        let active = ActiveSession::new();
+        let asr = FakeAsr::new();
+        let submitted = asr.submitted.clone();
+        let mut machine = machine_with(7, &recorder, &active, asr);
+        machine.start_listening();
+        machine.begin("wake".into());
+        let old = active.current().unwrap();
+        active.request_finish(old);
+        active.request_finish(old);
+        assert_eq!(active.take_finish(), Some(old));
+        assert_eq!(active.take_finish(), None);
+        machine.finish(1.0, AUDIO.to_vec());
+        machine.finish(1.0, AUDIO.to_vec());
+        assert_eq!(submitted.lock().unwrap().len(), 1);
+        active.clear();
+        machine.poll();
+        machine.begin("next".into());
+        let next = active.current().unwrap();
+        assert_ne!(old, next);
+        active.request_finish(old);
+        assert_eq!(active.take_finish(), None);
+        assert!(active.is_current(next));
     }
 
     #[test]

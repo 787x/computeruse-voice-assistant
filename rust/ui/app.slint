@@ -405,7 +405,11 @@ component ModelPicker inherits Rectangle {
                             Rectangle { horizontal-stretch: 1; }
                             Text { text: root.reasoning-applicable ? root.reasoning-options[root.reasoning-index] + "  ›" : "该端点未声明支持"; color: #777780; vertical-alignment: center; overflow: elide; }
                         }
-                        effort-entry := TouchArea { enabled: root.enabled && root.reasoning-applicable; clicked => { root.show-effort = !root.show-effort; } }
+                        effort-entry := TouchArea {
+                            enabled: root.enabled && root.reasoning-applicable;
+                            changed has-hover => { if self.has-hover { root.show-effort = true; } }
+                            clicked => { root.show-effort = true; }
+                        }
                     }
                 }
             }
@@ -700,6 +704,7 @@ export component AppWindow inherits Window {
     callback dictate-now();
     callback start-manual-from-tray();
     callback cancel-recognition();
+    callback finish-recognition();
     in-out property <string> hud-session;
     in-out property <int> hud-interaction;
     in-out property <string> hud-reasoning;
@@ -841,6 +846,7 @@ export component AppWindow inherits Window {
     // 语音（PR6）：只暴露「用户能看懂」的几项，不做完整 HUD。
     in-out property <bool> voice-enabled: false;
     // off | loading | listening | capturing | transcribing | error
+    in-out property <string> voice-submit-token;
     in-out property <string> voice-state: "off";
     in-out property <string> voice-device: "";
     in-out property <string> voice-level: "";
@@ -1288,6 +1294,8 @@ export component AppWindow inherits Window {
                             color: #8a8a90;
                             vertical-alignment: center;
                         }
+                        AppButton { label: "结束录音并识别"; enabled: root.voice-state == "capturing" && root.voice-submit-token != ""; clicked => { root.finish-recognition(); } }
+                        AppButton { label: "取消识别"; enabled: root.voice-state == "capturing" || root.voice-state == "transcribing" || root.voice-manual; clicked => { root.cancel-recognition(); } }
                         Rectangle { horizontal-stretch: 1; }
                         if root.voice-transcript != "" : Text {
                             text: "识别：" + root.voice-transcript;
@@ -1390,9 +1398,14 @@ export component AppWindow inherits Window {
                                         ArcTo { x: 9 + 8 * Math.sin(root.context-usage * 360deg); y: 9 - 8 * Math.cos(root.context-usage * 360deg); radius-x: 8; radius-y: 8; large-arc: root.context-usage > 0.5; sweep: true; }
                                     }
                                 }
-                                context-hit := TouchArea { clicked => { context-popup.show(); } }
+                                context-hit := TouchArea {
+                                    changed has-hover => {
+                                        if self.has-hover { context-popup.show(); }
+                                        else { context-popup.close(); }
+                                    }
+                                }
                                 context-popup := PopupWindow {
-                                    x: -120px; y: -90px; width: 280px; height: 80px; close-policy: close-on-click-outside;
+                                    x: -120px; y: -90px; width: 280px; height: 80px; close-policy: no-auto-close;
                                     Rectangle {
                                         background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #dedee3;
                                         Text { x: 12px; y: 10px; width: parent.width - 24px; height: parent.height - 20px; text: (root.context-known ? root.context-text : "上下文用量尚未统计，首轮请求后更新") + "\n" + root.model-hint; color: #44444b; wrap: word-wrap; }
@@ -2574,6 +2587,7 @@ export component VoiceHud inherits Window {
     in property <string> reasoning;
     in property <string> reply;
     in property <string> process;
+    in property <bool> can-finish-recognition;
     in property <bool> can-cancel-recognition;
     in property <string> summary;
     in property <string> listening;
@@ -2590,6 +2604,7 @@ export component VoiceHud inherits Window {
     }
     callback settings();
     callback cancel-recognition();
+    callback finish-recognition();
     callback answer(int, bool);
     callback open-main();
     callback hide-hud();
@@ -2652,6 +2667,7 @@ export component VoiceHud inherits Window {
             AppButton { label: "取消任务"; clicked => { root.cancel-task(); } }
         }
         HorizontalLayout {
+            AppButton { label: "结束录音并识别"; enabled: root.can-finish-recognition; clicked => { root.finish-recognition(); } }
             AppButton { label: "取消识别"; enabled: root.can-cancel-recognition; clicked => { root.cancel-recognition(); } }
             AppButton { label: "设置"; clicked => { root.settings(); } }
             AppButton { label: "主窗口"; clicked => { root.open-main(); } }
