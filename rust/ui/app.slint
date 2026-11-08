@@ -496,6 +496,7 @@ export struct EndpointModel {
 }
 export struct EndpointCard {
     id: string, name: string, url: string, key: string, default-model: string,
+    model-options: [string], default-index: int,
     saved-url: string, credential-url: string, catalog-origin: string, error: string,
     delete-pending: bool, revision: int, kind: int, thinking: int, effort: int, status: string, rows: [EndpointModel],
 }
@@ -517,15 +518,19 @@ component EndpointEditor inherits Rectangle {
         HorizontalLayout {
             Text { text: "名称"; width: 80px; color: Theme.text-color; }
             AppLineEdit { text <=> card.name; edited => { card.status = ""; card.error = ""; action("draft", card); } }
+            AppButton {
+                label: card.status == "busy" ? "测试中…" : card.status == "成功" ? "测试成功" : card.status == "失败" ? "测试失败" : "测试模型";
+                text-color: card.status == "成功" ? #1f7a3a : card.status == "失败" ? #a02020 : #242428;
+                enabled: card.status != "busy";
+                clicked => { action("test", card); }
+            }
         }
         HorizontalLayout {
             Text { text: "API Key"; width: 80px; color: Theme.text-color; }
             AppLineEdit { text <=> card.key; input-type-password: true; placeholder-text: "留空使用该实例已保存凭据"; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
-            AppButton {
-                label: card.status == "busy" ? "测试中…" : card.status == "成功" ? "测试成功" : card.status == "失败" ? "测试失败" : "测试连接";
-                text-color: card.status == "成功" ? #1f7a3a : card.status == "失败" ? #a02020 : #242428;
-                enabled: card.status != "busy";
-                clicked => { action("test", card); }
+            if card.kind == 0 || card.kind == 1 : AppButton {
+                label: "获取 API Key";
+                clicked => { action("api-keys", card); }
             }
         }
         if card.error != "" : Text { text: card.error; color: #a02020; wrap: word-wrap; }
@@ -535,6 +540,7 @@ component EndpointEditor inherits Rectangle {
         HorizontalLayout {
             Text { text: "API 地址"; width: 80px; color: Theme.text-color; }
             AppLineEdit { text <=> card.url; edited => { card.credential-url = ""; card.status = ""; card.error = ""; action("draft", card); } }
+            if card.kind == 0 || card.kind == 1 : AppButton { label: "填入官方地址"; clicked => { action("official-url", card); } }
         }
         if card.saved-url != card.url && card.credential-url != card.url && card.key == "" : AppButton {
             label: "确认将本实例已存 Key 用于此地址";
@@ -542,7 +548,11 @@ component EndpointEditor inherits Rectangle {
         }
         HorizontalLayout {
             Text { text: "默认模型"; width: 80px; color: Theme.text-color; }
-            AppLineEdit { text <=> card.default-model; edited => { card.status = ""; card.error = ""; action("draft", card); } }
+            AppComboBox {
+                options: card.model-options;
+                index: card.default-index;
+                picked(i) => { card.default-model = card.model-options[i]; card.status = ""; card.error = ""; action("draft", card); }
+            }
         }
         HorizontalLayout {
             AppComboBox { options: ["默认思考", "开启思考", "关闭思考"]; index <=> card.thinking; picked(i) => { card.status = ""; card.error = ""; action("draft", card); } }
@@ -587,7 +597,7 @@ component EndpointEditor inherits Rectangle {
         HorizontalLayout {
             Rectangle { horizontal-stretch: 1; }
             AppButton { label: "取消"; clicked => { action("cancel", card); } }
-            AppButton { label: "保存"; clicked => { action("save", card); } }
+            AppButton { label: "保存此端点"; clicked => { action("save", card); } }
         }
     }
 }
@@ -688,6 +698,17 @@ export component AppWindow inherits Window {
     in-out property <bool> context-known: false;
     in-out property <bool> voice-manual: false;
     callback dictate-now();
+    callback start-manual-from-tray();
+    callback cancel-recognition();
+    in-out property <string> hud-session;
+    in-out property <int> hud-interaction;
+    in-out property <string> hud-reasoning;
+    in-out property <string> hud-reply;
+    in-out property <string> hud-process;
+    in-out property <bool> hud-saved-listening;
+    in-out property <bool> hud-temporary;
+    in-out property <[ToolCard]> hud-tools;
+    in-out property <string> hud-followup;
     callback quick-permission-picked(int);
     in-out property <string> model-choice-label;
     in-out property <[string]> model-option-names;
@@ -903,6 +924,7 @@ export component AppWindow inherits Window {
     // 界面上读全部字段，由 Rust 侧当作一个事务处理；结果通过
     // `settings-error` / `settings-saving` 回填，所以不需要参数与返回值。
     callback save-all();
+    callback save-model-endpoints();
     // 关闭设置面板（取消）：丢弃界面上的未保存修改。
     callback cancel-settings();
     // 带上界面当前选中的提供商索引：清除的是**用户看到的**那一家，
@@ -2410,11 +2432,18 @@ export component AppWindow inherits Window {
                             clicked => { root.cancel-settings(); }
                         }
 
+                        if root.settings-tab-index == 0 : AppButton {
+                            label: "保存模型端点";
+                            primary: true;
+                            enabled: !root.settings-saving;
+                            clicked => { root.save-model-endpoints(); }
+                        }
+
                         AppButton {
                             // 保存是**异步**的：点击后立刻置「保存中」并禁用相关控件，
                             // 结果由 Rust 侧回填（成功关面板 / 失败就地显示原因）。
                             // 不在 UI 线程上等待，否则落盘和重建 TTS 会卡住界面。
-                            label: root.settings-saving ? "保存中…" : "保存";
+                            label: root.settings-saving ? "保存中…" : root.settings-tab-index == 0 ? "保存方案/其他设置" : "保存";
                             primary: true;
                             enabled: !root.settings-saving;
                             clicked => {
@@ -2514,7 +2543,8 @@ export component BackgroundTray inherits SystemTrayIcon {
     callback toggle-microphone();
     callback stop-speech();
     callback quit-app();
-    clicked => { open-main(); }
+    callback start-manual();
+    clicked => { start-manual(); }
     Menu {
         MenuItem { title: "打开主窗口"; activated => { open-main(); } }
         MenuItem { title: "打开/隐藏语音浮窗"; activated => { toggle-hud(); } }
@@ -2528,8 +2558,8 @@ export component BackgroundTray inherits SystemTrayIcon {
 
 export component VoiceHud inherits Window {
     title: "CUAVA Voice HUD";
-    out property <length> content-width: 380px;
-    out property <length> content-height: 290px;
+    out property <length> content-width: 440px;
+    out property <length> content-height: min(680px, body.preferred-height + (root.asking ? 360px : 190px));
     width: root.content-width;
     height: root.content-height;
     no-frame: true;
@@ -2541,6 +2571,25 @@ export component VoiceHud inherits Window {
     in property <bool> asking;
     in property <int> request-id;
     in property <string> prompt;
+    in property <string> reasoning;
+    in property <string> reply;
+    in property <string> process;
+    in property <bool> can-cancel-recognition;
+    in property <string> summary;
+    in property <string> listening;
+    in property <string> playback;
+    in property <string> followup;
+    in property <[ToolCard]> tools;
+    out property <bool> expanded: false;
+    in property <int> interaction-generation;
+    out property <bool> following-latest: true;
+    changed interaction-generation => {
+        root.expanded = false;
+        root.following-latest = true;
+        live-scroll.content-y = min(0px, live-scroll.height - live-scroll.content-height);
+    }
+    callback settings();
+    callback cancel-recognition();
     callback answer(int, bool);
     callback open-main();
     callback hide-hud();
@@ -2549,18 +2598,62 @@ export component VoiceHud inherits Window {
     VerticalLayout {
         padding: 16px;
         spacing: 8px;
-        Text { text: root.status; color: #234560; wrap: word-wrap; }
-        Text { text: root.transcript; color: #333; wrap: word-wrap; overflow: elide; }
-        Text { text: root.asking ? root.prompt : root.subtitle; color: #222; wrap: word-wrap; overflow: elide; vertical-stretch: 1; }
-        if root.asking : HorizontalLayout {
-            AppButton { label: "允许"; primary: true; clicked => { root.answer(root.request-id, true); } }
-            AppButton { label: "拒绝"; clicked => { root.answer(root.request-id, false); } }
+        Flickable {
+            height: min(status-text.preferred-height, 64px);
+            content-height: status-text.preferred-height;
+            status-text := Text { width: parent.width; color: #333333; text: root.status; wrap: word-wrap; }
+        }
+        live-scroll := ScrollView {
+            vertical-stretch: 1;
+            changed content-y => { root.following-latest = self.content-y <= min(0px, self.height - self.content-height) + 24px; }
+            changed content-height => { if root.following-latest { self.content-y = min(0px, self.height - self.content-height); } }
+            changed height => { if root.following-latest { self.content-y = min(0px, self.height - self.content-height); } }
+            body := VerticalLayout {
+                spacing: 6px;
+                Text { color: #333333; text: root.summary; wrap: word-wrap; }
+                Text { color: #333333; text: root.listening; wrap: word-wrap; }
+                if root.followup != "" : Text { color: #333333; text: root.followup; wrap: word-wrap; }
+                Text { color: #333333; text: "语音输入 · " + root.transcript; wrap: word-wrap; }
+                if root.reasoning != "" : VerticalLayout {
+                    AppButton { label: root.expanded ? "收起思考" : "展开思考"; clicked => { root.expanded = !root.expanded; } }
+                    Flickable {
+                        height: root.expanded ? min(thought.preferred-height, 220px) : min(thought.preferred-height, 40px);
+                        content-height: thought.preferred-height;
+                        content-y: root.expanded ? 0px : min(0px, self.height - thought.preferred-height);
+                        thought := Text { color: #333333; width: parent.width; text: root.reasoning; wrap: word-wrap; }
+                    }
+                }
+                for tool in root.tools : VerticalLayout {
+                    Text { color: #333333; text: tool.name + " · " + tool.state; wrap: word-wrap; }
+                    if tool.detail != "" : Text { color: #333333; text: tool.detail; wrap: word-wrap; }
+                }
+                if root.process != "" : Text { color: #666; text: "生成过程（尚未确认为最终答复）\n" + root.process; wrap: word-wrap; }
+                if root.reply != "" : Text { color: #333333; text: "助手回复\n" + root.reply; wrap: word-wrap; }
+                if root.subtitle != "" || root.playback != "" : Text { color: #333333; text: "播放 · " + root.playback + "\n" + root.subtitle; wrap: word-wrap; }
+
+            }
+        }
+        if root.asking : VerticalLayout {
+            spacing: 6px;
+            approval := Flickable {
+                property <int> live-request: root.request-id;
+                changed live-request => { self.content-y = 0px; }
+                height: min(approval-text.preferred-height, 140px);
+                content-height: approval-text.preferred-height;
+                approval-text := Text { width: parent.width; color: #234560; text: root.prompt + "\n可直接语音回答：可以 / 不可以"; wrap: word-wrap; }
+            }
+            HorizontalLayout {
+                AppButton { label: "允许"; primary: true; clicked => { root.answer(root.request-id, true); } }
+                AppButton { label: "拒绝"; clicked => { root.answer(root.request-id, false); } }
+            }
         }
         HorizontalLayout {
             AppButton { label: "停止播报"; clicked => { root.stop-speech(); } }
             AppButton { label: "取消任务"; clicked => { root.cancel-task(); } }
         }
         HorizontalLayout {
+            AppButton { label: "取消识别"; enabled: root.can-cancel-recognition; clicked => { root.cancel-recognition(); } }
+            AppButton { label: "设置"; clicked => { root.settings(); } }
             AppButton { label: "主窗口"; clicked => { root.open-main(); } }
             AppButton { label: "隐藏"; enabled: !root.asking; clicked => { root.hide-hud(); } }
         }

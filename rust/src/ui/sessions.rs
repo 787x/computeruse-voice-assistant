@@ -24,6 +24,11 @@ use crate::AppWindow;
 #[derive(Clone)]
 pub struct SessionRuntime {
     store: SessionStore,
+    hud_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    hud_revision_id: u64,
+    hud_suppressed: bool,
+    hud_eligible: Option<(u64, usize)>,
+    hud_final: Option<(u64, String)>,
     /// 列表元数据（按最近更新时间倒序）。
     summaries: Vec<SessionSummary>,
     /// 当前选中会话。
@@ -56,6 +61,11 @@ impl SessionRuntime {
         }
         Self {
             store,
+            hud_revision: Default::default(),
+            hud_revision_id: 0,
+            hud_suppressed: false,
+            hud_eligible: None,
+            hud_final: None,
             summaries: library.index.sessions,
             current,
             current_id: library.index.current_id,
@@ -65,6 +75,28 @@ impl SessionRuntime {
             last_save_error: None,
             key_presence: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn hud_version(&self) -> u64 {
+        self.hud_revision_id
+    }
+
+    pub fn reset_hud(&mut self, weak: &slint::Weak<AppWindow>) {
+        self.hud_revision_id = self
+            .hud_revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.hud_suppressed = true;
+        self.hud_eligible = None;
+        self.hud_final = None;
+        publish_timeline(weak, self);
+    }
+    pub fn hud_eligible(&mut self, turn: u64, step: usize) {
+        self.hud_eligible = Some((turn, step));
+    }
+    pub fn hud_finish(&mut self, turn: u64, text: &str) {
+        self.hud_final = Some((turn, text.into()));
     }
 
     pub fn summaries(&self) -> &[SessionSummary] {
@@ -233,14 +265,13 @@ impl SessionRuntime {
 
     /// 选中列表里的下一个（最近更新的那个）。
     fn select_next(&mut self) {
-        let Some(first) = self.summaries.first() else {
-            return;
-        };
-        let id = first.id.clone();
-        if let Ok(mut session) = self.store.read_session(&id) {
-            session.repair_after_restore();
-            self.current = Some(session);
-            self.current_id = id;
+        for summary in &self.summaries {
+            if let Ok(mut session) = self.store.read_session(&summary.id) {
+                session.repair_after_restore();
+                self.current = Some(session);
+                self.current_id = summary.id.clone();
+                break;
+            }
         }
     }
 
@@ -290,6 +321,16 @@ impl SessionRuntime {
 
     /// 追加一条时间线。
     pub fn push_timeline(&mut self, turn_id: u64, item: TimelineItem) {
+        if item.kind == TimelineKind::User {
+            self.hud_revision_id = self
+                .hud_revision
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.hud_suppressed = false;
+            self.hud_eligible = None;
+            self.hud_final = None;
+        }
+
         if let Some(session) = self.current.as_mut() {
             let mut item = item;
             item.turn_id = turn_id;
@@ -541,14 +582,155 @@ pub fn publish_session_list(weak: &slint::Weak<AppWindow>, runtime: &SessionRunt
     });
 }
 
+fn tool_summary(tool: &str, text: &str) -> String {
+    // Only short status-oriented tools expose text; file/clipboard/shell/network payloads remain in main.
+    let safe = matches!(
+        tool,
+        "click"
+            | "left_click"
+            | "right_click"
+            | "double_click"
+            | "scroll"
+            | "move_mouse"
+            | "key"
+            | "press_key"
+            | "wait"
+            | "open_app"
+            | "activate_window"
+            | "get_time"
+            | "get_current_time"
+            | "launch_app"
+            | "kill_app"
+            | "app_control"
+    );
+    let lower = text.to_ascii_lowercase();
+    if !safe
+        || text.trim_start().starts_with(['{', '['])
+        || [
+            "api_key", "token", "password", "secret", "base64", "bearer", "sk-",
+        ]
+        .iter()
+        .any(|key| lower.contains(key))
+    {
+        return format!(
+            "结果已返回（{} 字符），在主窗口查看详情",
+            text.chars().count()
+        );
+    }
+    let short: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect();
+    format!(
+        "{short}{}",
+        if text.chars().count() > 120 {
+            "… 在主窗口查看详情"
+        } else {
+            ""
+        }
+    )
+}
+
+fn hud_response(
+    items: &[TimelineItem],
+    eligible: Option<(u64, usize)>,
+    final_text: Option<&(u64, String)>,
+) -> (String, String) {
+    let Some(turn) = items.last().map(|i| i.turn_id) else {
+        return Default::default();
+    };
+    if let Some((_, text)) = final_text.filter(|(id, _)| *id == turn) {
+        return (text.clone(), String::new());
+    }
+    let step = items
+        .iter()
+        .rev()
+        .find(|i| i.turn_id == turn && i.kind == TimelineKind::Assistant)
+        .map(|i| i.step);
+    let text = items
+        .iter()
+        .filter(|i| i.turn_id == turn && Some(i.step) == step && i.kind == TimelineKind::Assistant)
+        .map(|i| i.text.as_str())
+        .collect::<String>();
+    if step.is_some_and(|step| eligible == Some((turn, step))) {
+        (text, String::new())
+    } else {
+        (String::new(), text)
+    }
+}
+
+/// 仅投影当前回合；参数不进入 HUD，字幕仍由 SpeechView 独立提供。
+fn hud_content(items: &[crate::session::TimelineItem]) -> (String, Vec<crate::ToolCard>) {
+    let turn = items.last().map(|i| i.turn_id);
+    let mut reasoning = String::new();
+    let mut hud_tools = Vec::new();
+    for item in items.iter().filter(|i| Some(i.turn_id) == turn) {
+        use crate::session::TimelineKind;
+        match item.kind {
+            TimelineKind::Reasoning => reasoning.push_str(&item.text),
+            TimelineKind::Tool => hud_tools.push(crate::ToolCard {
+                name: format!("#{} {}", item.call_id, item.tool).into(),
+                state: item.status.label().into(),
+                detail: format!(
+                    "{} · {} ms",
+                    if item.text.is_empty() {
+                        "暂无结果".to_string()
+                    } else {
+                        tool_summary(&item.tool, &item.text)
+                    },
+                    item.ms
+                )
+                .into(),
+                ..Default::default()
+            }),
+            _ => {}
+        }
+    }
+    (reasoning, hud_tools)
+}
+
 /// 把当前会话的时间线推给界面（对话气泡 + 工具卡片）。
 pub fn publish_timeline(weak: &slint::Weak<AppWindow>, runtime: &SessionRuntime) {
-    let view = TimelineView::from_items(runtime.timeline());
+    let items = runtime.timeline();
+    let (mut reasoning, mut hud_tools) = hud_content(&items);
+    let (mut reply, mut process) =
+        hud_response(&items, runtime.hud_eligible, runtime.hud_final.as_ref());
+    if runtime.hud_suppressed {
+        reasoning.clear();
+        reply.clear();
+        process.clear();
+        hud_tools.clear();
+    }
+    let suppressed = runtime.hud_suppressed;
+    let revision = runtime.hud_revision_id;
+    let guard = runtime.hud_revision.clone();
+    let session_id = runtime.current_id().to_string();
+    let view = TimelineView::from_items(items);
     let entries: Vec<crate::ChatEntry> = view.entries().to_vec();
     let tools: Vec<crate::ToolCard> = view.tools().to_vec();
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = weak.upgrade() {
+            if guard.load(std::sync::atomic::Ordering::SeqCst) != revision {
+                return;
+            }
+            if window.get_hud_session() != session_id {
+                window.set_voice_transcript("".into());
+                window.set_speech_subtitle("".into());
+                window.set_hud_session(session_id.into());
+            }
+            if suppressed {
+                window.set_voice_transcript("".into());
+                window.set_speech_subtitle("".into());
+            }
+            window.set_hud_interaction(revision as i32);
+            window.set_hud_process(process.into());
+            window.set_hud_reasoning(reasoning.into());
+            window.set_hud_reply(reply.into());
+            window.set_hud_tools(ModelRc::new(VecModel::from(hud_tools)));
             window.set_entries(ModelRc::new(VecModel::from(entries)));
             window.set_tools(ModelRc::new(VecModel::from(tools)));
         }
@@ -835,5 +1017,119 @@ mod tests {
         assert_eq!(items[1].status, TimelineToolStatus::Ok);
         assert_eq!(items[1].ms, 12);
         let _ = std::fs::remove_dir_all(&paths.root);
+    }
+}
+
+#[cfg(test)]
+mod pr16_projection_tests {
+    #[test]
+    fn reply_uses_eligible_step_or_protocol_final_only() {
+        let item = |step, kind, text: &str| TimelineItem {
+            turn_id: 8,
+            step,
+            kind,
+            text: text.into(),
+            ..Default::default()
+        };
+        let mut items = vec![item(
+            0,
+            TimelineKind::Assistant,
+            "已完成（其实尚未调用工具）",
+        )];
+        assert_eq!(
+            hud_response(&items, None, None),
+            ("".into(), "已完成（其实尚未调用工具）".into())
+        );
+        // No-tools streams reuse exactly SpeechEligible, and remain incremental.
+        assert_eq!(
+            hud_response(&items, Some((8, 0)), None).0,
+            "已完成（其实尚未调用工具）"
+        );
+        items.push(item(0, TimelineKind::Tool, "失败"));
+        items.push(item(1, TimelineKind::Assistant, "第二次尝试"));
+        items.push(item(1, TimelineKind::Tool, "成功"));
+        items.push(item(2, TimelineKind::Assistant, "最终"));
+        assert_eq!(
+            hud_response(&items, Some((8, 2)), None),
+            ("最终".into(), "".into())
+        );
+        assert_eq!(
+            hud_response(&items, None, Some(&(8, "最终确认".into()))).0,
+            "最终确认"
+        );
+        // Failed/cancelled terminal has no completed answer, including earlier success claims.
+        assert_eq!(
+            hud_response(&items, Some((8, 2)), Some(&(8, "".into()))),
+            Default::default()
+        );
+    }
+    #[test]
+    fn old_session_snapshot_cannot_repopulate_new_voice_hud() {
+        let paths = AppPaths::with_root(
+            std::env::temp_dir().join(format!("pr16-epoch-{}", std::process::id())),
+        );
+        let mut runtime = SessionRuntime::open(&paths);
+        runtime.ensure_one(1000);
+        runtime.push_timeline(1, TimelineItem::user("旧输入"));
+        let old = runtime.clone();
+        runtime.reset_hud(&slint::Weak::default());
+        assert!(runtime.hud_suppressed);
+        assert_ne!(
+            old.hud_revision_id,
+            old.hud_revision.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(runtime.timeline().len(), 1);
+        runtime.push_timeline(2, TimelineItem::user("新输入"));
+        assert!(!runtime.hud_suppressed);
+        assert_eq!(runtime.timeline().len(), 2);
+    }
+    #[test]
+    fn short_tool_status_is_readable_and_payloads_are_not_exposed() {
+        assert!(tool_summary("launch_app", "已打开记事本").contains("已打开记事本"));
+        assert!(tool_summary("click", "目标窗口不可用").contains("目标窗口不可用"));
+        assert!(!tool_summary("read_file", "secret document").contains("secret document"));
+        assert!(!tool_summary("launch_app", "API_KEY=sk-secret").contains("sk-secret"));
+        assert!(tool_summary("click", &"很长".repeat(500)).contains("主窗口"));
+    }
+
+    use super::*;
+    use crate::session::{TimelineItem, TimelineKind, TimelineToolStatus};
+    #[test]
+    fn latest_turn_layers_and_same_name_instances_remain_independent() {
+        let item = |turn_id, kind, text: &str| TimelineItem {
+            turn_id,
+            kind,
+            text: text.into(),
+            ..Default::default()
+        };
+        let mut items = vec![
+            item(1, TimelineKind::Assistant, "旧答案"),
+            item(2, TimelineKind::Reasoning, "真实推理"),
+            item(2, TimelineKind::Assistant, "正文"),
+        ];
+        for call_id in [1, 2] {
+            items.push(TimelineItem {
+                turn_id: 2,
+                kind: TimelineKind::Tool,
+                call_id,
+                tool: "read_file".into(),
+                args_summary: "secret".into(),
+                text: "x".repeat(500),
+                status: TimelineToolStatus::Ok,
+                ms: 12,
+                ..Default::default()
+            });
+        }
+        let (reasoning, tools) = hud_content(&items);
+        let (_, reply) = hud_response(&items, None, None);
+        assert_eq!(reasoning, "真实推理");
+        assert_eq!(reply, "正文");
+        assert_eq!(tools.len(), 2);
+        assert_ne!(tools[0].name, tools[1].name);
+        assert!(!tools[0].detail.contains("secret"));
+        assert!(tools[0].detail.len() < 200);
+        assert!(tools[0].detail.contains("12 ms"));
+        let (r, t) = hud_content(&[]);
+        assert!(r.is_empty() && t.is_empty());
     }
 }

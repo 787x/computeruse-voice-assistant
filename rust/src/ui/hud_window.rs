@@ -23,7 +23,7 @@ pub fn create() -> Result<VoiceHud, slint::PlatformError> {
 }
 
 type Geometry = (i32, i32, i32, i32, u64);
-type Viewport = ([i32; 4], u64);
+type Viewport = ([i32; 4], u64, u32, u32);
 #[derive(Default)]
 pub struct Placement {
     geometry: std::cell::Cell<Option<Geometry>>,
@@ -114,6 +114,8 @@ impl Placement {
                         let viewport = (
                             [area.left, area.top, area.right, area.bottom],
                             scale.to_bits(),
+                            hud.get_content_width().to_bits(),
+                            hud.get_content_height().to_bits(),
                         );
                         if self.viewport.replace(Some(viewport)) != Some(viewport) {
                             resize_to = Some(slint::LogicalSize::new(
@@ -219,6 +221,140 @@ mod native_tests {
                 if step.get() == 3 {
                     slint::quit_event_loop().unwrap();
                 }
+            },
+        );
+        slint::run_event_loop_until_quit().unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod pr16_layout_tests {
+    use super::*;
+    #[test]
+    #[ignore = "interactive Windows reasoning collapse acceptance"]
+    fn reasoning_generation_fixture() {
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .select()
+            .unwrap();
+        let hud = create().unwrap();
+        hud.set_reasoning("真实事件投影测试行\n".repeat(30).into());
+        hud.set_status("请展开思考，等待增量后点击允许；新代次折叠后再展开并点击拒绝".into());
+        hud.set_asking(true);
+        hud.set_prompt("仅 GUI 夹具，不执行任何工具".into());
+        hud.set_request_id(1);
+        let h = hud.as_weak();
+        hud.on_answer(move |id, _| {
+            let h = h.upgrade().unwrap();
+            assert!(
+                h.get_expanded(),
+                "user expansion must survive ordinary updates"
+            );
+            if id == 1 {
+                h.set_interaction_generation(1);
+                h.set_request_id(2);
+            } else {
+                slint::quit_event_loop().unwrap();
+            }
+        });
+        let placement = Placement::default();
+        placement.show(&hud);
+        let update = slint::Timer::default();
+        let h = hud.as_weak();
+        let count = std::cell::Cell::new(0);
+        update.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || {
+                let h = h.upgrade().unwrap();
+                let n = count.get() + 1;
+                count.set(n);
+                h.set_reasoning(format!("{}第 {n} 行增量\n", h.get_reasoning()).into());
+                h.set_subtitle(format!("第 {n} 句播放事件夹具").into());
+                eprintln!(
+                    "generation={} expanded={} following={}",
+                    h.get_interaction_generation(),
+                    h.get_expanded(),
+                    h.get_following_latest()
+                );
+                if n >= 180 {
+                    panic!("GUI acceptance timed out");
+                }
+            },
+        );
+        slint::run_event_loop_until_quit().unwrap();
+    }
+
+    #[test]
+    #[ignore = "interactive Windows HUD layout fixture"]
+    fn long_content_hud_fixture() {
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .select()
+            .unwrap();
+        let hud = create().unwrap();
+        hud.set_status("等待审批".into());
+        hud.set_listening("常驻监听（已保存）：开 · 当前状态：正在采集".into());
+        hud.set_transcript("请列出窗口并检查当前文档".into());
+        hud.set_reasoning("这是测试夹具中的模型事件文本。\n".repeat(60).into());
+        hud.set_reply("这是增量回复测试内容。\n".repeat(40).into());
+        hud.set_prompt("允许读取当前窗口标题吗？此操作会列出当前桌面窗口。".into());
+        hud.set_asking(true);
+        hud.set_tools(slint::ModelRc::new(slint::VecModel::from(
+            (1..=12)
+                .map(|id| crate::ToolCard {
+                    name: format!("#{id} click").into(),
+                    state: "成功".into(),
+                    detail: "已点击目标控件 · 20 ms".into(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )));
+        hud.set_request_id(1);
+        let h = hud.as_weak();
+        hud.on_answer(move |id, _| {
+            let h = h.upgrade().unwrap();
+            assert_eq!(id, h.get_request_id());
+            if id == 1 {
+                h.set_interaction_generation(h.get_interaction_generation() + 1);
+                h.set_request_id(2);
+                h.set_prompt("第二个请求：允许读取剪贴板吗？这是与第一个请求不同的操作。".into());
+            } else {
+                slint::quit_event_loop().unwrap();
+            }
+        });
+        hud.set_followup("可以继续说，无需唤醒词 · 8 秒".into());
+        let placement = Placement::default();
+        placement.show(&hud);
+        let updates = slint::Timer::default();
+        let h = hud.as_weak();
+        let tick = std::cell::Cell::new(0);
+        updates.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || {
+                let h = h.upgrade().unwrap();
+                let n = tick.get() + 1;
+                tick.set(n);
+                h.set_reply(format!("{}\n第 {n} 段新生成回复", h.get_reply()).into());
+                h.set_subtitle(format!("第 {n} 句实际播放字幕（测试夹具）").into());
+                h.set_status(
+                    if h.get_following_latest() {
+                        "跟随最新内容"
+                    } else {
+                        "阅读上文，暂停跟随"
+                    }
+                    .into(),
+                );
+                eprintln!("HUD tick={n} following={}", h.get_following_latest());
+            },
+        );
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_secs(90),
+            || {
+                slint::quit_event_loop().unwrap();
             },
         );
         slint::run_event_loop_until_quit().unwrap();

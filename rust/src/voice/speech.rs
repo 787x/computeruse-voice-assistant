@@ -163,6 +163,11 @@ impl SpeechRuntime {
     }
 
     /// 当前有效播报的身份（没有正在进行的播报时为 `None`）。
+    /// HUD invalidation watermark, including already settled speech whose events may still be queued.
+    pub fn last_issued_speech_id(&self) -> SpeechId {
+        self.next_speech_id
+    }
+
     pub fn current_speech_id(&self) -> Option<SpeechId> {
         self.speaking
             .as_ref()

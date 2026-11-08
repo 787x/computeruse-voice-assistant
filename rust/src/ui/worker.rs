@@ -169,6 +169,8 @@ pub enum UiCommand {
     /// 启用/关闭麦克风监听（界面开关）。
     SetVoiceEnabled(bool),
     DictateNow,
+    StartManualFromTray,
+    CancelRecognition,
     QuickPermissionPicked(i32),
     /// 语音线程发回的事件（内部消息，不是用户动作）。
     Voice(VoiceEvent),
@@ -353,6 +355,9 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 立刻把用户这句话放进对话区（不必等工作线程回报）。
             if let Some(window) = weak.upgrade() {
                 push_entry(&window, "你", &value, "", "#e8f0fe");
+                window.set_hud_reasoning("".into());
+                window.set_hud_reply("".into());
+                window.set_hud_tools(ModelRc::new(VecModel::from(Vec::<ToolCard>::new())));
                 window.set_busy(true);
                 window.set_status("正在思考…".into());
                 window.set_draft("".into());
@@ -413,6 +418,16 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let weak = window.as_weak();
         let save_generation = save_generation.clone();
         let model_drafts = model_drafts.clone();
+        let model_window = window.as_weak();
+        window.on_save_model_endpoints(move || {
+            if let Some(w) = model_window.upgrade() {
+                // Use each card's existing validation, credential boundary and serialized save path.
+                let cards: Vec<_> = w.get_endpoint_cards().iter().collect();
+                for card in cards {
+                    w.invoke_endpoint_action("save".into(), card);
+                }
+            }
+        });
         window.on_save_all(move || {
             // 界面上读一次当前全部字段（工作线程持有权威配置副本）。
             let mut request = match weak.upgrade() {
@@ -814,6 +829,14 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let direct_tx = command_tx.clone();
         window.on_dictate_now(move || {
             let _ = direct_tx.send(UiCommand::DictateNow);
+        });
+        let cancel_tx = command_tx.clone();
+        window.on_cancel_recognition(move || {
+            let _ = cancel_tx.send(UiCommand::CancelRecognition);
+        });
+        let tray_tx = command_tx.clone();
+        window.on_start_manual_from_tray(move || {
+            let _ = tray_tx.send(UiCommand::StartManualFromTray);
         });
         let permission_tx = command_tx.clone();
         window.on_quick_permission_picked(move |index| {
@@ -1828,6 +1851,23 @@ async fn run_worker(
         // 每一轮都按"当前是否在播报 / 是否有挂起的确认"重新决定聆听模式：
         // 只有播报期间与等待确认期间才允许不喊唤醒词。
         sync_listen_mode(&mut voice, &speech, &confirmer);
+        let followup = voice
+            .followup
+            .map(|end| {
+                format!(
+                    "可以继续说，无需唤醒词 · {} 秒",
+                    end.saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                )
+            })
+            .unwrap_or_default();
+        let saved_listening = settings.voice.enabled;
+        let temporary = voice.manual_temporary;
+        with_window(&weak, move |w| {
+            w.set_hud_saved_listening(saved_listening);
+            w.set_hud_temporary(temporary);
+            w.set_hud_followup(followup.into());
+        });
         if let Some(end) = voice
             .followup
             .filter(|_| !voice.mode.followup_started(voice.followup_generation))
@@ -1893,6 +1933,12 @@ async fn run_worker(
                 // 取消也作用于「正在录/正在识别的那一句」：之后返回的结果不提交。
                 // 已经开始的 Agent 回合仍按原有取消语义处理。
                 voice.cancel_pending();
+                if voice.manual_temporary {
+                    voice.disable(&weak);
+                } else {
+                    voice.manual_armed = false;
+                    with_window(&weak, |w| w.set_voice_manual(false));
+                }
             }
             UiCommand::StopSpeaking => {
                 voice.clear_followup();
@@ -1993,6 +2039,7 @@ async fn run_worker(
                     }
                     Ok(())
                 })();
+                let active_has_key = secret.has(&settings.provider_id);
                 let snapshot = settings.clone();
                 sessions.set_key_presence(super::endpoint_cards::key_presence(&settings, &secret));
                 let picker_sessions = sessions.clone();
@@ -2022,12 +2069,16 @@ async fn run_worker(
                             );
                         }
                         if saved_id == snapshot.provider_id {
+                            w.set_endpoint_text(
+                                config::describe_endpoint(&snapshot, active_has_key).into(),
+                            );
                             w.set_base_url(snapshot.base_url.clone().into());
                             w.set_model_name(snapshot.model.clone().into());
                             w.set_thinking_index(thinking_index(snapshot.thinking));
                             w.set_effort_index(reasoning_effort_index(snapshot.reasoning_effort));
                             fill_model_settings(w, &snapshot.provider(&saved_id));
                         }
+                        w.set_status(format!("端点 {saved_id} 已保存").into());
                         refresh_model_picker(w, &snapshot, &picker_sessions);
                     }
                 });
@@ -2249,6 +2300,9 @@ async fn run_worker(
             }
             // ---- 会话 ----
             UiCommand::NewSession => {
+                voice.cancel_recognition(&weak);
+                sessions.reset_hud(&weak);
+                speech_view.retire_through(Some(speech.last_issued_speech_id()), &weak);
                 voice.clear_followup();
                 speech.stop();
                 let now = crate::clock::now().unix_ms;
@@ -2272,55 +2326,29 @@ async fn run_worker(
                 set_status(&weak, "已新建会话");
             }
             UiCommand::SelectSession(id) => {
-                voice.clear_followup();
-                if id.trim().is_empty() {
-                    // 空 id = 界面没指定：保持当前选中，不做事。
-                } else {
-                    match sessions.select(&id) {
-                        Ok(()) => {
-                            if let Ok(mut state) = permissions.lock() {
-                                state.allowed_once.clear();
-                            }
-                            /*
-                             * 已结束 Agent 回合但 TTS 仍可能还在播：切会话要停旧播报，
-                             * 并让界面侧的播报身份失效——旧 `SpeechId` 的迟到事件
-                             * 不会再改到新会话的字幕。
-                             */
-                            speech.stop();
-                            speech_view.current = None;
-                            let weak_ui = weak.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(window) = weak_ui.upgrade() {
-                                    window.set_speech_subtitle("".into());
-                                    window.set_speech_active(false);
-                                }
-                            });
-                            {
-                                let settings = settings.clone();
-                                let sessions = sessions.clone();
-                                with_window(&weak, move |window| {
-                                    publish_session_list(&window.as_weak(), &sessions);
-                                    publish_timeline(&window.as_weak(), &sessions);
-                                    publish_session_title(&window.as_weak(), &sessions);
-                                    refresh_model_picker(window, &settings, &sessions);
-                                    publish_model_badges(window, &settings, &sessions);
-                                });
-                            }
-                            let warning = sessions
-                                .current()
-                                .map(|session| session.last_turn_status.needs_warning())
-                                .unwrap_or(false);
-                            if warning {
-                                set_status(
-                                    &weak,
-                                    "已切换会话；上一轮没有正常结束（不会自动重放工具）",
-                                );
-                            } else {
-                                set_status(&weak, "已切换会话");
-                            }
-                        }
-                        Err(error) => set_status(&weak, &format!("切换会话失败：{error}")),
+                match apply_session_navigation(
+                    &UiCommand::SelectSession(id),
+                    &mut sessions,
+                    &mut voice,
+                    &mut speech,
+                    &mut speech_view,
+                    &permissions,
+                    &weak,
+                ) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let settings = settings.clone();
+                        let sessions = sessions.clone();
+                        with_window(&weak, move |window| {
+                            publish_session_list(&window.as_weak(), &sessions);
+                            publish_timeline(&window.as_weak(), &sessions);
+                            publish_session_title(&window.as_weak(), &sessions);
+                            refresh_model_picker(window, &settings, &sessions);
+                            publish_model_badges(window, &settings, &sessions);
+                        });
+                        set_status(&weak, "已切换会话");
                     }
+                    Err(error) => set_status(&weak, &format!("切换会话失败：{error}")),
                 }
             }
             UiCommand::RenameSession { id, title } => {
@@ -2344,40 +2372,33 @@ async fn run_worker(
                 }
             }
             UiCommand::DeleteSession(id) => {
-                let target = if id.trim().is_empty() {
-                    sessions.current_id().to_string()
-                } else {
-                    id
-                };
-                speech.stop();
-                speech_view.current = None;
-                match sessions.delete(&target) {
-                    Ok(()) => {
-                        if let Ok(mut state) = permissions.lock() {
-                            state.allowed_once.clear();
-                        }
-                        // 删光了就补一个，保证界面始终有一个可对话的会话。
-                        if sessions.current().is_none() {
-                            sessions.ensure_one(crate::clock::now().unix_ms);
-                            let _ = sessions.save_current();
-                        }
-                        {
+                match apply_session_navigation(
+                    &UiCommand::DeleteSession(id),
+                    &mut sessions,
+                    &mut voice,
+                    &mut speech,
+                    &mut speech_view,
+                    &permissions,
+                    &weak,
+                ) {
+                    Ok(changed) => {
+                        publish_session_list(&weak, &sessions);
+                        if changed {
                             let settings = settings.clone();
                             let sessions = sessions.clone();
                             with_window(&weak, move |window| {
-                                publish_session_list(&window.as_weak(), &sessions);
                                 publish_timeline(&window.as_weak(), &sessions);
                                 publish_session_title(&window.as_weak(), &sessions);
                                 refresh_model_picker(window, &settings, &sessions);
                                 publish_model_badges(window, &settings, &sessions);
                             });
+                            set_status(&weak, "会话已删除");
                         }
-                        set_status(&weak, "会话已删除");
                     }
                     Err(error) => set_status(&weak, &format!("删除失败：{error}")),
                 }
             }
-            // ---- 输入区的模型 / 推理选择（只改当前会话） ----
+
             UiCommand::ModelChoicePicked(index) => {
                 handle_model_pick(&weak, &settings, &mut sessions, index);
             }
@@ -2521,22 +2542,32 @@ async fn run_worker(
                     }
                 }
             }
-            UiCommand::DictateNow => {
+            UiCommand::CancelRecognition => {
+                if voice.manual_session.is_some() {
+                    voice.cancel_recognition(&weak);
+                    sessions.reset_hud(&weak);
+                    set_status(&weak, "已取消识别");
+                }
+            }
+            UiCommand::DictateNow | UiCommand::StartManualFromTray => {
+                if matches!(command, UiCommand::StartManualFromTray)
+                    && !voice.can_start_manual_from_tray(confirmer.pending_request().is_some())
+                {
+                    continue;
+                }
                 if voice.manual_armed
                     || voice.route.pending.is_some()
                     || voice.route.active_session().current().is_some()
                 {
-                    if voice.manual_temporary {
-                        voice.disable(&weak);
-                    } else {
-                        voice.set_listen_mode(ListenPurpose::Wake, 0);
-                        voice.cancel_pending();
-                        voice.manual_armed = false;
-                        with_window(&weak, |w| w.set_voice_manual(false));
-                        set_status(&weak, "已取消识别，继续等待唤醒词");
-                    }
+                    voice.cancel_recognition(&weak);
+                    sessions.reset_hud(&weak);
+                    set_status(&weak, "已取消识别");
                 } else {
                     speech.stop();
+                    speech_view.retire_through(Some(speech.last_issued_speech_id()), &weak);
+                    sessions.reset_hud(&weak);
+                    voice.manual_session = Some(sessions.current_id().to_string());
+                    with_window(&weak, |w| w.set_voice_transcript("".into()));
                     voice.manual_temporary = !voice
                         .handle
                         .as_ref()
@@ -2580,7 +2611,27 @@ async fn run_worker(
                 );
             }
             UiCommand::Voice(event) => {
-                let prompt = handle_voice_event(
+                if voice.route.is_current(event.instance)
+                    && match &event.kind {
+                        VoiceEventKind::Woke { .. } => true,
+                        VoiceEventKind::DirectStarted {
+                            purpose: ListenPurpose::Followup,
+                            request_id,
+                            ..
+                        } => {
+                            *request_id == voice.followup_generation
+                                && voice.mode.followup_started(*request_id)
+                        }
+                        _ => false,
+                    }
+                {
+                    sessions.reset_hud(&weak);
+                    speech.stop();
+                    speech_view.retire_through(Some(speech.last_issued_speech_id()), &weak);
+                }
+
+                let prompt = handle_session_voice_event(
+                    sessions.current_id(),
                     &weak,
                     &mut voice,
                     &confirmer,
@@ -2789,6 +2840,48 @@ impl VoiceRoute {
     }
 }
 
+/// Session I/O must succeed before retiring the interaction belonging to the old selection.
+#[allow(clippy::too_many_arguments)]
+fn apply_session_navigation(
+    command: &UiCommand,
+    sessions: &mut SessionRuntime,
+    voice: &mut VoiceRuntime,
+    speech: &mut SpeechRuntime,
+    view: &mut SpeechView,
+    permissions: &Arc<std::sync::Mutex<PermissionState>>,
+    weak: &slint::Weak<AppWindow>,
+) -> Result<bool, String> {
+    let previous = sessions.current_id().to_string();
+    match command {
+        UiCommand::SelectSession(id) => {
+            if id.trim().is_empty() || id == &previous {
+                return Ok(false);
+            }
+            sessions.select(id)?;
+        }
+        UiCommand::DeleteSession(id) => {
+            let target = if id.trim().is_empty() { &previous } else { id };
+            sessions.delete(target)?;
+            if target != &previous {
+                return Ok(false);
+            }
+            if sessions.current().is_none() {
+                sessions.ensure_one(crate::clock::now().unix_ms);
+                let _ = sessions.save_current();
+            }
+        }
+        _ => return Err("不是会话导航操作".into()),
+    }
+    voice.cancel_recognition(weak);
+    sessions.reset_hud(weak);
+    view.retire_through(Some(speech.last_issued_speech_id()), weak);
+    speech.stop();
+    if let Ok(mut state) = permissions.lock() {
+        state.allowed_once.clear();
+    }
+    Ok(true)
+}
+
 /// 一次可提交的语音结果。
 struct VoicePrompt {
     text: String,
@@ -2828,6 +2921,7 @@ struct VoiceRuntime {
     manual_armed: bool,
     manual_temporary: bool,
     manual_request: u64,
+    manual_session: Option<String>,
     followup: Option<std::time::Instant>,
     followup_pending: bool,
     followup_generation: u64,
@@ -2844,12 +2938,43 @@ impl VoiceRuntime {
             manual_armed: false,
             manual_temporary: false,
             manual_request: 0,
+            manual_session: None,
             followup: None,
             followup_pending: false,
             followup_generation: 0,
             followup_seconds: 8,
             followup_allowed: true,
         }
+    }
+
+    fn cancel_recognition(&mut self, weak: &slint::Weak<AppWindow>) {
+        if self.manual_temporary {
+            self.disable(weak);
+        } else {
+            self.cancel_pending();
+            self.manual_armed = false;
+            self.set_listen_mode(ListenPurpose::Wake, 0);
+            with_window(weak, |w| w.set_voice_manual(false));
+        }
+        self.manual_session = None;
+    }
+
+    fn belongs_to_session(&self, event: &VoiceEvent, session: &str) -> bool {
+        !matches!(
+            event.kind,
+            VoiceEventKind::Final {
+                purpose: ListenPurpose::Manual,
+                ..
+            }
+        ) || self.manual_session.as_deref() == Some(session)
+    }
+
+    fn can_start_manual_from_tray(&self, asking: bool) -> bool {
+        !asking
+            && !self.manual_armed
+            && self.route.pending.is_none()
+            && self.route.active_session().current().is_none()
+            && self.followup.is_none()
     }
 
     /// 设置聆听模式（关麦时也会记下来，重开麦后沿用当前值）。
@@ -2890,7 +3015,7 @@ impl VoiceRuntime {
                 let message = errors.join("\n\n");
                 set_voice_state(weak, &VoiceState::Error("缺少语音模型".to_string()));
                 push_entry_via_weak(weak, "系统", &message, "", "#fdeeee");
-                set_status(weak, "语音模型不完整；文本模式仍然可用");
+                set_status(weak, &format!("语音模型不完整：{message}；请打开设置"));
                 return;
             }
         };
@@ -2924,6 +3049,7 @@ impl VoiceRuntime {
         with_window(weak, |w| w.set_voice_manual(false));
         self.manual_armed = false;
         self.manual_temporary = false;
+        self.manual_session = None;
         self.set_listen_mode(ListenPurpose::Wake, 0);
         // 先让还在识别的结果过期，再停线程：迟到的文本不会落到新实例上。
         self.route.close();
@@ -2964,12 +3090,20 @@ impl VoiceRuntime {
         match event.kind {
             VoiceEventKind::StateChanged(state) => {
                 set_voice_state(weak, &state);
-                set_status(weak, &state.label());
+                set_status(
+                    weak,
+                    &if state == VoiceState::Listening && self.manual_armed {
+                        "请直接说指令，无需唤醒词".to_string()
+                    } else {
+                        state.label()
+                    },
+                );
                 if !state.is_active() {
                     self.clear_followup();
                     with_window(weak, |w| w.set_voice_manual(false));
                     self.manual_armed = false;
                     self.manual_temporary = false;
+                    self.manual_session = None;
                     // 线程已结束或即将结束：释放句柄，但保留界面上的原因。
                     self.route.close();
                     if let Some(mut handle) = self.handle.take() {
@@ -3010,6 +3144,9 @@ impl VoiceRuntime {
                     return VoiceOutcome::None;
                 }
                 self.route.bind(event.instance, turn);
+                if matches!(purpose, ListenPurpose::Manual | ListenPurpose::Followup) {
+                    with_window(weak, |w| w.set_voice_transcript("".into()));
+                }
                 set_voice_state(weak, &VoiceState::Capturing);
                 match purpose {
                     ListenPurpose::BargeIn => {
@@ -3036,6 +3173,7 @@ impl VoiceRuntime {
                 if self.route.pending != Some(turn) {
                     return VoiceOutcome::None;
                 }
+                self.manual_session = None;
                 with_window(weak, |w| w.set_voice_manual(false));
                 if self.manual_temporary {
                     self.disable(weak);
@@ -3085,6 +3223,7 @@ impl VoiceRuntime {
                     return VoiceOutcome::None;
                 }
                 if purpose == ListenPurpose::Manual {
+                    self.manual_session = None;
                     with_window(weak, |w| w.set_voice_manual(false));
                     self.set_listen_mode(ListenPurpose::Wake, 0);
                     self.manual_armed = false;
@@ -3184,6 +3323,22 @@ fn sync_listen_mode(voice: &mut VoiceRuntime, speech: &SpeechRuntime, confirmer:
 /// 处理一条语音事件：只更新状态 / 提交指令 / 停止播报 / 结算语音确认。
 ///
 /// 返回 `Some(prompt)` 表示**要启动一个 Agent 回合**（只有常规唤醒路径会这样）。
+#[allow(clippy::too_many_arguments)]
+fn handle_session_voice_event(
+    session: &str,
+    weak: &slint::Weak<AppWindow>,
+    voice: &mut VoiceRuntime,
+    confirmer: &Arc<UiConfirmer>,
+    speech: &mut SpeechRuntime,
+    event: VoiceEvent,
+    busy: bool,
+) -> Option<VoicePrompt> {
+    if !voice.belongs_to_session(&event, session) {
+        return None;
+    }
+    handle_voice_event(weak, voice, confirmer, speech, event, busy)
+}
+
 fn handle_voice_event(
     weak: &slint::Weak<AppWindow>,
     voice: &mut VoiceRuntime,
@@ -3460,14 +3615,33 @@ fn set_speech_unavailable(weak: &slint::Weak<AppWindow>, reason: &str) {
 ///    `Stopped` / `Finished` / `Failed` / 字幕清空都不能覆盖 B。
 #[derive(Debug, Default)]
 struct SpeechView {
+    retired_through: SpeechId,
     /// 当前（或最近一次）播报的身份；`None` = 还没有播报。
     current: Option<SpeechId>,
     notice: Option<String>,
 }
 
 impl SpeechView {
+    fn retire_through(&mut self, id: Option<SpeechId>, weak: &slint::Weak<AppWindow>) {
+        with_window(weak, |w| {
+            w.set_speech_subtitle("".into());
+            w.set_speech_active(false);
+            w.set_speech_detail("".into());
+        });
+        if let Some(id) = id {
+            self.retired_through = self.retired_through.max(id);
+        }
+        if let Some(id) = self.current {
+            self.retired_through = self.retired_through.max(id);
+        }
+        self.notice = None;
+    }
+
     /// 这条事件是否属于当前有效播报；新播报会在这里接管界面。
     fn accepts(&mut self, speech_id: SpeechId) -> bool {
+        if speech_id <= self.retired_through {
+            return false;
+        }
         match self.current {
             Some(current) if speech_id < current => false,
             Some(current) if speech_id == current => true,
@@ -3492,9 +3666,13 @@ fn apply_speech_event(view: &mut SpeechView, weak: &slint::Weak<AppWindow>, even
         | SpeechEvent::Subtitle { speech_id, .. }
         | SpeechEvent::Notice { speech_id, .. } => *speech_id,
     };
+    let previous_speech = view.current;
     if !view.accepts(speech_id) {
         // 旧播报的迟到事件：不改状态、不改字幕、也不弹提示。
         return;
+    }
+    if previous_speech != view.current {
+        with_window(weak, |w| w.set_speech_subtitle("".into()));
     }
     match event {
         SpeechEvent::State { state, .. } => {
@@ -3870,6 +4048,11 @@ fn start_turn(
      * 优先级：会话手选 > 时段规则 → 方案 > 全局默认。**只在这里解析一次**，
      * 所以时段跨过边界、别的会话改模型都不会影响这一轮。
      */
+    with_window(weak, |w| {
+        w.set_hud_reasoning("".into());
+        w.set_hud_reply("".into());
+        w.set_hud_tools(ModelRc::new(VecModel::from(Vec::<ToolCard>::new())));
+    });
     let now = crate::clock::now();
     let selection = settings.resolve_selection(choice, &now);
     let profile = settings.profile_for_selection(&selection);
@@ -4216,6 +4399,7 @@ fn finish_quick_answer(
         answer,
     ));
     sessions.set_history(history);
+    sessions.hud_finish(turn_id, answer);
     sessions.set_last_turn(turn_id, TurnStatus::Completed);
     if let Err(error) = sessions.save_current() {
         set_status(weak, &format!("会话保存失败：{error}"));
@@ -4488,7 +4672,7 @@ async fn wait_turn(
                         set_status(weak, "上一轮还在跑，先取消再发新指令");
                     }
                     /*
-                     * 忙碌期间的会话操作：一律拒绝并说明原因。
+                     * 忙碌期间拒绝实际导航；重选当前会话无副作用，删除历史会话只更新列表。
                      *
                      * 正在跑的回合绑定在**发起时**的会话上；这时切换/删除会话
                      * 会让"工具结果要写进哪个会话"变得不确定——所以宁可拒绝。
@@ -4496,14 +4680,21 @@ async fn wait_turn(
                     Some(UiCommand::NewSession) => {
                         set_status(weak, "正在执行；先完成或取消这一轮再新建会话");
                     }
-                    Some(UiCommand::SelectSession(_)) => {
-                        set_status(weak, "正在执行；先完成或取消这一轮再切换会话");
+                    Some(UiCommand::SelectSession(id)) => {
+                        if !id.trim().is_empty() && id != sessions.current_id() {
+                            set_status(weak, "正在执行；先完成或取消这一轮再切换会话");
+                        }
                     }
                     Some(UiCommand::RenameSession { .. }) => {
                         set_status(weak, "正在执行；先完成或取消这一轮再改名");
                     }
-                    Some(UiCommand::DeleteSession(_)) => {
-                        set_status(weak, "正在执行；先完成或取消这一轮再删除会话");
+                    Some(UiCommand::DeleteSession(id)) => {
+                        if !id.trim().is_empty() && id != sessions.current_id() {
+                            match apply_session_navigation(&UiCommand::DeleteSession(id), sessions, voice, speech, speech_view, permissions, weak) {
+                                Ok(_) => publish_session_list(weak, sessions),
+                                Err(error) => set_status(weak, &format!("删除失败：{error}")),
+                            }
+                        } else { set_status(weak, "正在执行；先完成或取消这一轮再删除会话"); }
                     }
                     /*
                      * 忙碌期间的模型/推理选择：只提示"下一轮生效"，不热切换。
@@ -4543,7 +4734,8 @@ async fn wait_turn(
                      *  - 打断词与语音确认**照常生效**：它们不启动回合。
                      *  - 设备状态、加载失败、溢出与会话结束这些合法事件照常处理。
                      */
-                    Some(UiCommand::DictateNow) | Some(UiCommand::QuickPermissionPicked(_)) => { set_status(weak, "请先结束当前回合再切换"); }
+                    Some(UiCommand::CancelRecognition) => { /* Agent/审批继续，托盘不能取消审批。 */ }
+                    Some(UiCommand::StartManualFromTray) | Some(UiCommand::DictateNow) | Some(UiCommand::QuickPermissionPicked(_)) => { set_status(weak, "请先结束当前回合再切换"); }
                     Some(UiCommand::SetVoiceEnabled(enabled)) => {
                         apply_voice_enabled(weak, paths, settings, voice, command_tx, enabled);
                     }
@@ -4951,6 +5143,10 @@ fn record_event(
     use crate::session::{TimelineKind, TimelineToolStatus};
     let mut checkpoint = true;
     match &event {
+        AgentEvent::SpeechEligible { turn, step } if *turn == turn_id => {
+            sessions.hud_eligible(*turn, *step);
+            checkpoint = false;
+        }
         AgentEvent::TextDelta { turn, step, text } if *turn == turn_id => {
             sessions.extend_fragment(*turn, *step, crate::session::TimelineKind::Assistant, text);
             checkpoint = false;
@@ -5260,6 +5456,14 @@ fn finish_session_turn(
     } else if outcome.cancelled {
         sessions.push_timeline(turn_id, TimelineItem::system("这一轮被取消。"));
     }
+    sessions.hud_finish(
+        turn_id,
+        if outcome.failed || outcome.cancelled {
+            ""
+        } else {
+            &outcome.speech_text
+        },
+    );
     sessions.set_last_turn(turn_id, status);
     if let Err(error) = sessions.save_current() {
         set_status(weak, &format!("会话保存失败：{error}"));
@@ -6858,5 +7062,471 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+}
+
+#[cfg(test)]
+mod pr16_tests {
+    struct HoldingEngine;
+    impl crate::voice::tts::TtsEngine for HoldingEngine {
+        fn label(&self) -> String {
+            "navigation-test".into()
+        }
+        fn start(
+            &self,
+            _: crate::voice::tts::SynthRequest,
+        ) -> Result<crate::voice::tts::SpeechStream, String> {
+            Ok(crate::voice::tts::SpeechStream::new(
+                tokio::sync::mpsc::unbounded_channel().1,
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn navigation_business_entry_preserves_unrelated_interactions() {
+        for action in [
+            "delete-other",
+            "delete-failure",
+            "same",
+            "empty",
+            "missing",
+            "corrupt",
+            "switch",
+            "delete-current",
+        ] {
+            let paths = AppPaths::with_root(
+                std::env::temp_dir()
+                    .join(format!("pr16-navigation-{}-{action}", std::process::id())),
+            );
+            let mut sessions = SessionRuntime::open(&paths);
+            let a = sessions.create(1000, "A");
+            sessions.save_current().unwrap();
+            let b = sessions.create(2000, "B");
+            sessions.save_current().unwrap();
+            sessions.select(&a).unwrap();
+            // An unsaved in-memory value detects accidental re-reading of A.
+            sessions.push_timeline(9, TimelineItem::user("当前内存内容"));
+            let before = serde_json::to_value(sessions.timeline()).unwrap();
+            let version = sessions.hud_version();
+            if action == "corrupt" {
+                std::fs::write(paths.session_file(&b), "invalid json").unwrap();
+            }
+            if action == "delete-failure" {
+                std::fs::create_dir_all(paths.session_file("blocked")).unwrap();
+            }
+            let mut voice = VoiceRuntime::new();
+            let instance = voice.route.open();
+            let turn = VoiceTurn {
+                instance,
+                session: 1,
+            };
+            voice.route.bind(instance, turn);
+            voice.manual_session = Some(a.clone());
+            voice.manual_armed = true;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            voice.followup = Some(deadline);
+            let mut speech = SpeechRuntime::new(tokio::sync::mpsc::unbounded_channel().0);
+            speech.attach_playback_for_test(Arc::new(crate::voice::playback::PlaybackShared::new(
+                24000, 1,
+            )));
+            speech.attach_engine_for_test(Arc::new(HoldingEngine));
+            let id = speech.speak(1, "正在播报").unwrap();
+            let stop_revision = speech.stop_revision();
+            let mut view = SpeechView::default();
+            assert!(view.accepts(id));
+            let permissions = Arc::new(std::sync::Mutex::new(PermissionState::default()));
+            permissions
+                .lock()
+                .unwrap()
+                .allowed_once
+                .push(("test".into(), std::time::SystemTime::now()));
+            let confirmer = test_confirmer();
+            let (reply, mut wait) = tokio::sync::oneshot::channel();
+            *confirmer.pending.lock().unwrap() = Some(PendingConfirm {
+                request_id: 77,
+                reply,
+            });
+            confirmer.publish_pending(77);
+            let command = match action {
+                "delete-other" => UiCommand::DeleteSession(b.clone()),
+                "delete-failure" => UiCommand::DeleteSession("blocked".into()),
+                "same" => UiCommand::SelectSession(a.clone()),
+                "empty" => UiCommand::SelectSession(String::new()),
+                "missing" => UiCommand::SelectSession("missing".into()),
+                "corrupt" | "switch" => UiCommand::SelectSession(b.clone()),
+                _ => UiCommand::DeleteSession(a.clone()),
+            };
+            let weak = slint::Weak::default();
+            let result = apply_session_navigation(
+                &command,
+                &mut sessions,
+                &mut voice,
+                &mut speech,
+                &mut view,
+                &permissions,
+                &weak,
+            );
+            if matches!(action, "switch" | "delete-current") {
+                assert_eq!(result, Ok(true));
+                assert_ne!(sessions.current_id(), a);
+                assert!(voice.route.pending.is_none());
+                assert!(voice.followup.is_none());
+                assert!(speech.stop_revision() > stop_revision);
+                assert!(!speech.is_speaking());
+                assert!(!view.accepts(id));
+                let stale = VoiceEvent {
+                    instance,
+                    kind: VoiceEventKind::Final {
+                        turn,
+                        text: "不应执行".into(),
+                        audio_seconds: 1.0,
+                        decode_ms: 1,
+                        purpose: ListenPurpose::Manual,
+                        request_id: 1,
+                    },
+                };
+                assert!(handle_session_voice_event(
+                    sessions.current_id(),
+                    &weak,
+                    &mut voice,
+                    &confirmer,
+                    &mut speech,
+                    stale,
+                    false
+                )
+                .is_none());
+                assert!(permissions.lock().unwrap().allowed_once.is_empty());
+            } else {
+                if matches!(action, "missing" | "corrupt" | "delete-failure") {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result, Ok(false));
+                }
+                assert_eq!(sessions.current_id(), a);
+                assert_eq!(serde_json::to_value(sessions.timeline()).unwrap(), before);
+                assert_eq!(sessions.hud_version(), version);
+                assert_eq!(voice.route.instance, Some(instance));
+                assert_eq!(voice.route.pending, Some(turn));
+                assert!(voice.manual_armed);
+                assert_eq!(voice.followup, Some(deadline));
+                assert_eq!(speech.stop_revision(), stop_revision);
+                assert!(speech.is_speaking());
+                assert_eq!(view.retired_through, 0);
+                assert!(view.accepts(id));
+                assert_eq!(permissions.lock().unwrap().allowed_once.len(), 1);
+                assert_eq!(confirmer.pending_request(), Some(77));
+                assert!(confirmer.submit(77, ConfirmAnswer::deny_click()));
+                assert!(!wait.try_recv().unwrap().allow);
+                if action == "delete-other" {
+                    assert!(!paths.session_file(&b).exists());
+                }
+            }
+        }
+    }
+
+    fn test_confirmer() -> Arc<UiConfirmer> {
+        Arc::new(UiConfirmer {
+            weak: slint::Weak::default(),
+            pending: Default::default(),
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            pending_id: Default::default(),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            timeout: std::time::Duration::from_secs(2),
+        })
+    }
+    #[test]
+    fn retired_speech_rejects_even_previously_unseen_late_events() {
+        let mut view = SpeechView::default();
+        view.retire_through(Some(12), &slint::Weak::default());
+        assert!(!view.accepts(11));
+        assert!(!view.accepts(12));
+        assert!(view.accepts(13));
+        view.retire_through(None, &slint::Weak::default());
+        assert!(!view.accepts(13));
+        assert!(view.accepts(14));
+    }
+    #[tokio::test]
+    async fn session_navigation_drops_old_asr_before_real_agent_start() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for navigation in ["switch", "new", "delete", "cancel"] {
+            let paths = AppPaths::with_root(
+                std::env::temp_dir().join(format!("pr16-asr-{}-{navigation}", std::process::id())),
+            );
+            std::fs::create_dir_all(&paths.root).unwrap();
+            let sentinel = paths.root.join("settings-sentinel");
+            std::fs::write(&sentinel, "unchanged").unwrap();
+            let mut sessions = SessionRuntime::open(&paths);
+            let a = sessions.create(1000, "A");
+            sessions.save_current().unwrap();
+            let history_a = sessions.history();
+            let b = sessions.create(2000, "B");
+            sessions.select(&a).unwrap();
+            let mut voice = VoiceRuntime::new();
+            let old_instance = voice.route.open();
+            let old_turn = VoiceTurn {
+                instance: old_instance,
+                session: 1,
+            };
+            voice.route.bind(old_instance, old_turn);
+            voice.manual_session = Some(a.clone());
+            voice.manual_temporary = true;
+            let weak = slint::Weak::default();
+            voice.cancel_recognition(&weak);
+            match navigation {
+                "delete" => {
+                    sessions.delete(&a).unwrap();
+                    sessions.select(&b).unwrap();
+                }
+                "new" => {
+                    sessions.create(3000, "C");
+                }
+                _ => {
+                    sessions.select(&b).unwrap();
+                }
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let requests = received.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let requests = requests.clone();
+                    tokio::spawn(async move {
+                        let mut bytes = Vec::new();
+                        let mut buf = [0; 4096];
+                        loop {
+                            let n = socket.read(&mut buf).await.unwrap();
+                            if n == 0 {
+                                return;
+                            }
+                            bytes.extend_from_slice(&buf[..n]);
+                            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&bytes[..end]);
+                                let len: usize = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        l.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|v| v.trim().parse().unwrap())
+                                    })
+                                    .unwrap();
+                                if bytes.len() < end + 4 + len {
+                                    continue;
+                                }
+                                requests.lock().unwrap().push(
+                                    String::from_utf8_lossy(&bytes[end + 4..end + 4 + len]).into(),
+                                );
+                                break;
+                            }
+                        }
+                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"新的回答\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    });
+                }
+            });
+            let confirmer = test_confirmer();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut speech = SpeechRuntime::new(tx);
+            let old_final = || VoiceEvent {
+                instance: old_instance,
+                kind: VoiceEventKind::Final {
+                    turn: old_turn,
+                    text: "旧指令不应执行".into(),
+                    audio_seconds: 1.0,
+                    decode_ms: 1,
+                    purpose: ListenPurpose::Manual,
+                    request_id: 1,
+                },
+            };
+            let mut starts = 0;
+            for _ in 0..2 {
+                assert!(handle_session_voice_event(
+                    sessions.current_id(),
+                    &weak,
+                    &mut voice,
+                    &confirmer,
+                    &mut speech,
+                    old_final(),
+                    false
+                )
+                .is_none());
+            }
+            assert!(sessions.history().is_empty());
+            let instance = voice.route.open();
+            let turn = VoiceTurn {
+                instance,
+                session: 2,
+            };
+            voice.route.bind(instance, turn);
+            voice.manual_session = Some(sessions.current_id().into());
+            voice.set_listen_mode(ListenPurpose::Manual, 2);
+            let new_final = || VoiceEvent {
+                instance,
+                kind: VoiceEventKind::Final {
+                    turn,
+                    text: "新会话指令".into(),
+                    audio_seconds: 1.0,
+                    decode_ms: 1,
+                    purpose: ListenPurpose::Manual,
+                    request_id: 2,
+                },
+            };
+            let prompt = handle_session_voice_event(
+                sessions.current_id(),
+                &weak,
+                &mut voice,
+                &confirmer,
+                &mut speech,
+                new_final(),
+                false,
+            )
+            .unwrap();
+            assert!(handle_session_voice_event(
+                sessions.current_id(),
+                &weak,
+                &mut voice,
+                &confirmer,
+                &mut speech,
+                new_final(),
+                false
+            )
+            .is_none());
+            let mut settings = Settings::default();
+            let mut provider = settings.provider("deepseek");
+            settings.base_url = endpoint.clone();
+            settings.model = "mock".into();
+            provider.base_url = endpoint;
+            provider.model = "mock".into();
+            settings.provider_id = provider.id.clone();
+            settings.providers = vec![provider];
+            let secret = SecretStore::new(paths.root.join("test-secrets"));
+            secret.save("deepseek", "dummy-test-key").unwrap();
+            let tools = Arc::new(ToolRegistry::new(
+                None,
+                Arc::new(WebSearch::new(String::new())),
+                false,
+            ));
+            let permissions = Arc::new(std::sync::Mutex::new(PermissionState::from_settings(
+                settings.permission_mode,
+                &settings.permission_overrides,
+            )));
+            let audit = AuditLog::new(paths.audit_file());
+            let mut cancel = None;
+            let mut history = sessions.history();
+            let running = start_turn(
+                &weak,
+                &paths,
+                &secret,
+                &settings,
+                None,
+                &tools,
+                &confirmer,
+                &permissions,
+                &audit,
+                &mut history,
+                &mut cancel,
+                prompt.text,
+                1,
+                sessions.current_id().into(),
+            );
+            let TurnStart::Started(mut running) = running else {
+                panic!("new B input must start Agent")
+            };
+            starts += 1;
+            let (outcome, history, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), running.task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                !outcome.failed,
+                "{} {:?}",
+                outcome.text, outcome.failure_reason
+            );
+            assert_eq!(starts, 1);
+            let mut tool_starts = 0;
+            while let Ok(event) = running.events.try_recv() {
+                if matches!(event, AgentEvent::ToolStart { .. }) {
+                    tool_starts += 1;
+                }
+            }
+            assert_eq!(tool_starts, 0);
+            sessions.set_history(history);
+            sessions.save_current().unwrap();
+            let requests = received.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].contains("新会话指令"));
+            assert!(!requests[0].contains("旧指令不应执行"));
+            if navigation != "delete" {
+                sessions.select(&a).unwrap();
+                assert_eq!(
+                    serde_json::to_value(sessions.history()).unwrap(),
+                    serde_json::to_value(history_a).unwrap()
+                );
+            }
+            assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "unchanged");
+            server.abort();
+        }
+    }
+
+    use super::*;
+    #[test]
+    fn manual_final_is_consumed_once_and_temporary_capture_closes() {
+        for temporary in [false, true] {
+            let mut voice = VoiceRuntime::new();
+            let instance = voice.route.open();
+            let turn = VoiceTurn {
+                instance,
+                session: 1,
+            };
+            voice.route.bind(instance, turn);
+            voice.manual_temporary = temporary;
+            voice.manual_request = 1;
+            voice.set_listen_mode(ListenPurpose::Manual, 1);
+            let event = || VoiceEvent {
+                instance,
+                kind: VoiceEventKind::Final {
+                    turn,
+                    text: "测试".into(),
+                    audio_seconds: 1.0,
+                    decode_ms: 1,
+                    purpose: ListenPurpose::Manual,
+                    request_id: 1,
+                },
+            };
+            let weak = slint::Weak::default();
+            assert!(voice
+                .on_event(&weak, event(), false)
+                .into_prompt()
+                .is_some());
+            assert!(voice
+                .on_event(&weak, event(), false)
+                .into_prompt()
+                .is_none());
+            assert_eq!(voice.route.is_current(instance), !temporary);
+            assert_eq!(voice.mode.purpose(), ListenPurpose::Wake);
+        }
+    }
+    #[test]
+    fn tray_start_is_idempotent_and_preserves_confirmation_and_followup() {
+        let mut voice = VoiceRuntime::new();
+        assert!(voice.can_start_manual_from_tray(false));
+        assert!(!voice.can_start_manual_from_tray(true));
+        voice.manual_armed = true;
+        assert!(!voice.can_start_manual_from_tray(false));
+        voice.manual_armed = false;
+        voice.followup = Some(std::time::Instant::now());
+        assert!(!voice.can_start_manual_from_tray(false));
+        voice.followup = None;
+        let instance = voice.route.open();
+        voice.route.bind(
+            instance,
+            VoiceTurn {
+                instance,
+                session: 1,
+            },
+        );
+        assert!(!voice.can_start_manual_from_tray(false));
     }
 }
