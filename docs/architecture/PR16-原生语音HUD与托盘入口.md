@@ -77,3 +77,16 @@ Followup 显示原 VoiceRuntime 截止时间，每 250ms 更新；不增加另�
 - 本轮真实失败记录：第一版 scrolled 回调没有可靠保留用户上滚位置，GUI 实测失败后改用实际 content-y 变化复验通过；一次测试重新链接因旧 GUI 夹具仍占用 EXE 而 LNK1104，关闭夹具后重新构建通过。
 
 未执行与合并边界：真实托盘单双击、麦克风到实体扬声器的完整链路、多显示器负坐标与高 DPI 仍未验收；动态 GUI 夹具和假音频设备测试不算这些项目通过。本轮未发现其他已知阻断代码问题，原 PR16 的实机验收缺口仍需在合并前完成。保持 Draft，不合并、不发布，到此停止。
+
+
+## 最终折叠修复与实机验收（2026-11-08）
+
+代码只在 VoiceHud 的 changed interaction-generation 中恢复 expanded=false；原 following-latest 复位保持不变。当前回合的 reasoning、工具及字幕更新不修改 expanded。现有 expanded 改为只读输出，供原生 GUI 测试读取；无持久化字段、历史数据或状态机变更。
+
+- PR16 针对性测试：9 通过、2 GUI 项默认忽略。cargo fmt --check、cargo clippy --tests 和默认 CUDA Windows build 通过；仍有既有警告，未构建 CPU-only。
+- 新增 reasoning_generation_fixture，Windows 实际点击展开，普通 reasoning/字幕持续更新后保持展开；通过交互代次切换恢复两行，窗口从展开高度收缩，再展开后继续保持，按钮断言通过，夹具正常退出。首次夹具因真人操作/观察超过 60 秒而超时失败；延长仅用于人工操作的超时时间后重试通过，没有屏蔽功能断言。
+- 真实托盘验收由用户协助操作（自动化工具只暴露 Codex/浏览器，没有 Explorer/通知区域）：用户回报单击、连续点击/双击、报时声音及焦点测试通过。隔离 Session 确实记录了“现在几点?”和“现在是上午8点10分。”回复，测试设置常驻监听偏好仍为 false。此报时走本地快捷回答，不能作为普通 Agent/工具审批验收。
+- 同一隔离 Session 另记录一次“现在提点。”识别后进入未配置的模型端点并发生 llm_error，按实际失败记录；未声称完整链路通过。
+- 隔离实例使用已有 Whisper small、KWS 与本地 Kokoro 模型，独立 CUAVA_DATA_DIR/LOCALAPPDATA，无现有用户配置、Session 或真实密钥读写。系统可枚举到 Realtek 等音频驱动；驱动枚举本身不算声学验收。发现同时存在已安装版，已提示用户区分并退出旧实例，避免混算版本。
+
+完整 Agent、长回复流式播放、语音肯定/否定审批、真实 BargeIn、KWS/Followup 以及多屏/DPI 的最终结果尚待真人协作记录；不将 GUI 夹具或本地报时算作这些项目通过。PR16 保持 Draft，不合并、不发布。

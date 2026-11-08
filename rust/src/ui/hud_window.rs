@@ -231,6 +231,61 @@ mod native_tests {
 mod pr16_layout_tests {
     use super::*;
     #[test]
+    #[ignore = "interactive Windows reasoning collapse acceptance"]
+    fn reasoning_generation_fixture() {
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .select()
+            .unwrap();
+        let hud = create().unwrap();
+        hud.set_reasoning("真实事件投影测试行\n".repeat(30).into());
+        hud.set_status("请展开思考，等待增量后点击允许；新代次折叠后再展开并点击拒绝".into());
+        hud.set_asking(true);
+        hud.set_prompt("仅 GUI 夹具，不执行任何工具".into());
+        hud.set_request_id(1);
+        let h = hud.as_weak();
+        hud.on_answer(move |id, _| {
+            let h = h.upgrade().unwrap();
+            assert!(
+                h.get_expanded(),
+                "user expansion must survive ordinary updates"
+            );
+            if id == 1 {
+                h.set_interaction_generation(1);
+                h.set_request_id(2);
+            } else {
+                slint::quit_event_loop().unwrap();
+            }
+        });
+        let placement = Placement::default();
+        placement.show(&hud);
+        let update = slint::Timer::default();
+        let h = hud.as_weak();
+        let count = std::cell::Cell::new(0);
+        update.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || {
+                let h = h.upgrade().unwrap();
+                let n = count.get() + 1;
+                count.set(n);
+                h.set_reasoning(format!("{}第 {n} 行增量\n", h.get_reasoning()).into());
+                h.set_subtitle(format!("第 {n} 句播放事件夹具").into());
+                eprintln!(
+                    "generation={} expanded={} following={}",
+                    h.get_interaction_generation(),
+                    h.get_expanded(),
+                    h.get_following_latest()
+                );
+                if n >= 180 {
+                    panic!("GUI acceptance timed out");
+                }
+            },
+        );
+        slint::run_event_loop_until_quit().unwrap();
+    }
+
+    #[test]
     #[ignore = "interactive Windows HUD layout fixture"]
     fn long_content_hud_fixture() {
         slint::BackendSelector::new()

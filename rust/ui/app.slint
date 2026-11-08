@@ -2562,10 +2562,11 @@ export component VoiceHud inherits Window {
     in property <string> playback;
     in property <string> followup;
     in property <[ToolCard]> tools;
-    property <bool> expanded: false;
+    out property <bool> expanded: false;
     in property <int> interaction-generation;
     out property <bool> following-latest: true;
     changed interaction-generation => {
+        root.expanded = false;
         root.following-latest = true;
         live-scroll.content-y = min(0px, live-scroll.height - live-scroll.content-height);
     }
