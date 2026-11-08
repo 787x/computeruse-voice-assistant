@@ -418,6 +418,16 @@ pub fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let weak = window.as_weak();
         let save_generation = save_generation.clone();
         let model_drafts = model_drafts.clone();
+        let model_window = window.as_weak();
+        window.on_save_model_endpoints(move || {
+            if let Some(w) = model_window.upgrade() {
+                // Use each card's existing validation, credential boundary and serialized save path.
+                let cards: Vec<_> = w.get_endpoint_cards().iter().collect();
+                for card in cards {
+                    w.invoke_endpoint_action("save".into(), card);
+                }
+            }
+        });
         window.on_save_all(move || {
             // 界面上读一次当前全部字段（工作线程持有权威配置副本）。
             let mut request = match weak.upgrade() {
@@ -2029,6 +2039,7 @@ async fn run_worker(
                     }
                     Ok(())
                 })();
+                let active_has_key = secret.has(&settings.provider_id);
                 let snapshot = settings.clone();
                 sessions.set_key_presence(super::endpoint_cards::key_presence(&settings, &secret));
                 let picker_sessions = sessions.clone();
@@ -2058,12 +2069,16 @@ async fn run_worker(
                             );
                         }
                         if saved_id == snapshot.provider_id {
+                            w.set_endpoint_text(
+                                config::describe_endpoint(&snapshot, active_has_key).into(),
+                            );
                             w.set_base_url(snapshot.base_url.clone().into());
                             w.set_model_name(snapshot.model.clone().into());
                             w.set_thinking_index(thinking_index(snapshot.thinking));
                             w.set_effort_index(reasoning_effort_index(snapshot.reasoning_effort));
                             fill_model_settings(w, &snapshot.provider(&saved_id));
                         }
+                        w.set_status(format!("端点 {saved_id} 已保存").into());
                         refresh_model_picker(w, &snapshot, &picker_sessions);
                     }
                 });
