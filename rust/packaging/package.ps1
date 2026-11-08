@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)][string]$CudaRedist,
     [Parameter(Mandatory=$true)][string]$MsvcRedist,
     [Parameter(Mandatory=$true)][string]$MakeNsis,
@@ -6,6 +6,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+if (@(& git -C $repo status --porcelain --untracked-files=all).Count -ne 0) { throw '工作区不干净，拒绝发行构建。' }
 if (-not $env:CUDA_PATH -or -not (Test-Path (Join-Path $env:CUDA_PATH 'bin/nvcc.exe'))) { throw '请设置 CUDA_PATH 指向构建使用的 CUDA Toolkit。' }
 $cudaVersion = (Get-Content -Raw (Join-Path $env:CUDA_PATH 'version.json') | ConvertFrom-Json).cuda.version
 if ($cudaVersion -ne '13.4.1') { throw "需要锁定的 CUDA Toolkit 13.4.1，实际为 $cudaVersion。" }
@@ -48,7 +49,7 @@ while ($queue.Count -gt 0) {
     $binary = $queue.Dequeue()
     $lines = @(& dumpbin /dependents $binary)
     if ($LASTEXITCODE -ne 0) { throw "PE 依赖扫描失败: $binary" }
-    $imports += "`n### $([IO.Path]::GetFileName($binary))`n" + ($lines -join "`n")
+    $imports += "`n### $([IO.Path]::GetFileName($binary))`n" + (($lines | Where-Object { $_ -match '^\s+[\w.-]+\.dll\s*$' }) -join "`n")
     foreach ($line in $lines) {
         if ($line -notmatch '^\s+([\w.-]+\.dll)\s*$') { continue }
         $name = $Matches[1]
@@ -61,7 +62,7 @@ while ($queue.Count -gt 0) {
         if ($matches.Count -ne 1) { throw "NVIDIA redist 中必须有唯一的 $name，实际找到 $($matches.Count) 个。" }
         $toolkitDll = Join-Path $env:CUDA_PATH ("bin/x64/" + $name)
         if (-not (Test-Path -LiteralPath $toolkitDll) -or (Get-FileHash $toolkitDll).Hash -ne (Get-FileHash $matches[0].FullName).Hash) { throw "$name 与构建 Toolkit 不一致。" }
-        $nvidiaSources += "NVIDIA source: $($matches[0].FullName) SHA256=$((Get-FileHash -LiteralPath $matches[0].FullName -Algorithm SHA256).Hash)"
+        $nvidiaSources += "NVIDIA redist: $name SHA256=$((Get-FileHash -LiteralPath $matches[0].FullName -Algorithm SHA256).Hash)"
         $seen[$name] = $true
         Copy-Item -LiteralPath $matches[0].FullName -Destination $stage
         $queue.Enqueue((Join-Path $stage $name))
@@ -94,16 +95,16 @@ $i = 0
 foreach ($license in $licenseFiles) { $i++; Copy-Item -LiteralPath $license.FullName -Destination (Join-Path $nvidiaLicenses ("{0}-{1}" -f $i,$license.Name)) }
 $inventory | Set-Content -Encoding UTF8 (Join-Path $licenses 'cargo-inventory.txt')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'REDISTRIBUTION.md') -Destination $licenses
-$nvcc = (& (Join-Path $env:CUDA_PATH 'bin/nvcc.exe') --version) -join "`n"
-$record = @("Whisper: CUDA enabled; CPU runtime fallback", "source commit: $((& git -C $repo rev-parse HEAD))", "source status: $((& git -C $repo status --short) -join ' | ')", "CUDA Toolkit: $cudaVersion ($env:CUDA_PATH)", "NVIDIA redist: $CudaRedist", "MSVC redist: $MsvcRedist", $nvcc, "", "SHA-256:")
+$msvcVersion = (Get-Item (Join-Path $MsvcRedist 'vcruntime140.dll')).VersionInfo.FileVersion
+$record = @("Whisper: CUDA enabled; CPU runtime fallback", "source commit: $((& git -C $repo rev-parse HEAD))", "CUDA Toolkit: $cudaVersion", "MSVC CRT file version: $msvcVersion", "", "SHA-256:")
 $record += $nvidiaSources
-$record += Get-ChildItem -LiteralPath $stage -File -Recurse | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path)" }
+$record += Get-ChildItem -LiteralPath $stage -File -Recurse | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring($stage.Length + 1))" }
 $record | Set-Content -Encoding UTF8 (Join-Path $stage 'build-manifest.txt')
 $uninstall = Get-ChildItem -LiteralPath $stage -File | ForEach-Object { 'Delete "$INSTDIR\' + $_.Name + '"' }
 $uninstall | Set-Content -Encoding ASCII (Join-Path $stage 'uninstall-files.nsh')
-$zip = Join-Path $Output 'cuava-0.1.0-windows-x64-cuda.zip'
+$zip = Join-Path $Output 'cuava-0.1.1-windows-x64-cuda.zip'
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
-$installer = Join-Path $Output 'cuava-0.1.0-windows-x64-cuda-setup.exe'
+$installer = Join-Path $Output 'cuava-0.1.1-windows-x64-cuda-setup.exe'
 & $MakeNsis "/DSTAGE=$stage" "/DOUTPUT=$installer" (Join-Path $PSScriptRoot 'installer.nsi')
 if ($LASTEXITCODE -ne 0) { throw 'NSIS failed' }
 Get-FileHash -Algorithm SHA256 -LiteralPath $zip,$installer | Format-Table -AutoSize

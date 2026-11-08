@@ -1,7 +1,7 @@
-﻿# CUAVA Rust CUDA 发行候选
+﻿# CUAVA Rust CUDA 发行版
 
 本目录为原生 Slint 版本，无 Electron/WebView、Node、Python、Rust 或 CUDA Toolkit 运行要求。
-当前为未签名候选，系统可能提示未知发布者。不要关闭安全功能；正式使用前核对来源和 SHA-256。
+当前为未签名发行版，系统可能提示未知发布者。不要关闭安全功能；正式使用前核对来源和 SHA-256。
 安装器默认安装到当前用户 LocalAppData/Programs/CUAVA-Rust；便携包解压后运行 cuava.exe。
 升级前通过托盘「退出」关闭 Rust 程序，再安装；不会强杀任何进程。
 卸载默认保留 AppData/Roaming/cuava（Session、模型、DPAPI Key），不触碰旧 Electron 数据。
@@ -35,20 +35,22 @@
 enc: safeStorage 与 Rust DPAPI 不兼容，所有 Key 均不导入；按提供商手工重新输入。
 模型路径、自定义唤醒词、语音、模型方案/时段须手工配置。重复导入不会覆盖已有字段。
 
-| 功能 | Rust 候选状态 |
+| 功能 | Rust 状态 |
 | --- | --- |
 | 文本 Agent、权限/CUA、多 Session、模型/上下文/思考工具时间线 | 已实现（PR5–8） |
 | KWS/Whisper、MiMo/ONNX TTS、语音确认/打断 | 已实现，需资源和实机验证 |
 | 提供商 Key、模型、唤醒词、方案/时段 | 需要手动重新配置 |
-| 音乐登录/播放器、搜索服务、角色动画/音色、GPT-SoVITS | 尚未移植 |
+| 音乐登录/播放器、角色动画/音色、GPT-SoVITS | 尚未移植 |
 
-## CUDA 发行构建与验收
+已支持 PowerShell、文件和进程工具、系统时间及 Tavily 搜索，多供应商、MiMo TTS、增量播报、连续追问、原生 HUD、托盘单击与手动结束录音。模型错误会显示实际错误信息。尚无自动更新。
+
+## 开发者：CUDA 发行构建与验收
 
 在 x64 MSVC Developer PowerShell 准备 CUDA Toolkit 13.4.1（设置 CUDA_PATH）、CMake、Ninja、LIBCLANG_PATH、sherpa-onnx 静态 MD 库、NSIS、微软 CRT Redist，以及与 Toolkit 相同版本的 NVIDIA 官方 Windows x64 redist 解压目录。`package.ps1` 在全新 Cargo target 中执行默认 feature 的 `cargo build --release --locked`，检查 CMake CUDA 配置和 PE 导入，拒绝使用外部 EXE；它不会启用实验性 `tts-cuda`。
 
     ./rust/packaging/package.ps1 -CudaRedist <NVIDIA-redist目录> -MsvcRedist <微软CRT-redist目录> -MakeNsis <makensis.exe>
 
-脚本根据 PE 导入递归收集 NVIDIA 运行库，要求其与构建 Toolkit 的文件哈希一致，记录导入、文件哈希及来源。`nvcuda.dll` 由 NVIDIA 驱动提供，不随包复制。输出 ZIP 和安装器均为 CUDA 候选；正式发布前须审查 NVIDIA、MSVC、Slint 的许可。
+脚本根据 PE 导入递归收集 NVIDIA 运行库，要求其与构建 Toolkit 的文件哈希一致，记录导入、文件哈希及来源。`nvcuda.dll` 由 NVIDIA 驱动提供，不随包复制。输出 ZIP 和安装器均为 CUDA 发行包；正式发布前须审查 NVIDIA、MSVC、Slint 的许可。
 
 在兼容 NVIDIA 驱动的 Windows x64 上，从非源码工作目录安装和启动，使用真实 Whisper 模型确认 UI 显示 `Whisper CUDA` 且转录正确；然后关闭 `voice.useGpu`，确认同一 EXE 显示 `Whisper CPU` 且转录正确。退出、卸载并确认用户数据保留。缺少加载期 DLL 会导致启动失败，不可宣称会自动回退。构建通过不能替代实机验收。
 
