@@ -1,6 +1,6 @@
 # PR10：Whisper CUDA 发行与运行时回退
 
-正式发行固定使用 CUDA Toolkit 13.4.1 构建 Whisper，打包入口在新建的 Cargo target 内执行锁定依赖的默认 feature 构建，不接受外部 EXE。这样可避免历史 CPU-only CMake 缓存或同名程序混入；构建失败即停止。开发测试仍可选择 CPU-only 编译，但它不是发行构建。
+正式发行固定使用 CUDA Toolkit 13.4.1 构建 Whisper，打包入口在新建的 Cargo target 内执行锁定依赖的默认 feature 构建，不接受外部 EXE。这样可避免历史旧构建的 CMake 缓存或同名程序混入；构建失败即停止。开发测试与正式发行都使用默认 CUDA 构建；CPU 对照应在同一构建中关闭 GPU 推理。
 
 对实际 PE 导入递归扫描，只从 NVIDIA 官方 redist 收集需要的 DLL，并要求它们与构建 Toolkit 的对应文件哈希一致；不复制驱动提供的 nvcuda.dll。随包记录版本、来源、依赖与哈希并保留许可。与打包整个 Toolkit 相比，此方案减少分发内容，并避免按猜测的 DLL 后缀选择文件。CUDA Toolkit 是构建要求，运行时只需对应运行库与兼容驱动；动态加载阶段缺库时进程可能在 Rust 启动前失败，不能依靠应用内 CPU 回退。
 

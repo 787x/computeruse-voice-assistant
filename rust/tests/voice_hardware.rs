@@ -11,7 +11,7 @@
 //!  - 有可用输入设备，且能拿到合法的采样率/格式；
 //!  - 模型能真正加载（KWS 关键词流 + Whisper 上下文）；
 //!  - 启动后状态从 Loading 走到 Listening，而不是停在 Error；
-//!  - 实际推理后端被如实报告（CPU-only 构建不能显示 CUDA）；
+//!  - 实际推理后端被如实报告（未编入 CUDA 时不能显示 CUDA）；
 //!  - 停止后设备与线程都能收尾。
 //!
 //! 若想验证真实唤醒，运行后对着麦克风说「小爱同学」，看状态是否变成
@@ -160,11 +160,11 @@ fn real_models_and_microphone_reach_listening() {
         !snapshot.iter().any(|line| line.contains("state: error")),
         "启动过程中出现错误状态"
     );
-    // CPU-only 构建绝不能报 cuda。
+    // 防御性检查：未编入 CUDA 时不能报告 cuda。
     if !cuava::voice::asr::gpu_compiled_in() {
         assert!(
             ready_line.contains("backend=cpu"),
-            "CPU-only 构建不能显示 CUDA：{ready_line}"
+            "未编入 CUDA 时不能显示 CUDA：{ready_line}"
         );
     }
 }

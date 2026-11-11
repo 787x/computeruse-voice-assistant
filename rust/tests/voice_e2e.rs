@@ -351,8 +351,8 @@ fn real_session_from_wake_to_final_text() {
 /// **所有**语音指令都会被静默丢弃。这里断言结果送达后会话归属仍然有效，
 /// 由接收方（工作线程）接受后再清零。
 ///
-/// 顺带断言「实际后端」：CPU-only 构建必须报 CPU 并带原因；
-/// 带 CUDA 的构建如果报 CUDA，就不能同时带降级原因（否则自相矛盾）。
+/// 顺带断言「实际后端」：未编入 CUDA 时必须报 CPU 并带原因；
+/// 使用 CUDA 时不能同时带降级原因（否则自相矛盾）。
 #[test]
 fn asr_worker_delivers_final_and_keeps_session_until_consumed() {
     use cuava::voice::asr::{AsrBackend, AsrWorker, InferenceCancel};
@@ -379,10 +379,10 @@ fn asr_worker_delivers_final_and_keeps_session_until_consumed() {
         ready.backend, ready.fallback_reason
     );
     if !cuava::voice::asr::gpu_compiled_in() {
-        assert_eq!(ready.backend, AsrBackend::Cpu, "CPU-only 构建必须报 CPU");
+        assert_eq!(ready.backend, AsrBackend::Cpu, "未编入 CUDA 时必须报 CPU");
         assert!(
             ready.fallback_reason.is_some(),
-            "CPU-only 构建要说明为什么不是 CUDA"
+            "未编入 CUDA 时要说明为什么不是 CUDA"
         );
     }
     if ready.backend == AsrBackend::Cuda {
