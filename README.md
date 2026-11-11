@@ -1,4 +1,4 @@
-# 银狼 · 语音助手（Computer-Use Voice Assistant）
+# 语音助手（Computer-Use Voice Assistant）
 
 一个跑在 Windows 上的**桌面语音助手**：喊一声「小爱同学」，它就能听懂、开口、动手操作这台电脑。
 
