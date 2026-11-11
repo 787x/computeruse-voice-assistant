@@ -110,7 +110,7 @@ with_active(false) 仅保护初次显示，不能独立满足持续无焦点唤�
 
 新增小型 Safe Rust create()，用可嵌套且 panic 时恢复原值的作用域包围 VoiceHud::new；生产和原生测试共用该入口。显示作用域与已有 HWND 临时 NOACTIVATE 处理保留，不新增 unsafe，不改后端、运行时或权限路径。原生测试断言 new 阶段恰有一次 HUD hook，持续可见重复调用也保持前台不变。
 
-本轮 release、clippy、fmt 及 48 项 UI 单测通过（历史构建记录）（3项交互测试默认ignored，历史警告保留）。显式执行真实桌面焦点测试，首次/持续/隐藏重显三轮前台HWND均为0x40824；用户在记事本输入并确认输入正常，安装版HUD按钮可点击。本项不经过真实KWS。
+本轮 release、clippy、fmt 及 48 项 UI 单测通过（3 项交互测试默认忽略，历史警告保留；本记录为历史构建验证）。显式执行真实桌面焦点测试，首次/持续/隐藏重显三轮前台HWND均为0x40824；用户在记事本输入并确认输入正常，安装版HUD按钮可点击。本项不经过真实KWS。
 
 本轮重新从最新源码打包，安装PID24848退出0，目标卸载注册项匹配、安装EXE与release哈希一致、脚本BOM正确，从C:\Windows和Windows-only PATH启动新隔离配置PID12996。完整退出/卸载结果见 verification/pr9-last-round.json；旧构建证据仅作为历史记录，不作为本次候选结果。
 
@@ -127,6 +127,6 @@ with_active(false) 仅保护初次显示，不能独立满足持续无焦点唤�
 
 安装器在WriteUninstaller之前ClearErrors，之后检查错误标记、文件存在、可读MZ头及长度；任一失败即中止，不继续写卸载登记。用Uninstall.exe同名目录实际阻止生成，PID8904退出1且诊断uninstaller-failed，原有登记未覆盖。正常安装PID33612退出0，卸载程序54104字节、登记路径匹配，实际卸载PID28972退出0，测试EXE和登记移除。测试前原安装登记/快捷方式已备份并恢复。未改安装路径/占用检查/数据删除规则。
 
-本轮 fmt、clippy、release 及 50 项 UI 单测通过（历史构建记录）（3项交互测试默认ignored，历史警告保留），重新打包成功。真实长语音未执行：沿用用户此前暂缓，不自动开启麦克风或调用真实账户。未机械重复焦点/DPI/完整语音权限验收；干净VM、多屏、正式许可边界不变。证据见verification/pr9-minimal-closeout.json。
+本轮 fmt、clippy、release 及 50 项 UI 单测通过（3 项交互测试默认忽略，历史警告保留；本记录为历史构建验证），重新打包成功。真实长语音未执行：沿用用户此前暂缓，不自动开启麦克风或调用真实账户。未机械重复焦点/DPI/完整语音权限验收；干净VM、多屏、正式许可边界不变。证据见verification/pr9-minimal-closeout.json。
 
 本轮安装器SHA-256：6A9FDDAE78DF73C8D9B878EB8DA9A2DBC15191411126971CFB5640F292997C42；ZIP：96F747C30D595C6D02F822441DCF54A175C7A93B2728EF28409029C7689850F0。此前候选哈希为历史证据。
