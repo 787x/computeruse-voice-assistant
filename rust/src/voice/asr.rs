@@ -40,9 +40,8 @@ pub struct AsrConfig {
 
 /// 本构建是否带 CUDA 后端。
 ///
-/// `cuda` 是默认且**唯一受支持**的发行 feature（项目不再维护 CPU-only 版本）。
-/// 这个常量保留下来是为了让"没有 GPU 可用"与"构建里就没有 CUDA"这两种情况
-/// 在界面上仍能如实区分：没有设备时同一构建内回退 CPU 并说明原因。
+/// `cuda` 是默认且**唯一受支持**的构建 feature；CPU 只作为运行时回退。
+/// 特性检测用于区分编译时 CUDA 支持与运行时设备可用性，确保界面如实报告后端。
 pub const fn gpu_compiled_in() -> bool {
     cfg!(feature = "cuda")
 }
@@ -93,7 +92,7 @@ impl AsrConfig {
 pub struct BackendPlan {
     /// 依次尝试的后端。
     pub order: Vec<AsrBackend>,
-    /// 为什么没有尝试 GPU（CPU-only 构建 / 没有可用设备）；请求 GPU 时才有值。
+    /// 为什么没有尝试 GPU（编译时缺少 CUDA 支持 / 没有可用设备）；请求 GPU 时才有值。
     pub gpu_unavailable: Option<String>,
 }
 
@@ -468,7 +467,7 @@ fn load_context(config: &AsrConfig) -> Result<(WhisperContext, ReadyInfo), AsrEr
         )));
     }
 
-    // 只有真的要请求 GPU 时才去探测设备（CPU-only 构建里这次调用也不会发生）。
+    // 只有真正请求 GPU 且编入 CUDA feature 时才探测设备。
     let gpu_devices = if config.use_gpu && gpu_compiled_in() {
         gpu_device_count()
     } else {
@@ -799,7 +798,7 @@ mod tests {
         assert_eq!(plan.order, vec![AsrBackend::Cpu]);
         assert_eq!(plan.gpu_unavailable, None);
 
-        // CPU-only 构建：即使要求 GPU 也只走 CPU，并说明原因。
+        // 防御性分支：未编入 CUDA feature 时只走 CPU，并说明原因。
         let plan = plan_backends(true, false, 0);
         assert_eq!(plan.order, vec![AsrBackend::Cpu]);
         assert!(plan.gpu_unavailable.unwrap().contains("CUDA"));
@@ -868,7 +867,7 @@ mod tests {
         assert!(message.contains("模型文件不存在"), "{message}");
     }
 
-    /// CPU-only 构建里 ggml 不该报出任何 GPU 设备（否则会误以为能上 GPU）。
+    /// 未编入 CUDA feature 时，ggml 不该报出 GPU 设备。
     #[test]
     fn gpu_device_probe_matches_build() {
         if gpu_compiled_in() {
@@ -880,7 +879,7 @@ mod tests {
             );
             return;
         }
-        assert_eq!(gpu_device_count(), 0, "CPU-only 构建不应看到 GPU 设备");
+        assert_eq!(gpu_device_count(), 0, "未编入 CUDA feature 时不应看到 GPU 设备");
     }
 
     #[test]

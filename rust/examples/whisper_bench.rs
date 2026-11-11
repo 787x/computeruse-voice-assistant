@@ -7,9 +7,6 @@
 //! # 默认构建（带 CUDA；需要 CUDA Toolkit，见 README）
 //! cargo build --release --example whisper_bench
 //! .\target\release\examples\whisper_bench.exe assets\test\asr-zh.wav 8 3
-//!
-//! # CPU-only
-//! cargo build --release --no-default-features --example whisper_bench
 //! ```
 //!
 //! 输出是 JSON（一行），字段与 `tools/bench-whisper.mjs` 的期望一致。

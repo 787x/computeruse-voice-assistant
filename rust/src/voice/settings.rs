@@ -104,7 +104,7 @@ pub struct VoiceSettings {
     /// 是否让 whisper 用 GPU。默认 true：CUDA 构建 + 可用 GPU 时延迟从秒级降到百毫秒级。
     ///
     /// 这只是**用户的期望**：实际后端由 `voice::asr` 决定并如实上报——
-    /// CPU-only 构建、没有可用设备、CUDA 初始化失败都会退回 CPU 并说明原因。
+    /// 没有可用设备或 CUDA 初始化失败时，使用同一构建内的 CPU 后端并说明原因。
     #[serde(default = "default_use_gpu")]
     pub use_gpu: bool,
     /// 推理线程数。0 = 自动（min(硬件线程, 8)）。
